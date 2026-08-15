@@ -139,6 +139,9 @@ fn header_row(columns: &[String], widths: &[f32], colors: &theme::ThemeColors) -
     let mut row = div()
         .h(px(HEADER_HEIGHT))
         .flex_none()
+        // Rows are laid out inside the list, which does not stretch them;
+        // without this the hairlines stop where the values do.
+        .w_full()
         .flex()
         .items_center()
         .border_b_1()
@@ -188,6 +191,7 @@ fn data_row(
         .id(ix)
         .h(px(ROW_HEIGHT))
         .flex_none()
+        .w_full()
         .flex()
         .items_center()
         .border_b_1()
