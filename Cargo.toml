@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/meerkat",
+    "crates/theme",
+    "crates/ui",
+    "crates/workspace",
+    "crates/settings",
+    "crates/db_client",
+    "crates/db_sqlite",
+    "crates/db_postgres",
+    "crates/introspect",
+    "crates/query",
+    "crates/sql_editor",
+    "crates/results_grid",
+    "crates/schema_tree",
+    "crates/storage",
+    "crates/secrets",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+# GPUI, pinned to the same revision as the local Zed checkout this
+# project was modeled on. Bump both together.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "9bde578ef5afa84920c4300af25f9dee31c96fcf" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "9bde578ef5afa84920c4300af25f9dee31c96fcf", features = ["font-kit", "wayland", "x11"] }
+gpui_tokio = { git = "https://github.com/zed-industries/zed", rev = "9bde578ef5afa84920c4300af25f9dee31c96fcf" }
+
+# Internal crates
+theme = { path = "crates/theme" }
+ui = { path = "crates/ui" }
+workspace = { path = "crates/workspace" }
+settings = { path = "crates/settings" }
+db_client = { path = "crates/db_client" }
+db_sqlite = { path = "crates/db_sqlite" }
+db_postgres = { path = "crates/db_postgres" }
+introspect = { path = "crates/introspect" }
+query = { path = "crates/query" }
+sql_editor = { path = "crates/sql_editor" }
+results_grid = { path = "crates/results_grid" }
+schema_tree = { path = "crates/schema_tree" }
+storage = { path = "crates/storage" }
+secrets = { path = "crates/secrets" }
+
+# Third party
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "macros"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+dirs = "6"
+
+[profile.dev]
+# GPUI is slow in unoptimized builds; keep dependencies optimized.
+[profile.dev.package."*"]
+opt-level = 2
