@@ -6,11 +6,14 @@
 //! same as a 15-row one. Lane widths are measured once from the values
 //! themselves; dragging a column to resize it comes later.
 
+mod scrollbar;
+
 use db_client::Value;
 use gpui::{
-    App, Div, ElementId, FontWeight, Hsla, SharedString, Stateful, div, prelude::*, px,
-    uniform_list,
+    App, Div, ElementId, FontWeight, Hsla, ScrollHandle, SharedString, Stateful,
+    UniformListScrollHandle, div, prelude::*, px, uniform_list,
 };
+use scrollbar::{DragState, Scrollbar};
 use std::rc::Rc;
 use theme::theme;
 
@@ -36,6 +39,27 @@ const WIDTH_SAMPLE: usize = 200;
 
 /// Called with the row index when the user clicks a row.
 pub type OnClickRow = Rc<dyn Fn(usize, &mut gpui::Window, &mut App)>;
+
+/// Scroll position for one grid, held by whoever owns the tab so it
+/// survives the re-render after every keystroke and every page.
+#[derive(Clone, Default)]
+pub struct GridState {
+    rows: UniformListScrollHandle,
+    columns: ScrollHandle,
+    drag: DragState,
+}
+
+impl GridState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The row list scrolls through its own handle, which wraps a plain
+    /// one; the scrollbar only needs the plain one.
+    fn rows_handle(&self) -> ScrollHandle {
+        self.rows.0.borrow().base_handle.clone()
+    }
+}
 
 /// One rendered result set, with its lanes already sized. Widths are
 /// computed once here rather than on every frame.
@@ -81,39 +105,87 @@ pub fn column_widths(columns: &[String], rows: &[Vec<Value>]) -> Vec<f32> {
 pub fn grid(
     id: impl Into<SharedString>,
     data: Rc<GridData>,
+    state: &GridState,
     selected: Option<usize>,
     on_click: Option<OnClickRow>,
     cx: &App,
-) -> Stateful<Div> {
+) -> Div {
     let id: SharedString = id.into();
     let colors = theme(cx).colors.clone();
     // The content can be wider than the pane; the whole grid scrolls
     // sideways as one, header included.
     let content_width: f32 = data.widths.iter().sum();
-    let rows = row_list(&id, data.clone(), selected, on_click);
+    let rows = row_list(&id, data.clone(), state, selected, on_click);
 
+    // The bars sit outside the scrolling content, or they would scroll
+    // away with it.
     div()
-        .id(ElementId::Name(format!("{id}-grid").into()))
+        .relative()
         .flex_1()
         .min_h(px(0.))
-        .overflow_x_scroll()
-        // A grid has a scroll container per axis: this one for the
-        // columns, the row list for the rows. Locking each to the
-        // gesture's dominant axis keeps a diagonal swipe from moving both
-        // at once, and lets a vertical gesture pass through to the list.
-        .restrict_scroll_to_axis()
         .child(
             div()
-                .flex()
-                .flex_col()
-                .h_full()
-                .w(px(content_width))
-                .min_w_full()
-                // The lanes are measured against this size; leaving the
-                // default here would render the data wider than its lane.
-                .text_size(px(DATA_FONT_SIZE))
-                .child(header_row(&data.columns, &data.widths, &colors))
-                .child(rows),
+                .id(ElementId::Name(format!("{id}-grid").into()))
+                .size_full()
+                .overflow_x_scroll()
+                .track_scroll(&state.columns)
+                // A grid has a scroll container per axis: this one for the
+                // columns, the row list for the rows. Locking each to the
+                // gesture's dominant axis keeps a diagonal swipe from
+                // moving both at once, and lets a vertical gesture pass
+                // through to the list.
+                .restrict_scroll_to_axis()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .h_full()
+                        .w(px(content_width))
+                        .min_w_full()
+                        // The lanes are measured against this size; leaving
+                        // the default here would render the data wider than
+                        // its lane.
+                        .text_size(px(DATA_FONT_SIZE))
+                        .child(header_row(&data.columns, &data.widths, &colors))
+                        .child(rows),
+                ),
+        )
+        .children(
+            Scrollbar::new(
+                true,
+                state.rows_handle(),
+                state.drag.clone(),
+                colors.text_faint,
+                colors.text_muted,
+            )
+            .map(|bar| {
+                div()
+                    .absolute()
+                    // Start below the header, so the bar never covers it.
+                    .top(px(HEADER_HEIGHT))
+                    .right(px(0.))
+                    .bottom(px(0.))
+                    .w(px(scrollbar::THICKNESS))
+                    .child(bar)
+            }),
+        )
+        .children(
+            Scrollbar::new(
+                false,
+                state.columns.clone(),
+                state.drag.clone(),
+                colors.text_faint,
+                colors.text_muted,
+            )
+            .map(|bar| {
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .right(px(0.))
+                    .bottom(px(0.))
+                    .h(px(scrollbar::THICKNESS))
+                    .child(bar)
+            }),
         )
 }
 
@@ -124,6 +196,7 @@ pub fn grid(
 fn row_list(
     id: &SharedString,
     data: Rc<GridData>,
+    state: &GridState,
     selected: Option<usize>,
     on_click: Option<OnClickRow>,
 ) -> impl IntoElement {
@@ -147,7 +220,7 @@ fn row_list(
         },
     );
     rows.style().restrict_scroll_to_axis = Some(true);
-    rows.flex_1()
+    rows.track_scroll(&state.rows).flex_1()
 }
 
 fn header_row(columns: &[String], widths: &[f32], colors: &theme::ThemeColors) -> Div {

@@ -16,7 +16,7 @@ use gpui::{
     Stateful, Window, actions, div, prelude::*, px,
 };
 use introspect::{Catalog, Table, TableKind};
-use results_grid::{GridData, grid};
+use results_grid::{GridData, GridState, grid};
 use sql_editor::{Kind, Name, SqlEditor, Vocabulary};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -67,6 +67,8 @@ struct TableTab {
     loading: bool,
     error: Option<String>,
     selected: Option<usize>,
+    /// Scroll position, kept across the re-render after every page.
+    scroll: GridState,
     generation: u64,
 }
 
@@ -82,6 +84,7 @@ struct QueryTab {
     elapsed: Option<u128>,
     error: Option<String>,
     running: bool,
+    scroll: GridState,
     generation: u64,
 }
 
@@ -205,6 +208,7 @@ impl Shell {
             loading: false,
             error: None,
             selected: None,
+            scroll: GridState::new(),
             generation: 0,
         }));
         self.active = self.tabs.len() - 1;
@@ -280,6 +284,7 @@ impl Shell {
             elapsed: None,
             error: None,
             running: false,
+            scroll: GridState::new(),
             generation: 0,
         }));
         self.active = self.tabs.len() - 1;
@@ -905,6 +910,7 @@ impl Shell {
                 .child(grid(
                     format!("tab-{}", tab.id),
                     tab.data.clone(),
+                    &tab.scroll,
                     tab.selected,
                     Some(self.row_click_handler(tab.id, cx)),
                     cx,
@@ -1075,7 +1081,14 @@ impl Shell {
                 )
                 .child(summary),
         )
-        .child(grid(format!("tab-{}", tab.id), tab.data.clone(), None, None, cx))
+        .child(grid(
+            format!("tab-{}", tab.id),
+            tab.data.clone(),
+            &tab.scroll,
+            None,
+            None,
+            cx,
+        ))
     }
 
     fn placeholder(&self, colors: &ThemeColors, _window: &mut Window) -> Div {
