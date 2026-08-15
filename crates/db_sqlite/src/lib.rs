@@ -71,6 +71,9 @@ impl Connection for SqliteConnection {
                 kind: if kind == "view" { TableKind::View } else { TableKind::Table },
                 columns,
                 primary_key: pk.into_iter().map(|(_, col)| col).collect(),
+                // SQLite keeps no row estimate; a per-table COUNT(*) would
+                // scan every table on connect, so report nothing.
+                approx_rows: None,
             });
         }
 

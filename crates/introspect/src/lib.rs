@@ -26,6 +26,12 @@ pub struct Table {
     /// Names of the primary-key columns, in key order. Empty when the
     /// table has no primary key; such tables are not editable in place.
     pub primary_key: Vec<String>,
+    /// Estimated row count for the sidebar, from the engine's statistics
+    /// (`pg_class.reltuples`). `None` when the engine has no estimate or
+    /// the table was never analyzed — the UI then shows nothing rather
+    /// than a misleading zero. Never use this for paging arithmetic that
+    /// must be exact.
+    pub approx_rows: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

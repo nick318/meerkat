@@ -10,3 +10,15 @@ anyhow.workspace = true
 async-trait.workspace = true
 db_client.workspace = true
 introspect.workspace = true
+secrets.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true, features = [
+    "postgres",
+    "bigdecimal",
+    "uuid",
+    "time",
+    "json",
+] }
+
+[dev-dependencies]
+tokio.workspace = true
