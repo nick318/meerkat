@@ -1458,7 +1458,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1658,7 +1658,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2446,6 +2446,17 @@ dependencies = [
  "schemars",
  "serde",
  "smol_str",
+]
+
+[[package]]
+name = "gpui_tokio"
+version = "0.1.0"
+source = "git+https://github.com/zed-industries/zed?rev=9bde578ef5afa84920c4300af25f9dee31c96fcf#9bde578ef5afa84920c4300af25f9dee31c96fcf"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "gpui_util",
+ "tokio",
 ]
 
 [[package]]
@@ -3398,8 +3409,15 @@ dependencies = [
 name = "meerkat"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "db_client",
+ "db_postgres",
  "gpui",
  "gpui_platform",
+ "gpui_tokio",
+ "introspect",
+ "results_grid",
+ "sql_editor",
  "theme",
  "ui",
 ]
@@ -3584,7 +3602,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4809,6 +4827,11 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 [[package]]
 name = "results_grid"
 version = "0.1.0"
+dependencies = [
+ "db_client",
+ "gpui",
+ "theme",
+]
 
 [[package]]
 name = "resvg"
@@ -4936,7 +4959,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4949,7 +4972,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5473,7 +5496,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5516,6 +5539,10 @@ dependencies = [
 [[package]]
 name = "sql_editor"
 version = "0.1.0"
+dependencies = [
+ "gpui",
+ "theme",
+]
 
 [[package]]
 name = "sqlx"
@@ -5735,7 +5762,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6041,7 +6068,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6430,7 +6457,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7142,7 +7169,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

@@ -66,6 +66,34 @@ pub fn status_dot(color: gpui::Hsla) -> Div {
     div().size(px(6.)).rounded_full().bg(color)
 }
 
+/// Compact row counts for the sidebar: `640`, `18.4k`, `1.2m`.
+/// Estimates, so three significant figures are plenty.
+pub fn format_count(count: u64) -> String {
+    match count {
+        0..=999 => count.to_string(),
+        1_000..=999_999 => trim_zero(count as f64 / 1_000., "k"),
+        1_000_000..=999_999_999 => trim_zero(count as f64 / 1_000_000., "m"),
+        _ => trim_zero(count as f64 / 1_000_000_000., "b"),
+    }
+}
+
+fn trim_zero(value: f64, suffix: &str) -> String {
+    if value >= 100. {
+        format!("{}{suffix}", value.round() as u64)
+    } else {
+        format!("{value:.1}{suffix}")
+    }
+}
+
+/// Query timings: `34 ms` up to a second, then `1.9 s`.
+pub fn format_millis(millis: u128) -> String {
+    if millis < 1_000 {
+        format!("{millis} ms")
+    } else {
+        format!("{:.1} s", millis as f64 / 1_000.)
+    }
+}
+
 /// A tiny square glyph marking a table row in lists (accent when active).
 pub fn table_glyph(active: bool, cx: &App) -> Div {
     let colors = &theme(cx).colors;
@@ -74,4 +102,26 @@ pub fn table_glyph(active: bool, cx: &App) -> Div {
     } else {
         colors.text_faint
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_read_compactly() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(640), "640");
+        assert_eq!(format_count(18_412), "18.4k");
+        assert_eq!(format_count(311_000), "311k");
+        assert_eq!(format_count(1_200_000), "1.2m");
+        assert_eq!(format_count(2_400_000_000), "2.4b");
+    }
+
+    #[test]
+    fn timings_switch_to_seconds() {
+        assert_eq!(format_millis(34), "34 ms");
+        assert_eq!(format_millis(999), "999 ms");
+        assert_eq!(format_millis(1_900), "1.9 s");
+    }
 }

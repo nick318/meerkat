@@ -44,6 +44,9 @@ pub struct ThemeColors {
     pub text_muted: Hsla,
     /// Faintest text: NULL cells, disabled, hints.
     pub text_faint: Hsla,
+    /// Line numbers in the query editor gutter. Sits between `text_faint`
+    /// and the rules, so the numbers recede behind the SQL.
+    pub line_number: Hsla,
     /// The single ochre accent.
     pub accent: Hsla,
     /// Deeper accent for emphasized values and hover.
@@ -77,6 +80,7 @@ impl Theme {
                 text_secondary: rgb(0x55514A).into(),
                 text_muted: rgb(0x8A857C).into(),
                 text_faint: rgb(0xB0AAA0).into(),
+                line_number: rgb(0xC6C0B4).into(),
                 accent: rgb(0xB4762F).into(),
                 accent_deep: rgb(0x8E5A1E).into(),
                 selection: rgb(0xF0E5D2).into(),

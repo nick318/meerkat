@@ -1,254 +1,1114 @@
-//! Root view: breadcrumb bar | sidebar + table pane | status strip.
-//! Implements the "table" screen of the Meerkat design comp with sample
-//! data; panes get wired to real drivers as the Phase 1 crates land.
+//! Root view: breadcrumb bar | sidebar + tab pane | status strip.
+//!
+//! The shell owns the session: the connection, the catalog it introspected,
+//! and the open tabs. Every database call goes to the tokio runtime through
+//! `gpui_tokio` and comes back as an update on this entity, so the window
+//! keeps painting while a query runs.
+//!
+//! Stale replies are dropped by generation: each tab counts its requests,
+//! and a reply that does not carry the tab's current generation is thrown
+//! away. Without that, a slow first page would overwrite a fast second one.
 
-use gpui::{Context, Div, FontWeight, Hsla, Window, div, prelude::*, px};
-use theme::{FONT_FAMILY, theme};
-use ui::{card, section_label, status_dot, table_glyph, toolbar_button};
+use db_client::{Connection, QueryResult};
+use db_postgres::{Label, PostgresConnection};
+use gpui::{
+    App, Context, Div, ElementId, Entity, FocusHandle, Focusable, FontWeight, SharedString,
+    Stateful, Window, actions, div, prelude::*, px,
+};
+use introspect::{Catalog, Table, TableKind};
+use results_grid::{GridData, grid};
+use sql_editor::SqlEditor;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Instant;
+use theme::{FONT_FAMILY, ThemeColors, theme};
+use ui::{accent_button, card, format_count, format_millis, section_label, status_dot, table_glyph};
+
+use crate::sql::{PAGE_SIZE, page_query};
+
+actions!(meerkat, [RunQuery, NewQuery, Refresh, PrevPage, NextPage]);
 
 const SIDEBAR_WIDTH: f32 = 246.;
-// ID, EMAIL, NAME, PLAN, MRR, CREATED_AT (LAST_SEEN takes the rest).
-const COLUMN_WIDTHS: [f32; 6] = [64., 188., 150., 74., 96., 112.];
-
-const TABLES: &[(&str, &str)] = &[
-    ("users", "18.4k"),
-    ("accounts", "2.1k"),
-    ("orders", "96.7k"),
-    ("order_items", "311k"),
-    ("payments", "88.2k"),
-    ("subscriptions", "4.9k"),
-    ("sessions", "1.2m"),
-    ("webhooks", "640"),
-    ("feature_flags", "37"),
-    ("audit_log", "2.4m"),
-];
-
-const VIEWS: &[&str] = &["mrr_by_month", "active_users_7d", "churn_risk"];
-
-struct SampleRow {
-    id: &'static str,
-    email: &'static str,
-    name: &'static str,
-    plan: &'static str,
-    mrr: &'static str,
-    created: &'static str,
-    last_seen: &'static str,
-}
-
-const ROWS: &[SampleRow] = &[
-    SampleRow { id: "1041", email: "ida.vos@northwind.io", name: "Ida Vos", plan: "scale", mrr: "1,280.00", created: "2026-08-14", last_seen: "2026-08-15 09:12" },
-    SampleRow { id: "1040", email: "m.okafor@lumen.dev", name: "Michael Okafor", plan: "pro", mrr: "420.00", created: "2026-08-13", last_seen: "2026-08-15 08:44" },
-    SampleRow { id: "1039", email: "sara.lindqvist@atlas.co", name: "Sara Lindqvist", plan: "pro", mrr: "420.00", created: "2026-08-12", last_seen: "2026-08-14 21:03" },
-    SampleRow { id: "1038", email: "petra@brightloom.com", name: "Petra Nowak", plan: "free", mrr: "NULL", created: "2026-08-12", last_seen: "2026-08-12 11:47" },
-    SampleRow { id: "1037", email: "t.haddad@quaystreet.org", name: "Tariq Haddad", plan: "scale", mrr: "1,280.00", created: "2026-08-11", last_seen: "2026-08-15 07:20" },
-    SampleRow { id: "1036", email: "gwen.oyelaran@fern.app", name: "Gwen Oyelaran", plan: "pro", mrr: "420.00", created: "2026-08-10", last_seen: "2026-08-14 16:58" },
-    SampleRow { id: "1035", email: "hello@studiobark.se", name: "NULL", plan: "free", mrr: "NULL", created: "2026-08-09", last_seen: "2026-08-09 09:02" },
-    SampleRow { id: "1034", email: "j.mbeki@rivergate.io", name: "Joseph Mbeki", plan: "scale", mrr: "2,140.00", created: "2026-08-08", last_seen: "2026-08-15 10:31" },
-    SampleRow { id: "1033", email: "ana.ferreira@nube.mx", name: "Ana Ferreira", plan: "pro", mrr: "420.00", created: "2026-08-07", last_seen: "2026-08-13 13:19" },
-    SampleRow { id: "1032", email: "liam.chen@parcelworks.com", name: "Liam Chen", plan: "free", mrr: "NULL", created: "2026-08-06", last_seen: "2026-08-11 18:40" },
-    SampleRow { id: "1031", email: "office@haldencraft.no", name: "Nora Halden", plan: "pro", mrr: "380.00", created: "2026-08-05", last_seen: "2026-08-14 08:07" },
-    SampleRow { id: "1030", email: "dev@tinyforge.dev", name: "Rui Tavares", plan: "free", mrr: "NULL", created: "2026-08-04", last_seen: "2026-08-04 12:22" },
-    SampleRow { id: "1029", email: "k.svensson@bergen.io", name: "Karin Svensson", plan: "scale", mrr: "1,780.00", created: "2026-08-03", last_seen: "2026-08-15 06:55" },
-    SampleRow { id: "1028", email: "team@vergedata.ai", name: "Priya Raman", plan: "pro", mrr: "420.00", created: "2026-08-02", last_seen: "2026-08-12 22:14" },
-    SampleRow { id: "1027", email: "luca.moretti@ortica.it", name: "Luca Moretti", plan: "free", mrr: "NULL", created: "2026-08-01", last_seen: "2026-08-10 15:36" },
-];
+const EDITOR_HEIGHT: f32 = 250.;
 
 pub struct Shell {
-    selected_row: usize,
+    focus_handle: FocusHandle,
+    status: Status,
+    connection: Option<Arc<dyn Connection>>,
+    catalog: Option<Catalog>,
+    label: Option<Label>,
+    tabs: Vec<Tab>,
+    active: usize,
+    next_id: u64,
+}
+
+enum Status {
+    Connecting(String),
+    Connected,
+    Failed(String),
+}
+
+enum Tab {
+    Table(TableTab),
+    Query(QueryTab),
+}
+
+struct TableTab {
+    id: u64,
+    schema: String,
+    table: String,
+    kind: TableKind,
+    data: Rc<GridData>,
+    page: usize,
+    approx_rows: Option<u64>,
+    elapsed: Option<u128>,
+    loading: bool,
+    error: Option<String>,
+    selected: Option<usize>,
+    generation: u64,
+}
+
+struct QueryTab {
+    id: u64,
+    title: SharedString,
+    editor: Entity<SqlEditor>,
+    data: Rc<GridData>,
+    has_result: bool,
+    elapsed: Option<u128>,
+    error: Option<String>,
+    running: bool,
+    generation: u64,
+}
+
+impl Tab {
+    fn id(&self) -> u64 {
+        match self {
+            Tab::Table(tab) => tab.id,
+            Tab::Query(tab) => tab.id,
+        }
+    }
+
+    fn title(&self) -> SharedString {
+        match self {
+            Tab::Table(tab) => format!("{}.{}", tab.schema, tab.table).into(),
+            Tab::Query(tab) => tab.title.clone(),
+        }
+    }
+}
+
+fn empty_grid() -> Rc<GridData> {
+    Rc::new(GridData { columns: Vec::new(), rows: Vec::new() })
 }
 
 impl Shell {
-    pub fn new() -> Self {
-        Self { selected_row: 0 }
+    /// Open the shell and start connecting. The window paints the
+    /// connecting state immediately; the connection lands later.
+    pub fn new(url: String, cx: &mut Context<Self>) -> Self {
+        let mut shell = Self {
+            focus_handle: cx.focus_handle(),
+            status: Status::Connecting(url.clone()),
+            connection: None,
+            catalog: None,
+            label: None,
+            tabs: Vec::new(),
+            active: 0,
+            next_id: 1,
+        };
+        shell.connect(url, cx);
+        shell
+    }
+
+    fn connect(&mut self, url: String, cx: &mut Context<Self>) {
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            let connection = PostgresConnection::connect(&url).await?;
+            let label = connection.label().clone();
+            let catalog = connection.introspect().await?;
+            anyhow::Ok((Arc::new(connection) as Arc<dyn Connection>, label, catalog))
+        });
+
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            this.update(cx, |this, cx| {
+                match flatten(outcome) {
+                    Ok((connection, label, catalog)) => {
+                        this.connection = Some(connection);
+                        this.label = Some(label);
+                        this.catalog = Some(catalog);
+                        this.status = Status::Connected;
+                        this.open_first_table(cx);
+                    }
+                    Err(error) => this.status = Status::Failed(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_first_table(&mut self, cx: &mut Context<Self>) {
+        let Some(catalog) = &self.catalog else { return };
+        let Some((schema, table)) = catalog
+            .schemas
+            .iter()
+            .flat_map(|schema| schema.tables.first().map(|t| (schema.name.clone(), t.name.clone())))
+            .next()
+        else {
+            return;
+        };
+        self.open_table(schema, table, cx);
+    }
+
+    fn open_table(&mut self, schema: String, table: String, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tabs.iter().position(|tab| match tab {
+            Tab::Table(t) => t.schema == schema && t.table == table,
+            Tab::Query(_) => false,
+        }) {
+            self.active = ix;
+            cx.notify();
+            return;
+        }
+
+        let Some((kind, approx_rows)) = self
+            .table_model(&schema, &table)
+            .map(|model| (model.kind, model.approx_rows))
+        else {
+            return;
+        };
+        let id = self.take_id();
+        self.tabs.push(Tab::Table(TableTab {
+            id,
+            schema,
+            table,
+            kind,
+            data: empty_grid(),
+            page: 0,
+            approx_rows,
+            elapsed: None,
+            loading: false,
+            error: None,
+            selected: None,
+            generation: 0,
+        }));
+        self.active = self.tabs.len() - 1;
+        self.load_page(id, 0, cx);
+    }
+
+    fn table_model(&self, schema: &str, table: &str) -> Option<&Table> {
+        self.catalog
+            .as_ref()?
+            .schemas
+            .iter()
+            .find(|s| s.name == schema)?
+            .tables
+            .iter()
+            .find(|t| t.name == table)
+    }
+
+    fn load_page(&mut self, tab_id: u64, page: usize, cx: &mut Context<Self>) {
+        let Some(connection) = self.connection.clone() else { return };
+        let Some(Tab::Table(tab)) = self.tab_mut(tab_id) else { return };
+
+        let (schema, table) = (tab.schema.clone(), tab.table.clone());
+        let Some(model) = self.table_model(&schema, &table).cloned() else { return };
+        let sql = page_query(&schema, &model, page);
+
+        let Some(Tab::Table(tab)) = self.tab_mut(tab_id) else { return };
+        tab.page = page;
+        tab.loading = true;
+        tab.error = None;
+        tab.selected = None;
+        tab.generation += 1;
+        let generation = tab.generation;
+
+        let task = run_sql(connection, sql, cx);
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            this.update(cx, |this, cx| {
+                let Some(Tab::Table(tab)) = this.tab_mut(tab_id) else { return };
+                if tab.generation != generation {
+                    return;
+                }
+                tab.loading = false;
+                match flatten(outcome) {
+                    Ok((result, elapsed)) => {
+                        tab.elapsed = Some(elapsed);
+                        tab.data = Rc::new(GridData {
+                            columns: result.columns,
+                            rows: result.rows,
+                        });
+                    }
+                    Err(error) => {
+                        tab.error = Some(error);
+                        tab.data = empty_grid();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn new_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.take_id();
+        let editor = cx.new(|cx| SqlEditor::new("select 1 as x, now() as t", cx));
+        window.focus(&editor.focus_handle(cx), cx);
+        self.tabs.push(Tab::Query(QueryTab {
+            id,
+            title: format!("query {id}").into(),
+            editor,
+            data: empty_grid(),
+            has_result: false,
+            elapsed: None,
+            error: None,
+            running: false,
+            generation: 0,
+        }));
+        self.active = self.tabs.len() - 1;
+        cx.notify();
+    }
+
+    fn run_active_query(&mut self, cx: &mut Context<Self>) {
+        let Some(connection) = self.connection.clone() else { return };
+        let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else { return };
+
+        let sql = tab.editor.read(cx).text().trim().to_string();
+        if sql.is_empty() {
+            return;
+        }
+        let tab_id = tab.id;
+        tab.running = true;
+        tab.error = None;
+        tab.generation += 1;
+        let generation = tab.generation;
+
+        let task = run_sql(connection, sql, cx);
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            this.update(cx, |this, cx| {
+                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return };
+                if tab.generation != generation {
+                    return;
+                }
+                tab.running = false;
+                match flatten(outcome) {
+                    Ok((result, elapsed)) => {
+                        tab.elapsed = Some(elapsed);
+                        tab.has_result = true;
+                        tab.data = Rc::new(GridData {
+                            columns: result.columns,
+                            rows: result.rows,
+                        });
+                    }
+                    Err(error) => {
+                        tab.error = Some(error);
+                        tab.has_result = false;
+                        tab.data = empty_grid();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn close_tab(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(ix) = self.tabs.iter().position(|tab| tab.id() == tab_id) else { return };
+        self.tabs.remove(ix);
+        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        cx.notify();
+    }
+
+    fn step_page(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(Tab::Table(tab)) = self.tabs.get(self.active) else { return };
+        if tab.loading {
+            return;
+        }
+        let (id, page) = (tab.id, tab.page);
+        let next = if forward {
+            // Only offer the next page when this one came back full.
+            if tab.data.rows.len() < PAGE_SIZE {
+                return;
+            }
+            page + 1
+        } else {
+            if page == 0 {
+                return;
+            }
+            page - 1
+        };
+        self.load_page(id, next, cx);
+    }
+
+    fn refresh_active(&mut self, cx: &mut Context<Self>) {
+        match self.tabs.get(self.active) {
+            Some(Tab::Table(tab)) => {
+                let (id, page) = (tab.id, tab.page);
+                self.load_page(id, page, cx);
+            }
+            Some(Tab::Query(_)) => self.run_active_query(cx),
+            None => {}
+        }
+    }
+
+    fn tab_mut(&mut self, tab_id: u64) -> Option<&mut Tab> {
+        self.tabs.iter_mut().find(|tab| tab.id() == tab_id)
+    }
+
+    fn take_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    // --- actions ---------------------------------------------------------
+
+    fn on_run_query(&mut self, _: &RunQuery, _: &mut Window, cx: &mut Context<Self>) {
+        self.run_active_query(cx);
+    }
+
+    fn on_new_query(&mut self, _: &NewQuery, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_query(window, cx);
+    }
+
+    fn on_refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_active(cx);
+    }
+
+    fn on_prev_page(&mut self, _: &PrevPage, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_page(false, cx);
+    }
+
+    fn on_next_page(&mut self, _: &NextPage, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_page(true, cx);
+    }
+}
+
+/// Run one statement on tokio and time it. Timing wraps the call itself,
+/// so it measures the database, not the paint that follows.
+fn run_sql(
+    connection: Arc<dyn Connection>,
+    sql: String,
+    cx: &mut Context<Shell>,
+) -> gpui::Task<Result<anyhow::Result<(QueryResult, u128)>, gpui_tokio::JoinError>> {
+    gpui_tokio::Tokio::spawn(cx, async move {
+        let started = Instant::now();
+        let result = connection.execute(&sql).await?;
+        anyhow::Ok((result, started.elapsed().as_millis()))
+    })
+}
+
+/// Collapse "the tokio task died" and "the query failed" into one message.
+/// Either way the user needs a sentence, not a nested Result.
+fn flatten<T>(outcome: Result<anyhow::Result<T>, gpui_tokio::JoinError>) -> Result<T, String> {
+    match outcome {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(join) => Err(format!("the query was interrupted: {join}")),
+    }
+}
+
+impl Focusable for Shell {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
 impl Render for Shell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme(cx).colors.clone();
 
         div()
+            .key_context("Shell")
+            .track_focus(&self.focus_handle(cx))
+            .on_action(cx.listener(Self::on_run_query))
+            .on_action(cx.listener(Self::on_new_query))
+            .on_action(cx.listener(Self::on_refresh))
+            .on_action(cx.listener(Self::on_prev_page))
+            .on_action(cx.listener(Self::on_next_page))
             .flex()
             .flex_col()
             .size_full()
             .bg(colors.window)
             .font_family(FONT_FAMILY)
             .text_color(colors.text_body)
-            .child(breadcrumb_bar(cx))
+            .child(self.breadcrumb_bar(&colors))
             .child(
                 div()
                     .flex()
                     .flex_1()
                     .min_h(px(0.))
-                    .child(sidebar(cx))
+                    .child(self.sidebar(&colors, cx))
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .flex_1()
                             .min_w(px(0.))
-                            .child(tab_strip(cx))
-                            .child(table_toolbar(cx))
-                            .child(grid_header(cx))
-                            .child(grid_rows(self.selected_row, cx))
-                            .child(status_strip(cx)),
+                            .child(self.tab_strip(&colors, cx))
+                            .child(self.pane(&colors, window, cx))
+                            .child(self.status_strip(&colors, cx)),
                     ),
             )
     }
 }
 
-fn breadcrumb_bar(cx: &gpui::App) -> Div {
-    let colors = theme(cx).colors.clone();
-    let sep = |cx: &gpui::App| {
-        div()
-            .text_color(theme(cx).colors.text_faint)
-            .child("/")
-    };
-    div()
-        .h(px(38.))
-        .flex_none()
-        .flex()
-        .items_center()
-        .px(px(12.))
-        .gap(px(14.))
-        .border_b_1()
-        .border_color(colors.border)
-        .bg(colors.panel)
-        .text_size(px(11.))
-        .child(
-            div()
-                .flex_1()
-                .flex()
-                .justify_center()
-                .items_center()
-                .gap(px(7.))
-                .text_color(colors.text_muted)
-                .child(div().text_color(colors.text_secondary).child("meerkat_prod"))
-                .child(sep(cx))
-                .child("public")
-                .child(sep(cx))
+impl Shell {
+    fn breadcrumb_bar(&self, colors: &ThemeColors) -> Div {
+        let separator = || div().text_color(colors.text_faint).child("/");
+        let mut trail = div()
+            .flex_1()
+            .flex()
+            .justify_center()
+            .items_center()
+            .gap(px(7.))
+            .text_color(colors.text_muted)
+            .child(
+                div()
+                    .text_color(colors.text_secondary)
+                    .child(self.database_name()),
+            );
+        if let Some(Tab::Table(tab)) = self.tabs.get(self.active) {
+            trail = trail
+                .child(separator())
+                .child(tab.schema.clone())
+                .child(separator())
                 .child(
                     div()
                         .text_color(colors.text)
                         .font_weight(FontWeight::MEDIUM)
-                        .child("users"),
+                        .child(tab.table.clone()),
+                );
+        }
+
+        div()
+            .h(px(38.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .px(px(12.))
+            .gap(px(14.))
+            .border_b_1()
+            .border_color(colors.border)
+            .bg(colors.panel)
+            .text_size(px(11.))
+            .child(trail)
+            .child(
+                div()
+                    .px(px(6.))
+                    .py(px(4.))
+                    .border_1()
+                    .border_color(colors.border_strong)
+                    .rounded(px(4.))
+                    .bg(colors.window)
+                    .text_size(px(10.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(colors.text_muted)
+                    .child("⌘⏎"),
+            )
+    }
+
+    fn database_name(&self) -> SharedString {
+        match &self.label {
+            Some(label) if !label.database.is_empty() => label.database.clone().into(),
+            _ => "meerkat".into(),
+        }
+    }
+
+    fn sidebar(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
+        let (host, dot) = match (&self.label, &self.status) {
+            (Some(label), Status::Connected) => (
+                format!("{} · {}", label.host, label.port),
+                colors.ok,
+            ),
+            (_, Status::Failed(_)) => ("not connected".to_string(), colors.error),
+            _ => ("connecting…".to_string(), colors.text_faint),
+        };
+
+        div()
+            .w(px(SIDEBAR_WIDTH))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(colors.border)
+            .bg(colors.panel)
+            .child(
+                div().p(px(12.)).border_b_1().border_color(colors.hairline).child(
+                    card(cx)
+                        .flex()
+                        .items_center()
+                        .gap(px(9.))
+                        .px(px(8.))
+                        .py(px(7.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(colors.text)
+                                        .truncate()
+                                        .child(self.database_name()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(colors.text_muted)
+                                        .truncate()
+                                        .child(host),
+                                ),
+                        )
+                        .child(status_dot(dot)),
                 ),
-        )
-        .child(key_hint("⌘K", cx))
-        .child(key_hint("⌘⏎", cx))
-}
-
-fn key_hint(text: &'static str, cx: &gpui::App) -> Div {
-    let colors = theme(cx).colors.clone();
-    div()
-        .px(px(6.))
-        .py(px(4.))
-        .border_1()
-        .border_color(colors.border_strong)
-        .rounded(px(4.))
-        .bg(colors.window)
-        .text_size(px(10.))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(colors.text_muted)
-        .child(text)
-}
-
-fn sidebar(cx: &gpui::App) -> Div {
-    let colors = theme(cx).colors.clone();
-    div()
-        .w(px(SIDEBAR_WIDTH))
-        .flex_none()
-        .flex()
-        .flex_col()
-        .border_r_1()
-        .border_color(colors.border)
-        .bg(colors.panel)
-        .child(
-            // Connection card
-            div().p(px(12.)).border_b_1().border_color(colors.hairline).child(
-                card(cx)
+            )
+            .child(self.catalog_list(colors, cx))
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(12.))
+                    .py(px(9.))
+                    .border_t_1()
+                    .border_color(colors.hairline)
                     .flex()
-                    .items_center()
-                    .gap(px(9.))
-                    .px(px(8.))
-                    .py(px(7.))
-                    .cursor_pointer()
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(colors.text)
-                                    .child("meerkat_prod"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(colors.text_muted)
-                                    .child("db.internal · 5432"),
-                            ),
-                    )
-                    .child(status_dot(colors.ok)),
-            ),
-        )
-        .child(
-            // Search box
-            div().px(px(12.)).py(px(10.)).child(
-                card(cx)
-                    .flex()
-                    .items_center()
-                    .gap(px(7.))
-                    .px(px(8.))
-                    .py(px(6.))
+                    .justify_between()
+                    .text_size(px(10.))
+                    .text_color(colors.text_muted)
+                    .child(self.table_total())
+                    .child(div().text_color(colors.text_faint).child("read-only")),
+            )
+    }
+
+    fn table_total(&self) -> SharedString {
+        let count: usize = self
+            .catalog
+            .iter()
+            .flat_map(|catalog| catalog.schemas.iter())
+            .map(|schema| schema.tables.len())
+            .sum();
+        match count {
+            0 => "no tables".into(),
+            1 => "1 relation".into(),
+            n => format!("{n} relations").into(),
+        }
+    }
+
+    fn catalog_list(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Stateful<Div> {
+        let mut list = div()
+            .id("catalog")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .px(px(8.))
+            .pb(px(12.))
+            .flex()
+            .flex_col();
+
+        let active = match self.tabs.get(self.active) {
+            Some(Tab::Table(tab)) => Some((tab.schema.clone(), tab.table.clone())),
+            _ => None,
+        };
+
+        let Some(catalog) = &self.catalog else {
+            return list.child(
+                div()
+                    .pt(px(10.))
+                    .px(px(6.))
                     .text_size(px(11.))
-                    .child(div().flex_1().text_color(colors.text_faint).child("Search tables"))
-                    .child(div().text_size(px(10.)).text_color(colors.text_faint).child("⌘K")),
-            ),
-        )
-        .child(
-            // Table + view lists
-            div()
-                .flex_1()
-                .min_h(px(0.))
-                .overflow_hidden()
-                .px(px(8.))
-                .pb(px(12.))
+                    .text_color(colors.text_faint)
+                    .child(match &self.status {
+                        Status::Failed(_) => "no catalog",
+                        _ => "reading the catalog…",
+                    }),
+            );
+        };
+
+        for schema in &catalog.schemas {
+            let tables: Vec<&Table> =
+                schema.tables.iter().filter(|t| t.kind == TableKind::Table).collect();
+            let views: Vec<&Table> =
+                schema.tables.iter().filter(|t| t.kind == TableKind::View).collect();
+
+            if !tables.is_empty() {
+                list = list.child(list_header(
+                    format!("SCHEMA · {}", schema.name.to_ascii_uppercase()),
+                    tables.len(),
+                    colors,
+                    cx,
+                ));
+                for table in tables {
+                    list = list.child(self.catalog_item(
+                        &schema.name,
+                        table,
+                        active.as_ref(),
+                        colors,
+                        cx,
+                    ));
+                }
+            }
+            if !views.is_empty() {
+                list = list.child(list_header(
+                    format!("VIEWS · {}", schema.name.to_ascii_uppercase()),
+                    views.len(),
+                    colors,
+                    cx,
+                ));
+                for view in views {
+                    list = list.child(self.catalog_item(
+                        &schema.name,
+                        view,
+                        active.as_ref(),
+                        colors,
+                        cx,
+                    ));
+                }
+            }
+        }
+        list
+    }
+
+    fn catalog_item(
+        &self,
+        schema: &str,
+        table: &Table,
+        active: Option<&(String, String)>,
+        colors: &ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let is_active =
+            active.is_some_and(|(s, t)| s == schema && t.as_str() == table.name.as_str());
+        let count = table.approx_rows.map(format_count).unwrap_or_default();
+        let (schema_name, table_name) = (schema.to_string(), table.name.clone());
+
+        let item = div()
+            .id(ElementId::Name(format!("relation-{schema}-{}", table.name).into()))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(8.))
+            .py(px(5.))
+            .rounded(px(5.))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.open_table(schema_name.clone(), table_name.clone(), cx);
+            }))
+            .child(match table.kind {
+                TableKind::Table => table_glyph(is_active, cx),
+                TableKind::View => div()
+                    .size(px(5.))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(if is_active { colors.accent } else { colors.text_faint }),
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_size(px(12.))
+                    .font_weight(if is_active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                    .text_color(if is_active { colors.text } else { colors.text_secondary })
+                    .truncate()
+                    .child(table.name.clone()),
+            )
+            .child(div().text_size(px(10.)).text_color(colors.text_faint).child(count));
+
+        if is_active {
+            item.bg(colors.selection)
+        } else {
+            let hover = colors.hairline;
+            item.hover(move |s| s.bg(hover))
+        }
+    }
+
+    fn tab_strip(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
+        let mut strip = div()
+            .h(px(34.))
+            .flex_none()
+            .flex()
+            .items_stretch()
+            .border_b_1()
+            .border_color(colors.border)
+            .bg(colors.panel);
+
+        for (ix, tab) in self.tabs.iter().enumerate() {
+            let is_active = ix == self.active;
+            let id = tab.id();
+            let mut item = div()
+                .id(ElementId::Name(format!("tab-{id}").into()))
                 .flex()
-                .flex_col()
-                .child(list_header("SCHEMA · PUBLIC", "14", cx))
-                .children(
-                    TABLES
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (name, count))| table_item(name, count, i == 0, cx)),
+                .items_center()
+                .gap(px(8.))
+                .px(px(14.))
+                .border_r_1()
+                .border_color(colors.border)
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.active = ix;
+                    if let Some(Tab::Query(tab)) = this.tabs.get(ix) {
+                        window.focus(&tab.editor.focus_handle(cx), cx);
+                    }
+                    cx.notify();
+                }))
+                .child(match tab {
+                    Tab::Table(tab) if tab.kind == TableKind::Table => table_glyph(is_active, cx),
+                    // Views and query results are both "not a table": the
+                    // sidebar marks them with a ring, so tabs match.
+                    _ => div().size(px(5.)).rounded_full().border_1().border_color(
+                        if is_active { colors.accent } else { colors.text_faint },
+                    ),
+                })
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .font_weight(if is_active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                        .text_color(if is_active { colors.text } else { colors.text_muted })
+                        .child(tab.title()),
                 )
-                .child(list_header("VIEWS", "3", cx))
-                .children(VIEWS.iter().map(|name| view_item(name, cx))),
+                .child(
+                    div()
+                        .id(ElementId::Name(format!("close-{id}").into()))
+                        .text_size(px(12.))
+                        .text_color(colors.text_faint)
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(colors.error))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.close_tab(id, cx);
+                        }))
+                        .child("×"),
+                );
+            item = if is_active {
+                item.bg(colors.window)
+            } else {
+                let hover = colors.hairline;
+                item.hover(move |s| s.bg(hover))
+            };
+            strip = strip.child(item);
+        }
+
+        strip.child(div().flex_1()).child(
+            div()
+                .id("new-query")
+                .flex()
+                .items_center()
+                .px(px(12.))
+                .text_size(px(11.))
+                .text_color(colors.accent)
+                .cursor_pointer()
+                .hover(|s| s.text_color(colors.accent_deep))
+                .on_click(cx.listener(|this, _event, window, cx| this.new_query(window, cx)))
+                .child("+ new query"),
         )
-        .child(
-            // Sidebar footer
+    }
+
+    fn pane(&self, colors: &ThemeColors, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let pane = div().flex().flex_col().flex_1().min_h(px(0.)).min_w(px(0.));
+        match self.tabs.get(self.active) {
+            Some(Tab::Table(tab)) => pane
+                .child(self.table_toolbar(tab, colors, cx))
+                .children(tab.error.clone().map(|error| error_strip(error, colors)))
+                .child(grid(
+                    format!("tab-{}", tab.id),
+                    tab.data.clone(),
+                    tab.selected,
+                    Some(self.row_click_handler(tab.id, cx)),
+                    cx,
+                )),
+            Some(Tab::Query(tab)) => self.query_pane(pane, tab, colors, cx),
+            None => pane.child(self.placeholder(colors, window)),
+        }
+    }
+
+    /// Selecting a row is view state, so update it straight on the entity.
+    fn row_click_handler(&self, tab_id: u64, cx: &Context<Self>) -> results_grid::OnClickRow {
+        let this = cx.entity().downgrade();
+        Rc::new(move |ix, _window, cx| {
+            this.update(cx, |this: &mut Shell, cx| {
+                if let Some(Tab::Table(tab)) = this.tab_mut(tab_id) {
+                    tab.selected = Some(ix);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+    }
+
+    fn table_toolbar(&self, tab: &TableTab, colors: &ThemeColors, cx: &Context<Self>) -> Div {
+        let columns = self
+            .table_model(&tab.schema, &tab.table)
+            .map(|model| model.columns.len())
+            .unwrap_or(tab.data.columns.len());
+        let rows = match tab.approx_rows {
+            Some(count) => format!("~{} rows", format_count(count)),
+            None => "row count unknown".to_string(),
+        };
+
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(14.))
+            .py(px(9.))
+            .border_b_1()
+            .border_color(colors.hairline)
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(colors.text)
+                    .child(tab.table.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(colors.text_muted)
+                    .child(format!("{rows} · {columns} columns")),
+            )
+            .children(tab.loading.then(|| {
+                div().text_size(px(11.)).text_color(colors.accent).child("loading…")
+            }))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("refresh")
+                    .px(px(9.))
+                    .py(px(5.))
+                    .border_1()
+                    .border_color(colors.border_strong)
+                    .rounded(px(6.))
+                    .bg(colors.elevated)
+                    .text_size(px(11.))
+                    .text_color(colors.text_secondary)
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(colors.text_faint))
+                    .on_click(cx.listener(|this, _event, _window, cx| this.refresh_active(cx)))
+                    .child("refresh"),
+            )
+    }
+
+    fn query_pane(
+        &self,
+        pane: Div,
+        tab: &QueryTab,
+        colors: &ThemeColors,
+        cx: &Context<Self>,
+    ) -> Div {
+        let summary = if tab.running {
+            "running…".to_string()
+        } else if tab.has_result {
+            format!(
+                "{} rows · {} columns · {}",
+                tab.data.rows.len(),
+                tab.data.columns.len(),
+                tab.elapsed.map(format_millis).unwrap_or_default()
+            )
+        } else {
+            "not run yet".to_string()
+        };
+
+        pane.child(
+            // Query toolbar
             div()
                 .flex_none()
-                .px(px(12.))
-                .py(px(9.))
-                .border_t_1()
-                .border_color(colors.hairline)
                 .flex()
-                .justify_between()
+                .items_center()
+                .gap(px(10.))
+                .px(px(14.))
+                .py(px(9.))
+                .border_b_1()
+                .border_color(colors.hairline)
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors.text)
+                        .child(tab.title.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(colors.text_muted)
+                        .child(format!("{} · read-only", self.database_name())),
+                )
+                .child(div().flex_1())
+                .child(
+                    accent_button("run ⌘⏎", cx)
+                        .id("run-query")
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.run_active_query(cx)
+                        })),
+                ),
+        )
+        .child(
+            div()
+                .h(px(EDITOR_HEIGHT))
+                .flex_none()
+                .border_b_1()
+                .border_color(colors.border_strong)
+                .child(tab.editor.clone()),
+        )
+        .children(tab.error.clone().map(|error| error_strip(error, colors)))
+        .child(
+            // Result header
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .px(px(14.))
+                .py(px(8.))
+                .border_b_1()
+                .border_color(colors.hairline)
+                .bg(colors.panel)
                 .text_size(px(10.))
                 .text_color(colors.text_muted)
-                .child(div().cursor_pointer().hover(|s| s.text_color(colors.accent)).child("query history"))
-                .child(div().text_color(colors.text_faint).child("read-only")),
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.text)
+                        .child("RESULT"),
+                )
+                .child(summary),
         )
+        .child(grid(format!("tab-{}", tab.id), tab.data.clone(), None, None, cx))
+    }
+
+    fn placeholder(&self, colors: &ThemeColors, _window: &mut Window) -> Div {
+        let (heading, detail) = match &self.status {
+            Status::Connecting(url) => ("connecting".to_string(), redact(url)),
+            Status::Failed(error) => ("could not connect".to_string(), error.clone()),
+            Status::Connected => (
+                "nothing open".to_string(),
+                "pick a table on the left, or start a query".to_string(),
+            ),
+        };
+        let failed = matches!(self.status, Status::Failed(_));
+
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(8.))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if failed { colors.error } else { colors.text })
+                    .child(heading),
+            )
+            .child(
+                div()
+                    .max_w(px(560.))
+                    .text_size(px(11.))
+                    .text_color(if failed { colors.error } else { colors.text_muted })
+                    .child(detail),
+            )
+    }
+
+    fn status_strip(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
+        let divider = || div().text_color(colors.text_faint).child("|");
+        let (range, elapsed) = match self.tabs.get(self.active) {
+            Some(Tab::Table(tab)) => {
+                let first = tab.page * PAGE_SIZE + 1;
+                let last = tab.page * PAGE_SIZE + tab.data.rows.len();
+                let range = if tab.data.rows.is_empty() {
+                    "no rows".to_string()
+                } else {
+                    match tab.approx_rows {
+                        Some(total) => {
+                            format!("rows {first}–{last} of ~{}", format_count(total))
+                        }
+                        None => format!("rows {first}–{last}"),
+                    }
+                };
+                (range, tab.elapsed)
+            }
+            Some(Tab::Query(tab)) => (
+                if tab.has_result {
+                    format!("{} rows", tab.data.rows.len())
+                } else {
+                    String::new()
+                },
+                tab.elapsed,
+            ),
+            None => (String::new(), None),
+        };
+
+        let paging = matches!(self.tabs.get(self.active), Some(Tab::Table(_)));
+
+        div()
+            .h(px(30.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .px(px(14.))
+            .border_t_1()
+            .border_color(colors.border_strong)
+            .bg(colors.panel)
+            .text_size(px(10.))
+            .text_color(colors.text_muted)
+            .child(range)
+            .children(paging.then(|| divider()))
+            .children(paging.then(|| {
+                self.page_link("prev", false, colors, cx)
+            }))
+            .children(paging.then(|| {
+                self.page_link("next", true, colors, cx)
+            }))
+            .child(div().flex_1())
+            .children(
+                elapsed.map(|ms| div().child(format!("queried in {}", format_millis(ms)))),
+            )
+            .child(divider())
+            .child(match self.status {
+                Status::Connected => "on lookout",
+                Status::Connecting(_) => "connecting",
+                Status::Failed(_) => "off duty",
+            })
+            .child(status_dot(match self.status {
+                Status::Connected => colors.ok,
+                Status::Connecting(_) => colors.text_faint,
+                Status::Failed(_) => colors.error,
+            }))
+    }
+
+    fn page_link(
+        &self,
+        label: &'static str,
+        forward: bool,
+        colors: &ThemeColors,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let accent = colors.accent;
+        div()
+            .id(ElementId::Name(label.into()))
+            .cursor_pointer()
+            .hover(move |s| s.text_color(accent))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.step_page(forward, cx);
+            }))
+            .child(label)
+    }
 }
 
-fn list_header(label: &'static str, count: &'static str, cx: &gpui::App) -> Div {
-    let colors = theme(cx).colors.clone();
+fn list_header(
+    label: String,
+    count: usize,
+    colors: &ThemeColors,
+    cx: &App,
+) -> Div {
     div()
         .flex()
         .justify_between()
@@ -257,281 +1117,54 @@ fn list_header(label: &'static str, count: &'static str, cx: &gpui::App) -> Div 
         .pt(px(8.))
         .pb(px(6.))
         .child(section_label(label, cx))
-        .child(div().text_size(px(10.)).text_color(colors.text_faint).child(count))
-}
-
-fn table_item(name: &'static str, count: &'static str, active: bool, cx: &gpui::App) -> Div {
-    let colors = theme(cx).colors.clone();
-    let base = div()
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .px(px(8.))
-        .py(px(5.))
-        .rounded(px(5.))
-        .cursor_pointer()
-        .child(table_glyph(active, cx))
         .child(
             div()
-                .flex_1()
-                .text_size(px(12.))
-                .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
-                .text_color(if active { colors.text } else { colors.text_secondary })
-                .child(name),
-        )
-        .child(div().text_size(px(10.)).text_color(colors.text_faint).child(count));
-    if active {
-        base.bg(colors.selection)
-    } else {
-        base.hover(move |s| s.bg(colors.hairline))
-    }
-}
-
-fn view_item(name: &'static str, cx: &gpui::App) -> Div {
-    let colors = theme(cx).colors.clone();
-    div()
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .px(px(8.))
-        .py(px(5.))
-        .rounded(px(5.))
-        .cursor_pointer()
-        .hover(move |s| s.bg(colors.hairline))
-        .child(
-            div()
-                .size(px(5.))
-                .rounded_full()
-                .border_1()
-                .border_color(colors.text_faint),
-        )
-        .child(
-            div()
-                .flex_1()
-                .text_size(px(12.))
-                .text_color(colors.text_secondary)
-                .child(name),
+                .text_size(px(10.))
+                .text_color(colors.text_faint)
+                .child(count.to_string()),
         )
 }
 
-fn tab_strip(cx: &gpui::App) -> Div {
-    let colors = theme(cx).colors.clone();
-    div()
-        .h(px(34.))
-        .flex_none()
-        .flex()
-        .items_stretch()
-        .border_b_1()
-        .border_color(colors.border)
-        .bg(colors.panel)
-        .child(
-            // Active tab
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .px(px(14.))
-                .border_r_1()
-                .border_color(colors.border)
-                .bg(colors.window)
-                .cursor_pointer()
-                .child(table_glyph(true, cx))
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(colors.text)
-                        .child("public.users"),
-                )
-                .child(div().text_size(px(12.)).text_color(colors.text_faint).child("×")),
-        )
-        .child(
-            // Inactive tab
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .px(px(14.))
-                .border_r_1()
-                .border_color(colors.border)
-                .cursor_pointer()
-                .hover(|s| s.bg(theme(cx).colors.hairline))
-                .child(div().size(px(5.)).rounded_full().bg(colors.text_faint))
-                .child(div().text_size(px(11.)).text_color(colors.text_muted).child("churn_query.sql"))
-                .child(div().text_size(px(12.)).text_color(colors.text_faint).child("×")),
-        )
-        .child(div().flex_1())
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .px(px(12.))
-                .text_size(px(11.))
-                .text_color(colors.accent)
-                .cursor_pointer()
-                .child("+ new query"),
-        )
-}
-
-fn table_toolbar(cx: &gpui::App) -> Div {
-    let colors = theme(cx).colors.clone();
+/// The design's error tone: warm surface, warm border, warm text.
+fn error_strip(message: String, colors: &ThemeColors) -> Div {
     div()
         .flex_none()
-        .flex()
-        .items_center()
-        .gap(px(10.))
         .px(px(14.))
         .py(px(9.))
         .border_b_1()
-        .border_color(colors.hairline)
-        .child(
-            div()
-                .text_size(px(12.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(colors.text)
-                .child("users"),
-        )
-        .child(
-            div()
-                .text_size(px(11.))
-                .text_color(colors.text_muted)
-                .child("18,412 rows · 11 columns"),
-        )
-        .child(div().flex_1())
-        .child(toolbar_button("filter", cx))
-        .child(toolbar_button("sort · created_at ↓", cx))
-        .child(toolbar_button("export", cx))
+        .border_color(colors.error_border)
+        .bg(colors.error_surface)
+        .text_size(px(11.))
+        .text_color(colors.error)
+        .child(message)
 }
 
-fn grid_header(cx: &gpui::App) -> Div {
-    let colors = theme(cx).colors.clone();
-    let header_cell = |i: usize, label: &'static str, sorted: bool| {
-        let mut cell = div()
-            .px(px(12.))
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .flex()
-            .items_center()
-            .gap(px(4.))
-            .child(label);
-        cell = match COLUMN_WIDTHS.get(i) {
-            Some(w) => cell.w(px(*w)).flex_none(),
-            None => cell.flex_1(),
-        };
-        if i > 0 {
-            cell = cell.border_l_1().border_color(colors.hairline).h_full();
-        }
-        if sorted {
-            cell = cell.child(div().text_color(colors.accent).child("↓"));
-        }
-        cell
-    };
-    div()
-        .h(px(30.))
-        .flex_none()
-        .flex()
-        .items_center()
-        .border_b_1()
-        .border_color(colors.border_strong)
-        .bg(colors.panel)
-        .text_size(px(10.))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(colors.text_muted)
-        .child(header_cell(0, "ID", false))
-        .child(header_cell(1, "EMAIL", false))
-        .child(header_cell(2, "NAME", false))
-        .child(header_cell(3, "PLAN", false))
-        .child(header_cell(4, "MRR", false))
-        .child(header_cell(5, "CREATED_AT", true))
-        .child(header_cell(6, "LAST_SEEN", false))
-}
-
-fn grid_rows(selected: usize, cx: &gpui::App) -> Div {
-    // TODO: replace with uniform_list virtualization once the results_grid
-    // crate streams real rows.
-    div()
-        .flex_1()
-        .min_h(px(0.))
-        .overflow_hidden()
-        .flex()
-        .flex_col()
-        .text_size(px(12.))
-        .children(ROWS.iter().enumerate().map(|(i, row)| grid_row(row, i == selected, cx)))
-}
-
-fn grid_row(row: &SampleRow, selected: bool, cx: &gpui::App) -> Div {
-    let colors = theme(cx).colors.clone();
-    let value_color = |value: &str, muted: Hsla| {
-        if value == "NULL" { colors.text_faint } else { muted }
-    };
-    let plan_color = match row.plan {
-        "scale" => colors.accent_deep,
-        "pro" => colors.text_secondary,
-        _ => colors.text_muted,
-    };
-    let cell = |i: usize, text: &'static str, color: Hsla| {
-        let mut cell = div()
-            .px(px(12.))
-            .overflow_hidden()
-            .truncate()
-            .text_color(color)
-            .child(text);
-        cell = match COLUMN_WIDTHS.get(i) {
-            Some(w) => cell.w(px(*w)).flex_none(),
-            None => cell.flex_1(),
-        };
-        cell
-    };
-
-    let base = div()
-        .h(px(28.))
-        .flex_none()
-        .flex()
-        .items_center()
-        .border_b_1()
-        .border_color(colors.hairline)
-        .cursor_pointer()
-        .child(cell(0, row.id, colors.text_faint))
-        .child(cell(1, row.email, value_color(row.email, colors.text_body)))
-        .child(cell(2, row.name, value_color(row.name, colors.text_body)))
-        .child(cell(3, row.plan, plan_color))
-        .child(cell(4, row.mrr, value_color(row.mrr, colors.text_body)))
-        .child(cell(5, row.created, colors.text_muted))
-        .child(cell(6, row.last_seen, colors.text_muted));
-
-    if selected {
-        base.bg(colors.selection)
-    } else {
-        base.hover(move |s| s.bg(colors.panel))
+/// Never paint a password, not even in the "could not connect" card.
+fn redact(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else { return url.to_string() };
+    let (scheme, rest) = url.split_at(scheme_end + 3);
+    let Some(at) = rest.find('@') else { return url.to_string() };
+    let (credentials, host) = rest.split_at(at);
+    match credentials.split_once(':') {
+        Some((user, _)) => format!("{scheme}{user}:•••{host}"),
+        None => url.to_string(),
     }
 }
 
-fn status_strip(cx: &gpui::App) -> Div {
-    let colors = theme(cx).colors.clone();
-    let divider = |cx: &gpui::App| div().text_color(theme(cx).colors.text_faint).child("|");
-    let link = |text: &'static str, cx: &gpui::App| {
-        let accent = theme(cx).colors.accent;
-        div().cursor_pointer().hover(move |s| s.text_color(accent)).child(text)
-    };
-    div()
-        .h(px(30.))
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap(px(12.))
-        .px(px(14.))
-        .border_t_1()
-        .border_color(colors.border_strong)
-        .bg(colors.panel)
-        .text_size(px(10.))
-        .text_color(colors.text_muted)
-        .child("rows 1–15 of 18,412")
-        .child(divider(cx))
-        .child(link("prev", cx))
-        .child(link("next", cx))
-        .child(div().flex_1())
-        .child("queried in 34 ms")
-        .child(divider(cx))
-        .child("on lookout")
-        .child(status_dot(colors.ok))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passwords_never_reach_the_screen() {
+        assert_eq!(
+            redact("postgres://ada:hunter2@db.internal:5432/app"),
+            "postgres://ada:•••@db.internal:5432/app"
+        );
+        assert_eq!(
+            redact("postgres://ada@db.internal/app"),
+            "postgres://ada@db.internal/app"
+        );
+        assert_eq!(redact("postgres:///app"), "postgres:///app");
+    }
 }

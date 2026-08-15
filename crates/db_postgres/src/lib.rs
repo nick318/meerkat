@@ -23,6 +23,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct PostgresConnection {
     pool: PgPool,
+    label: Label,
+}
+
+/// What the header and the sidebar card say about this connection. The
+/// pool does not hand these back once it is built, so keep them.
+#[derive(Debug, Clone)]
+pub struct Label {
+    pub database: String,
+    pub host: String,
+    pub port: u16,
 }
 
 impl PostgresConnection {
@@ -54,14 +64,22 @@ impl PostgresConnection {
     }
 
     async fn connect_with(options: PgConnectOptions) -> Result<Self> {
-        let host = options.get_host().to_string();
+        let label = Label {
+            database: options.get_database().unwrap_or_default().to_string(),
+            host: options.get_host().to_string(),
+            port: options.get_port(),
+        };
         let pool = PgPoolOptions::new()
             .max_connections(MAX_CONNECTIONS)
             .acquire_timeout(CONNECT_TIMEOUT)
             .connect_with(options)
             .await
-            .with_context(|| format!("failed to connect to {host}"))?;
-        Ok(Self { pool })
+            .with_context(|| format!("failed to connect to {}", label.host))?;
+        Ok(Self { pool, label })
+    }
+
+    pub fn label(&self) -> &Label {
+        &self.label
     }
 }
 
