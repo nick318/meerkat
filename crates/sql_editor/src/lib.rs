@@ -155,8 +155,12 @@ const KEY_CONTEXT: &str = "SqlEditor";
 /// Only true while the completion panel is open, so ↑↓/enter/tab keep
 /// their ordinary meaning the rest of the time.
 const COMPLETING_CONTEXT: &str = "SqlEditor && completing";
-/// Width of the completions panel, from the design comp.
-const COMPLETIONS_WIDTH: f32 = 214.;
+/// The completion popup keeps a readable width without stretching to fit
+/// a long column name.
+const MENU_MIN_WIDTH: f32 = 220.;
+const MENU_MAX_WIDTH: f32 = 380.;
+/// Gap between the caret's line and the popup.
+const MENU_GAP: f32 = 4.;
 /// One tab inserts this much, matching the design comp's indented SQL.
 const INDENT: &str = "  ";
 /// 12px text on the comp's 1.75 line height.
@@ -1127,60 +1131,69 @@ impl Render for SqlEditor {
                             .child(EditorElement { editor: cx.entity() }),
                     ),
             )
-            .children((!self.completions.is_empty()).then(|| self.completions_panel(cx)))
     }
 }
 
 impl SqlEditor {
-    /// The design's COMPLETIONS panel: a fixed column beside the text
-    /// rather than a popover over it.
-    fn completions_panel(&self, cx: &mut Context<Self>) -> Div {
+    /// The completion popup, anchored under the caret by the element that
+    /// paints the text. It floats over whatever is below the editor, so
+    /// it never resizes the query pane.
+    fn completions_menu(&self, cx: &mut Context<Self>) -> Div {
         let colors = theme(cx).colors.clone();
+        // How much of each label the user has already typed, so the
+        // matched head can be marked and the rest left plain.
+        let typed = self.content[clamp_range(&self.content, self.completion_range.clone())]
+            .chars()
+            .count();
+
         div()
-            .w(px(COMPLETIONS_WIDTH))
-            .flex_none()
-            .h_full()
-            .border_l_1()
-            .border_color(colors.border)
-            .bg(colors.panel)
-            .p(px(12.))
             .flex()
             .flex_col()
-            .gap(px(7.))
-            .child(
-                div()
-                    .text_size(px(9.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(colors.text_faint)
-                    .child("COMPLETIONS"),
-            )
+            .min_w(px(MENU_MIN_WIDTH))
+            .max_w(px(MENU_MAX_WIDTH))
+            .py(px(4.))
+            .bg(colors.elevated)
+            .border_1()
+            .border_color(colors.border_strong)
+            .rounded(px(8.))
+            .shadow_md()
+            .text_size(px(12.))
             .children(self.completions.iter().enumerate().map(|(ix, completion)| {
                 let selected = ix == self.completion_ix;
+                let (head, tail) = split_at_chars(&completion.label, typed);
                 let row = div()
                     .id(ElementId::Name(format!("completion-{ix}").into()))
+                    .mx(px(4.))
                     .flex()
                     .items_center()
                     .justify_between()
-                    .gap(px(8.))
-                    .px(px(7.))
-                    .py(px(5.))
+                    .gap(px(12.))
+                    .px(px(8.))
+                    .py(px(4.))
                     .rounded(px(5.))
                     .cursor_pointer()
-                    .text_size(px(11.))
                     .on_click(cx.listener(move |this, _event, window, cx| {
                         this.apply_completion(ix, window, cx)
                     }))
                     .child(
                         div()
                             .min_w(px(0.))
-                            .truncate()
-                            .text_color(if selected { colors.text } else { colors.text_secondary })
-                            .child(completion.label.clone()),
+                            .flex()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(colors.accent_deep)
+                                    .child(head),
+                            )
+                            .child(div().truncate().text_color(colors.text).child(tail)),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .text_color(if selected { colors.text_muted } else { colors.text_faint })
+                            .text_size(px(11.))
+                            .text_color(colors.text_faint)
                             .child(completion.detail.clone()),
                     );
                 if selected {
@@ -1190,7 +1203,29 @@ impl SqlEditor {
                     row.hover(move |s| s.bg(hover))
                 }
             }))
+            .child(
+                div()
+                    .mt(px(4.))
+                    .pt(px(5.))
+                    .px(px(12.))
+                    .pb(px(2.))
+                    .border_t_1()
+                    .border_color(colors.hairline)
+                    .text_size(px(10.))
+                    .text_color(colors.text_faint)
+                    .child("↩ or ⇥ to insert · esc to dismiss"),
+            )
     }
+}
+
+/// Split a label after `count` characters, never mid-character.
+fn split_at_chars(label: &str, count: usize) -> (String, String) {
+    let split = label
+        .char_indices()
+        .nth(count)
+        .map(|(ix, _)| ix)
+        .unwrap_or(label.len());
+    (label[..split].to_string(), label[split..].to_string())
 }
 
 /// Byte offset for a UTF-16 offset *within* `text`, clamped to its end.
@@ -1353,6 +1388,10 @@ impl Element for EditorElement {
             )
         };
 
+        if !editor.completions.is_empty() {
+            self.draw_completions_menu(&layout, bounds, window, cx);
+        }
+
         PrepaintState { layout: Some(layout), quads, cursor, cursor_top }
     }
 
@@ -1407,6 +1446,52 @@ impl Element for EditorElement {
 }
 
 impl EditorElement {
+    /// Draw the completion popup under the caret. It is deferred so it
+    /// paints above everything else in the window instead of being
+    /// clipped by the editor's own pane, and it is built here rather than
+    /// in `render` because only the painted layout knows where the caret
+    /// actually landed this frame.
+    fn draw_completions_menu(
+        &self,
+        layout: &EditorLayout,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let (offset, row) = {
+            let editor = self.editor.read(cx);
+            let offset = editor.cursor_offset();
+            (offset, row_for_offset(&layout.line_starts, offset))
+        };
+        let Some(line) = layout.lines.get(row) else { return };
+        // Anchor to the start of the word, so the popup lines up with what
+        // it is completing rather than drifting right as the user types.
+        let anchor = {
+            let editor = self.editor.read(cx);
+            editor.completion_range.start.min(offset)
+        };
+        let x = line.x_for_index(anchor.saturating_sub(layout.line_starts[row]).min(line.len()));
+
+        let mut menu = self
+            .editor
+            .update(cx, |editor, cx| editor.completions_menu(cx).into_any_element());
+        let size = menu.layout_as_root(gpui::AvailableSpace::min_size(), window, cx);
+
+        let line_top = bounds.top() + layout.line_height * row as f32;
+        let below = line_top + layout.line_height + px(MENU_GAP);
+        let viewport = window.viewport_size();
+        // Flip above the caret when there is no room below, the way every
+        // editor does near the bottom of the screen.
+        let y = if below + size.height > viewport.height && line_top - size.height > px(0.) {
+            line_top - size.height - px(MENU_GAP)
+        } else {
+            below
+        };
+        let x = (bounds.left() + x).min(viewport.width - size.width).max(px(0.));
+
+        window.defer_draw(menu, point(x, y), 1, None);
+    }
+
     /// Pull the viewport back over the caret after it moved out of sight.
     /// A new offset only takes effect on the next frame, so ask for one.
     fn follow_cursor(
