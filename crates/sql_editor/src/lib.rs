@@ -249,6 +249,7 @@ impl SqlEditor {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = clamp_offset(&self.content, offset);
         self.selected_range = offset..offset;
         self.selection_reversed = false;
         // Moving the caret ends the current typing run: undo should stop
@@ -259,6 +260,7 @@ impl SqlEditor {
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = clamp_offset(&self.content, offset);
         if self.selection_reversed {
             self.selected_range.start = offset;
         } else {
@@ -657,18 +659,16 @@ impl SqlEditor {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
-            ));
+        let range = clamp_range(&self.content, self.selected_range.clone());
+        if !range.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(self.content[range].to_string()));
         }
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
-            ));
+        let range = clamp_range(&self.content, self.selected_range.clone());
+        if !range.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(self.content[range].to_string()));
             self.last_edit = EditKind::None;
             self.replace_text_in_range(None, "", window, cx);
         }
@@ -715,7 +715,7 @@ impl EntityInputHandler for SqlEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let range = self.range_from_utf16(&range_utf16);
+        let range = clamp_range(&self.content, self.range_from_utf16(&range_utf16));
         actual_range.replace(self.range_to_utf16(&range));
         Some(self.content[range].to_string())
     }
@@ -747,11 +747,14 @@ impl EntityInputHandler for SqlEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range_utf16
-            .as_ref()
-            .map(|range| self.range_from_utf16(range))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
+        let range = clamp_range(
+            &self.content,
+            range_utf16
+                .as_ref()
+                .map(|range| self.range_from_utf16(range))
+                .or(self.marked_range.clone())
+                .unwrap_or(self.selected_range.clone()),
+        );
 
         // A newline breaks the undo run, so undo lands on line boundaries
         // rather than swallowing the whole query. So does replacing a
@@ -784,11 +787,14 @@ impl EntityInputHandler for SqlEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range_utf16
-            .as_ref()
-            .map(|range| self.range_from_utf16(range))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
+        let range = clamp_range(
+            &self.content,
+            range_utf16
+                .as_ref()
+                .map(|range| self.range_from_utf16(range))
+                .or(self.marked_range.clone())
+                .unwrap_or(self.selected_range.clone()),
+        );
 
         // Composition rewrites itself as it goes: take one undo step when
         // it starts, none for the keystrokes inside it.
@@ -801,14 +807,21 @@ impl EntityInputHandler for SqlEditor {
             self.content[..range.start].to_owned() + new_text + &self.content[range.end..];
         self.marked_range =
             (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
-        self.selected_range = new_selected_range_utf16
-            .as_ref()
-            .map(|utf16| self.range_from_utf16(utf16))
-            .map(|selected| selected.start + range.start..selected.end + range.start)
-            .unwrap_or_else(|| {
+        // The platform reports this selection relative to `new_text`, so
+        // convert it inside that string and then shift it into the buffer.
+        // Converting against the whole buffer would run the offset past
+        // the end and slice mid-character on the next edit.
+        self.selected_range = match new_selected_range_utf16.as_ref() {
+            Some(selected) => {
+                let start = range.start + utf16_to_byte(new_text, selected.start);
+                let end = range.start + utf16_to_byte(new_text, selected.end);
+                clamp_range(&self.content, start..end)
+            }
+            None => {
                 let cursor = range.start + new_text.len();
                 cursor..cursor
-            });
+            }
+        };
         self.pending_autoscroll = true;
         cx.notify();
     }
@@ -821,20 +834,18 @@ impl EntityInputHandler for SqlEditor {
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let layout = self.last_layout.as_ref()?;
-        let range = self.range_from_utf16(&range_utf16);
+        let range = clamp_range(&self.content, self.range_from_utf16(&range_utf16));
         let row = row_for_offset(&layout.line_starts, range.start);
         let line = layout.lines.get(row)?;
+        let line_start = layout.line_starts[row];
+        // The IME can ask about a range that runs past this line; keep the
+        // rectangle on the line the range starts on.
+        let from = range.start.saturating_sub(line_start).min(line.len());
+        let to = range.end.saturating_sub(line_start).min(line.len());
         let top = bounds.top() + layout.line_height * row as f32;
         Some(Bounds::from_corners(
-            point(
-                bounds.left() + line.x_for_index(range.start - layout.line_starts[row]),
-                top,
-            ),
-            point(
-                bounds.left()
-                    + line.x_for_index(range.end.saturating_sub(layout.line_starts[row])),
-                top + layout.line_height,
-            ),
+            point(bounds.left() + line.x_for_index(from), top),
+            point(bounds.left() + line.x_for_index(to), top + layout.line_height),
         ))
     }
 
@@ -933,6 +944,44 @@ impl Render for SqlEditor {
                     .child(EditorElement { editor: cx.entity() }),
             )
     }
+}
+
+/// Byte offset for a UTF-16 offset *within* `text`, clamped to its end.
+/// The platform reports a composition's selection relative to the text it
+/// just handed us, not to the whole buffer.
+fn utf16_to_byte(text: &str, utf16_offset: usize) -> usize {
+    let mut utf8 = 0;
+    let mut utf16 = 0;
+    for ch in text.chars() {
+        if utf16 >= utf16_offset {
+            return utf8;
+        }
+        utf16 += ch.len_utf16();
+        utf8 += ch.len_utf8();
+    }
+    text.len()
+}
+
+/// Force an offset inside `text` and onto a character boundary.
+fn clamp_offset(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+/// Force a range inside `text`, onto character boundaries, and in order.
+///
+/// The platform hands us ranges it worked out from its own copy of the
+/// buffer, which can lag ours by an edit. Slicing on a stale range panics,
+/// and a panic inside an input-handler callback crosses an `extern "C"`
+/// boundary, where Rust aborts the process instead of unwinding. So every
+/// range that reaches a slice goes through here first.
+fn clamp_range(text: &str, range: Range<usize>) -> Range<usize> {
+    let start = clamp_offset(text, range.start);
+    let end = clamp_offset(text, range.end).max(start);
+    start..end
 }
 
 fn row_for_offset(line_starts: &[usize], offset: usize) -> usize {
@@ -1254,4 +1303,40 @@ fn cursor_quad(
         ),
         color,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stale_range_is_pulled_back_into_the_buffer() {
+        let text = "select 1";
+        // The platform's copy of the buffer can be an edit ahead of ours.
+        assert_eq!(clamp_range(text, 40..50), 8..8);
+        assert_eq!(clamp_range(text, 2..50), 2..8);
+        // Out of order comes back ordered rather than panicking on slice.
+        assert_eq!(clamp_range(text, 6..2), 6..6);
+    }
+
+    #[test]
+    fn clamping_never_splits_a_character() {
+        let text = "héllo";
+        // Byte 2 is inside the two-byte 'é'.
+        assert_eq!(clamp_offset(text, 2), 1);
+        assert!(text.is_char_boundary(clamp_offset(text, 2)));
+        for offset in 0..=text.len() + 4 {
+            assert!(text.is_char_boundary(clamp_offset(text, offset)));
+        }
+    }
+
+    #[test]
+    fn composition_selection_is_measured_inside_the_inserted_text() {
+        // Two UTF-16 units into "héllo" is one code point plus one byte
+        // of the two-byte one, so byte 3.
+        assert_eq!(utf16_to_byte("héllo", 2), 3);
+        assert_eq!(utf16_to_byte("abc", 0), 0);
+        // Past the end clamps rather than running off the buffer.
+        assert_eq!(utf16_to_byte("abc", 99), 3);
+    }
 }
