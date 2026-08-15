@@ -6,9 +6,11 @@
 //! This one is multi-line, so it keeps a shaped line per row and maps byte
 //! offsets to (row, column) both ways.
 //!
-//! It is deliberately plain: no syntax highlighting, no undo, no wrapping.
-//! Offsets are byte offsets into the buffer and always sit on a character
-//! boundary.
+//! It is deliberately small: colouring comes from a one-pass tokenizer,
+//! and there is no undo and no wrapping. Offsets are byte offsets into the
+//! buffer and always sit on a character boundary.
+
+mod highlight;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
@@ -17,6 +19,7 @@ use gpui::{
     Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
     Window, actions, div, fill, point, prelude::*, px, relative, size,
 };
+use highlight::Token;
 use std::ops::Range;
 use theme::theme;
 
@@ -654,15 +657,22 @@ impl Element for EditorElement {
         let mut offset = 0;
         for line in text.split('\n') {
             line_starts.push(offset);
-            let run = TextRun {
-                len: line.len(),
-                font: style.font(),
-                color: text_color,
-                background_color: None,
-                underline: underline_for(editor, offset, line.len()),
-                strikethrough: None,
+            let underline = underline_for(editor, offset, line.len());
+            let runs = if placeholder {
+                single_run(line, style.font(), text_color, underline)
+            } else {
+                highlight::spans(line)
+                    .into_iter()
+                    .map(|(range, token)| TextRun {
+                        len: range.len(),
+                        font: style.font(),
+                        color: token_color(token, text_color, &colors),
+                        background_color: None,
+                        underline,
+                        strikethrough: None,
+                    })
+                    .collect()
             };
-            let runs = if run.len == 0 { Vec::new() } else { vec![run] };
             lines.push(window.text_system().shape_line(
                 SharedString::from(line.to_string()),
                 font_size,
@@ -724,6 +734,34 @@ impl Element for EditorElement {
             editor.last_layout = Some(layout);
             editor.last_bounds = Some(bounds);
         });
+    }
+}
+
+fn single_run(
+    line: &str,
+    font: gpui::Font,
+    color: Hsla,
+    underline: Option<UnderlineStyle>,
+) -> Vec<TextRun> {
+    if line.is_empty() {
+        return Vec::new();
+    }
+    vec![TextRun {
+        len: line.len(),
+        font,
+        color,
+        background_color: None,
+        underline,
+        strikethrough: None,
+    }]
+}
+
+fn token_color(token: Token, plain: Hsla, colors: &theme::ThemeColors) -> Hsla {
+    match token {
+        Token::Keyword => colors.accent_deep,
+        Token::Literal => colors.syntax_literal,
+        Token::Comment => colors.text_muted,
+        Token::Plain => plain,
     }
 }
 

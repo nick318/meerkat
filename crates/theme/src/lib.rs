@@ -49,8 +49,11 @@ pub struct ThemeColors {
     pub line_number: Hsla,
     /// The single ochre accent.
     pub accent: Hsla,
-    /// Deeper accent for emphasized values and hover.
+    /// Deeper accent for emphasized values and hover. Also the SQL
+    /// keyword colour in the query editor.
     pub accent_deep: Hsla,
+    /// String and number literals in the query editor.
+    pub syntax_literal: Hsla,
     /// Selected row / active list item background.
     pub selection: Hsla,
     /// Success / connected.
@@ -83,6 +86,7 @@ impl Theme {
                 line_number: rgb(0xC6C0B4).into(),
                 accent: rgb(0xB4762F).into(),
                 accent_deep: rgb(0x8E5A1E).into(),
+                syntax_literal: rgb(0x5C7A4E).into(),
                 selection: rgb(0xF0E5D2).into(),
                 ok: rgb(0x5C8A4E).into(),
                 error: rgb(0x8E4A2A).into(),
