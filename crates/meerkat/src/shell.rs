@@ -409,6 +409,7 @@ fn grid_header(cx: &gpui::App) -> Div {
         let mut cell = div()
             .px(px(12.))
             .overflow_hidden()
+            .whitespace_nowrap()
             .flex()
             .items_center()
             .gap(px(4.))
@@ -472,6 +473,7 @@ fn grid_row(row: &SampleRow, selected: bool, cx: &gpui::App) -> Div {
         let mut cell = div()
             .px(px(12.))
             .overflow_hidden()
+            .truncate()
             .text_color(color)
             .child(text);
         cell = match COLUMN_WIDTHS.get(i) {
