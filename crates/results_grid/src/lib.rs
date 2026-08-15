@@ -18,10 +18,13 @@ use theme::theme;
 pub const ROW_HEIGHT: f32 = 28.;
 pub const HEADER_HEIGHT: f32 = 30.;
 
+/// Data text size, from the design comp.
+const DATA_FONT_SIZE: f32 = 12.;
 /// The app is monospaced throughout, so one character is one advance and
-/// a lane can be sized from the character count alone. JetBrains Mono at
-/// 12px advances by this much.
-const CHAR_WIDTH: f32 = 7.25;
+/// a lane can be sized from the character count alone. JetBrains Mono
+/// advances 0.6em, so 7.2px at 12px; round up so a full-width value keeps
+/// a hair of slack instead of tripping the ellipsis.
+const CHAR_WIDTH: f32 = DATA_FONT_SIZE * 0.62;
 /// The 12px of padding on each side of a cell.
 const CELL_PADDING: f32 = 24.;
 const MIN_COLUMN_WIDTH: f32 = 56.;
@@ -103,6 +106,9 @@ pub fn grid(
                 .h_full()
                 .w(px(content_width))
                 .min_w_full()
+                // The lanes are measured against this size; leaving the
+                // default here would render the data wider than its lane.
+                .text_size(px(DATA_FONT_SIZE))
                 .child(header_row(&data.columns, &data.widths, &colors))
                 .child(
                     uniform_list(
@@ -244,6 +250,8 @@ mod tests {
         assert_eq!(data.widths[0], MIN_COLUMN_WIDTH);
         // 15 characters plus the padding.
         assert_eq!(data.widths[1], 15. * CHAR_WIDTH + CELL_PADDING);
+        // A lane must hold its own text: 15 characters at the data size.
+        assert!(data.widths[1] >= 15. * DATA_FONT_SIZE * 0.6 + CELL_PADDING);
     }
 
     #[test]
