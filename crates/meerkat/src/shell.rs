@@ -17,7 +17,7 @@ use gpui::{
 };
 use introspect::{Catalog, Table, TableKind};
 use results_grid::{GridData, grid};
-use sql_editor::{SqlEditor, Vocabulary};
+use sql_editor::{Kind, Name, SqlEditor, Vocabulary};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -397,13 +397,37 @@ impl Shell {
     }
 }
 
-/// Every schema, relation and column name in the catalog, so the query
-/// editor can tell a real name from a typo while the user types.
+/// Every schema, relation and column in the catalog, so the query editor
+/// can colour the names the database really has and complete them as the
+/// user types.
+///
+/// Ownership is what makes `users.` offer that table's columns: a column
+/// is owned by its relation, a relation by its schema.
 fn vocabulary_of(catalog: &Catalog) -> Vocabulary {
     Vocabulary::new(catalog.schemas.iter().flat_map(|schema| {
-        std::iter::once(schema.name.clone()).chain(schema.tables.iter().flat_map(|table| {
-            std::iter::once(table.name.clone())
-                .chain(table.columns.iter().map(|column| column.name.clone()))
+        std::iter::once(Name {
+            name: schema.name.clone(),
+            detail: "schema".to_string(),
+            kind: Kind::Schema,
+            owner: None,
+        })
+        .chain(schema.tables.iter().flat_map(|table| {
+            std::iter::once(Name {
+                name: table.name.clone(),
+                detail: match table.kind {
+                    TableKind::Table => "table".to_string(),
+                    TableKind::View => "view".to_string(),
+                },
+                kind: Kind::Relation,
+                owner: Some(schema.name.clone()),
+            })
+            .chain(table.columns.iter().map(|column| Name {
+                name: column.name.clone(),
+                // The declared type, as the design's panel shows it.
+                detail: column.data_type.clone(),
+                kind: Kind::Column,
+                owner: Some(table.name.clone()),
+            }))
         }))
     }))
 }

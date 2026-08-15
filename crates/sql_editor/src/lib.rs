@@ -15,17 +15,20 @@
 //! Offsets are byte offsets into the buffer and always sit on a character
 //! boundary.
 
+mod completion;
 mod highlight;
 mod motion;
 
-pub use highlight::Vocabulary;
+pub use completion::{Kind, Name, Vocabulary};
 
+use completion::Completion;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, Hsla, IntoElement,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ScrollHandle, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
-    actions, div, fill, point, prelude::*, px, relative, size,
+    App, Bounds, ClipboardItem, Context, CursorStyle, Div, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
+    GlobalElementId, Hsla, IntoElement, KeyContext, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollHandle, ShapedLine, SharedString,
+    Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*,
+    px, relative, size,
 };
 use highlight::Token;
 use std::ops::Range;
@@ -37,7 +40,9 @@ actions!(
     [
         Backspace,
         Copy,
+        ConfirmCompletion,
         Cut,
+        DismissCompletion,
         Delete,
         DeleteToBeginningOfLine,
         DeleteToEndOfLine,
@@ -55,7 +60,10 @@ actions!(
         MoveToPreviousWordStart,
         MoveUp,
         Newline,
+        NextCompletion,
+        OpenCompletion,
         Paste,
+        PreviousCompletion,
         Redo,
         SelectAll,
         SelectDown,
@@ -81,6 +89,11 @@ pub fn key_bindings() -> Vec<gpui::KeyBinding> {
     macro_rules! bind {
         ($keystroke:expr, $action:expr) => {
             gpui::KeyBinding::new($keystroke, $action, Some(KEY_CONTEXT))
+        };
+    }
+    macro_rules! completing {
+        ($keystroke:expr, $action:expr) => {
+            gpui::KeyBinding::new($keystroke, $action, Some(COMPLETING_CONTEXT))
         };
     }
     vec![
@@ -125,10 +138,25 @@ pub fn key_bindings() -> Vec<gpui::KeyBinding> {
         bind!("cmd-v", Paste),
         bind!("cmd-c", Copy),
         bind!("cmd-x", Cut),
+        bind!("ctrl-space", OpenCompletion),
+        // Registered last, and scoped to the completing context, so they
+        // outrank the caret bindings above only while the panel is open.
+        completing!("down", NextCompletion),
+        completing!("ctrl-n", NextCompletion),
+        completing!("up", PreviousCompletion),
+        completing!("ctrl-p", PreviousCompletion),
+        completing!("enter", ConfirmCompletion),
+        completing!("tab", ConfirmCompletion),
+        completing!("escape", DismissCompletion),
     ]
 }
 
 const KEY_CONTEXT: &str = "SqlEditor";
+/// Only true while the completion panel is open, so ↑↓/enter/tab keep
+/// their ordinary meaning the rest of the time.
+const COMPLETING_CONTEXT: &str = "SqlEditor && completing";
+/// Width of the completions panel, from the design comp.
+const COMPLETIONS_WIDTH: f32 = 214.;
 /// One tab inserts this much, matching the design comp's indented SQL.
 const INDENT: &str = "  ";
 /// 12px text on the comp's 1.75 line height.
@@ -160,6 +188,15 @@ pub struct SqlEditor {
     is_selecting: bool,
     /// Set whenever the caret moves, cleared once the viewport follows it.
     pending_autoscroll: bool,
+    /// Candidates for the word under the caret. Empty means the panel is
+    /// closed, which is also what drives the `completing` key context.
+    completions: Vec<Completion>,
+    completion_ix: usize,
+    /// The word the candidates would replace.
+    completion_range: Range<usize>,
+    /// Escape closes the panel until the next edit, so it does not spring
+    /// straight back open on the next keystroke.
+    completions_dismissed: bool,
 }
 
 #[derive(Clone)]
@@ -210,6 +247,10 @@ impl SqlEditor {
             last_bounds: None,
             is_selecting: false,
             pending_autoscroll: false,
+            completions: Vec::new(),
+            completion_ix: 0,
+            completion_range: 0..0,
+            completions_dismissed: false,
         }
     }
 
@@ -250,6 +291,7 @@ impl SqlEditor {
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         let offset = clamp_offset(&self.content, offset);
+        self.close_completions();
         self.selected_range = offset..offset;
         self.selection_reversed = false;
         // Moving the caret ends the current typing run: undo should stop
@@ -261,6 +303,7 @@ impl SqlEditor {
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         let offset = clamp_offset(&self.content, offset);
+        self.close_completions();
         if self.selection_reversed {
             self.selected_range.start = offset;
         } else {
@@ -429,6 +472,121 @@ impl SqlEditor {
         let line = &layout.lines[row];
         let local = line.closest_index_for_x(position.x - bounds.left());
         layout.line_starts[row] + local
+    }
+
+    // --- completions -----------------------------------------------------
+
+    fn close_completions(&mut self) {
+        self.completions.clear();
+        self.completion_ix = 0;
+    }
+
+    /// Recompute the candidates for the caret's position. Called after
+    /// every edit; `forced` is ⌃Space, which opens the panel even where
+    /// typing alone would not.
+    fn refresh_completions(&mut self, forced: bool) {
+        self.close_completions();
+        if self.vocabulary.is_empty() && !forced {
+            return;
+        }
+        if !self.selected_range.is_empty() || (self.completions_dismissed && !forced) {
+            return;
+        }
+
+        let caret = self.cursor_offset();
+        // Never inside a string or a comment: there is nothing there the
+        // catalog can finish.
+        let line_start = self.line_start(caret);
+        let line = &self.content[line_start..self.line_end(caret)];
+        let column = caret - line_start;
+        if highlight::spans(line, &self.vocabulary).iter().any(|(range, token)| {
+            range.contains(&column.saturating_sub(1))
+                && matches!(token, highlight::Token::Literal | highlight::Token::Comment)
+        }) {
+            return;
+        }
+
+        let range = completion::prefix_range(&self.content, caret);
+        let qualifier = completion::qualifier_range(&self.content, range.start)
+            .map(|range| self.content[range].to_string());
+        // With nothing typed, only a qualifier justifies opening: `users.`
+        // has an obvious answer, a blank line does not.
+        if range.is_empty() && qualifier.is_none() && !forced {
+            return;
+        }
+
+        self.completions = self
+            .vocabulary
+            .candidates(&self.content[range.clone()], qualifier.as_deref());
+        self.completion_range = range;
+    }
+
+    fn confirm_completion(
+        &mut self,
+        _: &ConfirmCompletion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_completion(self.completion_ix, window, cx);
+    }
+
+    fn apply_completion(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(completion) = self.completions.get(ix) else { return };
+        let label = completion.label.clone();
+        let range = self.completion_range.clone();
+
+        // Accepting is one undo step, never joined to the typing before it.
+        self.last_edit = EditKind::None;
+        self.selected_range = range.clone();
+        self.replace_text_in_range(
+            Some(self.range_to_utf16(&range)),
+            &label,
+            window,
+            cx,
+        );
+        self.last_edit = EditKind::None;
+        // The word is now complete; it is not a prefix waiting for more.
+        self.close_completions();
+        cx.notify();
+    }
+
+    fn next_completion(&mut self, _: &NextCompletion, _: &mut Window, cx: &mut Context<Self>) {
+        if self.completions.is_empty() {
+            return;
+        }
+        self.completion_ix = (self.completion_ix + 1) % self.completions.len();
+        cx.notify();
+    }
+
+    fn previous_completion(
+        &mut self,
+        _: &PreviousCompletion,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.completions.is_empty() {
+            return;
+        }
+        self.completion_ix =
+            (self.completion_ix + self.completions.len() - 1) % self.completions.len();
+        cx.notify();
+    }
+
+    fn open_completion(&mut self, _: &OpenCompletion, _: &mut Window, cx: &mut Context<Self>) {
+        self.completions_dismissed = false;
+        self.refresh_completions(true);
+        cx.notify();
+    }
+
+    fn dismiss_completion(
+        &mut self,
+        _: &DismissCompletion,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.completions_dismissed = true;
+        self.close_completions();
+        cx.notify();
     }
 
     // --- motion actions --------------------------------------------------
@@ -776,6 +934,10 @@ impl EntityInputHandler for SqlEditor {
         self.selection_reversed = false;
         self.marked_range.take();
         self.pending_autoscroll = true;
+        // Any edit re-opens the panel that Escape closed: the user is
+        // typing a different word now.
+        self.completions_dismissed = false;
+        self.refresh_completions(false);
         cx.notify();
     }
 
@@ -870,11 +1032,18 @@ impl Render for SqlEditor {
         let colors = theme(cx).colors.clone();
         let line_count = self.line_count();
 
+        // The `completing` entry is what lets the completion bindings
+        // outrank the caret bindings, and only while the panel is open.
+        let mut key_context = KeyContext::new_with_defaults();
+        key_context.add(KEY_CONTEXT);
+        if !self.completions.is_empty() {
+            key_context.add("completing");
+        }
+
         div()
             .id("sql-editor")
-            .key_context(KEY_CONTEXT)
+            .key_context(key_context)
             .track_focus(&self.focus_handle(cx))
-            .track_scroll(&self.scroll_handle)
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
@@ -910,39 +1079,117 @@ impl Render for SqlEditor {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
+            .on_action(cx.listener(Self::open_completion))
+            .on_action(cx.listener(Self::confirm_completion))
+            .on_action(cx.listener(Self::next_completion))
+            .on_action(cx.listener(Self::previous_completion))
+            .on_action(cx.listener(Self::dismiss_completion))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .size_full()
-            .overflow_y_scroll()
             .flex()
             .text_size(px(FONT_SIZE))
             .line_height(px(LINE_HEIGHT))
             .child(
-                // Line-number gutter, right-aligned against the rule.
+                // Only the text scrolls; the completions panel stays put.
                 div()
-                    .w(px(GUTTER_WIDTH))
-                    .flex_none()
-                    .py(px(TEXT_PADDING_Y))
-                    .pr(px(10.))
-                    .bg(colors.panel)
-                    .border_r_1()
-                    .border_color(colors.border)
-                    .text_color(colors.line_number)
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .children((1..=line_count).map(|n| div().child(n.to_string()))),
-            )
-            .child(
-                div()
+                    .id("sql-editor-text")
+                    .track_scroll(&self.scroll_handle)
                     .flex_1()
                     .min_w(px(0.))
-                    .px(px(TEXT_PADDING_X))
-                    .py(px(TEXT_PADDING_Y))
-                    .child(EditorElement { editor: cx.entity() }),
+                    .h_full()
+                    .overflow_y_scroll()
+                    .flex()
+                    .child(
+                        // Line-number gutter, right-aligned against the rule.
+                        div()
+                            .w(px(GUTTER_WIDTH))
+                            .flex_none()
+                            .py(px(TEXT_PADDING_Y))
+                            .pr(px(10.))
+                            .bg(colors.panel)
+                            .border_r_1()
+                            .border_color(colors.border)
+                            .text_color(colors.line_number)
+                            .flex()
+                            .flex_col()
+                            .items_end()
+                            .children((1..=line_count).map(|n| div().child(n.to_string()))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .px(px(TEXT_PADDING_X))
+                            .py(px(TEXT_PADDING_Y))
+                            .child(EditorElement { editor: cx.entity() }),
+                    ),
             )
+            .children((!self.completions.is_empty()).then(|| self.completions_panel(cx)))
+    }
+}
+
+impl SqlEditor {
+    /// The design's COMPLETIONS panel: a fixed column beside the text
+    /// rather than a popover over it.
+    fn completions_panel(&self, cx: &mut Context<Self>) -> Div {
+        let colors = theme(cx).colors.clone();
+        div()
+            .w(px(COMPLETIONS_WIDTH))
+            .flex_none()
+            .h_full()
+            .border_l_1()
+            .border_color(colors.border)
+            .bg(colors.panel)
+            .p(px(12.))
+            .flex()
+            .flex_col()
+            .gap(px(7.))
+            .child(
+                div()
+                    .text_size(px(9.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.text_faint)
+                    .child("COMPLETIONS"),
+            )
+            .children(self.completions.iter().enumerate().map(|(ix, completion)| {
+                let selected = ix == self.completion_ix;
+                let row = div()
+                    .id(ElementId::Name(format!("completion-{ix}").into()))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .px(px(7.))
+                    .py(px(5.))
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.apply_completion(ix, window, cx)
+                    }))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(if selected { colors.text } else { colors.text_secondary })
+                            .child(completion.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(if selected { colors.text_muted } else { colors.text_faint })
+                            .child(completion.detail.clone()),
+                    );
+                if selected {
+                    row.bg(colors.selection)
+                } else {
+                    let hover = colors.hairline;
+                    row.hover(move |s| s.bg(hover))
+                }
+            }))
     }
 }
 

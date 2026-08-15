@@ -11,7 +11,9 @@
 //! its colour after the first newline. That is the price of not carrying
 //! a parser; nothing else depends on this being exact.
 
-use std::collections::HashSet;
+use crate::completion::Vocabulary;
+#[cfg(test)]
+use crate::completion::{Kind, Name};
 use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,31 +24,6 @@ pub enum Token {
     /// A name the connected database actually has.
     Identifier,
     Plain,
-}
-
-/// The names in the connected database, folded to lower case because
-/// Postgres folds unquoted identifiers the same way.
-#[derive(Debug, Default)]
-pub struct Vocabulary {
-    names: HashSet<String>,
-}
-
-impl Vocabulary {
-    pub fn new(names: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            names: names.into_iter().map(|name| name.to_ascii_lowercase()).collect(),
-        }
-    }
-
-    pub fn contains(&self, word: &str) -> bool {
-        // A one-character name would light up half the buffer for no
-        // information; `id` and longer is where this starts to help.
-        word.len() > 1 && self.names.contains(&word.to_ascii_lowercase())
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
-    }
 }
 
 /// Split one line into coloured spans. The spans are in order, they never
@@ -138,8 +115,8 @@ fn is_keyword(word: &str) -> bool {
     KEYWORDS.binary_search(&word.to_ascii_lowercase().as_str()).is_ok()
 }
 
-/// Sorted, so the lookup can bisect.
-const KEYWORDS: &[&str] = &[
+/// Sorted, so the lookup can bisect. Shared with the completion list.
+pub(crate) const KEYWORDS: &[&str] = &[
     "all", "alter", "and", "any", "array", "as", "asc", "begin", "between", "by", "case", "cast",
     "coalesce", "commit", "count", "create", "cross", "current_date", "current_timestamp",
     "delete", "desc", "distinct", "drop", "else", "end", "except", "exists", "explain", "false",
@@ -153,6 +130,15 @@ const KEYWORDS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(names: &[&str]) -> Vocabulary {
+        Vocabulary::new(names.iter().map(|name| Name {
+            name: (*name).to_string(),
+            detail: "table".to_string(),
+            kind: Kind::Relation,
+            owner: None,
+        }))
+    }
 
     fn kinds(line: &str) -> Vec<(&str, Token)> {
         spans(line, &Vocabulary::default())
@@ -215,7 +201,7 @@ mod tests {
 
     #[test]
     fn catalog_names_are_marked_and_typos_are_not() {
-        let vocabulary = Vocabulary::new(["public".into(), "users".into(), "email".into()]);
+        let vocabulary = names(&["public", "users", "email"]);
         let line = "select email from public.userz";
         let marked: Vec<&str> = spans(line, &vocabulary)
             .into_iter()
@@ -227,16 +213,16 @@ mod tests {
 
     #[test]
     fn catalog_names_are_matched_case_insensitively() {
-        let vocabulary = Vocabulary::new(["Users".into()]);
+        let vocabulary = names(&["Users"]);
         assert!(vocabulary.contains("USERS"));
         assert!(vocabulary.contains("users"));
         // One character is noise, not information.
-        assert!(!Vocabulary::new(["x".into()]).contains("x"));
+        assert!(!names(&["x"]).contains("x"));
     }
 
     #[test]
     fn a_keyword_that_is_also_a_column_stays_a_keyword() {
-        let vocabulary = Vocabulary::new(["order".into()]);
+        let vocabulary = names(&["order"]);
         assert_eq!(
             spans("order", &vocabulary),
             vec![(0..5, Token::Keyword)]
