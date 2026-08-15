@@ -10,10 +10,13 @@ workspace, GPUI frontend, sqlx drivers behind a `Connection` trait).
 
 ## Status
 
-Read-only PostgreSQL. Point it at a database and it lists the real
-schemas, tables and views, pages through any of them, and runs ad-hoc
-SQL in a query tab. In-place editing, MySQL and saved connection
-profiles are Phase 2.
+Read-only PostgreSQL. Launched with no argument, it opens the
+connections screen: saved connections, each probed live for its relation
+counts and server version, plus a form that takes a `postgres://` URL.
+Passwords go to the OS keychain, never to the profiles file. Open one
+and it lists the real schemas, tables and views, pages through any of
+them, and runs ad-hoc SQL in a query tab. In-place editing and MySQL are
+Phase 2.
 
 ## Build
 
@@ -21,7 +24,8 @@ Requires the latest stable Rust. On macOS you also need Xcode and its
 command line tools (GPUI renders with Metal).
 
 ```sh
-cargo run -p meerkat -- postgres://user@host:5432/database
+cargo run -p meerkat                                          # connections screen
+cargo run -p meerkat -- postgres://user@host:5432/database    # straight to a database
 cargo test               # driver, grid, editor and storage tests
 ```
 
@@ -41,9 +45,9 @@ while. `gpui`/`gpui_platform` are pinned by git rev in the workspace
 
 | Crate | Role |
 |---|---|
-| `meerkat` | Binary: app entry, window bootstrap |
+| `meerkat` | Binary: app entry, window bootstrap, connections screen |
 | `workspace` | Panes, docks, tabs, keymap (placeholder) |
-| `ui`, `theme` | Component kit and color tokens on GPUI |
+| `ui`, `theme` | Component kit (incl. the text field) and color tokens |
 | `settings` | User-editable JSON settings |
 | `db_client` | Engine-agnostic `Connection` trait, values, changesets |
 | `db_sqlite` | SQLite driver (sqlx) — introspect + query work |

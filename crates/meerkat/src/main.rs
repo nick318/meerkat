@@ -2,8 +2,11 @@
 //! the warm-paper theme, open the main window on a database.
 //!
 //! Usage: `meerkat postgres://user@host/db`, or set `MEERKAT_DATABASE_URL`.
-//! A saved-connection screen comes later; one URL is enough to browse.
+//! With neither, the window opens on the connections screen, which lists
+//! the saved connections and takes new ones.
 
+mod connections;
+mod root;
 mod shell;
 mod sql;
 
@@ -12,20 +15,15 @@ use gpui::{
     prelude::*, px, size,
 };
 use gpui_platform::application;
-use shell::Shell;
+use root::Root;
+use shell::Target;
 use std::borrow::Cow;
 use theme::Theme;
 
 actions!(meerkat, [Quit]);
 
-const USAGE: &str = "usage: meerkat postgres://user@host:5432/database\n\
-                     (or set MEERKAT_DATABASE_URL)";
-
 fn main() {
-    let Some(url) = database_url() else {
-        eprintln!("{USAGE}");
-        std::process::exit(2);
-    };
+    let target = database_url().map(Target::Url);
 
     application().run(move |cx: &mut App| {
         // Before anything else: the drivers run on tokio, and every view
@@ -43,6 +41,7 @@ fn main() {
         cx.set_global(Theme::warm_paper());
 
         cx.bind_keys(sql_editor::key_bindings());
+        cx.bind_keys(ui::text_field_key_bindings());
         cx.bind_keys([
             KeyBinding::new("cmd-enter", shell::RunQuery, None),
             KeyBinding::new("cmd-t", shell::NewQuery, None),
@@ -64,15 +63,15 @@ fn main() {
                     }),
                     ..Default::default()
                 },
-                |_, cx| cx.new(|cx| Shell::new(url.clone(), cx)),
+                |window, cx| cx.new(|cx| Root::new(target.clone(), window, cx)),
             )
             .expect("failed to open the main window");
 
-        // The shell must hold focus from the first frame, or the key
+        // The screen must hold focus from the first frame, or the key
         // bindings above have nowhere to dispatch.
         window
-            .update(cx, |shell, window, cx| {
-                window.focus(&shell.focus_handle(cx), cx);
+            .update(cx, |root, window, cx| {
+                window.focus(&root.focus_handle(cx), cx);
             })
             .expect("failed to focus the main window");
         cx.activate(true);

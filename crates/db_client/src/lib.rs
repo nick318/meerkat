@@ -102,6 +102,10 @@ pub trait Connection: Send + Sync {
     /// Read the full schema model for the schema tree.
     async fn introspect(&self) -> Result<Catalog>;
 
+    /// A short description of the server, as the connections screen shows
+    /// it next to the connection: "PG 16.2", "SQLite 3.45".
+    async fn server_version(&self) -> Result<String>;
+
     /// Run one SQL statement and collect its result.
     /// TODO: switch to a row stream with a fetch cap and cancellation.
     async fn execute(&self, sql: &str) -> Result<QueryResult>;

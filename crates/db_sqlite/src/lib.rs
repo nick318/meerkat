@@ -82,6 +82,14 @@ impl Connection for SqliteConnection {
         })
     }
 
+    async fn server_version(&self) -> Result<String> {
+        let (version,): (String,) = sqlx::query_as("SELECT sqlite_version()")
+            .fetch_one(&self.pool)
+            .await
+            .context("failed to read the SQLite version")?;
+        Ok(format!("SQLite {version}"))
+    }
+
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
         let rows: Vec<SqliteRow> = sqlx::query(sql).fetch_all(&self.pool).await?;
         let Some(first) = rows.first() else {

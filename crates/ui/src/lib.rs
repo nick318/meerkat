@@ -2,6 +2,10 @@
 //! Implements the warm-paper design language: hairline rules, bordered
 //! pills, one ochre accent. Grows as Meerkat needs more controls.
 
+mod text_field;
+
+pub use text_field::{TextField, TextFieldEvent, text_field_key_bindings};
+
 use gpui::{
     App, Div, FontWeight, InteractiveElement as _, ParentElement as _, SharedString, Styled as _,
     div, px,
@@ -92,6 +96,64 @@ pub fn format_millis(millis: u128) -> String {
     } else {
         format!("{:.1} s", millis as f64 / 1_000.)
     }
+}
+
+/// The meerkat itself: two ears, a head, two eyes and a muzzle, drawn as
+/// plain rectangles so the app carries no image assets. The comp draws it
+/// at 42px; every part scales from that.
+pub fn meerkat_mark(size: f32, cx: &App) -> Div {
+    let colors = &theme(cx).colors;
+    // Every offset below is the comp's 42px geometry, in units of the
+    // requested size.
+    let unit = |value: f32| px(value / 42. * size);
+    let ear = |left: bool| {
+        let mut ear = div()
+            .absolute()
+            .top(px(0.))
+            .size(unit(13.))
+            .rounded_full()
+            .bg(colors.mark_ears);
+        ear = if left { ear.left(unit(2.)) } else { ear.right(unit(2.)) };
+        ear
+    };
+    let eye = |offset: f32| {
+        div()
+            .absolute()
+            .left(unit(offset))
+            .top(unit(18.))
+            .size(unit(5.))
+            .rounded_full()
+            .bg(colors.mark_ink)
+    };
+
+    div()
+        .relative()
+        .flex_none()
+        .w(px(size))
+        .h(px(size))
+        .child(ear(true))
+        .child(ear(false))
+        .child(
+            div()
+                .absolute()
+                .left(unit(4.))
+                .top(unit(7.))
+                .size(unit(34.))
+                .rounded_full()
+                .bg(colors.mark_face),
+        )
+        .child(eye(12.))
+        .child(eye(25.))
+        .child(
+            div()
+                .absolute()
+                .left(unit(18.))
+                .top(unit(27.))
+                .w(unit(7.))
+                .h(unit(5.))
+                .rounded_full()
+                .bg(colors.mark_muzzle),
+        )
 }
 
 /// A tiny square glyph marking a table row in lists (accent when active).

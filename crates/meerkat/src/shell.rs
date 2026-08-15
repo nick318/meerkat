@@ -9,11 +9,12 @@
 //! and a reply that does not carry the tab's current generation is thrown
 //! away. Without that, a slow first page would overwrite a fast second one.
 
-use db_client::{Connection, QueryResult};
+use db_client::{Connection, Profile, QueryResult};
 use db_postgres::{Label, PostgresConnection};
 use gpui::{
-    App, Context, Div, ElementId, Entity, FocusHandle, Focusable, FontWeight, SharedString,
-    Stateful, Window, actions, div, prelude::*, px,
+    AnyElement, App, Context, Div, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, SharedString, Stateful, UniformListScrollHandle, Window, actions, div, prelude::*,
+    px, uniform_list,
 };
 use introspect::{Catalog, Table, TableKind};
 use results_grid::{GridData, GridState, grid};
@@ -30,18 +31,42 @@ actions!(meerkat, [RunQuery, NewQuery, Refresh, PrevPage, NextPage]);
 
 const SIDEBAR_WIDTH: f32 = 246.;
 const EDITOR_HEIGHT: f32 = 250.;
+/// Every sidebar row is this tall, headers included: `uniform_list` needs
+/// one height to measure, and the design's rows are already within a
+/// pixel of each other.
+const CATALOG_ROW_HEIGHT: f32 = 24.;
 
 pub struct Shell {
     focus_handle: FocusHandle,
     status: Status,
     connection: Option<Arc<dyn Connection>>,
     catalog: Option<Catalog>,
+    /// The sidebar's rows, flattened once when the catalog lands.
+    catalog_rows: Rc<Vec<CatalogRow>>,
+    /// Where the sidebar is scrolled, kept across re-renders.
+    catalog_scroll: UniformListScrollHandle,
+    /// How many relations the catalog holds, for the sidebar footer.
+    relation_total: usize,
     /// Every name in the catalog, for the editor's colouring.
     vocabulary: Arc<Vocabulary>,
     label: Option<Label>,
     tabs: Vec<Tab>,
     active: usize,
     next_id: u64,
+}
+
+/// What the workspace was opened on: a URL from the command line, or a
+/// connection saved on the connections screen.
+#[derive(Clone)]
+pub enum Target {
+    Url(String),
+    Profile(Profile),
+}
+
+/// What the workspace tells the window around it.
+pub enum ShellEvent {
+    /// The user asked for the connections screen back.
+    Close,
 }
 
 enum Status {
@@ -111,25 +136,33 @@ fn empty_grid() -> Rc<GridData> {
 impl Shell {
     /// Open the shell and start connecting. The window paints the
     /// connecting state immediately; the connection lands later.
-    pub fn new(url: String, cx: &mut Context<Self>) -> Self {
+    pub fn new(target: Target, cx: &mut Context<Self>) -> Self {
         let mut shell = Self {
             focus_handle: cx.focus_handle(),
-            status: Status::Connecting(url.clone()),
+            status: Status::Connecting(describe(&target)),
             connection: None,
             catalog: None,
+            catalog_rows: Rc::new(Vec::new()),
+            catalog_scroll: UniformListScrollHandle::new(),
+            relation_total: 0,
             vocabulary: Arc::new(Vocabulary::default()),
             label: None,
             tabs: Vec::new(),
             active: 0,
             next_id: 1,
         };
-        shell.connect(url, cx);
+        shell.connect(target, cx);
         shell
     }
 
-    fn connect(&mut self, url: String, cx: &mut Context<Self>) {
+    fn connect(&mut self, target: Target, cx: &mut Context<Self>) {
         let task = gpui_tokio::Tokio::spawn(cx, async move {
-            let connection = PostgresConnection::connect(&url).await?;
+            let connection = match &target {
+                Target::Url(url) => PostgresConnection::connect(url).await?,
+                // A saved connection takes its password from the OS
+                // keychain, so nothing here carries one.
+                Target::Profile(profile) => PostgresConnection::connect_profile(profile).await?,
+            };
             let label = connection.label().clone();
             let catalog = connection.introspect().await?;
             anyhow::Ok((Arc::new(connection) as Arc<dyn Connection>, label, catalog))
@@ -143,6 +176,9 @@ impl Shell {
                         this.connection = Some(connection);
                         this.label = Some(label);
                         this.vocabulary = Arc::new(vocabulary_of(&catalog));
+                        this.catalog_rows = catalog_rows(&catalog);
+                        this.relation_total =
+                            catalog.schemas.iter().map(|schema| schema.tables.len()).sum();
                         this.catalog = Some(catalog);
                         this.status = Status::Connected;
                         // A query tab opened while connecting was built
@@ -510,6 +546,16 @@ impl Focusable for Shell {
     }
 }
 
+impl EventEmitter<ShellEvent> for Shell {}
+
+/// What the connecting line says before there is a connection to describe.
+fn describe(target: &Target) -> String {
+    match target {
+        Target::Url(url) => redact(url),
+        Target::Profile(profile) => profile.name.clone(),
+    }
+}
+
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme(cx).colors.clone();
@@ -528,7 +574,7 @@ impl Render for Shell {
             .bg(colors.window)
             .font_family(FONT_FAMILY)
             .text_color(colors.text_body)
-            .child(self.breadcrumb_bar(&colors))
+            .child(self.breadcrumb_bar(&colors, cx))
             .child(
                 div()
                     .flex()
@@ -550,7 +596,7 @@ impl Render for Shell {
 }
 
 impl Shell {
-    fn breadcrumb_bar(&self, colors: &ThemeColors) -> Div {
+    fn breadcrumb_bar(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
         let separator = || div().text_color(colors.text_faint).child("/");
         let mut trail = div()
             .flex_1()
@@ -588,6 +634,20 @@ impl Shell {
             .border_color(colors.border)
             .bg(colors.panel)
             .text_size(px(11.))
+            // The way back to the connections screen, where the comp puts
+            // the window controls.
+            .child(
+                div()
+                    .id("connections")
+                    .flex_none()
+                    .text_color(colors.text_muted)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(colors.accent))
+                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                        cx.emit(ShellEvent::Close);
+                    }))
+                    .child("‹ connections"),
+            )
             .child(trail)
             .child(
                 div()
@@ -681,144 +741,65 @@ impl Shell {
     }
 
     fn table_total(&self) -> SharedString {
-        let count: usize = self
-            .catalog
-            .iter()
-            .flat_map(|catalog| catalog.schemas.iter())
-            .map(|schema| schema.tables.len())
-            .sum();
-        match count {
+        match self.relation_total {
             0 => "no tables".into(),
             1 => "1 relation".into(),
             n => format!("{n} relations").into(),
         }
     }
 
-    fn catalog_list(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Stateful<Div> {
-        let mut list = div()
-            .id("catalog")
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .px(px(8.))
-            .pb(px(12.))
-            .flex()
-            .flex_col();
+    /// The sidebar list. A catalog can run to thousands of relations, so
+    /// the rows are virtualized: the flattened list is built once, when
+    /// the catalog lands, and only the rows on screen are laid out.
+    fn catalog_list(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> AnyElement {
+        if self.catalog_rows.is_empty() {
+            return div()
+                .id("catalog")
+                .flex_1()
+                .min_h(px(0.))
+                .px(px(14.))
+                .pt(px(10.))
+                .text_size(px(11.))
+                .text_color(colors.text_faint)
+                .child(match &self.status {
+                    Status::Failed(_) => "no catalog",
+                    Status::Connected => "no relations",
+                    Status::Connecting(_) => "reading the catalog…",
+                })
+                .into_any_element();
+        }
 
         let active = match self.tabs.get(self.active) {
-            Some(Tab::Table(tab)) => Some((tab.schema.clone(), tab.table.clone())),
+            Some(Tab::Table(tab)) => {
+                Some((SharedString::from(tab.schema.clone()), SharedString::from(tab.table.clone())))
+            }
             _ => None,
         };
+        let rows = self.catalog_rows.clone();
+        let shell = cx.entity().downgrade();
 
-        let Some(catalog) = &self.catalog else {
-            return list.child(
-                div()
-                    .pt(px(10.))
-                    .px(px(6.))
-                    .text_size(px(11.))
-                    .text_color(colors.text_faint)
-                    .child(match &self.status {
-                        Status::Failed(_) => "no catalog",
-                        _ => "reading the catalog…",
-                    }),
-            );
-        };
-
-        for schema in &catalog.schemas {
-            let tables: Vec<&Table> =
-                schema.tables.iter().filter(|t| t.kind == TableKind::Table).collect();
-            let views: Vec<&Table> =
-                schema.tables.iter().filter(|t| t.kind == TableKind::View).collect();
-
-            if !tables.is_empty() {
-                list = list.child(list_header(
-                    format!("SCHEMA · {}", schema.name.to_ascii_uppercase()),
-                    tables.len(),
-                    colors,
-                    cx,
-                ));
-                for table in tables {
-                    list = list.child(self.catalog_item(
-                        &schema.name,
-                        table,
-                        active.as_ref(),
-                        colors,
-                        cx,
-                    ));
-                }
-            }
-            if !views.is_empty() {
-                list = list.child(list_header(
-                    format!("VIEWS · {}", schema.name.to_ascii_uppercase()),
-                    views.len(),
-                    colors,
-                    cx,
-                ));
-                for view in views {
-                    list = list.child(self.catalog_item(
-                        &schema.name,
-                        view,
-                        active.as_ref(),
-                        colors,
-                        cx,
-                    ));
-                }
-            }
-        }
-        list
-    }
-
-    fn catalog_item(
-        &self,
-        schema: &str,
-        table: &Table,
-        active: Option<&(String, String)>,
-        colors: &ThemeColors,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let is_active =
-            active.is_some_and(|(s, t)| s == schema && t.as_str() == table.name.as_str());
-        let count = table.approx_rows.map(format_count).unwrap_or_default();
-        let (schema_name, table_name) = (schema.to_string(), table.name.clone());
-
-        let item = div()
-            .id(ElementId::Name(format!("relation-{schema}-{}", table.name).into()))
-            .flex()
-            .items_center()
-            .gap(px(8.))
+        let mut list = uniform_list(
+            "catalog",
+            rows.len(),
+            move |range, _window, cx| {
+                let colors = theme(cx).colors.clone();
+                range
+                    .map(|ix| {
+                        catalog_row(ix, &rows[ix], active.as_ref(), &shell, &colors, cx)
+                    })
+                    .collect::<Vec<_>>()
+            },
+        );
+        // `UniformList` carries an `Interactivity` but not
+        // `StatefulInteractiveElement`, so the flag that
+        // `restrict_scroll_to_axis()` would set is set by hand, as the
+        // results grid does.
+        list.style().restrict_scroll_to_axis = Some(true);
+        list.track_scroll(&self.catalog_scroll)
+            .flex_1()
+            .min_h(px(0.))
             .px(px(8.))
-            .py(px(5.))
-            .rounded(px(5.))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.open_table(schema_name.clone(), table_name.clone(), cx);
-            }))
-            .child(match table.kind {
-                TableKind::Table => table_glyph(is_active, cx),
-                TableKind::View => div()
-                    .size(px(5.))
-                    .rounded_full()
-                    .border_1()
-                    .border_color(if is_active { colors.accent } else { colors.text_faint }),
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .text_size(px(12.))
-                    .font_weight(if is_active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
-                    .text_color(if is_active { colors.text } else { colors.text_secondary })
-                    .truncate()
-                    .child(table.name.clone()),
-            )
-            .child(div().text_size(px(10.)).text_color(colors.text_faint).child(count));
-
-        if is_active {
-            item.bg(colors.selection)
-        } else {
-            let hover = colors.hairline;
-            item.hover(move |s| s.bg(hover))
-        }
+            .into_any_element()
     }
 
     fn tab_strip(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
@@ -1093,7 +1074,7 @@ impl Shell {
 
     fn placeholder(&self, colors: &ThemeColors, _window: &mut Window) -> Div {
         let (heading, detail) = match &self.status {
-            Status::Connecting(url) => ("connecting".to_string(), redact(url)),
+            Status::Connecting(target) => ("connecting".to_string(), target.clone()),
             Status::Failed(error) => ("could not connect".to_string(), error.clone()),
             Status::Connected => (
                 "nothing open".to_string(),
@@ -1212,26 +1193,111 @@ impl Shell {
     }
 }
 
-fn list_header(
-    label: String,
-    count: usize,
+/// The sidebar tree, flattened into rows of one height. Headers and
+/// relations share the list so `uniform_list` can measure once and lay
+/// out only what is on screen.
+#[derive(Clone)]
+enum CatalogRow {
+    Header { label: SharedString },
+    Relation { schema: SharedString, name: SharedString, kind: TableKind },
+}
+
+/// Flatten the catalog the way the sidebar reads it: each schema's tables
+/// under a `SCHEMA ·` header, then its views under a `VIEWS ·` one. Built
+/// once per catalog, not once per frame.
+fn catalog_rows(catalog: &Catalog) -> Rc<Vec<CatalogRow>> {
+    let mut rows = Vec::new();
+    for schema in &catalog.schemas {
+        for (kind, label) in [(TableKind::Table, "SCHEMA"), (TableKind::View, "VIEWS")] {
+            let mut relations = schema.tables.iter().filter(|table| table.kind == kind).peekable();
+            if relations.peek().is_none() {
+                continue;
+            }
+            rows.push(CatalogRow::Header {
+                label: format!("{label} · {}", schema.name.to_ascii_uppercase()).into(),
+            });
+            rows.extend(relations.map(|table| CatalogRow::Relation {
+                schema: schema.name.clone().into(),
+                name: table.name.clone().into(),
+                kind,
+            }));
+        }
+    }
+    Rc::new(rows)
+}
+
+/// One row of the flattened list. Free-standing because the list's render
+/// closure outlives the borrow of the shell it was built from; it reaches
+/// the shell again through a weak handle when a row is clicked.
+fn catalog_row(
+    ix: usize,
+    row: &CatalogRow,
+    active: Option<&(SharedString, SharedString)>,
+    shell: &gpui::WeakEntity<Shell>,
     colors: &ThemeColors,
     cx: &App,
-) -> Div {
-    div()
-        .flex()
-        .justify_between()
-        .items_center()
-        .px(px(6.))
-        .pt(px(8.))
-        .pb(px(6.))
-        .child(section_label(label, cx))
-        .child(
-            div()
-                .text_size(px(10.))
-                .text_color(colors.text_faint)
-                .child(count.to_string()),
-        )
+) -> AnyElement {
+    match row {
+        CatalogRow::Header { label } => div()
+            .h(px(CATALOG_ROW_HEIGHT))
+            .flex()
+            .items_end()
+            .px(px(6.))
+            .pb(px(5.))
+            .child(section_label(label.clone(), cx))
+            .into_any_element(),
+        CatalogRow::Relation { schema, name, kind } => {
+            let is_active = active.is_some_and(|(s, t)| s == schema && t == name);
+            let shell = shell.clone();
+            let (schema_name, table_name) = (schema.to_string(), name.to_string());
+
+            let item = div()
+                .id(ElementId::NamedInteger("relation".into(), ix as u64))
+                .h(px(CATALOG_ROW_HEIGHT))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(8.))
+                .rounded(px(5.))
+                .cursor_pointer()
+                .on_click(move |_event, _window, cx| {
+                    shell
+                        .update(cx, |shell, cx| {
+                            shell.open_table(schema_name.clone(), table_name.clone(), cx)
+                        })
+                        .ok();
+                })
+                .child(match kind {
+                    TableKind::Table => table_glyph(is_active, cx),
+                    TableKind::View => div()
+                        .size(px(5.))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(if is_active { colors.accent } else { colors.text_faint }),
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_size(px(12.))
+                        .font_weight(if is_active {
+                            FontWeight::MEDIUM
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .text_color(if is_active { colors.text } else { colors.text_secondary })
+                        .truncate()
+                        .child(name.clone()),
+                );
+
+            if is_active {
+                item.bg(colors.selection).into_any_element()
+            } else {
+                let hover = colors.hairline;
+                item.hover(move |s| s.bg(hover)).into_any_element()
+            }
+        }
+    }
 }
 
 /// The design's error tone: warm surface, warm border, warm text.
@@ -1263,6 +1329,54 @@ fn redact(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use introspect::Schema;
+
+    fn relation(name: &str, kind: TableKind) -> Table {
+        Table { name: name.to_string(), kind, columns: Vec::new(), primary_key: Vec::new(), approx_rows: None }
+    }
+
+    #[test]
+    fn the_sidebar_flattens_tables_then_views_per_schema() {
+        let catalog = Catalog {
+            schemas: vec![
+                Schema {
+                    name: "public".to_string(),
+                    tables: vec![
+                        relation("users", TableKind::Table),
+                        relation("active_users", TableKind::View),
+                        relation("orders", TableKind::Table),
+                    ],
+                },
+                // A schema of views only gets one header, not an empty
+                // `SCHEMA ·` one above it.
+                Schema {
+                    name: "reporting".to_string(),
+                    tables: vec![relation("daily", TableKind::View)],
+                },
+            ],
+        };
+
+        let rows = catalog_rows(&catalog);
+        let read: Vec<String> = rows
+            .iter()
+            .map(|row| match row {
+                CatalogRow::Header { label } => format!("[{label}]"),
+                CatalogRow::Relation { name, .. } => name.to_string(),
+            })
+            .collect();
+        assert_eq!(
+            read,
+            [
+                "[SCHEMA · PUBLIC]",
+                "users",
+                "orders",
+                "[VIEWS · PUBLIC]",
+                "active_users",
+                "[VIEWS · REPORTING]",
+                "daily",
+            ]
+        );
+    }
 
     #[test]
     fn passwords_never_reach_the_screen() {

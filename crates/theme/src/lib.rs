@@ -62,12 +62,26 @@ pub struct ThemeColors {
     pub selection: Hsla,
     /// Success / connected.
     pub ok: Hsla,
+    /// A connection that is saved but not open: the sand dot.
+    pub idle: Hsla,
     /// Error text.
     pub error: Hsla,
+    /// Secondary text inside an error row: the reason, the retry link.
+    pub error_secondary: Hsla,
+    /// Muted meta text inside an error row ("last seen 3d ago").
+    pub error_faint: Hsla,
+    /// The dot marking a connection that is down.
+    pub error_mark: Hsla,
     /// Error row/card background.
     pub error_surface: Hsla,
     /// Error border.
     pub error_border: Hsla,
+    /// The meerkat mark: head, ears, eyes and muzzle. Only the mark uses
+    /// these; nothing else in the app is drawn from them.
+    pub mark_face: Hsla,
+    pub mark_ears: Hsla,
+    pub mark_ink: Hsla,
+    pub mark_muzzle: Hsla,
 }
 
 impl Theme {
@@ -94,9 +108,17 @@ impl Theme {
                 syntax_identifier: rgb(0x3F5A6B).into(),
                 selection: rgb(0xF0E5D2).into(),
                 ok: rgb(0x5C8A4E).into(),
+                idle: rgb(0xCFC8B8).into(),
                 error: rgb(0x8E4A2A).into(),
+                error_secondary: rgb(0xA9694A).into(),
+                error_faint: rgb(0xC0A192).into(),
+                error_mark: rgb(0xC08A6A).into(),
                 error_surface: rgb(0xFCF7F4).into(),
                 error_border: rgb(0xE4D3C9).into(),
+                mark_face: rgb(0xC98B3E).into(),
+                mark_ears: rgb(0xB4762F).into(),
+                mark_ink: rgb(0x3B3325).into(),
+                mark_muzzle: rgb(0x7A5522).into(),
             },
         }
     }

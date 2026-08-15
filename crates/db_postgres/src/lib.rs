@@ -81,6 +81,57 @@ impl PostgresConnection {
     pub fn label(&self) -> &Label {
         &self.label
     }
+
+    /// Hand the server's connections back now. Dropping the pool closes
+    /// them eventually; a connections screen that probes several databases
+    /// in a row should not wait for that.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+}
+
+/// Split a `postgres://user:password@host:port/database` URL into a saved
+/// profile and the password. The password is handed back separately
+/// because it belongs in the OS keychain, never in the profiles file.
+///
+/// The URL is parsed by sqlx, so anything the driver would accept at
+/// connect time is accepted here, and a typo is caught while the user is
+/// still looking at the form.
+pub fn profile_from_url(id: &str, name: &str, url: &str) -> Result<(Profile, Option<String>)> {
+    let options = PgConnectOptions::from_str(url)
+        .with_context(|| format!("not a valid PostgreSQL URL: {url}"))?;
+    let database = options
+        .get_database()
+        .filter(|database| !database.is_empty())
+        .context("the URL names no database")?
+        .to_string();
+    let user = options.get_username().to_string();
+
+    let profile = Profile {
+        id: id.to_string(),
+        // An unnamed connection goes by its database, as the design's
+        // rows do: `meerkat_prod` over the URL it came from.
+        name: if name.trim().is_empty() { database.clone() } else { name.trim().to_string() },
+        engine: db_client::Engine::Postgres,
+        host: Some(options.get_host().to_string()),
+        port: Some(options.get_port()),
+        database,
+        user: (!user.is_empty()).then_some(user),
+    };
+    Ok((profile, password_in(url)))
+}
+
+/// The password inside a URL's credentials, if it carries one.
+fn password_in(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let (credentials, _) = rest.split_once('@')?;
+    let (_, password) = credentials.split_once(':')?;
+    (!password.is_empty()).then(|| password.to_string())
+}
+
+/// `16.2 (Debian 16.2-1.pgdg120+2)` is more than a connection row needs.
+fn short_version(reported: &str) -> &str {
+    reported.split_whitespace().next().unwrap_or(reported)
 }
 
 /// One row of the table listing, before columns and keys are attached.
@@ -143,6 +194,14 @@ impl Connection for PostgresConnection {
         .context("failed to list primary keys")?;
 
         Ok(build_catalog(tables, columns, keys))
+    }
+
+    async fn server_version(&self) -> Result<String> {
+        let (version,): (String,) = sqlx::query_as("SHOW server_version")
+            .fetch_one(&self.pool)
+            .await
+            .context("failed to read the server version")?;
+        Ok(format!("PG {}", short_version(&version)))
     }
 
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
@@ -417,5 +476,42 @@ mod tests {
 
         let error = conn.execute("SELECT * FROM no_such_table_here").await.unwrap_err();
         assert!(error.to_string().contains("no_such_table_here"), "{error}");
+    }
+
+    #[test]
+    fn a_url_becomes_a_profile_and_a_keychain_password() {
+        let (profile, password) = profile_from_url(
+            "p1",
+            "prod",
+            "postgres://ada:hunter2@db.internal:5432/meerkat",
+        )
+        .unwrap();
+        assert_eq!(profile.name, "prod");
+        assert_eq!(profile.host.as_deref(), Some("db.internal"));
+        assert_eq!(profile.port, Some(5432));
+        assert_eq!(profile.database, "meerkat");
+        assert_eq!(profile.user.as_deref(), Some("ada"));
+        // The password never reaches the profile itself.
+        assert_eq!(password.as_deref(), Some("hunter2"));
+
+        let (profile, password) =
+            profile_from_url("p2", "  ", "postgres://ada@db.internal/analytics").unwrap();
+        // No name given: the database names the connection.
+        assert_eq!(profile.name, "analytics");
+        assert_eq!(password, None);
+    }
+
+    #[test]
+    fn a_url_without_a_database_is_rejected() {
+        let error = profile_from_url("p1", "prod", "postgres://ada@db.internal").unwrap_err();
+        assert!(error.to_string().contains("names no database"), "{error}");
+        let error = profile_from_url("p1", "prod", "not a url").unwrap_err();
+        assert!(error.to_string().contains("not a valid PostgreSQL URL"), "{error}");
+    }
+
+    #[test]
+    fn the_server_version_reads_short() {
+        assert_eq!(short_version("16.2 (Debian 16.2-1.pgdg120+2)"), "16.2");
+        assert_eq!(short_version("15.6"), "15.6");
     }
 }

@@ -3410,6 +3410,7 @@ name = "meerkat"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "db_client",
  "db_postgres",
  "gpui",
@@ -3418,7 +3419,9 @@ dependencies = [
  "introspect",
  "query",
  "results_grid",
+ "secrets",
  "sql_editor",
+ "storage",
  "theme",
  "ui",
 ]
