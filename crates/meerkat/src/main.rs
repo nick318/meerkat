@@ -6,6 +6,7 @@
 //! the saved connections and takes new ones.
 
 mod connections;
+mod history;
 mod root;
 mod shell;
 mod sql;
@@ -46,6 +47,7 @@ fn main() {
             KeyBinding::new("cmd-enter", shell::RunQuery, None),
             KeyBinding::new("cmd-t", shell::NewQuery, None),
             KeyBinding::new("cmd-r", shell::Refresh, None),
+            KeyBinding::new("cmd-y", shell::ShowHistory, None),
             KeyBinding::new("cmd-[", shell::PrevPage, None),
             KeyBinding::new("cmd-]", shell::NextPage, None),
             KeyBinding::new("cmd-q", Quit, None),

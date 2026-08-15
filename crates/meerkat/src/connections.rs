@@ -816,7 +816,9 @@ fn ago(seconds: i64) -> String {
     }
 }
 
-fn unix_now() -> i64 {
+/// Wall clock in unix seconds: what the store keeps its times in, both
+/// for "last opened" and for the query history.
+pub(crate) fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_secs() as i64)

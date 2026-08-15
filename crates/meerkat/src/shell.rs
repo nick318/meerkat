@@ -22,12 +22,15 @@ use sql_editor::{Kind, Name, SqlEditor, Vocabulary};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
+use storage::{HistoryFilter, NewRun, RunSource, Store};
 use theme::{FONT_FAMILY, ThemeColors, theme};
 use ui::{accent_button, card, format_count, format_millis, section_label, status_dot, table_glyph};
 
+use crate::connections::unix_now;
+use crate::history::{self, HistoryRow, OnOpenRun};
 use crate::sql::{PAGE_SIZE, page_query};
 
-actions!(meerkat, [RunQuery, NewQuery, Refresh, PrevPage, NextPage]);
+actions!(meerkat, [RunQuery, NewQuery, Refresh, PrevPage, NextPage, ShowHistory]);
 
 const SIDEBAR_WIDTH: f32 = 246.;
 const EDITOR_HEIGHT: f32 = 250.;
@@ -35,6 +38,9 @@ const EDITOR_HEIGHT: f32 = 250.;
 /// one height to measure, and the design's rows are already within a
 /// pixel of each other.
 const CATALOG_ROW_HEIGHT: f32 = 24.;
+/// How far back the history screen looks, in days. The comp's header says
+/// "last 7 days", and that is the window the list actually reads.
+const HISTORY_DAYS: i64 = 7;
 
 pub struct Shell {
     focus_handle: FocusHandle,
@@ -53,6 +59,15 @@ pub struct Shell {
     tabs: Vec<Tab>,
     active: usize,
     next_id: u64,
+    /// The local file that remembers what this session ran. `None` when
+    /// it could not be opened; the history screen then says so instead of
+    /// showing an empty list.
+    store: Option<Store>,
+    store_error: Option<String>,
+    /// Which connection the history belongs to: a profile id, or a key
+    /// built from the URL the app was started with. A password never
+    /// reaches it.
+    scope: String,
 }
 
 /// What the workspace was opened on: a URL from the command line, or a
@@ -78,6 +93,7 @@ enum Status {
 enum Tab {
     Table(TableTab),
     Query(QueryTab),
+    History(HistoryTab),
 }
 
 struct TableTab {
@@ -113,11 +129,28 @@ struct QueryTab {
     generation: u64,
 }
 
+/// The history screen, as a tab. It is a view of the local file rather
+/// than of the database, so it holds no generation counter: reading it is
+/// a synchronous SQLite call, and there is no slow reply to outrun.
+struct HistoryTab {
+    id: u64,
+    /// Day headings and runs, flattened for `uniform_list`.
+    rows: Rc<Vec<HistoryRow>>,
+    /// How many of those rows are runs, for the status strip.
+    runs: usize,
+    /// The comp's two chips.
+    user_only: bool,
+    errors_only: bool,
+    error: Option<String>,
+    scroll: UniformListScrollHandle,
+}
+
 impl Tab {
     fn id(&self) -> u64 {
         match self {
             Tab::Table(tab) => tab.id,
             Tab::Query(tab) => tab.id,
+            Tab::History(tab) => tab.id,
         }
     }
 
@@ -125,6 +158,7 @@ impl Tab {
         match self {
             Tab::Table(tab) => format!("{}.{}", tab.schema, tab.table).into(),
             Tab::Query(tab) => tab.title.clone(),
+            Tab::History(_) => "history".into(),
         }
     }
 }
@@ -137,6 +171,10 @@ impl Shell {
     /// Open the shell and start connecting. The window paints the
     /// connecting state immediately; the connection lands later.
     pub fn new(target: Target, cx: &mut Context<Self>) -> Self {
+        let (store, store_error) = match Store::open_default() {
+            Ok(store) => (Some(store), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
         let mut shell = Self {
             focus_handle: cx.focus_handle(),
             status: Status::Connecting(describe(&target)),
@@ -150,6 +188,9 @@ impl Shell {
             tabs: Vec::new(),
             active: 0,
             next_id: 1,
+            store,
+            store_error,
+            scope: scope_of(&target),
         };
         shell.connect(target, cx);
         shell
@@ -218,7 +259,7 @@ impl Shell {
     fn open_table(&mut self, schema: String, table: String, cx: &mut Context<Self>) {
         if let Some(ix) = self.tabs.iter().position(|tab| match tab {
             Tab::Table(t) => t.schema == schema && t.table == table,
-            Tab::Query(_) => false,
+            Tab::Query(_) | Tab::History(_) => false,
         }) {
             self.active = ix;
             cx.notify();
@@ -278,6 +319,7 @@ impl Shell {
         tab.generation += 1;
         let generation = tab.generation;
 
+        let recorded = sql.clone();
         let task = run_sql(connection, sql, cx);
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
@@ -287,16 +329,21 @@ impl Shell {
                     return;
                 }
                 tab.loading = false;
-                match flatten(outcome) {
+                let run = match flatten(outcome) {
                     Ok((result, elapsed)) => {
+                        let rows = result.rows.len() as u64;
                         tab.elapsed = Some(elapsed);
                         tab.data = Rc::new(GridData::new(result.columns, result.rows));
+                        Outcome { elapsed: Some(elapsed), rows: Some(rows), error: None }
                     }
                     Err(error) => {
-                        tab.error = Some(error);
+                        tab.error = Some(error.clone());
                         tab.data = empty_grid();
+                        Outcome { elapsed: None, rows: None, error: Some(error) }
                     }
-                }
+                };
+                this.record_run(&recorded, RunSource::App, &run);
+                this.reload_open_history(cx);
                 cx.notify();
             })
             .ok();
@@ -306,9 +353,16 @@ impl Shell {
     }
 
     fn new_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_query_with("select 1 as x, now() as t", window, cx);
+    }
+
+    /// Open a query tab on a statement. The history screen opens a run
+    /// this way, so a query comes back editable rather than re-run behind
+    /// the user's back.
+    fn new_query_with(&mut self, sql: &str, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.take_id();
         let vocabulary = self.vocabulary.clone();
-        let editor = cx.new(|cx| SqlEditor::new("select 1 as x, now() as t", vocabulary, cx));
+        let editor = cx.new(|cx| SqlEditor::new(sql, vocabulary, cx));
         window.focus(&editor.focus_handle(cx), cx);
         self.tabs.push(Tab::Query(QueryTab {
             id,
@@ -346,6 +400,7 @@ impl Shell {
         tab.generation += 1;
         let generation = tab.generation;
 
+        let recorded = sql;
         let task = run_statements(connection, statements, cx);
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
@@ -355,25 +410,138 @@ impl Shell {
                     return;
                 }
                 tab.running = false;
-                match flatten(outcome) {
+                let run = match flatten(outcome) {
                     Ok((result, elapsed, ran)) => {
+                        let rows = result.rows.len() as u64;
                         tab.elapsed = Some(elapsed);
                         tab.has_result = true;
                         tab.statements_run = ran;
                         tab.data = Rc::new(GridData::new(result.columns, result.rows));
+                        Outcome { elapsed: Some(elapsed), rows: Some(rows), error: None }
                     }
                     Err(error) => {
-                        tab.error = Some(error);
+                        tab.error = Some(error.clone());
                         tab.has_result = false;
                         tab.data = empty_grid();
+                        Outcome { elapsed: None, rows: None, error: Some(error) }
                     }
-                }
+                };
+                this.record_run(&recorded, RunSource::User, &run);
+                this.reload_open_history(cx);
                 cx.notify();
             })
             .ok();
         })
         .detach();
         cx.notify();
+    }
+
+    // --- query history ---------------------------------------------------
+
+    /// Remember a run in the local file. A history that cannot be written
+    /// is not worth interrupting a session over, so the error is dropped.
+    fn record_run(&self, statement: &str, source: RunSource, outcome: &Outcome) {
+        let Some(store) = &self.store else { return };
+        // A blank buffer is not a run worth keeping.
+        if statement.trim().is_empty() {
+            return;
+        }
+        store
+            .record_query(NewRun {
+                scope: &self.scope,
+                statement: statement.trim(),
+                ran_at: unix_now(),
+                source,
+                elapsed_ms: outcome.elapsed.map(|millis| millis as u64),
+                row_count: outcome.rows,
+                error: outcome.error.as_deref(),
+            })
+            .ok();
+    }
+
+    /// Focus the history tab, opening it if this session has none. One
+    /// history tab is enough: it is a view of one file, not of a query.
+    fn open_history(&mut self, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tabs.iter().position(|tab| matches!(tab, Tab::History(_))) {
+            self.active = ix;
+            let id = self.tabs[ix].id();
+            self.load_history(id, cx);
+            return;
+        }
+        let id = self.take_id();
+        self.tabs.push(Tab::History(HistoryTab {
+            id,
+            rows: Rc::new(Vec::new()),
+            runs: 0,
+            user_only: false,
+            errors_only: false,
+            error: None,
+            scroll: UniformListScrollHandle::new(),
+        }));
+        self.active = self.tabs.len() - 1;
+        self.load_history(id, cx);
+    }
+
+    /// Read the runs back and flatten them. Reading is a local SQLite
+    /// call, so it stays on this thread; the tokio bridge is for the
+    /// database, not for a file next to the profiles.
+    fn load_history(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let scope = self.scope.clone();
+        let Some(Tab::History(tab)) = self.tab_mut(tab_id) else { return };
+        let filter = HistoryFilter {
+            user_only: tab.user_only,
+            errors_only: tab.errors_only,
+            since: Some(unix_now() - HISTORY_DAYS * 24 * 60 * 60),
+            ..Default::default()
+        };
+
+        if self.store.is_none() {
+            let reason = self.store_error.clone().unwrap_or_else(|| "no history file".into());
+            if let Some(Tab::History(tab)) = self.tab_mut(tab_id) {
+                tab.error = Some(reason);
+            }
+            cx.notify();
+            return;
+        }
+        let read = self.store.as_ref().expect("checked above").list_history(&scope, filter);
+        let Some(Tab::History(tab)) = self.tab_mut(tab_id) else { return };
+        match read {
+            Ok(runs) => {
+                let rows = history::flatten(&runs, history::today());
+                tab.runs = runs.len();
+                tab.rows = Rc::new(rows);
+                tab.error = None;
+            }
+            Err(error) => {
+                tab.rows = Rc::new(Vec::new());
+                tab.runs = 0;
+                tab.error = Some(error.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    /// Keep an open history tab current when a run finishes behind it.
+    fn reload_open_history(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .tabs
+            .iter()
+            .find(|tab| matches!(tab, Tab::History(_)))
+            .map(|tab| tab.id())
+        else {
+            return;
+        };
+        self.load_history(id, cx);
+    }
+
+    fn toggle_history_filter(&mut self, tab_id: u64, errors: bool, cx: &mut Context<Self>) {
+        let Some(Tab::History(tab)) = self.tab_mut(tab_id) else { return };
+        if errors {
+            tab.errors_only = !tab.errors_only;
+        } else {
+            tab.user_only = !tab.user_only;
+        }
+        self.load_history(tab_id, cx);
     }
 
     fn close_tab(&mut self, tab_id: u64, cx: &mut Context<Self>) {
@@ -411,6 +579,12 @@ impl Shell {
                 self.load_page(id, page, cx);
             }
             Some(Tab::Query(_)) => self.run_active_query(cx),
+            // Refreshing the history re-reads the local file, which is
+            // what ⌘R means on every other tab: show me this again.
+            Some(Tab::History(tab)) => {
+                let id = tab.id;
+                self.load_history(id, cx);
+            }
             None => {}
         }
     }
@@ -445,6 +619,28 @@ impl Shell {
 
     fn on_next_page(&mut self, _: &NextPage, _: &mut Window, cx: &mut Context<Self>) {
         self.step_page(true, cx);
+    }
+
+    fn on_show_history(&mut self, _: &ShowHistory, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_history(cx);
+    }
+}
+
+/// What a finished run is worth remembering by: the timing and the row
+/// count on success, the message on failure.
+struct Outcome {
+    elapsed: Option<u128>,
+    rows: Option<u64>,
+    error: Option<String>,
+}
+
+/// Which connection a session's history belongs to. A saved connection
+/// has an id already; a URL from the command line is keyed by the URL
+/// with its password taken out, so the history file never holds one.
+fn scope_of(target: &Target) -> String {
+    match target {
+        Target::Profile(profile) => profile.id.clone(),
+        Target::Url(url) => format!("url:{}", redact(url)),
     }
 }
 
@@ -568,6 +764,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::on_refresh))
             .on_action(cx.listener(Self::on_prev_page))
             .on_action(cx.listener(Self::on_next_page))
+            .on_action(cx.listener(Self::on_show_history))
             .flex()
             .flex_col()
             .size_full()
@@ -610,17 +807,28 @@ impl Shell {
                     .text_color(colors.text_secondary)
                     .child(self.database_name()),
             );
-        if let Some(Tab::Table(tab)) = self.tabs.get(self.active) {
-            trail = trail
-                .child(separator())
-                .child(tab.schema.clone())
-                .child(separator())
-                .child(
+        match self.tabs.get(self.active) {
+            Some(Tab::Table(tab)) => {
+                trail = trail
+                    .child(separator())
+                    .child(tab.schema.clone())
+                    .child(separator())
+                    .child(
+                        div()
+                            .text_color(colors.text)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(tab.table.clone()),
+                    );
+            }
+            Some(Tab::History(_)) => {
+                trail = trail.child(separator()).child(
                     div()
                         .text_color(colors.text)
                         .font_weight(FontWeight::MEDIUM)
-                        .child(tab.table.clone()),
+                        .child("history"),
                 );
+            }
+            _ => {}
         }
 
         div()
@@ -732,11 +940,29 @@ impl Shell {
                     .border_t_1()
                     .border_color(colors.hairline)
                     .flex()
-                    .justify_between()
+                    .flex_col()
+                    .gap(px(6.))
                     .text_size(px(10.))
                     .text_color(colors.text_muted)
-                    .child(self.table_total())
-                    .child(div().text_color(colors.text_faint).child("read-only")),
+                    // The comp's way into the history, kept where it puts
+                    // it: the foot of the sidebar.
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .id("query-history")
+                                    .cursor_pointer()
+                                    .hover(|s| s.text_color(colors.accent))
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.open_history(cx)
+                                    }))
+                                    .child("query history"),
+                            )
+                            .child(div().text_color(colors.text_faint).child("read-only")),
+                    )
+                    .child(div().text_color(colors.text_faint).child(self.table_total())),
             )
     }
 
@@ -897,6 +1123,7 @@ impl Shell {
                     cx,
                 )),
             Some(Tab::Query(tab)) => self.query_pane(pane, tab, colors, cx),
+            Some(Tab::History(tab)) => self.history_pane(pane, tab, colors, cx),
             None => pane.child(self.placeholder(colors, window)),
         }
     }
@@ -1072,6 +1299,108 @@ impl Shell {
         ))
     }
 
+    /// The history screen: a heading, the comp's two chips, and the list
+    /// of runs under their day.
+    fn history_pane(
+        &self,
+        pane: Div,
+        tab: &HistoryTab,
+        colors: &ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let tab_id = tab.id;
+
+        pane.child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(14.))
+                .py(px(9.))
+                .border_b_1()
+                .border_color(colors.hairline)
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors.text)
+                        .child("Query history"),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(colors.text_muted)
+                        .child(format!("{} · last {HISTORY_DAYS} days", self.database_name())),
+                )
+                .child(div().flex_1())
+                .child(
+                    history::filter_chip("mine-only", "mine only", tab.user_only, colors).on_click(
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.toggle_history_filter(tab_id, false, cx)
+                        }),
+                    ),
+                )
+                .child(
+                    history::filter_chip("errors-only", "errors", tab.errors_only, colors)
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.toggle_history_filter(tab_id, true, cx)
+                        })),
+                ),
+        )
+        .children(tab.error.clone().map(|error| error_strip(error, colors)))
+        .child(self.history_list(tab, colors, cx))
+    }
+
+    fn history_list(
+        &self,
+        tab: &HistoryTab,
+        colors: &ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if tab.rows.is_empty() {
+            return div()
+                .flex_1()
+                .min_h(px(0.))
+                .px(px(16.))
+                .pt(px(14.))
+                .text_size(px(11.))
+                .text_color(colors.text_faint)
+                .child(if tab.user_only || tab.errors_only {
+                    "no runs match these filters"
+                } else {
+                    "nothing run yet on this connection"
+                })
+                .into_any_element();
+        }
+
+        let rows = tab.rows.clone();
+        let open: OnOpenRun = {
+            let shell = cx.entity().downgrade();
+            Rc::new(move |statement, window, cx| {
+                shell
+                    .update(cx, |shell: &mut Shell, cx| {
+                        shell.new_query_with(&statement, window, cx)
+                    })
+                    .ok();
+            })
+        };
+
+        let mut list = uniform_list("history", rows.len(), move |range, _window, cx| {
+            let colors = theme(cx).colors.clone();
+            range
+                .map(|ix| history::history_row(ix, &rows[ix], &open, &colors, cx))
+                .collect::<Vec<_>>()
+        });
+        list.style().restrict_scroll_to_axis = Some(true);
+        list.track_scroll(&tab.scroll)
+            .flex_1()
+            .min_h(px(0.))
+            .px(px(16.))
+            .pt(px(6.))
+            .into_any_element()
+    }
+
     fn placeholder(&self, colors: &ThemeColors, _window: &mut Window) -> Div {
         let (heading, detail) = match &self.status {
             Status::Connecting(target) => ("connecting".to_string(), target.clone()),
@@ -1131,6 +1460,14 @@ impl Shell {
                     String::new()
                 },
                 tab.elapsed,
+            ),
+            Some(Tab::History(tab)) => (
+                match tab.runs {
+                    0 => "no runs".to_string(),
+                    1 => "1 run".to_string(),
+                    n => format!("{n} runs"),
+                },
+                None,
             ),
             None => (String::new(), None),
         };
