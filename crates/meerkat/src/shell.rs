@@ -97,7 +97,7 @@ impl Tab {
 }
 
 fn empty_grid() -> Rc<GridData> {
-    Rc::new(GridData { columns: Vec::new(), rows: Vec::new() })
+    Rc::new(GridData::empty())
 }
 
 impl Shell {
@@ -233,10 +233,7 @@ impl Shell {
                 match flatten(outcome) {
                     Ok((result, elapsed)) => {
                         tab.elapsed = Some(elapsed);
-                        tab.data = Rc::new(GridData {
-                            columns: result.columns,
-                            rows: result.rows,
-                        });
+                        tab.data = Rc::new(GridData::new(result.columns, result.rows));
                     }
                     Err(error) => {
                         tab.error = Some(error);
@@ -297,10 +294,7 @@ impl Shell {
                     Ok((result, elapsed)) => {
                         tab.elapsed = Some(elapsed);
                         tab.has_result = true;
-                        tab.data = Rc::new(GridData {
-                            columns: result.columns,
-                            rows: result.rows,
-                        });
+                        tab.data = Rc::new(GridData::new(result.columns, result.rows));
                     }
                     Err(error) => {
                         tab.error = Some(error);

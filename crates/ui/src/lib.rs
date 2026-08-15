@@ -78,7 +78,7 @@ pub fn format_count(count: u64) -> String {
 }
 
 fn trim_zero(value: f64, suffix: &str) -> String {
-    if value >= 100. {
+    if value >= 100. || (value.fract() * 10.).round() == 0. {
         format!("{}{suffix}", value.round() as u64)
     } else {
         format!("{value:.1}{suffix}")
@@ -114,6 +114,9 @@ mod tests {
         assert_eq!(format_count(640), "640");
         assert_eq!(format_count(18_412), "18.4k");
         assert_eq!(format_count(311_000), "311k");
+        // A round thousand reads better without the trailing zero.
+        assert_eq!(format_count(5_000), "5k");
+        assert_eq!(format_count(20_000), "20k");
         assert_eq!(format_count(1_200_000), "1.2m");
         assert_eq!(format_count(2_400_000_000), "2.4b");
     }
