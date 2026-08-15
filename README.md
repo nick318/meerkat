@@ -10,8 +10,10 @@ workspace, GPUI frontend, sqlx drivers behind a `Connection` trait).
 
 ## Status
 
-Bootstrap skeleton. The app opens the main window with placeholder panes.
-The SQLite driver can introspect and query; in-place editing is Phase 2.
+Read-only PostgreSQL. Point it at a database and it lists the real
+schemas, tables and views, pages through any of them, and runs ad-hoc
+SQL in a query tab. In-place editing, MySQL and saved connection
+profiles are Phase 2.
 
 ## Build
 
@@ -19,8 +21,16 @@ Requires the latest stable Rust. On macOS you also need Xcode and its
 command line tools (GPUI renders with Metal).
 
 ```sh
-cargo run -p meerkat     # open the app window
-cargo test               # driver + storage tests
+cargo run -p meerkat -- postgres://user@host:5432/database
+cargo test               # driver, grid, editor and storage tests
+```
+
+`MEERKAT_DATABASE_URL` works instead of the argument. The PostgreSQL
+driver tests need a server and skip without one:
+
+```sh
+MEERKAT_TEST_PG_URL=postgres://postgres:pg@localhost:5432/postgres \
+  cargo test -p db_postgres
 ```
 
 The first build compiles GPUI from the pinned Zed revision and takes a
@@ -37,11 +47,11 @@ while. `gpui`/`gpui_platform` are pinned by git rev in the workspace
 | `settings` | User-editable JSON settings |
 | `db_client` | Engine-agnostic `Connection` trait, values, changesets |
 | `db_sqlite` | SQLite driver (sqlx) — introspect + query work |
-| `db_postgres` | PostgreSQL driver (placeholder) |
+| `db_postgres` | PostgreSQL driver (sqlx) — introspect + query |
 | `introspect` | Schema model: schemas, tables, columns, keys |
 | `query` | Query execution service (placeholder) |
-| `sql_editor` | Editor pane (placeholder) |
-| `results_grid` | Virtualized grid, cell editing (placeholder) |
+| `sql_editor` | Multi-line SQL buffer with SQL colouring |
+| `results_grid` | Virtualized grid; cell editing is Phase 2 |
 | `schema_tree` | Sidebar tree (placeholder) |
 | `storage` | Local SQLite: profiles, layout, history |
 | `secrets` | OS keychain wrapper for passwords |
