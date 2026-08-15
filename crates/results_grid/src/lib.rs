@@ -90,15 +90,18 @@ pub fn grid(
     // The content can be wider than the pane; the whole grid scrolls
     // sideways as one, header included.
     let content_width: f32 = data.widths.iter().sum();
-    let row_count = data.rows.len();
-
-    let list_data = data.clone();
+    let rows = row_list(&id, data.clone(), selected, on_click);
 
     div()
         .id(ElementId::Name(format!("{id}-grid").into()))
         .flex_1()
         .min_h(px(0.))
         .overflow_x_scroll()
+        // A grid has a scroll container per axis: this one for the
+        // columns, the row list for the rows. Locking each to the
+        // gesture's dominant axis keeps a diagonal swipe from moving both
+        // at once, and lets a vertical gesture pass through to the list.
+        .restrict_scroll_to_axis()
         .child(
             div()
                 .flex()
@@ -110,29 +113,41 @@ pub fn grid(
                 // default here would render the data wider than its lane.
                 .text_size(px(DATA_FONT_SIZE))
                 .child(header_row(&data.columns, &data.widths, &colors))
-                .child(
-                    uniform_list(
-                        ElementId::Name(format!("{id}-rows").into()),
-                        row_count,
-                        move |range, _window, cx| {
-                            let colors = theme(cx).colors.clone();
-                            range
-                                .map(|ix| {
-                                    data_row(
-                                        ix,
-                                        &list_data.rows[ix],
-                                        &list_data.widths,
-                                        selected == Some(ix),
-                                        on_click.clone(),
-                                        &colors,
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        },
-                    )
-                    .flex_1(),
-                ),
+                .child(rows),
         )
+}
+
+/// The virtualized row list. Built here rather than inline so the axis
+/// lock can be set: `UniformList` carries an `Interactivity` but not
+/// `StatefulInteractiveElement`, so the style flag that
+/// `restrict_scroll_to_axis()` would set is set by hand.
+fn row_list(
+    id: &SharedString,
+    data: Rc<GridData>,
+    selected: Option<usize>,
+    on_click: Option<OnClickRow>,
+) -> impl IntoElement {
+    let mut rows = uniform_list(
+        ElementId::Name(format!("{id}-rows").into()),
+        data.rows.len(),
+        move |range, _window, cx| {
+            let colors = theme(cx).colors.clone();
+            range
+                .map(|ix| {
+                    data_row(
+                        ix,
+                        &data.rows[ix],
+                        &data.widths,
+                        selected == Some(ix),
+                        on_click.clone(),
+                        &colors,
+                    )
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+    rows.style().restrict_scroll_to_axis = Some(true);
+    rows.flex_1()
 }
 
 fn header_row(columns: &[String], widths: &[f32], colors: &theme::ThemeColors) -> Div {
