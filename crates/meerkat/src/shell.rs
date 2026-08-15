@@ -17,7 +17,7 @@ use gpui::{
 };
 use introspect::{Catalog, Table, TableKind};
 use results_grid::{GridData, grid};
-use sql_editor::SqlEditor;
+use sql_editor::{SqlEditor, Vocabulary};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,6 +36,8 @@ pub struct Shell {
     status: Status,
     connection: Option<Arc<dyn Connection>>,
     catalog: Option<Catalog>,
+    /// Every name in the catalog, for the editor's colouring.
+    vocabulary: Arc<Vocabulary>,
     label: Option<Label>,
     tabs: Vec<Tab>,
     active: usize,
@@ -109,6 +111,7 @@ impl Shell {
             status: Status::Connecting(url.clone()),
             connection: None,
             catalog: None,
+            vocabulary: Arc::new(Vocabulary::default()),
             label: None,
             tabs: Vec::new(),
             active: 0,
@@ -133,8 +136,19 @@ impl Shell {
                     Ok((connection, label, catalog)) => {
                         this.connection = Some(connection);
                         this.label = Some(label);
+                        this.vocabulary = Arc::new(vocabulary_of(&catalog));
                         this.catalog = Some(catalog);
                         this.status = Status::Connected;
+                        // A query tab opened while connecting was built
+                        // with an empty vocabulary; give it the real one.
+                        let vocabulary = this.vocabulary.clone();
+                        for tab in &this.tabs {
+                            if let Tab::Query(tab) = tab {
+                                tab.editor.update(cx, |editor, cx| {
+                                    editor.set_vocabulary(vocabulary.clone(), cx)
+                                });
+                            }
+                        }
                         this.open_first_table(cx);
                     }
                     Err(error) => this.status = Status::Failed(error),
@@ -250,7 +264,8 @@ impl Shell {
 
     fn new_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.take_id();
-        let editor = cx.new(|cx| SqlEditor::new("select 1 as x, now() as t", cx));
+        let vocabulary = self.vocabulary.clone();
+        let editor = cx.new(|cx| SqlEditor::new("select 1 as x, now() as t", vocabulary, cx));
         window.focus(&editor.focus_handle(cx), cx);
         self.tabs.push(Tab::Query(QueryTab {
             id,
@@ -380,6 +395,17 @@ impl Shell {
     fn on_next_page(&mut self, _: &NextPage, _: &mut Window, cx: &mut Context<Self>) {
         self.step_page(true, cx);
     }
+}
+
+/// Every schema, relation and column name in the catalog, so the query
+/// editor can tell a real name from a typo while the user types.
+fn vocabulary_of(catalog: &Catalog) -> Vocabulary {
+    Vocabulary::new(catalog.schemas.iter().flat_map(|schema| {
+        std::iter::once(schema.name.clone()).chain(schema.tables.iter().flat_map(|table| {
+            std::iter::once(table.name.clone())
+                .chain(table.columns.iter().map(|column| column.name.clone()))
+        }))
+    }))
 }
 
 /// Run one statement on tokio and time it. Timing wraps the call itself,

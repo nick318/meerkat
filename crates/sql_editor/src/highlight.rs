@@ -2,10 +2,16 @@
 //! design comp does: keywords in the deep accent, literals in green,
 //! comments muted, everything else in the body colour.
 //!
-//! It works a line at a time, so a string literal or a block comment that
-//! spans lines loses its colour after the first newline. That is the price
-//! of not carrying a parser; nothing else depends on this being exact.
+//! It also colours the names of the connected database. A word that the
+//! catalog knows — a schema, a table, a view or a column — gets the
+//! identifier colour; a word it does not know stays plain, so a typo is
+//! visible before the query runs.
+//!
+//! It works a line at a time, so a string literal that spans lines loses
+//! its colour after the first newline. That is the price of not carrying
+//! a parser; nothing else depends on this being exact.
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,13 +19,40 @@ pub enum Token {
     Keyword,
     Literal,
     Comment,
+    /// A name the connected database actually has.
+    Identifier,
     Plain,
+}
+
+/// The names in the connected database, folded to lower case because
+/// Postgres folds unquoted identifiers the same way.
+#[derive(Debug, Default)]
+pub struct Vocabulary {
+    names: HashSet<String>,
+}
+
+impl Vocabulary {
+    pub fn new(names: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            names: names.into_iter().map(|name| name.to_ascii_lowercase()).collect(),
+        }
+    }
+
+    pub fn contains(&self, word: &str) -> bool {
+        // A one-character name would light up half the buffer for no
+        // information; `id` and longer is where this starts to help.
+        word.len() > 1 && self.names.contains(&word.to_ascii_lowercase())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
 }
 
 /// Split one line into coloured spans. The spans are in order, they never
 /// overlap, and their lengths add up to the length of the line, so they
 /// can be handed straight to the text system as runs.
-pub fn spans(line: &str) -> Vec<(Range<usize>, Token)> {
+pub fn spans(line: &str, vocabulary: &Vocabulary) -> Vec<(Range<usize>, Token)> {
     let bytes = line.as_bytes();
     let mut spans: Vec<(Range<usize>, Token)> = Vec::new();
     let mut ix = 0;
@@ -50,7 +83,16 @@ pub fn spans(line: &str) -> Vec<(Range<usize>, Token)> {
                 while ix < bytes.len() && is_word_byte(bytes[ix]) {
                     ix += 1;
                 }
-                if is_keyword(&line[start..ix]) { Token::Keyword } else { Token::Plain }
+                let word = &line[start..ix];
+                // Keywords win: a column called `order` still reads as a
+                // keyword, which is what the SQL parser will do with it.
+                if is_keyword(word) {
+                    Token::Keyword
+                } else if vocabulary.contains(word) {
+                    Token::Identifier
+                } else {
+                    Token::Plain
+                }
             }
             _ => {
                 // Punctuation, spaces and any multi-byte character: step to
@@ -113,7 +155,7 @@ mod tests {
     use super::*;
 
     fn kinds(line: &str) -> Vec<(&str, Token)> {
-        spans(line)
+        spans(line, &Vocabulary::default())
             .into_iter()
             .map(|(range, token)| (&line[range], token))
             .collect()
@@ -135,7 +177,8 @@ mod tests {
             "",
             "select 'héllo wörld' as greeting",
         ] {
-            let total: usize = spans(line).iter().map(|(range, _)| range.len()).sum();
+            let total: usize =
+                spans(line, &Vocabulary::default()).iter().map(|(range, _)| range.len()).sum();
             assert_eq!(total, line.len(), "{line}");
         }
     }
@@ -167,6 +210,36 @@ mod tests {
         assert_eq!(
             kinds("from \"order\""),
             vec![("from", Token::Keyword), (" \"order\"", Token::Plain)]
+        );
+    }
+
+    #[test]
+    fn catalog_names_are_marked_and_typos_are_not() {
+        let vocabulary = Vocabulary::new(["public".into(), "users".into(), "email".into()]);
+        let line = "select email from public.userz";
+        let marked: Vec<&str> = spans(line, &vocabulary)
+            .into_iter()
+            .filter(|(_, token)| *token == Token::Identifier)
+            .map(|(range, _)| &line[range])
+            .collect();
+        assert_eq!(marked, vec!["email", "public"]);
+    }
+
+    #[test]
+    fn catalog_names_are_matched_case_insensitively() {
+        let vocabulary = Vocabulary::new(["Users".into()]);
+        assert!(vocabulary.contains("USERS"));
+        assert!(vocabulary.contains("users"));
+        // One character is noise, not information.
+        assert!(!Vocabulary::new(["x".into()]).contains("x"));
+    }
+
+    #[test]
+    fn a_keyword_that_is_also_a_column_stays_a_keyword() {
+        let vocabulary = Vocabulary::new(["order".into()]);
+        assert_eq!(
+            spans("order", &vocabulary),
+            vec![(0..5, Token::Keyword)]
         );
     }
 

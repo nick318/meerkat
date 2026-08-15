@@ -6,67 +6,125 @@
 //! This one is multi-line, so it keeps a shaped line per row and maps byte
 //! offsets to (row, column) both ways.
 //!
-//! It is deliberately small: colouring comes from a one-pass tokenizer,
-//! and there is no undo and no wrapping. Offsets are byte offsets into the
-//! buffer and always sit on a character boundary.
+//! It carries what a macOS editor is expected to have: word and line
+//! motion, selection for every motion, word and line deletion, undo and
+//! redo, double and triple click selection, and a viewport that follows
+//! the caret. Colouring comes from a one-pass tokenizer that also knows
+//! the names in the connected database. There is no soft wrap.
+//!
+//! Offsets are byte offsets into the buffer and always sit on a character
+//! boundary.
 
 mod highlight;
+mod motion;
+
+pub use highlight::Vocabulary;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, Hsla,
-    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
-    Window, actions, div, fill, point, prelude::*, px, relative, size,
+    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, Hsla, IntoElement,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    ScrollHandle, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
+    actions, div, fill, point, prelude::*, px, relative, size,
 };
 use highlight::Token;
 use std::ops::Range;
+use std::sync::Arc;
 use theme::theme;
 
 actions!(
     sql_editor,
     [
         Backspace,
+        Copy,
+        Cut,
         Delete,
-        Left,
-        Right,
-        Up,
-        Down,
+        DeleteToBeginningOfLine,
+        DeleteToEndOfLine,
+        DeleteToNextWordEnd,
+        DeleteToPreviousWordStart,
+        Indent,
+        MoveDown,
+        MoveLeft,
+        MoveRight,
+        MoveToBeginning,
+        MoveToBeginningOfLine,
+        MoveToEnd,
+        MoveToEndOfLine,
+        MoveToNextWordEnd,
+        MoveToPreviousWordStart,
+        MoveUp,
+        Newline,
+        Paste,
+        Redo,
+        SelectAll,
+        SelectDown,
         SelectLeft,
         SelectRight,
-        SelectAll,
-        Home,
-        End,
-        Newline,
-        Indent,
-        Paste,
-        Cut,
-        Copy,
+        SelectToBeginning,
+        SelectToBeginningOfLine,
+        SelectToEnd,
+        SelectToEndOfLine,
+        SelectToNextWordEnd,
+        SelectToPreviousWordStart,
+        SelectUp,
+        Undo,
     ]
 );
 
-/// Key bindings for the editor. Bind these once at startup, scoped to the
-/// editor's key context so they never shadow the app's own bindings.
+/// Key bindings for the editor, following Zed's macOS keymap. Bind these
+/// once at startup; they are scoped to the editor's key context so they
+/// never shadow the app's own bindings.
 pub fn key_bindings() -> Vec<gpui::KeyBinding> {
-    let context = Some(KEY_CONTEXT);
+    // A closure cannot take the action: `KeyBinding::new` is generic over
+    // the concrete action type, and `Box<dyn Action>` is not one.
+    macro_rules! bind {
+        ($keystroke:expr, $action:expr) => {
+            gpui::KeyBinding::new($keystroke, $action, Some(KEY_CONTEXT))
+        };
+    }
     vec![
-        gpui::KeyBinding::new("backspace", Backspace, context),
-        gpui::KeyBinding::new("delete", Delete, context),
-        gpui::KeyBinding::new("left", Left, context),
-        gpui::KeyBinding::new("right", Right, context),
-        gpui::KeyBinding::new("up", Up, context),
-        gpui::KeyBinding::new("down", Down, context),
-        gpui::KeyBinding::new("shift-left", SelectLeft, context),
-        gpui::KeyBinding::new("shift-right", SelectRight, context),
-        gpui::KeyBinding::new("cmd-a", SelectAll, context),
-        gpui::KeyBinding::new("ctrl-a", SelectAll, context),
-        gpui::KeyBinding::new("home", Home, context),
-        gpui::KeyBinding::new("end", End, context),
-        gpui::KeyBinding::new("enter", Newline, context),
-        gpui::KeyBinding::new("tab", Indent, context),
-        gpui::KeyBinding::new("cmd-v", Paste, context),
-        gpui::KeyBinding::new("cmd-c", Copy, context),
-        gpui::KeyBinding::new("cmd-x", Cut, context),
+        bind!("backspace", Backspace),
+        bind!("delete", Delete),
+        bind!("alt-backspace", DeleteToPreviousWordStart),
+        bind!("alt-delete", DeleteToNextWordEnd),
+        bind!("cmd-backspace", DeleteToBeginningOfLine),
+        bind!("cmd-delete", DeleteToEndOfLine),
+        bind!("left", MoveLeft),
+        bind!("right", MoveRight),
+        bind!("up", MoveUp),
+        bind!("down", MoveDown),
+        bind!("alt-left", MoveToPreviousWordStart),
+        bind!("alt-right", MoveToNextWordEnd),
+        bind!("cmd-left", MoveToBeginningOfLine),
+        bind!("cmd-right", MoveToEndOfLine),
+        bind!("home", MoveToBeginningOfLine),
+        bind!("end", MoveToEndOfLine),
+        // The emacs pair macOS honours in every text field.
+        bind!("ctrl-a", MoveToBeginningOfLine),
+        bind!("ctrl-e", MoveToEndOfLine),
+        bind!("cmd-up", MoveToBeginning),
+        bind!("cmd-down", MoveToEnd),
+        bind!("shift-left", SelectLeft),
+        bind!("shift-right", SelectRight),
+        bind!("shift-up", SelectUp),
+        bind!("shift-down", SelectDown),
+        bind!("alt-shift-left", SelectToPreviousWordStart),
+        bind!("alt-shift-right", SelectToNextWordEnd),
+        bind!("cmd-shift-left", SelectToBeginningOfLine),
+        bind!("cmd-shift-right", SelectToEndOfLine),
+        bind!("shift-home", SelectToBeginningOfLine),
+        bind!("shift-end", SelectToEndOfLine),
+        bind!("cmd-shift-up", SelectToBeginning),
+        bind!("cmd-shift-down", SelectToEnd),
+        bind!("cmd-a", SelectAll),
+        bind!("enter", Newline),
+        bind!("tab", Indent),
+        bind!("cmd-z", Undo),
+        bind!("cmd-shift-z", Redo),
+        bind!("cmd-v", Paste),
+        bind!("cmd-c", Copy),
+        bind!("cmd-x", Cut),
     ]
 }
 
@@ -79,17 +137,44 @@ const LINE_HEIGHT: f32 = 21.;
 const GUTTER_WIDTH: f32 = 44.;
 const TEXT_PADDING_X: f32 = 16.;
 const TEXT_PADDING_Y: f32 = 12.;
+/// Deep enough for a long editing session, bounded so a runaway paste
+/// loop cannot grow the history without limit.
+const UNDO_DEPTH: usize = 256;
 
 pub struct SqlEditor {
     focus_handle: FocusHandle,
+    scroll_handle: ScrollHandle,
     content: String,
     placeholder: SharedString,
+    vocabulary: Arc<Vocabulary>,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// What the last edit was, so a run of typing collapses into one undo
+    /// step instead of one step per character.
+    last_edit: EditKind,
     last_layout: Option<EditorLayout>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    /// Set whenever the caret moves, cleared once the viewport follows it.
+    pending_autoscroll: bool,
+}
+
+#[derive(Clone)]
+struct Snapshot {
+    content: String,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditKind {
+    /// Nothing to join onto: the next edit always starts a new undo step.
+    None,
+    Insert,
+    Delete,
 }
 
 /// What the last paint produced, kept so mouse hits and IME rectangles can
@@ -102,19 +187,29 @@ struct EditorLayout {
 }
 
 impl SqlEditor {
-    pub fn new(content: impl Into<String>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        content: impl Into<String>,
+        vocabulary: Arc<Vocabulary>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let content = content.into();
         let end = content.len();
         Self {
             focus_handle: cx.focus_handle(),
+            scroll_handle: ScrollHandle::new(),
             content,
             placeholder: "select 1".into(),
+            vocabulary,
             selected_range: end..end,
             selection_reversed: false,
             marked_range: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            last_edit: EditKind::None,
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            pending_autoscroll: false,
         }
     }
 
@@ -126,13 +221,24 @@ impl SqlEditor {
         self.content.split('\n').count()
     }
 
+    /// Swap in the names of the connected database, so the tokenizer can
+    /// tell a real relation from a typo.
+    pub fn set_vocabulary(&mut self, vocabulary: Arc<Vocabulary>, cx: &mut Context<Self>) {
+        self.vocabulary = vocabulary;
+        cx.notify();
+    }
+
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.push_undo(EditKind::None);
         self.content = text.into();
         let end = self.content.len();
         self.selected_range = end..end;
+        self.selection_reversed = false;
         self.marked_range = None;
         cx.notify();
     }
+
+    // --- selection -------------------------------------------------------
 
     fn cursor_offset(&self) -> usize {
         if self.selection_reversed {
@@ -145,6 +251,10 @@ impl SqlEditor {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
         self.selection_reversed = false;
+        // Moving the caret ends the current typing run: undo should stop
+        // where the user stopped, not swallow the previous sentence too.
+        self.last_edit = EditKind::None;
+        self.pending_autoscroll = true;
         cx.notify();
     }
 
@@ -158,25 +268,91 @@ impl SqlEditor {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.last_edit = EditKind::None;
+        self.pending_autoscroll = true;
         cx.notify();
     }
 
-    /// Byte offset of the start of the line holding `offset`.
+    /// Delete from the caret to `offset`, in one undo step.
+    fn delete_to(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            if offset == self.cursor_offset() {
+                return;
+            }
+            self.select_to(offset, cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    // --- undo ------------------------------------------------------------
+
+    /// Record the buffer before an edit, unless this edit continues the
+    /// run the last one started.
+    fn push_undo(&mut self, kind: EditKind) {
+        if kind != EditKind::None && kind == self.last_edit {
+            return;
+        }
+        self.undo.push(Snapshot {
+            content: self.content.clone(),
+            selected_range: self.selected_range.clone(),
+            selection_reversed: self.selection_reversed,
+        });
+        if self.undo.len() > UNDO_DEPTH {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    fn restore(&mut self, snapshot: Snapshot) -> Snapshot {
+        let current = Snapshot {
+            content: std::mem::replace(&mut self.content, snapshot.content),
+            selected_range: std::mem::replace(&mut self.selected_range, snapshot.selected_range),
+            selection_reversed: std::mem::replace(
+                &mut self.selection_reversed,
+                snapshot.selection_reversed,
+            ),
+        };
+        self.marked_range = None;
+        self.last_edit = EditKind::None;
+        self.pending_autoscroll = true;
+        current
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.undo.pop() else { return };
+        let current = self.restore(snapshot);
+        self.redo.push(current);
+        cx.notify();
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.redo.pop() else { return };
+        let current = self.restore(snapshot);
+        self.undo.push(current);
+        cx.notify();
+    }
+
+    // --- offset helpers --------------------------------------------------
+
     fn line_start(&self, offset: usize) -> usize {
-        self.content[..offset].rfind('\n').map(|ix| ix + 1).unwrap_or(0)
+        motion::line_start(&self.content, offset)
     }
 
-    /// Byte offset of the end of the line holding `offset`, before the newline.
     fn line_end(&self, offset: usize) -> usize {
-        self.content[offset..]
-            .find('\n')
-            .map(|ix| offset + ix)
-            .unwrap_or(self.content.len())
+        motion::line_end(&self.content, offset)
     }
 
-    /// Move the cursor one line up or down, keeping the column as close to
-    /// the current one as the target line allows.
-    fn move_vertically(&mut self, down: bool, cx: &mut Context<Self>) {
+    fn previous_boundary(&self, offset: usize) -> usize {
+        motion::previous_boundary(&self.content, offset)
+    }
+
+    fn next_boundary(&self, offset: usize) -> usize {
+        motion::next_boundary(&self.content, offset)
+    }
+
+    /// One line up or down, keeping the column as close to the current one
+    /// as the target line allows.
+    fn vertical_target(&self, down: bool) -> Option<usize> {
         let offset = self.cursor_offset();
         let start = self.line_start(offset);
         let column = self.content[start..offset].chars().count();
@@ -184,39 +360,24 @@ impl SqlEditor {
         let target_start = if down {
             let end = self.line_end(offset);
             if end == self.content.len() {
-                return;
+                return None;
             }
             end + 1
         } else {
             if start == 0 {
-                return;
+                return None;
             }
             self.line_start(start - 1)
         };
 
         let target_end = self.line_end(target_start);
-        let target = self.content[target_start..target_end]
-            .char_indices()
-            .nth(column)
-            .map(|(ix, _)| target_start + ix)
-            .unwrap_or(target_end);
-        self.move_to(target, cx);
-    }
-
-    fn previous_boundary(&self, offset: usize) -> usize {
-        self.content[..offset]
-            .char_indices()
-            .next_back()
-            .map(|(ix, _)| ix)
-            .unwrap_or(0)
-    }
-
-    fn next_boundary(&self, offset: usize) -> usize {
-        self.content[offset..]
-            .char_indices()
-            .nth(1)
-            .map(|(ix, _)| offset + ix)
-            .unwrap_or(self.content.len())
+        Some(
+            self.content[target_start..target_end]
+                .char_indices()
+                .nth(column)
+                .map(|(ix, _)| target_start + ix)
+                .unwrap_or(target_end),
+        )
     }
 
     fn offset_from_utf16(&self, target: usize) -> usize {
@@ -268,53 +429,80 @@ impl SqlEditor {
         layout.line_starts[row] + local
     }
 
-    // --- actions ---------------------------------------------------------
+    // --- motion actions --------------------------------------------------
 
-    fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            let previous = self.previous_boundary(self.cursor_offset());
-            if previous == self.cursor_offset() {
-                return;
-            }
-            self.select_to(previous, cx);
-        }
-        self.replace_text_in_range(None, "", window, cx);
-    }
-
-    fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            let next = self.next_boundary(self.cursor_offset());
-            if next == self.cursor_offset() {
-                return;
-            }
-            self.select_to(next, cx);
-        }
-        self.replace_text_in_range(None, "", window, cx);
-    }
-
-    fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            self.move_to(self.previous_boundary(self.cursor_offset()), cx);
+    fn move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let target = if self.selected_range.is_empty() {
+            self.previous_boundary(self.cursor_offset())
         } else {
-            self.move_to(self.selected_range.start, cx);
-        }
+            self.selected_range.start
+        };
+        self.move_to(target, cx);
     }
 
-    fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            self.move_to(self.next_boundary(self.cursor_offset()), cx);
+    fn move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
+        let target = if self.selected_range.is_empty() {
+            self.next_boundary(self.cursor_offset())
         } else {
-            self.move_to(self.selected_range.end, cx);
-        }
+            self.selected_range.end
+        };
+        self.move_to(target, cx);
     }
 
-    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_vertically(false, cx);
+    fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.vertical_target(false).unwrap_or(0);
+        self.move_to(target, cx);
     }
 
-    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_vertically(true, cx);
+    fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.vertical_target(true).unwrap_or(self.content.len());
+        self.move_to(target, cx);
     }
+
+    fn move_to_previous_word_start(
+        &mut self,
+        _: &MoveToPreviousWordStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = motion::previous_word_start(&self.content, self.cursor_offset());
+        self.move_to(target, cx);
+    }
+
+    fn move_to_next_word_end(
+        &mut self,
+        _: &MoveToNextWordEnd,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = motion::next_word_end(&self.content, self.cursor_offset());
+        self.move_to(target, cx);
+    }
+
+    fn move_to_beginning_of_line(
+        &mut self,
+        _: &MoveToBeginningOfLine,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.line_start(self.cursor_offset());
+        self.move_to(target, cx);
+    }
+
+    fn move_to_end_of_line(&mut self, _: &MoveToEndOfLine, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.line_end(self.cursor_offset());
+        self.move_to(target, cx);
+    }
+
+    fn move_to_beginning(&mut self, _: &MoveToBeginning, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+    }
+
+    fn move_to_end(&mut self, _: &MoveToEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(self.content.len(), cx);
+    }
+
+    // --- selection actions -----------------------------------------------
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.select_to(self.previous_boundary(self.cursor_offset()), cx);
@@ -324,21 +512,135 @@ impl SqlEditor {
         self.select_to(self.next_boundary(self.cursor_offset()), cx);
     }
 
+    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.vertical_target(false).unwrap_or(0);
+        self.select_to(target, cx);
+    }
+
+    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.vertical_target(true).unwrap_or(self.content.len());
+        self.select_to(target, cx);
+    }
+
+    fn select_to_previous_word_start(
+        &mut self,
+        _: &SelectToPreviousWordStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = motion::previous_word_start(&self.content, self.cursor_offset());
+        self.select_to(target, cx);
+    }
+
+    fn select_to_next_word_end(
+        &mut self,
+        _: &SelectToNextWordEnd,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = motion::next_word_end(&self.content, self.cursor_offset());
+        self.select_to(target, cx);
+    }
+
+    fn select_to_beginning_of_line(
+        &mut self,
+        _: &SelectToBeginningOfLine,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.line_start(self.cursor_offset());
+        self.select_to(target, cx);
+    }
+
+    fn select_to_end_of_line(
+        &mut self,
+        _: &SelectToEndOfLine,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.line_end(self.cursor_offset());
+        self.select_to(target, cx);
+    }
+
+    fn select_to_beginning(
+        &mut self,
+        _: &SelectToBeginning,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(0, cx);
+    }
+
+    fn select_to_end(&mut self, _: &SelectToEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.content.len(), cx);
+    }
+
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(0, cx);
         self.select_to(self.content.len(), cx);
     }
 
-    fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.line_start(self.cursor_offset()), cx);
+    // --- editing actions -------------------------------------------------
+
+    fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.previous_boundary(self.cursor_offset());
+        self.delete_to(target, window, cx);
     }
 
-    fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.line_end(self.cursor_offset()), cx);
+    fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.next_boundary(self.cursor_offset());
+        self.delete_to(target, window, cx);
+    }
+
+    fn delete_to_previous_word_start(
+        &mut self,
+        _: &DeleteToPreviousWordStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = motion::previous_word_start(&self.content, self.cursor_offset());
+        self.delete_to(target, window, cx);
+    }
+
+    fn delete_to_next_word_end(
+        &mut self,
+        _: &DeleteToNextWordEnd,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = motion::next_word_end(&self.content, self.cursor_offset());
+        self.delete_to(target, window, cx);
+    }
+
+    fn delete_to_beginning_of_line(
+        &mut self,
+        _: &DeleteToBeginningOfLine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.line_start(self.cursor_offset());
+        self.delete_to(target, window, cx);
+    }
+
+    fn delete_to_end_of_line(
+        &mut self,
+        _: &DeleteToEndOfLine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.line_end(self.cursor_offset());
+        self.delete_to(target, window, cx);
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
-        self.replace_text_in_range(None, "\n", window, cx);
+        // Carry the current line's indent onto the new one, the way every
+        // editor does; a query indented by hand stays indented.
+        let start = self.line_start(self.cursor_offset());
+        let indent: String = self.content[start..]
+            .chars()
+            .take_while(|ch| *ch == ' ' || *ch == '\t')
+            .collect();
+        self.replace_text_in_range(None, &format!("\n{indent}"), window, cx);
     }
 
     fn indent(&mut self, _: &Indent, window: &mut Window, cx: &mut Context<Self>) {
@@ -347,7 +649,10 @@ impl SqlEditor {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            // A paste is one undo step, never joined to the typing around it.
+            self.last_edit = EditKind::None;
             self.replace_text_in_range(None, &text, window, cx);
+            self.last_edit = EditKind::None;
         }
     }
 
@@ -364,17 +669,30 @@ impl SqlEditor {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
+            self.last_edit = EditKind::None;
             self.replace_text_in_range(None, "", window, cx);
         }
     }
 
+    // --- mouse -----------------------------------------------------------
+
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.is_selecting = true;
         let offset = self.offset_for_position(event.position);
-        if event.modifiers.shift {
-            self.select_to(offset, cx);
-        } else {
-            self.move_to(offset, cx);
+        match event.click_count {
+            1 if event.modifiers.shift => self.select_to(offset, cx),
+            1 => {
+                self.is_selecting = true;
+                self.move_to(offset, cx);
+            }
+            2 => {
+                let word = motion::word_at(&self.content, offset);
+                self.move_to(word.start, cx);
+                self.select_to(word.end, cx);
+            }
+            _ => {
+                self.move_to(self.line_start(offset), cx);
+                self.select_to(self.line_end(offset), cx);
+            }
         }
     }
 
@@ -435,12 +753,26 @@ impl EntityInputHandler for SqlEditor {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        // A newline breaks the undo run, so undo lands on line boundaries
+        // rather than swallowing the whole query. So does replacing a
+        // selection: the selection is part of what undo must bring back.
+        let kind = if !range.is_empty() || new_text.contains('\n') {
+            EditKind::None
+        } else if new_text.is_empty() {
+            EditKind::Delete
+        } else {
+            EditKind::Insert
+        };
+        self.push_undo(kind);
+        self.last_edit = kind;
+
         self.content =
             self.content[..range.start].to_owned() + new_text + &self.content[range.end..];
         let cursor = range.start + new_text.len();
         self.selected_range = cursor..cursor;
         self.selection_reversed = false;
         self.marked_range.take();
+        self.pending_autoscroll = true;
         cx.notify();
     }
 
@@ -458,10 +790,17 @@ impl EntityInputHandler for SqlEditor {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        // Composition rewrites itself as it goes: take one undo step when
+        // it starts, none for the keystrokes inside it.
+        if self.marked_range.is_none() {
+            self.push_undo(EditKind::None);
+        }
+        self.last_edit = EditKind::None;
+
         self.content =
             self.content[..range.start].to_owned() + new_text + &self.content[range.end..];
-        self.marked_range = (!new_text.is_empty())
-            .then(|| range.start..range.start + new_text.len());
+        self.marked_range =
+            (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
         self.selected_range = new_selected_range_utf16
             .as_ref()
             .map(|utf16| self.range_from_utf16(utf16))
@@ -470,6 +809,7 @@ impl EntityInputHandler for SqlEditor {
                 let cursor = range.start + new_text.len();
                 cursor..cursor
             });
+        self.pending_autoscroll = true;
         cx.notify();
     }
 
@@ -523,20 +863,39 @@ impl Render for SqlEditor {
             .id("sql-editor")
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle(cx))
+            .track_scroll(&self.scroll_handle)
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
-            .on_action(cx.listener(Self::left))
-            .on_action(cx.listener(Self::right))
-            .on_action(cx.listener(Self::up))
-            .on_action(cx.listener(Self::down))
+            .on_action(cx.listener(Self::delete_to_previous_word_start))
+            .on_action(cx.listener(Self::delete_to_next_word_end))
+            .on_action(cx.listener(Self::delete_to_beginning_of_line))
+            .on_action(cx.listener(Self::delete_to_end_of_line))
+            .on_action(cx.listener(Self::move_left))
+            .on_action(cx.listener(Self::move_right))
+            .on_action(cx.listener(Self::move_up))
+            .on_action(cx.listener(Self::move_down))
+            .on_action(cx.listener(Self::move_to_previous_word_start))
+            .on_action(cx.listener(Self::move_to_next_word_end))
+            .on_action(cx.listener(Self::move_to_beginning_of_line))
+            .on_action(cx.listener(Self::move_to_end_of_line))
+            .on_action(cx.listener(Self::move_to_beginning))
+            .on_action(cx.listener(Self::move_to_end))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_up))
+            .on_action(cx.listener(Self::select_down))
+            .on_action(cx.listener(Self::select_to_previous_word_start))
+            .on_action(cx.listener(Self::select_to_next_word_end))
+            .on_action(cx.listener(Self::select_to_beginning_of_line))
+            .on_action(cx.listener(Self::select_to_end_of_line))
+            .on_action(cx.listener(Self::select_to_beginning))
+            .on_action(cx.listener(Self::select_to_end))
             .on_action(cx.listener(Self::select_all))
-            .on_action(cx.listener(Self::home))
-            .on_action(cx.listener(Self::end))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::indent))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
@@ -593,6 +952,9 @@ struct PrepaintState {
     layout: Option<EditorLayout>,
     quads: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
+    /// Top of the caret's line in window coordinates, so paint can pull
+    /// the viewport back over it.
+    cursor_top: Option<Pixels>,
 }
 
 impl IntoElement for EditorElement {
@@ -661,7 +1023,7 @@ impl Element for EditorElement {
             let runs = if placeholder {
                 single_run(line, style.font(), text_color, underline)
             } else {
-                highlight::spans(line)
+                highlight::spans(line, &editor.vocabulary)
                     .into_iter()
                     .map(|(range, token)| TextRun {
                         len: range.len(),
@@ -684,16 +1046,18 @@ impl Element for EditorElement {
 
         let layout = EditorLayout { lines, line_starts, line_height };
 
-        let (quads, cursor) = if placeholder {
-            (Vec::new(), None)
+        let (quads, cursor, cursor_top) = if placeholder {
+            (Vec::new(), None, None)
         } else {
+            let row = row_for_offset(&layout.line_starts, editor.cursor_offset());
             (
                 selection_quads(editor, &layout, bounds, colors.selection),
                 cursor_quad(editor, &layout, bounds, colors.accent),
+                Some(bounds.top() + line_height * row as f32),
             )
         };
 
-        PrepaintState { layout: Some(layout), quads, cursor }
+        PrepaintState { layout: Some(layout), quads, cursor, cursor_top }
     }
 
     fn paint(
@@ -730,10 +1094,58 @@ impl Element for EditorElement {
             window.paint_quad(cursor);
         }
 
+        let line_height = layout.line_height;
+        let follow = prepaint
+            .cursor_top
+            .filter(|_| self.editor.read(cx).pending_autoscroll);
+
         self.editor.update(cx, |editor, _| {
             editor.last_layout = Some(layout);
             editor.last_bounds = Some(bounds);
         });
+
+        if let Some(cursor_top) = follow {
+            self.follow_cursor(cursor_top, line_height, window, cx);
+        }
+    }
+}
+
+impl EditorElement {
+    /// Pull the viewport back over the caret after it moved out of sight.
+    /// A new offset only takes effect on the next frame, so ask for one.
+    fn follow_cursor(
+        &self,
+        cursor_top: Pixels,
+        line_height: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let (scroll_handle, viewport) = {
+            let editor = self.editor.read(cx);
+            (editor.scroll_handle.clone(), editor.scroll_handle.bounds())
+        };
+        if viewport.size.height <= px(0.) {
+            return;
+        }
+
+        // Keep the editor's padding visible above and below the caret, so
+        // it never sits flush against the edge of the pane.
+        let above = cursor_top - px(TEXT_PADDING_Y);
+        let below = cursor_top + line_height + px(TEXT_PADDING_Y);
+        let mut offset = scroll_handle.offset();
+        if above < viewport.top() {
+            offset.y += viewport.top() - above;
+        } else if below > viewport.bottom() {
+            offset.y -= below - viewport.bottom();
+        } else {
+            self.editor.update(cx, |editor, _| editor.pending_autoscroll = false);
+            return;
+        }
+        offset.y = offset.y.min(px(0.));
+
+        scroll_handle.set_offset(offset);
+        self.editor.update(cx, |editor, _| editor.pending_autoscroll = false);
+        window.refresh();
     }
 }
 
@@ -761,6 +1173,9 @@ fn token_color(token: Token, plain: Hsla, colors: &theme::ThemeColors) -> Hsla {
         Token::Keyword => colors.accent_deep,
         Token::Literal => colors.syntax_literal,
         Token::Comment => colors.text_muted,
+        // A name the connected database actually has. A typo stays plain,
+        // which is the point: the colour doubles as a spell check.
+        Token::Identifier => colors.syntax_identifier,
         Token::Plain => plain,
     }
 }
@@ -790,14 +1205,25 @@ fn selection_quads(
         let end = start + line.len();
         let from = editor.selected_range.start.clamp(start, end);
         let to = editor.selected_range.end.clamp(start, end);
-        if from == to {
+        // A line whose break is inside the selection gets a sliver of
+        // trailing highlight, so a multi-line selection reads as one block
+        // instead of ragged stripes.
+        let trailing = if editor.selected_range.start <= end && editor.selected_range.end > end {
+            px(4.)
+        } else {
+            px(0.)
+        };
+        if from == to && trailing == px(0.) {
             continue;
         }
         let top = bounds.top() + layout.line_height * row as f32;
         quads.push(fill(
             Bounds::from_corners(
                 point(bounds.left() + line.x_for_index(from - start), top),
-                point(bounds.left() + line.x_for_index(to - start), top + layout.line_height),
+                point(
+                    bounds.left() + line.x_for_index(to - start) + trailing,
+                    top + layout.line_height,
+                ),
             ),
             color,
         ));

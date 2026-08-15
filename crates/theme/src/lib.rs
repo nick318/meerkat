@@ -54,6 +54,10 @@ pub struct ThemeColors {
     pub accent_deep: Hsla,
     /// String and number literals in the query editor.
     pub syntax_literal: Hsla,
+    /// Names the connected database actually has: schemas, tables, views
+    /// and columns. Ink against the ochre keywords, so a query reads as
+    /// commands in warm tones over the schema in cool ones.
+    pub syntax_identifier: Hsla,
     /// Selected row / active list item background.
     pub selection: Hsla,
     /// Success / connected.
@@ -87,6 +91,7 @@ impl Theme {
                 accent: rgb(0xB4762F).into(),
                 accent_deep: rgb(0x8E5A1E).into(),
                 syntax_literal: rgb(0x5C7A4E).into(),
+                syntax_identifier: rgb(0x3F5A6B).into(),
                 selection: rgb(0xF0E5D2).into(),
                 ok: rgb(0x5C8A4E).into(),
                 error: rgb(0x8E4A2A).into(),
