@@ -19,6 +19,7 @@ mod completion;
 mod highlight;
 mod motion;
 
+
 pub use completion::{Kind, Name, Vocabulary};
 
 use completion::Completion;
@@ -260,6 +261,14 @@ impl SqlEditor {
 
     pub fn text(&self) -> &str {
         &self.content
+    }
+
+    /// The selected text, when there is a selection. The query tab runs
+    /// this in place of the whole buffer.
+    pub fn selected_text(&self) -> Option<String> {
+        let range = clamp_range(&self.content, self.selected_range.clone());
+        let selected = self.content[range].trim().to_string();
+        (!selected.is_empty()).then_some(selected)
     }
 
     pub fn line_count(&self) -> usize {

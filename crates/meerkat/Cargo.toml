@@ -13,6 +13,7 @@ gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
 introspect.workspace = true
+query.workspace = true
 results_grid.workspace = true
 sql_editor.workspace = true
 theme.workspace = true

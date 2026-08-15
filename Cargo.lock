@@ -3416,6 +3416,7 @@ dependencies = [
  "gpui_platform",
  "gpui_tokio",
  "introspect",
+ "query",
  "results_grid",
  "sql_editor",
  "theme",

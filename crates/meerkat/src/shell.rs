@@ -76,6 +76,9 @@ struct QueryTab {
     editor: Entity<SqlEditor>,
     data: Rc<GridData>,
     has_result: bool,
+    /// How many statements the last run sent, so the result strip can say
+    /// which set is on screen.
+    statements_run: usize,
     elapsed: Option<u128>,
     error: Option<String>,
     running: bool,
@@ -273,6 +276,7 @@ impl Shell {
             editor,
             data: empty_grid(),
             has_result: false,
+            statements_run: 0,
             elapsed: None,
             error: None,
             running: false,
@@ -286,8 +290,13 @@ impl Shell {
         let Some(connection) = self.connection.clone() else { return };
         let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else { return };
 
-        let sql = tab.editor.read(cx).text().trim().to_string();
-        if sql.is_empty() {
+        // The selection when there is one, the whole buffer otherwise.
+        let editor = tab.editor.read(cx);
+        let sql = editor.selected_text().unwrap_or_else(|| editor.text().to_string());
+        // A driver runs one command at a time, so send the statements in
+        // turn rather than handing the server a whole scratchpad.
+        let statements = query::statements(&sql);
+        if statements.is_empty() {
             return;
         }
         let tab_id = tab.id;
@@ -296,7 +305,7 @@ impl Shell {
         tab.generation += 1;
         let generation = tab.generation;
 
-        let task = run_sql(connection, sql, cx);
+        let task = run_statements(connection, statements, cx);
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
             this.update(cx, |this, cx| {
@@ -306,9 +315,10 @@ impl Shell {
                 }
                 tab.running = false;
                 match flatten(outcome) {
-                    Ok((result, elapsed)) => {
+                    Ok((result, elapsed, ran)) => {
                         tab.elapsed = Some(elapsed);
                         tab.has_result = true;
+                        tab.statements_run = ran;
                         tab.data = Rc::new(GridData::new(result.columns, result.rows));
                     }
                     Err(error) => {
@@ -397,6 +407,14 @@ impl Shell {
     }
 }
 
+/// Say when a run would send only part of the buffer.
+fn run_scope(tab: &QueryTab, cx: &App) -> Option<SharedString> {
+    tab.editor
+        .read(cx)
+        .selected_text()
+        .map(|_| "runs the selection".into())
+}
+
 /// Every schema, relation and column in the catalog, so the query editor
 /// can colour the names the database really has and complete them as the
 /// user types.
@@ -443,6 +461,31 @@ fn run_sql(
         let started = Instant::now();
         let result = connection.execute(&sql).await?;
         anyhow::Ok((result, started.elapsed().as_millis()))
+    })
+}
+
+/// Run a buffer's statements in order and keep the last result that has
+/// columns, so a trailing `create table` does not blank a grid the SELECT
+/// before it filled. The first statement to fail stops the run and its
+/// error is what the user sees.
+#[allow(clippy::type_complexity)]
+fn run_statements(
+    connection: Arc<dyn Connection>,
+    statements: Vec<String>,
+    cx: &mut Context<Shell>,
+) -> gpui::Task<Result<anyhow::Result<(QueryResult, u128, usize)>, gpui_tokio::JoinError>> {
+    gpui_tokio::Tokio::spawn(cx, async move {
+        let started = Instant::now();
+        let mut last = QueryResult::default();
+        let mut ran = 0;
+        for statement in &statements {
+            let result = connection.execute(statement).await?;
+            ran += 1;
+            if !result.columns.is_empty() {
+                last = result;
+            }
+        }
+        anyhow::Ok((last, started.elapsed().as_millis(), ran))
     })
 }
 
@@ -949,8 +992,12 @@ impl Shell {
         let summary = if tab.running {
             "running…".to_string()
         } else if tab.has_result {
+            let statements = match tab.statements_run {
+                0 | 1 => String::new(),
+                n => format!("{n} statements · last result · "),
+            };
             format!(
-                "{} rows · {} columns · {}",
+                "{statements}{} rows · {} columns · {}",
                 tab.data.rows.len(),
                 tab.data.columns.len(),
                 tab.elapsed.map(format_millis).unwrap_or_default()
@@ -983,6 +1030,11 @@ impl Shell {
                         .text_color(colors.text_muted)
                         .child(format!("{} · read-only", self.database_name())),
                 )
+                // With several statements in the buffer, say which one a
+                // run would send, so ⌘⏎ never comes as a surprise.
+                .children(run_scope(tab, cx).map(|scope| {
+                    div().text_size(px(11.)).text_color(colors.text_faint).child(scope)
+                }))
                 .child(div().flex_1())
                 .child(
                     accent_button("run ⌘⏎", cx)
