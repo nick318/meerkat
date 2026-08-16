@@ -36,6 +36,21 @@ pub fn page_query(schema: &str, table: &Table, page: usize) -> String {
     sql
 }
 
+/// `SELECT * FROM "schema"."table" LIMIT 500;` — what a click in the
+/// sidebar puts in a query tab.
+///
+/// No ORDER BY: this statement is the user's from the moment it lands,
+/// and paging is not what it is for. It ends in a semicolon because that
+/// is how the line would be typed, and it needs no catalog entry, so a
+/// relation can be opened from a cached sidebar.
+pub fn browse_query(schema: &str, table: &str) -> String {
+    format!(
+        "SELECT * FROM {}.{} LIMIT {PAGE_SIZE};",
+        quote_ident(schema),
+        quote_ident(table)
+    )
+}
+
 fn order_by(table: &Table) -> Option<String> {
     let columns: Vec<&String> = if table.has_primary_key() {
         table.primary_key.iter().collect()
@@ -99,6 +114,19 @@ mod tests {
         assert_eq!(
             page_query("public", &users, 3),
             "SELECT * FROM \"public\".\"users\" ORDER BY \"id\" LIMIT 500 OFFSET 1500"
+        );
+    }
+
+    #[test]
+    fn a_browsed_relation_reads_as_a_typed_statement() {
+        assert_eq!(
+            browse_query("public", "users"),
+            "SELECT * FROM \"public\".\"users\" LIMIT 500;"
+        );
+        // Quoted like everything else the app splices in.
+        assert_eq!(
+            browse_query("we\"ird", "users"),
+            "SELECT * FROM \"we\"\"ird\".\"users\" LIMIT 500;"
         );
     }
 

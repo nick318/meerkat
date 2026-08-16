@@ -65,15 +65,15 @@ UI crates may depend on data crates; the reverse is forbidden. `db_postgres`,
 
 | Crate | Role |
 |---|---|
-| `meerkat` | Binary: `main.rs` boots, `root.rs` switches screens, `connections.rs` and `shell.rs` are the two screens, `history.rs` is the query-history tab, `palette.rs` is the ⌘K palette, `switcher.rs` is the ⌃⇥ tab switcher, `sql.rs` builds the app's own SQL |
+| `meerkat` | Binary: `main.rs` boots, `root.rs` switches screens, `connections.rs` and `shell.rs` are the two screens, `history.rs` is the query-history tab, `palette.rs` is the ⌘K palette, `sql.rs` builds the app's own SQL |
 | `db_client` | Engine-agnostic `Connection` trait, `Profile`, `Value`, `QueryResult`, `RowChange` |
 | `db_postgres`, `db_sqlite` | sqlx drivers behind that trait |
 | `introspect` | Schema model (`Catalog` → `Schema` → `Table` → `Column`) that drivers fill |
 | `query` | `statements()`: split a buffer into statements, quote- and comment-aware |
 | `sql_editor` | Multi-line SQL buffer: motion, undo, colouring, completion |
-| `results_grid` | Virtualized grid plus its overlay scrollbar |
-| `ui`, `theme` | Component kit (incl. `TextField`) and color tokens |
-| `storage` | Local SQLite: profiles, cached probe counts, layout, history |
+| `results_grid` | Virtualized grid |
+| `ui`, `theme` | Component kit (incl. `TextField` and the overlay `scrollbar`) and color tokens |
+| `storage` | Local SQLite: profiles, cached probe counts, layout, history, cached catalogs |
 | `secrets` | OS keychain wrapper for passwords |
 | `workspace`, `schema_tree` | Empty placeholders |
 
@@ -86,6 +86,83 @@ connection pool, so a closed database keeps no sockets open.
 `Shell` owns the session: the `Arc<dyn Connection>`, the introspected
 `Catalog`, the flattened sidebar rows, the completion vocabulary, and the
 open tabs (`Tab::Table`, `Tab::Query` or `Tab::History`).
+
+### Opening a connection
+
+A session opens on an empty query tab. That needs neither a catalog nor a
+round trip, so the user can type while the connect is still in flight. The
+shell never picks a table to open on the user's behalf.
+
+The connect and the introspection are two requests, not one. `connect`
+opens the pool and nothing else, so the session reports "connected" and
+runs queries as soon as there is a pool; `introspect` then reads the
+catalog behind it and `catalog_loading` says so in the sidebar. Reading the
+catalog of a large database takes far longer than the connect, and nothing
+but the sidebar needs it.
+
+The catalog is cached in the local store, in `catalog_cache`, keyed by the
+same *scope* the history uses. `Shell::new` reads that row synchronously —
+it is local SQLite, like the history — and paints the sidebar and the
+completion vocabulary from it at once. The connect and the introspection
+then run in the background as before, and `apply_catalog` replaces the
+cached shape with the real one and writes the cache back. So the cache is
+always revalidated; it is never trusted past the first paint.
+
+A row that no longer parses (the `introspect` model changed under it) is
+dropped and reported as a miss, never as an error. An introspection that
+fails leaves the cached catalog on screen and sets `catalog_error`: a stale
+sidebar beats no sidebar, and the connection is still good for queries.
+
+Because the sidebar is live before the connection is, a table can be opened
+with no connection to page it. `load_page` then leaves the tab marked
+loading and sends nothing; `resume_pending_pages` asks again when the
+connection lands, and a failed connect marks those tabs `NOT_CONNECTED`
+instead of leaving them waiting for ever.
+
+### The sidebar
+
+The tree is schema → `TABLES` and `VIEWS` → the relations. The catalog is
+read into `Group`s (a schema) holding `Section`s (its tables, its views),
+and flattened into `CatalogRow`s again whenever what the sidebar shows
+changes.
+
+**The two levels remember themselves the other way round.** A schema is
+closed until `open_schemas` holds it, because a database of 3,000
+relations is a wall of names when every schema is expanded; a section is
+open until `closed_sections` holds it, because a schema the user just
+opened was opened to see what is in it — one click, not three. Both sets
+are keyed by name, so they survive an introspection replacing the cached
+catalog.
+
+The filter line over the list narrows the names the session already
+holds — no query goes out — by the palette's own rule, through
+`palette::path_matches`: a case-insensitive substring, and **a dot names
+a path**. So `address` finds every `address`, `dev.addr` finds the one in
+`sample_dev_sample`, and a bare schema name answers with everything under
+it. Whatever is left with nothing under it is dropped, header and all,
+and what survives is drawn open whatever the two sets say — a search that
+needs a second click to show its hits is not a search. ⏎ opens the first
+relation left, ⎋ empties the line.
+
+⇥ completes the line from the first match, through
+`palette::complete_path`, so a name is walked in the same steps here and
+in the palette: one part at a time, **replacing** what was typed rather
+than appending to it, and the faint hint is painted only when the
+completion happens to carry on from what is there.
+
+**A click on a relation opens a query tab, not a table tab.** It writes
+`sql::browse_query` — `SELECT * FROM "schema"."relation" LIMIT 500;` —
+into a new tab, names the tab after the relation, and runs it at once: a
+click on a table name asks for its rows, not for a line of SQL to look
+at. From there the statement is the user's, editable and re-run with ⌘⏎.
+The tab keeps a `relation` so the sidebar can mark the row it came from.
+Every click opens another tab; the paged `Tab::Table` view is what the
+palette still opens.
+
+The list carries an overlay scrollbar, `ui::scrollbar`, the one the
+results grid uses. It reads the plain `ScrollHandle` that
+`UniformListScrollHandle` keeps inside itself, and is painted outside the
+scrolling list, or it would scroll away with it.
 
 ### Query history
 
@@ -150,24 +227,18 @@ query while the shell has focus and opens a palette row in a new tab while
 the palette is open. A binding with no context is treated as the *deepest*
 match, so binding either one globally would take the key from the other.
 
-### The ⌃⇥ tab switcher
+### Walking the tabs
 
-`switcher.rs` is the popup ⌃⇥ walks. The tab strip paints the tabs in the
-order they were opened; the switcher walks `Shell::order`, the same tabs by
-id with the active one at the front, so one press lands on the tab used
-before this one. Every path that changes the active tab goes through
-`Shell::activate`, which is what keeps that order true.
+⌃⇥ moves to the next tab and ⌃⇧⇥ to the one before it, on the keystroke.
+There is no popup and no most-recently-used order: the walk follows the
+strip, which paints the tabs in the order they were opened, and the strip
+is the list the user is reading. `step_wrapping` **wraps** at both ends,
+because the tabs are a ring — one press past the last is how the user
+comes back to the first.
 
-Selection **wraps**, unlike the palette's list: a switcher is a ring, and
-one press past the end is how the user comes back to where they started.
-Nothing is switched until the user commits. **Releasing ⌃ commits**, which
-is an `on_modifiers_changed` listener on the popup; ⏎ and a click on a row
-do the same, and esc leaves the active tab where it was.
-
-The popup takes the focus while it is open, so its keys — bound to the
-`Switcher` context — outrank the query editor's ⏎ and esc. ⌃⇥ itself is
-bound twice, to `Shell` as well, because it has to open the popup when
-there is none.
+Both keys are bound to the `Shell` context. The walk does nothing while
+the palette is open: that dialog is already the one taking keys. Every
+path that changes the active tab still goes through `Shell::activate`.
 
 ### Async bridge
 

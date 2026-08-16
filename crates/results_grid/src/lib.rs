@@ -6,16 +6,14 @@
 //! same as a 15-row one. Lane widths are measured once from the values
 //! themselves; dragging a column to resize it comes later.
 
-mod scrollbar;
-
 use db_client::Value;
 use gpui::{
     App, Div, ElementId, FontWeight, Hsla, ScrollHandle, SharedString, Stateful,
     UniformListScrollHandle, div, prelude::*, px, uniform_list,
 };
-use scrollbar::{DragState, Scrollbar};
 use std::rc::Rc;
 use theme::theme;
+use ui::scrollbar::{self, DragState, Scrollbar};
 
 /// Row height from the design comp. The header is 30px, data rows 28px.
 pub const ROW_HEIGHT: f32 = 28.;

@@ -2,6 +2,7 @@
 //! Implements the warm-paper design language: hairline rules, bordered
 //! pills, one ochre accent. Grows as Meerkat needs more controls.
 
+pub mod scrollbar;
 mod text_field;
 
 pub use text_field::{TextField, TextFieldEvent, text_field_key_bindings};

@@ -503,15 +503,33 @@ pub fn completion(rows: &[Row], selected: usize, needle: &str) -> Option<String>
     if item.path.is_empty() {
         return None;
     }
+    finish(&item.path, item.named, needle)
+}
+
+/// Finish a query from one path, the way the palette finishes it from the
+/// selected row. The sidebar's filter asks for this, so ⇥ walks a name in
+/// the same steps wherever it is typed.
+pub fn complete_path(parts: &[String], needle: &str) -> Option<String> {
+    if needle.is_empty() {
+        return None;
+    }
+    let (_, named) = find_path(parts, needle, true)?;
+    finish(parts, named, needle)
+}
+
+/// The line the query becomes when it takes the next part of `path`.
+/// `named` is the part the query addressed; everything before it the user
+/// did not ask about and does not get.
+fn finish(path: &[String], named: usize, needle: &str) -> Option<String> {
     // One past the part being typed. A query cannot reach deeper than the
     // path it matched, but a stale selection could still say so.
-    let reached = item.named + needle.split('.').count();
-    if reached > item.path.len() {
+    let reached = named + needle.split('.').count();
+    if reached > path.len() {
         return None;
     }
 
-    let mut completed = item.path[item.named..reached].join(".");
-    if reached < item.path.len() {
+    let mut completed = path[named..reached].join(".");
+    if reached < path.len() {
         completed.push('.');
     }
     (completed != needle).then_some(completed)
@@ -556,6 +574,12 @@ fn find_path(
         }
         Some((hits, named))
     })
+}
+
+/// Does a path answer this query? The sidebar's filter asks the palette,
+/// so `schema.table` finds the same thing in both places.
+pub fn path_matches(parts: &[String], needle: &str) -> bool {
+    find_path(parts, needle, true).is_some()
 }
 
 /// How a result sorts: an alignment further out first, because a name the
@@ -1168,6 +1192,25 @@ mod tests {
         // A path that is already whole has nothing left to add, which is
         // what frees ⇥ to go back to walking the chips.
         assert_eq!(step("sample_dev_sample.task"), None);
+    }
+
+    #[test]
+    fn a_path_completes_the_same_way_off_a_bare_path() {
+        // What the sidebar's filter asks for: no rows, just the path of
+        // the first match. It walks in the same steps as the palette.
+        let path = ["sample_dev_sample".to_string(), "task".to_string()];
+        assert_eq!(complete_path(&path, "dev").as_deref(), Some("sample_dev_sample."));
+        assert_eq!(
+            complete_path(&path, "sample_dev_sample.").as_deref(),
+            Some("sample_dev_sample.task")
+        );
+        // A hit on the relation completes that name and stops there.
+        assert_eq!(complete_path(&path, "as").as_deref(), Some("task"));
+        // Nothing left to finish, and nothing to finish from.
+        assert_eq!(complete_path(&path, "sample_dev_sample.task"), None);
+        assert_eq!(complete_path(&path, ""), None);
+        // A query the path does not answer completes nothing.
+        assert_eq!(complete_path(&path, "public.users"), None);
     }
 
     #[test]

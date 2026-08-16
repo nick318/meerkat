@@ -13,17 +13,19 @@ use db_client::{Connection, Profile, QueryResult};
 use db_postgres::{Label, PostgresConnection};
 use gpui::{
     AnyElement, App, BoxShadow, Context, Div, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, ModifiersChangedEvent, ScrollStrategy, SharedString, Stateful,
-    Subscription, UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
+    Focusable, FontWeight, ScrollStrategy, SharedString, Stateful, Subscription,
+    UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
 };
 use introspect::{Catalog, Table, TableKind};
 use results_grid::{GridData, GridState, grid};
 use sql_editor::{Kind, Name, SqlEditor, Vocabulary};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 use storage::{HistoryFilter, NewRun, QueryRun, RunSource, Store};
 use theme::{FONT_FAMILY, ThemeColors, theme};
+use ui::scrollbar::{self, DragState, Scrollbar};
 use ui::{
     TextField, TextFieldEvent, accent_button, card, format_count, format_millis, meerkat_mark,
     section_label, status_dot, table_glyph,
@@ -32,10 +34,12 @@ use ui::{
 use crate::connections::unix_now;
 use crate::history::{self, HistoryRow, OnOpenRun};
 use crate::palette::{self, OnPick, Pick, Scope};
-use crate::sql::{PAGE_SIZE, page_query};
-use crate::switcher::{self, Entry};
+use crate::sql::{PAGE_SIZE, browse_query, page_query};
 
-actions!(meerkat, [RunQuery, NewQuery, CloseTab, Refresh, PrevPage, NextPage, ShowHistory]);
+actions!(
+    meerkat,
+    [RunQuery, NewQuery, CloseTab, Refresh, PrevPage, NextPage, ShowHistory, NextTab, PrevTab]
+);
 
 const SIDEBAR_WIDTH: f32 = 246.;
 const EDITOR_HEIGHT: f32 = 250.;
@@ -43,19 +47,58 @@ const EDITOR_HEIGHT: f32 = 250.;
 /// one height to measure, and the design's rows are already within a
 /// pixel of each other.
 const CATALOG_ROW_HEIGHT: f32 = 24.;
+/// The sidebar's filter line, a size under the relation names it filters.
+const FILTER_FONT_SIZE: f32 = 11.;
 /// How far back the history screen looks, in days. The comp's header says
 /// "last 7 days", and that is the window the list actually reads.
 const HISTORY_DAYS: i64 = 7;
+/// What a tab says when it wanted the server before there was one. The
+/// cached catalog lets a session open tabs while the connect is still in
+/// flight, so this is reachable on a first keystroke.
+const NOT_CONNECTED: &str = "not connected yet";
+/// The tab strip is one row tall, as the comp draws it.
+const TAB_STRIP_HEIGHT: f32 = 34.;
+/// A tab is never squeezed below this, so the strip reads as a row of
+/// tabs rather than a row of words of different lengths.
+const TAB_MIN_WIDTH: f32 = 116.;
+/// ...and never wider than this, so one long table name cannot take the
+/// strip. The title truncates at that point.
+const TAB_MAX_WIDTH: f32 = 220.;
 
 pub struct Shell {
     focus_handle: FocusHandle,
     status: Status,
     connection: Option<Arc<dyn Connection>>,
     catalog: Option<Catalog>,
-    /// The sidebar's rows, flattened once when the catalog lands.
+    /// True while the introspection runs. It is a second round trip after
+    /// the connect, so a session is connected — and can run a query —
+    /// before there is a catalog to paint.
+    catalog_loading: bool,
+    /// Why the last introspection failed, when one did. The connection is
+    /// still usable then: a query tab works without a catalog.
+    catalog_error: Option<String>,
+    /// The sidebar's groups, built once when the catalog lands: a schema's
+    /// tables, then its views.
+    catalog_groups: Rc<Vec<Group>>,
+    /// Those groups flattened for `uniform_list`, as the open set and the
+    /// filter leave them. Rebuilt when either changes, never per frame.
     catalog_rows: Rc<Vec<CatalogRow>>,
+    /// Which schemas are open. Empty to start: a catalog of thousands of
+    /// relations is a wall of names when every schema is expanded, so the
+    /// sidebar opens closed and the user opens what they want.
+    open_schemas: HashSet<SharedString>,
+    /// Which `TABLES` / `VIEWS` sections are closed. This one is the other
+    /// way round because a schema the user just opened was opened to see
+    /// what is in it: sections start open, and closing one is the choice
+    /// worth remembering.
+    closed_sections: HashSet<SharedString>,
+    /// The sidebar's filter line. It narrows the rows already in hand — no
+    /// query goes out for it.
+    catalog_filter: Entity<TextField>,
     /// Where the sidebar is scrolled, kept across re-renders.
     catalog_scroll: UniformListScrollHandle,
+    /// Which of the sidebar's scrollbars is being dragged, if any.
+    catalog_drag: DragState,
     /// How many relations the catalog holds, for the sidebar footer.
     relation_total: usize,
     /// Every name in the catalog, for the editor's colouring.
@@ -63,9 +106,6 @@ pub struct Shell {
     label: Option<Label>,
     tabs: Vec<Tab>,
     active: usize,
-    /// The same tabs by id, most recently used first. The strip paints the
-    /// order they were opened in; ⌃⇥ walks this one.
-    order: Vec<u64>,
     next_id: u64,
     /// The local file that remembers what this session ran. `None` when
     /// it could not be opened; the history screen then says so instead of
@@ -80,23 +120,9 @@ pub struct Shell {
     /// in a window of its own, so closing it cannot leave the workspace
     /// without focus.
     palette: Option<Palette>,
-    /// The ⌃⇥ tab switcher, while it is open. It lives beside the palette,
-    /// and for the same reason.
-    switcher: Option<Switcher>,
-}
-
-/// The open switcher: the tabs it walks, frozen when it opened, and where
-/// the selection sits in them. Nothing is switched until the user commits,
-/// so the shell's own `active` is untouched until then.
-struct Switcher {
-    /// The popup holds the focus while it is open, so its keys — ⏎, esc
-    /// and ⌃⇥ itself — outrank the query editor's.
-    focus_handle: FocusHandle,
-    /// Tab ids, most recently used first, as they were when it opened. It
-    /// must not re-sort under the user mid-walk.
-    order: Vec<u64>,
-    selected: usize,
-    scroll: UniformListScrollHandle,
+    /// Held for as long as the shell lives, so the filter line keeps
+    /// reporting what was typed into it.
+    _subscriptions: Vec<Subscription>,
 }
 
 /// The open palette: what was typed, what it found, and where the
@@ -166,6 +192,11 @@ struct TableTab {
 struct QueryTab {
     id: u64,
     title: SharedString,
+    /// The relation the tab was opened on, when it came from the sidebar.
+    /// The statement is the user's to edit from there on, so this says
+    /// where the tab started, not what it now runs — the sidebar marks the
+    /// row it came from with it.
+    relation: Option<(String, String)>,
     editor: Entity<SqlEditor>,
     data: Rc<GridData>,
     has_result: bool,
@@ -220,35 +251,196 @@ fn empty_grid() -> Rc<GridData> {
 impl Shell {
     /// Open the shell and start connecting. The window paints the
     /// connecting state immediately; the connection lands later.
-    pub fn new(target: Target, cx: &mut Context<Self>) -> Self {
+    pub fn new(target: Target, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (store, store_error) = match Store::open_default() {
             Ok(store) => (Some(store), None),
             Err(error) => (None, Some(error.to_string())),
         };
+        let scope = scope_of(&target);
+        // The catalog this connection had when it was last open. It paints
+        // the sidebar and feeds completion straight away; the introspection
+        // running behind it replaces it when it lands. A store that cannot
+        // be read is a miss, not an error: the session works without it.
+        let cached = store.as_ref().and_then(|store| store.cached_catalog(&scope).ok().flatten());
+        let catalog_filter =
+            cx.new(|cx| TextField::new("filter schemas and tables…", cx).bare(FILTER_FONT_SIZE));
+        let subscriptions = vec![cx.subscribe_in(&catalog_filter, window, Self::on_filter_event)];
         let mut shell = Self {
             focus_handle: cx.focus_handle(),
             status: Status::Connecting(describe(&target)),
             connection: None,
             catalog: None,
+            catalog_loading: false,
+            catalog_error: None,
+            catalog_groups: Rc::new(Vec::new()),
             catalog_rows: Rc::new(Vec::new()),
+            open_schemas: HashSet::new(),
+            closed_sections: HashSet::new(),
+            catalog_filter,
             catalog_scroll: UniformListScrollHandle::new(),
+            catalog_drag: DragState::default(),
             relation_total: 0,
             vocabulary: Arc::new(Vocabulary::default()),
             label: None,
             tabs: Vec::new(),
             active: 0,
-            order: Vec::new(),
             next_id: 1,
             store,
             store_error,
-            scope: scope_of(&target),
+            scope,
             palette: None,
-            switcher: None,
+            _subscriptions: subscriptions,
         };
+        if let Some(catalog) = cached {
+            shell.apply_catalog(catalog, cx);
+        }
         shell.connect(target, cx);
+        // A session opens on an empty query tab rather than on the first
+        // table: it needs no catalog and no round trip, so the user can
+        // type while the connection is still being made.
+        shell.new_query(window, cx);
         shell
     }
 
+    // --- the sidebar's catalog list --------------------------------------
+
+    /// Flatten the groups again for the list. Every path that changes what
+    /// the sidebar shows — a catalog landing, a group opening, a keystroke
+    /// in the filter — goes through here, so the rows and the state that
+    /// produced them cannot drift apart.
+    fn rebuild_catalog_rows(&mut self, cx: &mut Context<Self>) {
+        // The matching lowercases as it goes, so the line is passed on as
+        // it was typed.
+        let needle = self.catalog_filter.read(cx).trimmed().to_string();
+        self.catalog_rows = catalog_rows(
+            &self.catalog_groups,
+            &self.open_schemas,
+            &self.closed_sections,
+            &needle,
+        );
+        // What ⇥ would take is read off the rows, so the hint is set here
+        // rather than by each caller.
+        self.update_filter_ghost(cx);
+        cx.notify();
+    }
+
+    /// What ⇥ would finish the filter line with: the next part of the
+    /// first relation the filter left, as the palette finishes a name.
+    fn filter_completion(&self, cx: &App) -> Option<String> {
+        let needle = self.catalog_filter.read(cx).trimmed();
+        let first = self.catalog_rows.iter().find_map(|row| match row {
+            CatalogRow::Relation { schema, name, .. } => {
+                Some(vec![schema.to_string(), name.to_string()])
+            }
+            CatalogRow::Schema { .. } | CatalogRow::Section { .. } => None,
+        })?;
+        palette::complete_path(&first, needle)
+    }
+
+    /// Show what ⇥ would take, faint and after the caret — but only when
+    /// it carries on from what was typed. A hit sits anywhere inside a
+    /// name, so ⇥ often rewrites the line instead of extending it, and a
+    /// hint that says otherwise lies.
+    fn update_filter_ghost(&mut self, cx: &mut Context<Self>) {
+        let needle = self.catalog_filter.read(cx).trimmed().to_string();
+        let ghost = self
+            .filter_completion(cx)
+            .and_then(|completed| completed.strip_prefix(needle.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        self.catalog_filter.update(cx, |field, cx| field.set_ghost(ghost, cx));
+    }
+
+    /// Take the first match's name into the filter line, one part at a
+    /// time, so ⇥⇥ walks schema then relation. It **replaces** the line
+    /// rather than appending to it, because a hit sits anywhere inside a
+    /// name: `dev` completes to `sample_dev_sample.`.
+    fn complete_filter(&mut self, cx: &mut Context<Self>) {
+        let Some(completed) = self.filter_completion(cx) else { return };
+        // Setting the text emits `Changed`, which filters again, so the
+        // list already follows the completed line when this returns.
+        self.catalog_filter.update(cx, |field, cx| field.set_text(completed, cx));
+    }
+
+    /// Open a closed schema, or close an open one.
+    fn toggle_schema(&mut self, key: SharedString, cx: &mut Context<Self>) {
+        if !self.open_schemas.remove(&key) {
+            self.open_schemas.insert(key);
+        }
+        self.rebuild_catalog_rows(cx);
+    }
+
+    /// Close an open section, or open a closed one. A section is open
+    /// until it is closed, so the set holds the opposite of the schemas'.
+    fn toggle_section(&mut self, key: SharedString, cx: &mut Context<Self>) {
+        if !self.closed_sections.remove(&key) {
+            self.closed_sections.insert(key);
+        }
+        self.rebuild_catalog_rows(cx);
+    }
+
+    fn on_filter_event(
+        &mut self,
+        _field: &Entity<TextField>,
+        event: &TextFieldEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TextFieldEvent::Changed => {
+                // A filtered list is scrolled to wherever the last one was,
+                // which is nowhere in particular once the rows change under
+                // it. Send it back to the top.
+                self.catalog_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                self.rebuild_catalog_rows(cx);
+            }
+            // Enter opens the first relation the filter left, which is what
+            // a one-hit filter is for. Escape empties the line and hands the
+            // keys back to the workspace.
+            TextFieldEvent::Submit => {
+                let first = self.catalog_rows.iter().find_map(|row| match row {
+                    CatalogRow::Relation { schema, name, .. } => {
+                        Some((schema.to_string(), name.to_string()))
+                    }
+                    CatalogRow::Schema { .. } | CatalogRow::Section { .. } => None,
+                });
+                if let Some((schema, table)) = first {
+                    self.browse_table(&schema, &table, window, cx);
+                }
+            }
+            TextFieldEvent::Cancel => {
+                self.catalog_filter.update(cx, |field, cx| field.clear(cx));
+                window.focus(&self.focus_handle, cx);
+            }
+            // ⇥ finishes the line from the first match, one part at a time.
+            TextFieldEvent::NextField => self.complete_filter(cx),
+        }
+    }
+
+    /// Take a catalog as the session's own. The sidebar rows, the
+    /// completion vocabulary and the relation count all derive from it,
+    /// and every open query tab is handed the new words — a tab built
+    /// before the catalog landed carries an empty vocabulary otherwise.
+    fn apply_catalog(&mut self, catalog: Catalog, cx: &mut Context<Self>) {
+        self.vocabulary = Arc::new(vocabulary_of(&catalog));
+        self.catalog_groups = catalog_groups(&catalog);
+        // A group the user opened keeps its name across an introspection,
+        // so the sidebar does not close under them when the real catalog
+        // replaces the cached one.
+        self.rebuild_catalog_rows(cx);
+        self.relation_total = catalog.schemas.iter().map(|schema| schema.tables.len()).sum();
+        self.catalog = Some(catalog);
+        let vocabulary = self.vocabulary.clone();
+        for tab in &self.tabs {
+            if let Tab::Query(tab) = tab {
+                tab.editor.update(cx, |editor, cx| editor.set_vocabulary(vocabulary.clone(), cx));
+            }
+        }
+    }
+
+    /// Open the pool, and nothing more. Reading the catalog of a large
+    /// database takes far longer than the connect itself, so it is a
+    /// second request: the session says "connected" and runs queries as
+    /// soon as there is a pool, and the sidebar fills in behind it.
     fn connect(&mut self, target: Target, cx: &mut Context<Self>) {
         let task = gpui_tokio::Tokio::spawn(cx, async move {
             let connection = match &target {
@@ -258,36 +450,33 @@ impl Shell {
                 Target::Profile(profile) => PostgresConnection::connect_profile(profile).await?,
             };
             let label = connection.label().clone();
-            let catalog = connection.introspect().await?;
-            anyhow::Ok((Arc::new(connection) as Arc<dyn Connection>, label, catalog))
+            anyhow::Ok((Arc::new(connection) as Arc<dyn Connection>, label))
         });
 
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
             this.update(cx, |this, cx| {
                 match flatten(outcome) {
-                    Ok((connection, label, catalog)) => {
+                    Ok((connection, label)) => {
                         this.connection = Some(connection);
                         this.label = Some(label);
-                        this.vocabulary = Arc::new(vocabulary_of(&catalog));
-                        this.catalog_rows = catalog_rows(&catalog);
-                        this.relation_total =
-                            catalog.schemas.iter().map(|schema| schema.tables.len()).sum();
-                        this.catalog = Some(catalog);
                         this.status = Status::Connected;
-                        // A query tab opened while connecting was built
-                        // with an empty vocabulary; give it the real one.
-                        let vocabulary = this.vocabulary.clone();
-                        for tab in &this.tabs {
-                            if let Tab::Query(tab) = tab {
-                                tab.editor.update(cx, |editor, cx| {
-                                    editor.set_vocabulary(vocabulary.clone(), cx)
-                                });
+                        this.resume_pending_pages(cx);
+                        this.introspect(cx);
+                    }
+                    Err(error) => {
+                        this.status = Status::Failed(error);
+                        // Tabs opened from the cached catalog were waiting
+                        // for this connection. Nothing is coming.
+                        for tab in &mut this.tabs {
+                            if let Tab::Table(tab) = tab
+                                && tab.loading
+                            {
+                                tab.loading = false;
+                                tab.error = Some(NOT_CONNECTED.to_string());
                             }
                         }
-                        this.open_first_table(cx);
                     }
-                    Err(error) => this.status = Status::Failed(error),
                 }
                 cx.notify();
             })
@@ -296,21 +485,77 @@ impl Shell {
         .detach();
     }
 
-    fn open_first_table(&mut self, cx: &mut Context<Self>) {
-        let Some(catalog) = &self.catalog else { return };
-        let Some((schema, table)) = catalog
-            .schemas
-            .iter()
-            .flat_map(|schema| schema.tables.first().map(|t| (schema.name.clone(), t.name.clone())))
-            .next()
-        else {
-            return;
-        };
-        self.open_table(schema, table, cx);
+    /// Read the catalog behind the connection. A session that opened on a
+    /// cached catalog keeps painting it until this lands, and keeps it if
+    /// this fails — a stale sidebar beats no sidebar.
+    fn introspect(&mut self, cx: &mut Context<Self>) {
+        let Some(connection) = self.connection.clone() else { return };
+        self.catalog_loading = true;
+        self.catalog_error = None;
+        let task = gpui_tokio::Tokio::spawn(cx, async move { connection.introspect().await });
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            this.update(cx, |this, cx| {
+                this.catalog_loading = false;
+                match flatten(outcome) {
+                    Ok(catalog) => {
+                        // Keep this shape for the next session. A cache
+                        // that cannot be written costs nothing here.
+                        if let Some(store) = &this.store {
+                            store.cache_catalog(&this.scope, &catalog, unix_now()).ok();
+                        }
+                        this.apply_catalog(catalog, cx);
+                    }
+                    Err(error) => this.catalog_error = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
-    fn open_table(&mut self, schema: String, table: String, cx: &mut Context<Self>) {
-        self.open_table_in(schema, table, false, cx);
+    /// A table opened from the cached catalog before the connection landed
+    /// is still waiting for its first page: `load_page` left it marked
+    /// loading and sent nothing. Ask for those pages now.
+    fn resume_pending_pages(&mut self, cx: &mut Context<Self>) {
+        let pending: Vec<(u64, usize)> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| match tab {
+                Tab::Table(tab) if tab.loading => Some((tab.id, tab.page)),
+                _ => None,
+            })
+            .collect();
+        for (id, page) in pending {
+            self.load_page(id, page, cx);
+        }
+    }
+
+    /// Open a relation the way a click in the sidebar asks for one: a new
+    /// query tab on `SELECT * FROM ... LIMIT 500;`, run at once.
+    ///
+    /// The statement is the user's from that moment — editable, and re-run
+    /// with ⌘⏎ — which is the point of opening a relation this way rather
+    /// than in the paged table view. It is run rather than left waiting
+    /// because a click on a table name asks for its rows, not for a line of
+    /// SQL to look at.
+    fn browse_table(
+        &mut self,
+        schema: &str,
+        table: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_query_with(&browse_query(schema, table), window, cx);
+        // The tab is named for what it opened, not `query 7`: the strip is
+        // then a list of what the user is looking at.
+        if let Some(Tab::Query(tab)) = self.tabs.last_mut() {
+            tab.title = format!("{schema}.{table}").into();
+            tab.relation = Some((schema.to_string(), table.to_string()));
+        }
+        self.run_active_query(cx);
     }
 
     /// Open a table, or focus the tab that already holds it. `new_tab` is
@@ -372,8 +617,21 @@ impl Shell {
     }
 
     fn load_page(&mut self, tab_id: u64, page: usize, cx: &mut Context<Self>) {
-        let Some(connection) = self.connection.clone() else { return };
+        let connection = self.connection.clone();
+        let failed = matches!(self.status, Status::Failed(_));
         let Some(Tab::Table(tab)) = self.tab_mut(tab_id) else { return };
+        // The cached catalog can open a table before the connection is
+        // there. Leave the tab loading; `resume_pending_pages` asks again
+        // as soon as the connection lands. Once the connect has failed
+        // there is nothing left to wait for, so say so instead.
+        let Some(connection) = connection else {
+            tab.page = page;
+            tab.selected = None;
+            tab.loading = !failed;
+            tab.error = failed.then(|| NOT_CONNECTED.to_string());
+            cx.notify();
+            return;
+        };
 
         let (schema, table) = (tab.schema.clone(), tab.table.clone());
         let Some(model) = self.table_model(&schema, &table).cloned() else { return };
@@ -435,6 +693,7 @@ impl Shell {
         self.tabs.push(Tab::Query(QueryTab {
             id,
             title: format!("query {id}").into(),
+            relation: None,
             editor,
             data: empty_grid(),
             has_result: false,
@@ -450,8 +709,15 @@ impl Shell {
     }
 
     fn run_active_query(&mut self, cx: &mut Context<Self>) {
-        let Some(connection) = self.connection.clone() else { return };
+        let connection = self.connection.clone();
         let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else { return };
+        // The tab opens before the connection does, so ⌘⏎ can arrive
+        // first. Say so rather than doing nothing.
+        let Some(connection) = connection else {
+            tab.error = Some(NOT_CONNECTED.to_string());
+            cx.notify();
+            return;
+        };
 
         // The selection when there is one, the whole buffer otherwise.
         let editor = tab.editor.read(cx);
@@ -799,78 +1065,21 @@ impl Shell {
         }
     }
 
-    // --- the ⌃⇥ tab switcher ---------------------------------------------
+    // --- walking the tabs -------------------------------------------------
 
-    /// Move the switcher's selection, opening it on the active tab first
-    /// when it is closed. One press therefore lands on the tab used before
-    /// this one, which is what ⌃⇥ means everywhere else.
+    /// ⌃⇥ moves to the next tab, ⌃⇧⇥ to the one before it, in the order
+    /// the strip paints them. There is no popup: the switch happens on
+    /// the keystroke, and the strip is the list.
     ///
     /// It stays out of the way while the palette is up: that dialog is
     /// already the one taking keys.
-    fn step_switcher(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette.is_some() {
+    fn step_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() || self.tabs.len() < 2 {
             return;
         }
-        if self.switcher.is_none() {
-            // With one tab there is nothing to switch to, and a popup
-            // saying so would only be in the way.
-            if self.tabs.len() < 2 {
-                return;
-            }
-            let focus_handle = cx.focus_handle();
-            window.focus(&focus_handle, cx);
-            self.switcher = Some(Switcher {
-                focus_handle,
-                order: self.order.clone(),
-                selected: 0,
-                scroll: UniformListScrollHandle::new(),
-            });
-        }
-        let Some(switcher) = &mut self.switcher else { return };
-        switcher.selected = switcher::step(switcher.order.len(), switcher.selected, forward);
-        switcher.scroll.scroll_to_item(switcher.selected, ScrollStrategy::Center);
-        cx.notify();
-    }
-
-    /// Switch to the selected tab and close the popup. Releasing ⌃ ends up
-    /// here, as ⏎ and a click on a row do.
-    fn confirm_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(switcher) = self.switcher.take() else { return };
-        let picked = switcher.order.get(switcher.selected).copied();
-        if let Some(ix) = picked.and_then(|id| self.tabs.iter().position(|tab| tab.id() == id)) {
-            self.activate(ix);
-        }
+        self.activate(step_wrapping(self.tabs.len(), self.active, forward));
         self.focus_active_tab(window, cx);
         cx.notify();
-    }
-
-    /// Leave the active tab where it was.
-    fn cancel_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.switcher.take().is_none() {
-            return;
-        }
-        self.focus_active_tab(window, cx);
-        cx.notify();
-    }
-
-    /// The open tabs in the order the switcher walks them, ready to paint.
-    fn switcher_entries(&self, switcher: &Switcher) -> Vec<Entry> {
-        switcher
-            .order
-            .iter()
-            .filter_map(|id| self.tabs.iter().find(|tab| tab.id() == *id))
-            .map(|tab| Entry {
-                id: tab.id(),
-                title: tab.title(),
-                detail: match tab {
-                    Tab::Table(tab) if tab.kind == TableKind::View => "view".into(),
-                    Tab::Table(_) => "table".into(),
-                    Tab::Query(_) => "query".into(),
-                    Tab::History(_) => "history".into(),
-                },
-                table: matches!(tab, Tab::Table(tab) if tab.kind == TableKind::Table),
-            })
-            .collect()
     }
 
     /// Close one tab and hand the focus to whatever takes its place. The
@@ -879,7 +1088,6 @@ impl Shell {
     fn close_tab(&mut self, tab_id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.tabs.iter().position(|tab| tab.id() == tab_id) else { return };
         self.tabs.remove(ix);
-        switcher::forget(&mut self.order, tab_id);
         if ix < self.active {
             self.active -= 1;
         }
@@ -888,14 +1096,13 @@ impl Shell {
         cx.notify();
     }
 
-    /// Make one tab the active one, and remember that it was the last one
-    /// used. Every path that changes the active tab goes through here, or
-    /// ⌃⇥ walks an order that does not match the session.
+    /// Make one tab the active one. Every path that changes the active tab
+    /// goes through here.
     fn activate(&mut self, ix: usize) {
-        let Some(tab) = self.tabs.get(ix) else { return };
-        let id = tab.id();
+        if self.tabs.get(ix).is_none() {
+            return;
+        }
         self.active = ix;
-        switcher::touch(&mut self.order, id);
     }
 
     /// A query tab types into its editor, so it wants the focus itself;
@@ -1014,41 +1221,23 @@ impl Shell {
         self.open_palette_selection(true, window, cx);
     }
 
-    fn on_switcher_next(
-        &mut self,
-        _: &switcher::Next,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.step_switcher(true, window, cx);
+    fn on_next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_tab(true, window, cx);
     }
 
-    fn on_switcher_prev(
-        &mut self,
-        _: &switcher::Prev,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.step_switcher(false, window, cx);
+    fn on_prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_tab(false, window, cx);
     }
+}
 
-    fn on_switcher_confirm(
-        &mut self,
-        _: &switcher::Confirm,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.confirm_switcher(window, cx);
+/// Where one step lands. It wraps at both ends, because the tabs are a
+/// ring: one press past the last tab is how the user comes back to the
+/// first.
+fn step_wrapping(len: usize, from: usize, forward: bool) -> usize {
+    if len == 0 {
+        return 0;
     }
-
-    fn on_switcher_cancel(
-        &mut self,
-        _: &switcher::Cancel,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.cancel_switcher(window, cx);
-    }
+    if forward { (from + 1) % len } else { (from + len - 1) % len }
 }
 
 /// What a finished run is worth remembering by: the timing and the row
@@ -1192,8 +1381,8 @@ impl Render for Shell {
             .on_action(cx.listener(Self::on_next_page))
             .on_action(cx.listener(Self::on_show_history))
             .on_action(cx.listener(Self::on_toggle_palette))
-            .on_action(cx.listener(Self::on_switcher_next))
-            .on_action(cx.listener(Self::on_switcher_prev))
+            .on_action(cx.listener(Self::on_next_tab))
+            .on_action(cx.listener(Self::on_prev_tab))
             .relative()
             .flex()
             .flex_col()
@@ -1220,7 +1409,6 @@ impl Render for Shell {
                     ),
             )
             .children(self.palette_overlay(&colors, cx))
-            .children(self.switcher_overlay(&colors, cx))
     }
 }
 
@@ -1363,6 +1551,7 @@ impl Shell {
                         .child(status_dot(dot)),
                 ),
             )
+            .child(self.catalog_filter_row(colors, cx))
             .child(self.catalog_list(colors, cx))
             .child(
                 div()
@@ -1406,6 +1595,51 @@ impl Shell {
         }
     }
 
+    /// The filter line over the catalog list. It searches the names the
+    /// session already holds, so a keystroke costs a substring scan and
+    /// never a query.
+    fn catalog_filter_row(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
+        let filtering = !self.catalog_filter.read(cx).is_empty();
+        div()
+            .flex_none()
+            .px(px(12.))
+            .py(px(8.))
+            .border_b_1()
+            .border_color(colors.hairline)
+            .child(
+                card(cx)
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .px(px(8.))
+                    .py(px(5.))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.))
+                            .text_color(colors.text_faint)
+                            .child("⌕"),
+                    )
+                    .child(div().flex_1().min_w(px(0.)).child(self.catalog_filter.clone()))
+                    // The way out of a filter for the mouse. It appears only
+                    // when there is something to clear.
+                    .children(filtering.then(|| {
+                        div()
+                            .id("clear-filter")
+                            .flex_none()
+                            .text_size(px(10.))
+                            .text_color(colors.text_faint)
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(colors.accent))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.catalog_filter.update(cx, |field, cx| field.clear(cx));
+                                this.rebuild_catalog_rows(cx);
+                            }))
+                            .child("✕")
+                    })),
+            )
+    }
+
     /// The sidebar list. A catalog can run to thousands of relations, so
     /// the rows are virtualized: the flattened list is built once, when
     /// the catalog lands, and only the rows on screen are laid out.
@@ -1419,18 +1653,31 @@ impl Shell {
                 .pt(px(10.))
                 .text_size(px(11.))
                 .text_color(colors.text_faint)
-                .child(match &self.status {
-                    Status::Failed(_) => "no catalog",
-                    Status::Connected => "no relations",
-                    Status::Connecting(_) => "reading the catalog…",
+                // The catalog is a request of its own, so a connected
+                // session can still be waiting for one. A filter that
+                // matched nothing empties the list as well, and says so
+                // rather than reporting an empty catalog.
+                .child(match (&self.status, self.catalog_loading) {
+                    _ if !self.catalog_groups.is_empty() => "nothing goes by that name",
+                    (Status::Failed(_), _) => "no catalog",
+                    (_, true) => "reading the catalog…",
+                    (Status::Connecting(_), _) => "connecting…",
+                    (Status::Connected, _) if self.catalog_error.is_some() => "no catalog",
+                    (Status::Connected, _) => "no relations",
                 })
                 .into_any_element();
         }
 
+        // The row the active tab came from, whichever kind of tab that is:
+        // a query tab opened from the sidebar marks its row too.
         let active = match self.tabs.get(self.active) {
             Some(Tab::Table(tab)) => {
                 Some((SharedString::from(tab.schema.clone()), SharedString::from(tab.table.clone())))
             }
+            Some(Tab::Query(tab)) => tab
+                .relation
+                .as_ref()
+                .map(|(schema, table)| (schema.clone().into(), table.clone().into())),
             _ => None,
         };
         let rows = self.catalog_rows.clone();
@@ -1453,28 +1700,60 @@ impl Shell {
         // `restrict_scroll_to_axis()` would set is set by hand, as the
         // results grid does.
         list.style().restrict_scroll_to_axis = Some(true);
-        list.track_scroll(&self.catalog_scroll)
+        let list = list.track_scroll(&self.catalog_scroll).size_full().px(px(8.));
+
+        // The bar sits outside the scrolling list, or it would scroll away
+        // with it. `uniform_list` keeps a plain handle inside its own, and
+        // that is the one the scrollbar reads.
+        let handle = self.catalog_scroll.0.borrow().base_handle.clone();
+        div()
+            .relative()
             .flex_1()
             .min_h(px(0.))
-            .px(px(8.))
+            .child(list)
+            .children(
+                Scrollbar::new(
+                    true,
+                    handle,
+                    self.catalog_drag.clone(),
+                    colors.text_faint,
+                    colors.text_muted,
+                )
+                .map(|bar| {
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .right(px(0.))
+                        .bottom(px(0.))
+                        .w(px(scrollbar::THICKNESS))
+                        .child(bar)
+                }),
+            )
             .into_any_element()
     }
 
     fn tab_strip(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
-        let mut strip = div()
-            .h(px(34.))
-            .flex_none()
+        // The tabs scroll inside the strip rather than pushing "+ new
+        // query" off the end, and each one keeps its height and a width
+        // between the two bounds: a long table name is truncated, and a
+        // short one is not squeezed to its text.
+        let mut tabs = div()
+            .id("tabs")
             .flex()
+            .flex_1()
+            .min_w(px(0.))
             .items_stretch()
-            .border_b_1()
-            .border_color(colors.border)
-            .bg(colors.panel);
+            .overflow_x_scroll();
 
         for (ix, tab) in self.tabs.iter().enumerate() {
             let is_active = ix == self.active;
             let id = tab.id();
             let mut item = div()
                 .id(ElementId::Name(format!("tab-{id}").into()))
+                .h_full()
+                .flex_none()
+                .min_w(px(TAB_MIN_WIDTH))
+                .max_w(px(TAB_MAX_WIDTH))
                 .flex()
                 .items_center()
                 .gap(px(8.))
@@ -1490,23 +1769,32 @@ impl Shell {
                     cx.notify();
                 }))
                 .child(match tab {
-                    Tab::Table(tab) if tab.kind == TableKind::Table => table_glyph(is_active, cx),
+                    Tab::Table(tab) if tab.kind == TableKind::Table => {
+                        table_glyph(is_active, cx).flex_none()
+                    }
                     // Views and query results are both "not a table": the
                     // sidebar marks them with a ring, so tabs match.
-                    _ => div().size(px(5.)).rounded_full().border_1().border_color(
+                    _ => div().size(px(5.)).flex_none().rounded_full().border_1().border_color(
                         if is_active { colors.accent } else { colors.text_faint },
                     ),
                 })
                 .child(
+                    // The title is what gives way when the tab is at its
+                    // widest, so it takes the room the glyph and the ×
+                    // leave and truncates inside it.
                     div()
+                        .flex_1()
+                        .min_w(px(0.))
                         .text_size(px(11.))
                         .font_weight(if is_active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
                         .text_color(if is_active { colors.text } else { colors.text_muted })
+                        .truncate()
                         .child(tab.title()),
                 )
                 .child(
                     div()
                         .id(ElementId::Name(format!("close-{id}").into()))
+                        .flex_none()
                         .text_size(px(12.))
                         .text_color(colors.text_faint)
                         .cursor_pointer()
@@ -1522,22 +1810,32 @@ impl Shell {
                 let hover = colors.hairline;
                 item.hover(move |s| s.bg(hover))
             };
-            strip = strip.child(item);
+            tabs = tabs.child(item);
         }
 
-        strip.child(div().flex_1()).child(
-            div()
-                .id("new-query")
-                .flex()
-                .items_center()
-                .px(px(12.))
-                .text_size(px(11.))
-                .text_color(colors.accent)
-                .cursor_pointer()
-                .hover(|s| s.text_color(colors.accent_deep))
-                .on_click(cx.listener(|this, _event, window, cx| this.new_query(window, cx)))
-                .child("+ new query"),
-        )
+        div()
+            .h(px(TAB_STRIP_HEIGHT))
+            .flex_none()
+            .flex()
+            .items_stretch()
+            .border_b_1()
+            .border_color(colors.border)
+            .bg(colors.panel)
+            .child(tabs)
+            .child(
+                div()
+                    .id("new-query")
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px(px(12.))
+                    .text_size(px(11.))
+                    .text_color(colors.accent)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(colors.accent_deep))
+                    .on_click(cx.listener(|this, _event, window, cx| this.new_query(window, cx)))
+                    .child("+ new query"),
+            )
     }
 
     fn pane(&self, colors: &ThemeColors, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -2135,147 +2433,6 @@ impl Shell {
             .child(div().text_color(colors.text_faint).truncate().child(found))
     }
 
-    /// The ⌃⇥ switcher, over everything. It takes the focus while it is
-    /// open — that is what lets ⏎ and esc reach it rather than the query
-    /// editor — and hands it back to the tab it settles on.
-    fn switcher_overlay(
-        &self,
-        colors: &ThemeColors,
-        cx: &mut Context<Self>,
-    ) -> Option<Stateful<Div>> {
-        let switcher = self.switcher.as_ref()?;
-        let entries = Rc::new(self.switcher_entries(switcher));
-        if entries.is_empty() {
-            return None;
-        }
-        let selected = switcher.selected;
-        let height = (entries.len() as f32 * switcher::ROW_HEIGHT).min(switcher::MAX_LIST_HEIGHT);
-
-        let on_pick: switcher::OnPick = {
-            let shell = cx.entity().downgrade();
-            Rc::new(move |id, window, cx| {
-                shell
-                    .update(cx, |shell: &mut Shell, cx| {
-                        if let Some(ix) = shell.tabs.iter().position(|tab| tab.id() == id) {
-                            shell.switcher = None;
-                            shell.activate(ix);
-                            shell.focus_active_tab(window, cx);
-                            cx.notify();
-                        }
-                    })
-                    .ok();
-            })
-        };
-
-        let rows = entries.clone();
-        let mut list = uniform_list("switcher-rows", entries.len(), move |range, _window, cx| {
-            let colors = theme(cx).colors.clone();
-            range
-                .map(|ix| {
-                    switcher::switcher_row(ix, &rows[ix], ix == selected, &on_pick, &colors, cx)
-                })
-                .collect::<Vec<_>>()
-        });
-        list.style().restrict_scroll_to_axis = Some(true);
-
-        Some(
-            div()
-                .id("switcher-scrim")
-                .absolute()
-                .top(px(0.))
-                .left(px(0.))
-                .size_full()
-                .flex()
-                .justify_center()
-                .items_start()
-                .pt(px(switcher::TOP_MARGIN))
-                .bg(colors.overlay)
-                // Nothing behind the scrim may be clicked through it.
-                .occlude()
-                .on_click(cx.listener(|this, _event, window, cx| this.cancel_switcher(window, cx)))
-                .child(
-                    div()
-                        .id("switcher")
-                        .key_context(switcher::KEY_CONTEXT)
-                        .track_focus(&switcher.focus_handle)
-                        .on_action(cx.listener(Self::on_switcher_next))
-                        .on_action(cx.listener(Self::on_switcher_prev))
-                        .on_action(cx.listener(Self::on_switcher_confirm))
-                        .on_action(cx.listener(Self::on_switcher_cancel))
-                        // Letting ⌃ go is what commits, the way it does in
-                        // every other tab switcher.
-                        .on_modifiers_changed(cx.listener(
-                            |this, event: &ModifiersChangedEvent, window, cx| {
-                                if !event.modifiers.control {
-                                    this.confirm_switcher(window, cx);
-                                }
-                            },
-                        ))
-                        .occlude()
-                        .w(px(switcher::WIDTH))
-                        .flex()
-                        .flex_col()
-                        .overflow_hidden()
-                        .border_1()
-                        .border_color(colors.border_strong)
-                        .rounded(px(10.))
-                        .bg(colors.elevated)
-                        .shadow(vec![
-                            BoxShadow::new(px(0.), px(24.), colors.shadow)
-                                .blur_radius(px(60.))
-                                .spread_radius(px(-20.)),
-                        ])
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(px(15.))
-                                .py(px(10.))
-                                .border_b_1()
-                                .border_color(colors.border)
-                                .child(section_label("OPEN TABS", cx)),
-                        )
-                        .child(
-                            div()
-                                .h(px(height))
-                                .flex_none()
-                                .flex()
-                                .flex_col()
-                                .px(px(8.))
-                                .py(px(8.))
-                                .child(
-                                    list.track_scroll(&switcher.scroll).flex_1().min_h(px(0.)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .gap(px(14.))
-                                .px(px(14.))
-                                .py(px(9.))
-                                .border_t_1()
-                                .border_color(colors.border)
-                                .bg(colors.panel)
-                                .text_size(px(10.))
-                                .text_color(colors.text_muted)
-                                .child("⌃⇥ next")
-                                .child("⌃⇧⇥ back")
-                                .child("release ⌃ to switch")
-                                .child(div().flex_1())
-                                .child(
-                                    div()
-                                        .text_color(colors.text_faint)
-                                        .child(match entries.len() {
-                                            1 => "1 tab".to_string(),
-                                            n => format!("{n} tabs"),
-                                        }),
-                                ),
-                        ),
-                ),
-        )
-    }
-
     fn page_link(
         &self,
         label: &'static str,
@@ -2300,32 +2457,191 @@ impl Shell {
 /// out only what is on screen.
 #[derive(Clone)]
 enum CatalogRow {
-    Header { label: SharedString },
+    /// A schema, and how many relations it holds.
+    Schema { key: SharedString, label: SharedString, count: usize, open: bool },
+    /// `TABLES` or `VIEWS` inside the schema above it.
+    Section { key: SharedString, label: SharedString, count: usize, open: bool },
     Relation { schema: SharedString, name: SharedString, kind: TableKind },
 }
 
-/// Flatten the catalog the way the sidebar reads it: each schema's tables
-/// under a `SCHEMA ·` header, then its views under a `VIEWS ·` one. Built
-/// once per catalog, not once per frame.
-fn catalog_rows(catalog: &Catalog) -> Rc<Vec<CatalogRow>> {
-    let mut rows = Vec::new();
+/// One schema of the sidebar tree, with its relations split into the two
+/// sections under it. Built once per catalog, and flattened into rows
+/// again whenever something opens or the filter changes.
+struct Group {
+    /// Identity of the schema in the open set: its own name.
+    key: SharedString,
+    label: SharedString,
+    schema: SharedString,
+    sections: Vec<Section>,
+}
+
+/// A schema's tables, or the same schema's views.
+struct Section {
+    /// Identity of the section in the closed set. A schema name cannot
+    /// hold a tab, so the two parts cannot run together into another
+    /// section's key.
+    key: SharedString,
+    label: SharedString,
+    kind: TableKind,
+    relations: Vec<SharedString>,
+}
+
+/// Read the catalog the way the sidebar reads it: a schema, then `TABLES`
+/// and `VIEWS` under it, then the relations under those. A section with
+/// nothing in it is left out rather than drawn empty.
+fn catalog_groups(catalog: &Catalog) -> Rc<Vec<Group>> {
+    let mut groups = Vec::new();
     for schema in &catalog.schemas {
-        for (kind, label) in [(TableKind::Table, "SCHEMA"), (TableKind::View, "VIEWS")] {
-            let mut relations = schema.tables.iter().filter(|table| table.kind == kind).peekable();
-            if relations.peek().is_none() {
-                continue;
-            }
-            rows.push(CatalogRow::Header {
-                label: format!("{label} · {}", schema.name.to_ascii_uppercase()).into(),
+        let sections: Vec<Section> = [(TableKind::Table, "TABLES"), (TableKind::View, "VIEWS")]
+            .into_iter()
+            .filter_map(|(kind, label)| {
+                let relations: Vec<SharedString> = schema
+                    .tables
+                    .iter()
+                    .filter(|table| table.kind == kind)
+                    .map(|table| table.name.clone().into())
+                    .collect();
+                (!relations.is_empty()).then(|| Section {
+                    key: format!("{}\t{label}", schema.name).into(),
+                    label: label.into(),
+                    kind,
+                    relations,
+                })
+            })
+            .collect();
+        if sections.is_empty() {
+            continue;
+        }
+        groups.push(Group {
+            key: schema.name.clone().into(),
+            label: schema.name.to_ascii_uppercase().into(),
+            schema: schema.name.clone().into(),
+            sections,
+        });
+    }
+    Rc::new(groups)
+}
+
+/// Flatten the tree for `uniform_list`: a schema row, its section rows
+/// while it is open, and their relations while they are.
+///
+/// The two levels remember themselves the other way round. A schema is
+/// closed until `open_schemas` holds it, because a catalog of thousands of
+/// relations is a wall of names otherwise; a section is open until
+/// `closed_sections` holds it, because a schema the user just opened was
+/// opened to see what is in it.
+///
+/// A `needle` narrows the list to the relations it matches, by the same
+/// rule the palette uses: a case-insensitive substring, and **a dot names
+/// a path**. So `address` finds every `address`, `dev.addr` finds the one
+/// in `sample_dev_sample`, and a bare schema name answers with everything
+/// under it. Whatever is left with nothing under it is dropped, header and
+/// all. While the filter is on, everything that survived is drawn open
+/// whatever the two sets say — a search that needs a second click to show
+/// its hits is not a search.
+fn catalog_rows(
+    groups: &[Group],
+    open_schemas: &HashSet<SharedString>,
+    closed_sections: &HashSet<SharedString>,
+    needle: &str,
+) -> Rc<Vec<CatalogRow>> {
+    let filtering = !needle.is_empty();
+    let mut rows = Vec::new();
+    for group in groups {
+        let found: Vec<(&Section, Vec<&SharedString>)> = group
+            .sections
+            .iter()
+            .filter_map(|section| {
+                let matches: Vec<&SharedString> = if !filtering {
+                    section.relations.iter().collect()
+                } else {
+                    section
+                        .relations
+                        .iter()
+                        .filter(|name| {
+                            let path = [group.schema.to_string(), name.to_string()];
+                            palette::path_matches(&path, needle)
+                        })
+                        .collect()
+                };
+                (!matches.is_empty()).then_some((section, matches))
+            })
+            .collect();
+        let count: usize = found.iter().map(|(_, matches)| matches.len()).sum();
+        if count == 0 {
+            continue;
+        }
+
+        let open = filtering || open_schemas.contains(&group.key);
+        rows.push(CatalogRow::Schema {
+            key: group.key.clone(),
+            label: group.label.clone(),
+            count,
+            open,
+        });
+        if !open {
+            continue;
+        }
+        for (section, matches) in found {
+            let open = filtering || !closed_sections.contains(&section.key);
+            rows.push(CatalogRow::Section {
+                key: section.key.clone(),
+                label: section.label.clone(),
+                count: matches.len(),
+                open,
             });
-            rows.extend(relations.map(|table| CatalogRow::Relation {
-                schema: schema.name.clone().into(),
-                name: table.name.clone().into(),
-                kind,
-            }));
+            if open {
+                rows.extend(matches.into_iter().map(|name| CatalogRow::Relation {
+                    schema: group.schema.clone(),
+                    name: name.clone(),
+                    kind: section.kind,
+                }));
+            }
         }
     }
     Rc::new(rows)
+}
+
+/// The shell of a header row, up to its chevron: the caller adds the
+/// label and the count. `indent` is what puts the level on the tree.
+fn header_row(
+    ix: usize,
+    id: &'static str,
+    indent: f32,
+    open: bool,
+    colors: &ThemeColors,
+) -> Stateful<Div> {
+    let hover = colors.hairline;
+    div()
+        .id(ElementId::NamedInteger(id.into(), ix as u64))
+        .h(px(CATALOG_ROW_HEIGHT))
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .pl(px(indent))
+        .pr(px(8.))
+        .rounded(px(5.))
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+        // The chevron is the whole affordance: a closed row shows nothing
+        // else that says it can be opened.
+        .child(
+            div()
+                .flex_none()
+                .w(px(8.))
+                .text_size(px(8.))
+                .text_color(colors.text_faint)
+                .child(if open { "▾" } else { "▸" }),
+        )
+}
+
+/// How many relations sit under a header, at its right edge.
+fn count_label(count: usize, colors: &ThemeColors) -> Div {
+    div()
+        .flex_none()
+        .text_size(px(9.))
+        .text_color(colors.text_faint)
+        .child(format_count(count as u64))
 }
 
 /// One row of the flattened list. Free-standing because the list's render
@@ -2340,14 +2656,37 @@ fn catalog_row(
     cx: &App,
 ) -> AnyElement {
     match row {
-        CatalogRow::Header { label } => div()
-            .h(px(CATALOG_ROW_HEIGHT))
-            .flex()
-            .items_end()
-            .px(px(6.))
-            .pb(px(5.))
-            .child(section_label(label.clone(), cx))
-            .into_any_element(),
+        // The two header levels differ in where they sit and how loud
+        // they read; the chevron, the count and the click are the same.
+        CatalogRow::Schema { key, label, count, open } => {
+            let (key, shell) = (key.clone(), shell.clone());
+            header_row(ix, "schema", 6., *open, colors)
+                .on_click(move |_event, _window, cx| {
+                    shell.update(cx, |shell, cx| shell.toggle_schema(key.clone(), cx)).ok();
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors.text_secondary)
+                        .truncate()
+                        .child(label.clone()),
+                )
+                .child(count_label(*count, colors))
+                .into_any_element()
+        }
+        CatalogRow::Section { key, label, count, open } => {
+            let (key, shell) = (key.clone(), shell.clone());
+            header_row(ix, "section", 19., *open, colors)
+                .on_click(move |_event, _window, cx| {
+                    shell.update(cx, |shell, cx| shell.toggle_section(key.clone(), cx)).ok();
+                })
+                .child(div().flex_1().min_w(px(0.)).child(section_label(label.clone(), cx)))
+                .child(count_label(*count, colors))
+                .into_any_element()
+        }
         CatalogRow::Relation { schema, name, kind } => {
             let is_active = active.is_some_and(|(s, t)| s == schema && t == name);
             let shell = shell.clone();
@@ -2359,13 +2698,16 @@ fn catalog_row(
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .px(px(8.))
+                // Indented under its section's chevron, so the schema and
+                // the section a relation sits in read off the left edge.
+                .pl(px(32.))
+                .pr(px(8.))
                 .rounded(px(5.))
                 .cursor_pointer()
-                .on_click(move |_event, _window, cx| {
+                .on_click(move |_event, window, cx| {
                     shell
                         .update(cx, |shell, cx| {
-                            shell.open_table(schema_name.clone(), table_name.clone(), cx)
+                            shell.browse_table(&schema_name, &table_name, window, cx)
                         })
                         .ok();
                 })
@@ -2454,8 +2796,50 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_flattens_tables_then_views_per_schema() {
-        let catalog = Catalog {
+    fn walking_the_tabs_wraps_at_both_ends() {
+        assert_eq!(step_wrapping(3, 0, true), 1);
+        assert_eq!(step_wrapping(3, 1, true), 2);
+        // Past the last tab is the first one again.
+        assert_eq!(step_wrapping(3, 2, true), 0);
+        // ⌃⇧⇥ walks the other way, and wraps as well.
+        assert_eq!(step_wrapping(3, 0, false), 2);
+        assert_eq!(step_wrapping(3, 2, false), 1);
+    }
+
+    #[test]
+    fn one_tab_or_none_stays_put() {
+        assert_eq!(step_wrapping(0, 0, true), 0);
+        assert_eq!(step_wrapping(1, 0, true), 0);
+        assert_eq!(step_wrapping(1, 0, false), 0);
+    }
+
+    /// The rows as the sidebar draws them: a schema in `[]`, a section in
+    /// `()`, both with their count and whether they are open, and a
+    /// relation as its own name.
+    fn read(rows: &[CatalogRow]) -> Vec<String> {
+        let shown = |count: &usize, open: &bool| {
+            format!("{count}{}", if *open { " open" } else { "" })
+        };
+        rows.iter()
+            .map(|row| match row {
+                CatalogRow::Schema { label, count, open, .. } => {
+                    format!("[{label} {}]", shown(count, open))
+                }
+                CatalogRow::Section { label, count, open, .. } => {
+                    format!("({label} {})", shown(count, open))
+                }
+                CatalogRow::Relation { name, .. } => name.to_string(),
+            })
+            .collect()
+    }
+
+    /// `catalog_rows` with both sets at their starting state.
+    fn rows(groups: &[Group], needle: &str) -> Rc<Vec<CatalogRow>> {
+        catalog_rows(groups, &HashSet::new(), &HashSet::new(), needle)
+    }
+
+    fn sample() -> Catalog {
+        Catalog {
             schemas: vec![
                 Schema {
                     name: "public".to_string(),
@@ -2465,34 +2849,114 @@ mod tests {
                         relation("orders", TableKind::Table),
                     ],
                 },
-                // A schema of views only gets one header, not an empty
-                // `SCHEMA ·` one above it.
+                // A schema of views only gets a `VIEWS` section, not an
+                // empty `TABLES` one above it.
                 Schema {
                     name: "reporting".to_string(),
                     tables: vec![relation("daily", TableKind::View)],
                 },
             ],
-        };
+        }
+    }
 
-        let rows = catalog_rows(&catalog);
-        let read: Vec<String> = rows
-            .iter()
-            .map(|row| match row {
-                CatalogRow::Header { label } => format!("[{label}]"),
-                CatalogRow::Relation { name, .. } => name.to_string(),
-            })
-            .collect();
+    #[test]
+    fn a_schema_holds_a_tables_section_and_a_views_section() {
+        let groups = catalog_groups(&sample());
+        let read: Vec<String> = groups.iter().map(|group| group.label.to_string()).collect();
+        assert_eq!(read, ["PUBLIC", "REPORTING"]);
+
+        let sections: Vec<String> =
+            groups[0].sections.iter().map(|section| section.label.to_string()).collect();
+        assert_eq!(sections, ["TABLES", "VIEWS"]);
+        assert_eq!(groups[0].sections[0].relations, ["users", "orders"]);
+        // A schema of views only carries the one section.
+        assert_eq!(groups[1].sections.len(), 1);
+    }
+
+    #[test]
+    fn every_schema_starts_closed() {
+        let groups = catalog_groups(&sample());
+        // The schemas and their totals, and nothing under them.
+        assert_eq!(read(&rows(&groups, "")), ["[PUBLIC 3]", "[REPORTING 1]"]);
+    }
+
+    #[test]
+    fn an_open_schema_shows_its_sections_and_their_relations() {
+        let groups = catalog_groups(&sample());
+        let open = HashSet::from([groups[0].key.clone()]);
+        // A section is open until it is closed: opening the schema is one
+        // click, not three.
         assert_eq!(
-            read,
+            read(&catalog_rows(&groups, &open, &HashSet::new(), "")),
             [
-                "[SCHEMA · PUBLIC]",
+                "[PUBLIC 3 open]",
+                "(TABLES 2 open)",
                 "users",
                 "orders",
-                "[VIEWS · PUBLIC]",
+                "(VIEWS 1 open)",
                 "active_users",
-                "[VIEWS · REPORTING]",
-                "daily",
+                "[REPORTING 1]",
             ]
+        );
+
+        // Closing a section leaves its header and takes its relations.
+        let closed = HashSet::from([groups[0].sections[0].key.clone()]);
+        assert_eq!(
+            read(&catalog_rows(&groups, &open, &closed, "")),
+            ["[PUBLIC 3 open]", "(TABLES 2)", "(VIEWS 1 open)", "active_users", "[REPORTING 1]"]
+        );
+    }
+
+    #[test]
+    fn the_filter_opens_what_it_matched() {
+        let groups = catalog_groups(&sample());
+        // A relation name: only what holds a hit survives, open however
+        // the two sets stand, and the counts are of the hits.
+        assert_eq!(
+            read(&rows(&groups, "user")),
+            ["[PUBLIC 2 open]", "(TABLES 1 open)", "users", "(VIEWS 1 open)", "active_users"]
+        );
+        // A schema's own name keeps everything under it.
+        assert_eq!(
+            read(&rows(&groups, "report")),
+            ["[REPORTING 1 open]", "(VIEWS 1 open)", "daily"]
+        );
+        // No hit anywhere is an empty list, not a list of empty headers.
+        assert!(rows(&groups, "nothing").is_empty());
+    }
+
+    #[test]
+    fn a_dot_in_the_filter_names_a_path() {
+        let groups = catalog_groups(&sample());
+        // Both parts must hit: the schema, then the relation under it.
+        assert_eq!(
+            read(&rows(&groups, "public.orders")),
+            ["[PUBLIC 1 open]", "(TABLES 1 open)", "orders"]
+        );
+        // Part of each is enough, as in the palette.
+        assert_eq!(
+            read(&rows(&groups, "rep.dai")),
+            ["[REPORTING 1 open]", "(VIEWS 1 open)", "daily"]
+        );
+        // A trailing dot asks for everything the schema holds.
+        assert_eq!(
+            read(&rows(&groups, "public.")),
+            [
+                "[PUBLIC 3 open]",
+                "(TABLES 2 open)",
+                "users",
+                "orders",
+                "(VIEWS 1 open)",
+                "active_users",
+            ]
+        );
+        // The schema of the hit is part of the query, so a relation of the
+        // right name under the wrong schema is not an answer.
+        assert!(rows(&groups, "reporting.orders").is_empty());
+        // Case never matters, on either side of the dot.
+        assert_eq!(
+            read(&rows(&groups, "PUBLIC.Orders")),
+            ["[PUBLIC 1 open]", "(TABLES 1 open)", "orders"]
         );
     }
 

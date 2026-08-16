@@ -40,7 +40,7 @@ impl Root {
     }
 
     fn workspace(target: Target, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let workspace = cx.new(|cx| Shell::new(target, cx));
+        let workspace = cx.new(|cx| Shell::new(target, window, cx));
         let subscription = cx.subscribe_in(&workspace, window, Self::on_shell_event);
         window.focus(&workspace.focus_handle(cx), cx);
         Self { screen: Screen::Workspace(workspace), _subscription: subscription }

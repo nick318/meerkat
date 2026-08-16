@@ -9,3 +9,4 @@ publish.workspace = true
 db_client.workspace = true
 gpui.workspace = true
 theme.workspace = true
+ui.workspace = true

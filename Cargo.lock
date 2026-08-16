@@ -4835,6 +4835,7 @@ dependencies = [
  "db_client",
  "gpui",
  "theme",
+ "ui",
 ]
 
 [[package]]
@@ -5803,7 +5804,9 @@ dependencies = [
  "anyhow",
  "db_client",
  "dirs",
+ "introspect",
  "rusqlite",
+ "serde_json",
 ]
 
 [[package]]

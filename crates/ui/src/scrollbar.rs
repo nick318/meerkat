@@ -1,9 +1,12 @@
-//! An overlay scrollbar for the results grid.
+//! An overlay scrollbar.
 //!
 //! GPUI ships scroll containers but no scrollbar, and Zed's own is far
-//! more than a grid needs. This one paints a thumb over the content and
+//! more than this app needs. This one paints a thumb over the content and
 //! drags it: the mouse handlers are registered on the window, not on a
 //! hitbox, so a drag keeps working after the pointer leaves the 10px bar.
+//!
+//! It takes a plain `ScrollHandle`, so it serves the results grid and the
+//! sidebar's `uniform_list` alike — the list's handle carries one inside.
 
 use gpui::{
     App, Bounds, Corners, Edges, Element, ElementId, GlobalElementId, Hitbox, HitboxBehavior, Hsla,

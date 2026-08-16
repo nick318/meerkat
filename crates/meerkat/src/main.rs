@@ -11,7 +11,6 @@ mod palette;
 mod root;
 mod shell;
 mod sql;
-mod switcher;
 
 use gpui::{
     App, Bounds, Focusable as _, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions,
@@ -47,7 +46,6 @@ fn main() {
         cx.bind_keys(ui::text_field_key_bindings());
         cx.bind_keys(connections::key_bindings());
         cx.bind_keys(palette::key_bindings());
-        cx.bind_keys(switcher::key_bindings());
         // The workspace's keys are scoped to the workspace, not bound
         // globally, so the palette can take ⌘⏎ for itself while it is
         // open: GPUI gives a keystroke to the binding that matched deepest
@@ -60,6 +58,10 @@ fn main() {
             KeyBinding::new("cmd-y", shell::ShowHistory, Some("Shell")),
             KeyBinding::new("cmd-[", shell::PrevPage, Some("Shell")),
             KeyBinding::new("cmd-]", shell::NextPage, Some("Shell")),
+            // ⌃⇥ switches on the keystroke, with no popup in between, so
+            // both keys are bound to the shell and nowhere else.
+            KeyBinding::new("ctrl-tab", shell::NextTab, Some("Shell")),
+            KeyBinding::new("ctrl-shift-tab", shell::PrevTab, Some("Shell")),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());

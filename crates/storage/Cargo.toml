@@ -9,4 +9,6 @@ publish.workspace = true
 anyhow.workspace = true
 db_client.workspace = true
 dirs.workspace = true
+introspect.workspace = true
 rusqlite.workspace = true
+serde_json.workspace = true

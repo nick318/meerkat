@@ -3,7 +3,8 @@
 
 use anyhow::{Context as _, Result};
 use db_client::{Engine, Profile};
-use rusqlite::Connection;
+use introspect::Catalog;
+use rusqlite::{Connection, OptionalExtension as _};
 use std::path::PathBuf;
 
 pub struct Store {
@@ -120,7 +121,12 @@ impl Store {
                 error TEXT
             );
             CREATE INDEX IF NOT EXISTS query_history_scope_time
-                ON query_history (scope, ran_at DESC);",
+                ON query_history (scope, ran_at DESC);
+            CREATE TABLE IF NOT EXISTS catalog_cache (
+                scope TEXT PRIMARY KEY,
+                catalog TEXT NOT NULL,
+                cached_at INTEGER NOT NULL
+            );",
         )?;
         let store = Self { conn };
         store.migrate()?;
@@ -226,6 +232,51 @@ impl Store {
 
     pub fn delete_profile(&self, id: &str) -> Result<()> {
         self.conn.execute("DELETE FROM profiles WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    // --- catalog cache ----------------------------------------------------
+
+    /// The catalog this connection had the last time it was open, as JSON.
+    /// The shell paints the sidebar from it while the real introspection
+    /// runs, so a large database opens at once instead of after a round
+    /// trip. A row that no longer parses — the model changed under it —
+    /// is dropped and reported as a miss, never as an error.
+    pub fn cached_catalog(&self, scope: &str) -> Result<Option<Catalog>> {
+        let json: Option<String> = self
+            .conn
+            .query_row("SELECT catalog FROM catalog_cache WHERE scope = ?1", [scope], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(json) = json else { return Ok(None) };
+        match serde_json::from_str(&json) {
+            Ok(catalog) => Ok(Some(catalog)),
+            Err(_) => {
+                self.forget_catalog(scope)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Keep the catalog a successful introspection produced. One row per
+    /// connection, overwritten every time, so the file holds the current
+    /// shape and nothing older.
+    pub fn cache_catalog(&self, scope: &str, catalog: &Catalog, at: i64) -> Result<()> {
+        let json = serde_json::to_string(catalog)?;
+        self.conn.execute(
+            "INSERT INTO catalog_cache (scope, catalog, cached_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(scope) DO UPDATE SET
+                catalog = excluded.catalog,
+                cached_at = excluded.cached_at",
+            rusqlite::params![scope, json, at],
+        )?;
+        Ok(())
+    }
+
+    pub fn forget_catalog(&self, scope: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM catalog_cache WHERE scope = ?1", [scope])?;
         Ok(())
     }
 
@@ -480,6 +531,55 @@ mod tests {
         // The oldest runs are the ones that go.
         assert_eq!(kept[0].statement, format!("select {}", HISTORY_LIMIT + 19));
         assert_eq!(kept[HISTORY_LIMIT - 1].statement, format!("select {}", 20));
+    }
+
+    #[test]
+    fn the_catalog_cache_is_per_connection_and_overwritten() {
+        let store = store_at("catalog.sqlite");
+        let catalog = |table: &str| Catalog {
+            schemas: vec![introspect::Schema {
+                name: "public".into(),
+                tables: vec![introspect::Table {
+                    name: table.into(),
+                    kind: introspect::TableKind::Table,
+                    columns: Vec::new(),
+                    primary_key: vec!["id".into()],
+                    approx_rows: Some(12),
+                }],
+            }],
+        };
+
+        assert!(store.cached_catalog("prod").unwrap().is_none());
+        store.cache_catalog("prod", &catalog("users"), 100).unwrap();
+        store.cache_catalog("staging", &catalog("orders"), 100).unwrap();
+        // The second read of the same connection replaces the first.
+        store.cache_catalog("prod", &catalog("people"), 200).unwrap();
+
+        let prod = store.cached_catalog("prod").unwrap().unwrap();
+        assert_eq!(prod.schemas[0].tables[0].name, "people");
+        assert_eq!(prod.schemas[0].tables[0].primary_key, ["id"]);
+        let staging = store.cached_catalog("staging").unwrap().unwrap();
+        assert_eq!(staging.schemas[0].tables[0].name, "orders");
+    }
+
+    #[test]
+    fn a_catalog_the_model_no_longer_parses_is_a_miss() {
+        let store = store_at("catalog-stale.sqlite");
+        store
+            .conn
+            .execute(
+                "INSERT INTO catalog_cache (scope, catalog, cached_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["prod", "{\"schemas\":\"whatever\"}", 100],
+            )
+            .unwrap();
+
+        assert!(store.cached_catalog("prod").unwrap().is_none());
+        // The row that cannot be read is dropped rather than re-read.
+        let left: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM catalog_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]
