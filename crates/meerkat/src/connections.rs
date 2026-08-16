@@ -1,24 +1,30 @@
 //! The connections screen: what the app opens on when it is not pointed
 //! at a database.
 //!
-//! It lists the saved connections, probes each one so the list says what
-//! is actually reachable right now, and takes a new `postgres://` URL.
+//! It lists the saved connections and takes a new `postgres://` URL.
 //! Profiles live in the local SQLite store; passwords go to the OS
 //! keychain and never touch that file.
 //!
-//! Probing is the reason a row can say "14 tables · 3 views · PG 16.2":
-//! each row connects, introspects and disconnects on the tokio runtime,
-//! and the counts are cached in the store so the next launch paints them
-//! before the servers answer.
+//! ⌘F narrows the list. The search reads the rows already in memory —
+//! name, URL and user — so it costs a substring scan, not a query, and
+//! it is a filter, not a jump: the list keeps the store's order.
+//!
+//! Opening the screen touches no server. A saved connection is a note of
+//! where a database is, not a standing session: the app must not wake a
+//! sleeping server, spend a connection slot, or ask the keychain for a
+//! password nobody asked it to use. A probe — connect, read the server
+//! version, disconnect on the tokio runtime — runs only when the user
+//! asks for it: saving a new connection, or clicking a row that failed.
+//! The version it read is cached in the store, so the next launch paints
+//! "read-only · PG 17.2" without a socket.
 
 use chrono::Local;
 use db_client::{Connection, Engine, Profile};
 use db_postgres::PostgresConnection;
 use gpui::{
     App, Context, Div, ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    SharedString, Stateful, Subscription, Window, div, prelude::*, px,
+    KeyBinding, SharedString, Stateful, Subscription, Window, actions, div, prelude::*, px,
 };
-use introspect::{Catalog, TableKind};
 use std::time::{SystemTime, UNIX_EPOCH};
 use storage::{SavedConnection, Store};
 use theme::{FONT_FAMILY, ThemeColors, theme};
@@ -26,9 +32,24 @@ use ui::{TextField, TextFieldEvent, accent_button, meerkat_mark, section_label, 
 
 /// The comp's reading column: the list never stretches over a wide window.
 const COLUMN_WIDTH: f32 = 900.;
-const STATS_WIDTH: f32 = 150.;
+/// Empty on a row that is up, so it costs nothing until a probe fails
+/// and needs the room for the error.
+const STATUS_WIDTH: f32 = 220.;
 const MODE_WIDTH: f32 = 130.;
 const ACTION_WIDTH: f32 = 76.;
+/// The search line sits beside the section label, so it takes a fixed
+/// share of that row rather than all of it.
+const SEARCH_WIDTH: f32 = 300.;
+
+/// The screen's own key context. ⌘F belongs to this screen, not to the
+/// app, so it cannot take the key from a workspace that is open.
+const KEY_CONTEXT: &str = "Connections";
+
+actions!(connections, [FocusSearch]);
+
+pub fn key_bindings() -> Vec<KeyBinding> {
+    vec![KeyBinding::new("cmd-f", FocusSearch, Some(KEY_CONTEXT))]
+}
 
 pub enum ConnectionsEvent {
     /// The user picked a connection: open the workspace on it.
@@ -42,10 +63,14 @@ pub struct Connections {
     store: Option<Store>,
     error: Option<String>,
     rows: Vec<Row>,
+    /// The search line over the saved connections. It filters the list
+    /// that is already in memory; it never reaches a server.
+    search: Entity<TextField>,
     form: Option<Form>,
     /// Unix seconds when the screen opened, so "3d ago" stays put while
     /// the user reads it.
     now: i64,
+    _subscriptions: Vec<Subscription>,
 }
 
 struct Row {
@@ -55,8 +80,11 @@ struct Row {
 
 /// What the last probe of one connection found.
 enum Probe {
+    /// Nothing has been asked of this server in this session. The row
+    /// paints what the store cached at the last probe, if anything.
+    Idle,
     Probing,
-    Ready { tables: u32, views: u32, server: String },
+    Ready { server: String },
     Failed(String),
 }
 
@@ -82,22 +110,67 @@ impl Form {
 impl EventEmitter<ConnectionsEvent> for Connections {}
 
 impl Connections {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (store, error) = match Store::open_default() {
             Ok(store) => (Some(store), None),
             Err(error) => (None, Some(error.to_string())),
         };
+        let search = cx.new(|cx| TextField::new("name, host, port or database", cx).bare(11.));
+        let subscription = cx.subscribe_in(&search, window, Self::on_search_event);
         let mut screen = Self {
             focus_handle: cx.focus_handle(),
             store,
             error,
             rows: Vec::new(),
+            search,
             form: None,
             now: unix_now(),
+            _subscriptions: vec![subscription],
         };
         screen.reload(cx);
-        screen.probe_all(cx);
         screen
+    }
+
+    fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.search.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn on_search_event(
+        &mut self,
+        _field: &Entity<TextField>,
+        event: &TextFieldEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            // esc empties the line. A filter left behind would hide
+            // connections with nothing on screen to say why.
+            TextFieldEvent::Cancel => {
+                self.search.update(cx, |field, cx| field.clear(cx));
+                window.focus(&self.focus_handle, cx);
+                cx.notify();
+            }
+            // With the list down to one connection, ⏎ opens it: the
+            // search line is then the fastest way into a database.
+            TextFieldEvent::Submit => {
+                let matched: Vec<String> = self
+                    .matching(cx)
+                    .into_iter()
+                    .map(|row| row.saved.profile.id.clone())
+                    .collect();
+                if let [id] = matched.as_slice() {
+                    self.open(&id.clone(), cx);
+                }
+            }
+            _ => cx.notify(),
+        }
+    }
+
+    /// The rows the search line leaves on screen, in the store's order.
+    fn matching(&self, cx: &App) -> Vec<&Row> {
+        let query = self.search.read(cx).trimmed().to_ascii_lowercase();
+        self.rows.iter().filter(|row| matches_query(&row.saved, &query)).collect()
     }
 
     /// Read the saved connections back from the store, keeping whatever a
@@ -119,7 +192,7 @@ impl Connections {
                             .iter()
                             .position(|(id, _)| *id == saved.profile.id)
                             .map(|ix| known.remove(ix).1)
-                            .unwrap_or(Probe::Probing);
+                            .unwrap_or(Probe::Idle);
                         Row { saved, state }
                     })
                     .collect();
@@ -130,14 +203,10 @@ impl Connections {
         cx.notify();
     }
 
-    fn probe_all(&mut self, cx: &mut Context<Self>) {
-        for id in self.rows.iter().map(|row| row.saved.profile.id.clone()).collect::<Vec<_>>() {
-            self.probe(&id, cx);
-        }
-    }
-
-    /// Connect, count the relations, read the server version, drop the
-    /// connection. The row paints whatever comes back.
+    /// Connect, read the server version, drop the connection. The row
+    /// paints whatever comes back. A probe never introspects: the row
+    /// says nothing about a catalog, so reading one would cost a large
+    /// database a long query for a line nobody reads.
     fn probe(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(row) = self.rows.iter_mut().find(|row| row.saved.profile.id == id) else {
             return;
@@ -153,14 +222,12 @@ impl Connections {
 
         let task = gpui_tokio::Tokio::spawn(cx, async move {
             let connection = PostgresConnection::connect_profile(&profile).await?;
-            let catalog = connection.introspect().await?;
             // A server that will not say its version is still usable.
             let server = connection.server_version().await.unwrap_or_default();
             // A probe is a look, not a session: give the sockets back
             // before the row paints.
             connection.close().await;
-            let (tables, views) = count_relations(&catalog);
-            anyhow::Ok((tables, views, server))
+            anyhow::Ok(server)
         });
 
         let id = id.to_string();
@@ -168,20 +235,18 @@ impl Connections {
             let outcome = task.await;
             this.update(cx, |this, cx| {
                 let state = match flatten(outcome) {
-                    Ok((tables, views, server)) => {
+                    Ok(server) => {
                         if let Some(store) = &this.store {
                             // Cache what this probe saw; a failure to
                             // write it is not worth interrupting anyone.
-                            store.record_probe(&id, tables, views, &server).ok();
+                            store.record_probe(&id, &server).ok();
                         }
-                        Probe::Ready { tables, views, server }
+                        Probe::Ready { server }
                     }
                     Err(error) => Probe::Failed(error),
                 };
                 if let Some(row) = this.rows.iter_mut().find(|row| row.saved.profile.id == id) {
-                    if let Probe::Ready { tables, views, server } = &state {
-                        row.saved.tables = Some(*tables);
-                        row.saved.views = Some(*views);
+                    if let Probe::Ready { server } = &state {
                         row.saved.server = Some(server.clone());
                     }
                     row.state = state;
@@ -339,11 +404,13 @@ impl Focusable for Connections {
 }
 
 impl Render for Connections {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme(cx).colors.clone();
 
         div()
             .track_focus(&self.focus_handle(cx))
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(Self::focus_search))
             .size_full()
             .bg(colors.window)
             .font_family(FONT_FAMILY)
@@ -364,7 +431,7 @@ impl Render for Connections {
                             .flex_col()
                             .gap(px(26.))
                             .child(self.header(&colors, cx))
-                            .child(self.list(&colors, cx))
+                            .child(self.list(&colors, window, cx))
                             .children(self.error.clone().map(|error| {
                                 div().text_size(px(11.)).text_color(colors.error).child(error)
                             }))
@@ -404,15 +471,40 @@ impl Connections {
             )
     }
 
-    fn list(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
+    fn list(&self, colors: &ThemeColors, window: &Window, cx: &mut Context<Self>) -> Div {
+        let matching = self.matching(cx);
+        let searching = !self.search.read(cx).is_empty();
         let mut list = div()
             .flex()
             .flex_col()
             .gap(px(9.))
-            .child(section_label("CONNECTIONS", cx));
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(section_label("CONNECTIONS", cx))
+                    // The line holds its place whatever the list holds, so
+                    // it does not appear and disappear under the pointer.
+                    .child(self.search_line(colors, window, cx)),
+            );
 
-        for row in &self.rows {
+        for row in matching {
             list = list.child(self.row(row, colors, cx));
+        }
+
+        // A filter that hides everything must say so, or the screen reads
+        // as a store that lost its connections.
+        if searching && self.matching(cx).is_empty() {
+            list = list.child(
+                div()
+                    .px(px(16.))
+                    .py(px(14.))
+                    .text_size(px(11.))
+                    .text_color(colors.text_muted)
+                    .child("no connection matches the search"),
+            );
         }
 
         match &self.form {
@@ -439,6 +531,39 @@ impl Connections {
         }
     }
 
+    /// The search line: a bare field inside a surface of the screen's own,
+    /// the way the palette's line is built.
+    fn search_line(
+        &self,
+        colors: &ThemeColors,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let focused = self.search.focus_handle(cx).is_focused(window);
+        div()
+            .id("search-connections")
+            .w(px(SEARCH_WIDTH))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(10.))
+            .py(px(6.))
+            .border_1()
+            .border_color(if focused { colors.accent } else { colors.border })
+            .rounded(px(6.))
+            .bg(colors.panel)
+            .cursor_pointer()
+            // Clicking anywhere on the surface puts the caret in the line.
+            .on_click(cx.listener(|this, _event, window, cx| {
+                window.focus(&this.search.focus_handle(cx), cx);
+                cx.notify();
+            }))
+            .child(div().text_size(px(11.)).text_color(colors.text_faint).child("⌕"))
+            .child(div().flex_1().min_w(px(0.)).child(self.search.clone()))
+            .child(div().text_size(px(10.)).text_color(colors.text_faint).child("⌘F"))
+    }
+
     fn row(&self, row: &Row, colors: &ThemeColors, cx: &mut Context<Self>) -> Stateful<Div> {
         let failed = matches!(row.state, Probe::Failed(_));
         let id = row.saved.profile.id.clone();
@@ -449,7 +574,9 @@ impl Connections {
             Probe::Ready { .. } => {
                 (colors.text, colors.text_muted, colors.text_muted, colors.ok)
             }
-            Probe::Probing => (colors.text, colors.text_muted, colors.text_muted, colors.idle),
+            Probe::Idle | Probe::Probing => {
+                (colors.text, colors.text_muted, colors.text_muted, colors.idle)
+            }
             Probe::Failed(_) => (
                 colors.error,
                 colors.error_secondary,
@@ -458,13 +585,12 @@ impl Connections {
             ),
         };
 
-        let stats = match &row.state {
-            Probe::Ready { tables, views, .. } => relation_count(*tables, *views),
-            Probe::Probing => match (row.saved.tables, row.saved.views) {
-                // Last launch's counts, until this probe answers.
-                (Some(tables), Some(views)) => relation_count(tables, views),
-                _ => "connecting…".to_string(),
-            },
+        // A row that is up says nothing here: the name and the URL are
+        // what identify a connection, and everything else is noise until
+        // something goes wrong.
+        let status = match &row.state {
+            Probe::Ready { .. } | Probe::Idle => String::new(),
+            Probe::Probing => "connecting…".to_string(),
             Probe::Failed(error) => first_line(error),
         };
 
@@ -473,7 +599,7 @@ impl Connections {
                 format!("read-only · {server}")
             }
             Probe::Ready { .. } => "read-only".to_string(),
-            Probe::Probing => row
+            Probe::Idle | Probe::Probing => row
                 .saved
                 .server
                 .clone()
@@ -486,7 +612,7 @@ impl Connections {
         };
 
         let (action, action_color) = match &row.state {
-            Probe::Ready { .. } => ("open →", colors.accent),
+            Probe::Ready { .. } | Probe::Idle => ("open →", colors.accent),
             Probe::Probing => ("…", colors.text_faint),
             Probe::Failed(_) => ("retry", colors.error_secondary),
         };
@@ -540,12 +666,12 @@ impl Connections {
             )
             .child(
                 div()
-                    .w(px(STATS_WIDTH))
+                    .w(px(STATUS_WIDTH))
                     .flex_none()
                     .text_size(px(11.))
                     .text_color(meta_color)
                     .truncate()
-                    .child(stats),
+                    .child(status),
             )
             .child(
                 div()
@@ -770,28 +896,26 @@ fn merge_credentials(
     }
 }
 
-fn count_relations(catalog: &Catalog) -> (u32, u32) {
-    let mut tables = 0;
-    let mut views = 0;
-    for schema in &catalog.schemas {
-        for table in &schema.tables {
-            match table.kind {
-                TableKind::Table => tables += 1,
-                TableKind::View => views += 1,
-            }
-        }
+/// Does this connection answer the search line? `query` must already be
+/// lowercased, as `matching` hands it over.
+///
+/// The haystack is the name, the URL the row paints, and the user, so a
+/// port ("5433"), a host, a database name or the name the user gave the
+/// connection all find it. Every word must hit, so a second word narrows
+/// the list rather than widening it.
+fn matches_query(saved: &SavedConnection, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
     }
-    (tables, views)
-}
-
-fn relation_count(tables: u32, views: u32) -> String {
-    let plural = |count: u32, one: &str, many: &str| {
-        format!("{count} {}", if count == 1 { one } else { many })
-    };
-    match views {
-        0 => plural(tables, "table", "tables"),
-        _ => format!("{} · {}", plural(tables, "table", "tables"), plural(views, "view", "views")),
-    }
+    let profile = &saved.profile;
+    let haystack = format!(
+        "{} {} {}",
+        profile.name,
+        profile_url(profile),
+        profile.user.clone().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    query.split_whitespace().all(|word| haystack.contains(word))
 }
 
 /// A driver error can run to several lines; a row has space for one.
@@ -851,13 +975,6 @@ mod tests {
     use db_client::Engine;
 
     #[test]
-    fn a_row_names_its_relations() {
-        assert_eq!(relation_count(14, 3), "14 tables · 3 views");
-        assert_eq!(relation_count(1, 1), "1 table · 1 view");
-        assert_eq!(relation_count(9, 0), "9 tables");
-    }
-
-    #[test]
     fn a_row_url_carries_no_credentials() {
         let profile = Profile {
             id: "p1".into(),
@@ -869,6 +986,52 @@ mod tests {
             user: Some("ada".into()),
         };
         assert_eq!(profile_url(&profile), "postgres://db.internal:5432/meerkat");
+    }
+
+    #[test]
+    fn the_search_line_matches_the_name_the_url_and_the_user() {
+        let saved = saved_connection("prod", Some("db.internal"), Some(5432), "meerkat", "ada");
+
+        // The name, the host, the port, the database and the user.
+        for query in ["prod", "db.internal", "5432", "meerkat", "ada", "postgres://"] {
+            assert!(matches_query(&saved, query), "{query} should match");
+        }
+        // An empty line hides nothing.
+        assert!(matches_query(&saved, ""));
+        assert!(!matches_query(&saved, "staging"));
+    }
+
+    #[test]
+    fn every_word_of_the_search_must_hit() {
+        let prod = saved_connection("prod", Some("db.internal"), Some(5432), "meerkat", "ada");
+        let staging = saved_connection("staging", Some("db.internal"), Some(5433), "meerkat", "ada");
+
+        // A second word narrows: both rows are on db.internal, only one
+        // answers to the port as well.
+        assert!(matches_query(&prod, "db.internal 5432"));
+        assert!(!matches_query(&staging, "db.internal 5432"));
+    }
+
+    fn saved_connection(
+        name: &str,
+        host: Option<&str>,
+        port: Option<u16>,
+        database: &str,
+        user: &str,
+    ) -> SavedConnection {
+        SavedConnection {
+            profile: Profile {
+                id: name.into(),
+                name: name.into(),
+                engine: Engine::Postgres,
+                host: host.map(str::to_string),
+                port,
+                database: database.into(),
+                user: Some(user.into()),
+            },
+            last_opened: None,
+            server: None,
+        }
     }
 
     #[test]

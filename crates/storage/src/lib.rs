@@ -17,15 +17,13 @@ const HISTORY_LIMIT: usize = 500;
 
 /// A saved profile plus what the connections screen remembers about it:
 /// when it was last opened, and what the last successful probe saw. The
-/// counts are cached so the screen has something to show before it has
-/// reached the server.
+/// server description is cached so the screen has something to show
+/// without reaching the server at all.
 #[derive(Debug, Clone)]
 pub struct SavedConnection {
     pub profile: Profile,
     /// Unix seconds.
     pub last_opened: Option<i64>,
-    pub tables: Option<u32>,
-    pub views: Option<u32>,
     /// Server description, as the driver reports it ("PG 16.2").
     pub server: Option<String>,
 }
@@ -137,12 +135,9 @@ impl Store {
             let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
             rows.collect::<std::result::Result<_, _>>()?
         };
-        for (column, kind) in [
-            ("last_opened", "INTEGER"),
-            ("tables", "INTEGER"),
-            ("views", "INTEGER"),
-            ("server", "TEXT"),
-        ] {
+        // `tables` and `views` were dropped from the screen; an older file
+        // keeps those columns, and nothing reads them.
+        for (column, kind) in [("last_opened", "INTEGER"), ("server", "TEXT")] {
             if !existing.iter().any(|name| name == column) {
                 self.conn
                     .execute_batch(&format!("ALTER TABLE profiles ADD COLUMN {column} {kind}"))?;
@@ -187,7 +182,7 @@ impl Store {
     pub fn list_connections(&self) -> Result<Vec<SavedConnection>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, engine, host, port, database, user,
-                    last_opened, tables, views, server
+                    last_opened, server
              FROM profiles
              ORDER BY last_opened IS NULL, last_opened DESC, name",
         )?;
@@ -203,9 +198,7 @@ impl Store {
                     user: row.get(6)?,
                 },
                 last_opened: row.get(7)?,
-                tables: row.get(8)?,
-                views: row.get(9)?,
-                server: row.get(10)?,
+                server: row.get(8)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -222,17 +215,11 @@ impl Store {
     }
 
     /// Cache what a successful probe saw, so the next launch can paint the
-    /// row before the server answers.
-    pub fn record_probe(
-        &self,
-        id: &str,
-        tables: u32,
-        views: u32,
-        server: &str,
-    ) -> Result<()> {
+    /// row without a probe of its own.
+    pub fn record_probe(&self, id: &str, server: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE profiles SET tables = ?2, views = ?3, server = ?4 WHERE id = ?1",
-            rusqlite::params![id, tables, views, server],
+            "UPDATE profiles SET server = ?2 WHERE id = ?1",
+            rusqlite::params![id, server],
         )?;
         Ok(())
     }
@@ -403,7 +390,7 @@ mod tests {
             user: Some("nick".into()),
         };
         store.save_profile(&profile).unwrap();
-        store.record_probe("p1", 14, 3, "PG 16.2").unwrap();
+        store.record_probe("p1", "PG 16.2").unwrap();
         store.mark_opened("p1", 1_700_000_000).unwrap();
 
         // Renaming the profile must not lose what the probe learned.
@@ -412,8 +399,6 @@ mod tests {
 
         let saved = store.list_connections().unwrap();
         assert_eq!(saved[0].profile.name, "Prod");
-        assert_eq!(saved[0].tables, Some(14));
-        assert_eq!(saved[0].views, Some(3));
         assert_eq!(saved[0].server.as_deref(), Some("PG 16.2"));
         assert_eq!(saved[0].last_opened, Some(1_700_000_000));
     }

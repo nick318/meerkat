@@ -33,7 +33,7 @@ impl Root {
     }
 
     fn connections(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let screen = cx.new(|cx| Connections::new(cx));
+        let screen = cx.new(|cx| Connections::new(window, cx));
         let subscription = cx.subscribe_in(&screen, window, Self::on_connections_event);
         window.focus(&screen.focus_handle(cx), cx);
         Self { screen: Screen::Connections(screen), _subscription: subscription }
