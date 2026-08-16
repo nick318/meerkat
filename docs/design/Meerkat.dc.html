@@ -32,10 +32,11 @@
       <button onClick="{{ goRow }}" style="font:500 11px/1 'JetBrains Mono',monospace;padding:6px 9px;border:0;border-radius:5px;cursor:pointer;background:transparent;color:#55514A" style-hover="background:#EDEAE3">row detail</button>
       <button onClick="{{ goQuery }}" style="font:500 11px/1 'JetBrains Mono',monospace;padding:6px 9px;border:0;border-radius:5px;cursor:pointer;background:transparent;color:#55514A" style-hover="background:#EDEAE3">query</button>
       <button onClick="{{ goHistory }}" style="font:500 11px/1 'JetBrains Mono',monospace;padding:6px 9px;border:0;border-radius:5px;cursor:pointer;background:transparent;color:#55514A" style-hover="background:#EDEAE3">history</button>
+      <button onClick="{{ togglePalette }}" style="font:500 11px/1 'JetBrains Mono',monospace;padding:6px 9px;border:0;border-radius:5px;cursor:pointer;background:transparent;color:#B4762F" style-hover="background:#EDEAE3">⌘K palette</button>
     </div>
   </div>
 
-  <div style="width:1360px;height:880px;display:flex;flex-direction:column;background:#FBFAF7;border:1px solid #DAD5C9;border-radius:11px;box-shadow:0 1px 1px rgba(33,31,27,.04),0 18px 44px -18px rgba(33,31,27,.22);overflow:hidden">
+  <div style="position:relative;width:1360px;height:880px;display:flex;flex-direction:column;background:#FBFAF7;border:1px solid #DAD5C9;border-radius:11px;box-shadow:0 1px 1px rgba(33,31,27,.04),0 18px 44px -18px rgba(33,31,27,.22);overflow:hidden">
 
     <div style="height:38px;flex:none;display:flex;align-items:center;gap:14px;padding:0 12px;border-bottom:1px solid #EAE6DC;background:#F5F3ED">
       <div style="display:flex;gap:7px">
@@ -51,7 +52,7 @@
         <span style="color:#211F1B;font-weight:500">{{ crumb }}</span>
       </div>
       <div style="display:flex;align-items:center;gap:6px">
-        <div style="font:500 10px/1 'JetBrains Mono',monospace;color:#8A857C;border:1px solid #E2DDD2;border-radius:4px;padding:4px 6px;background:#FBFAF7">⌘K</div>
+        <div onClick="{{ togglePalette }}" style="font:500 10px/1 'JetBrains Mono',monospace;color:#8A857C;border:1px solid #E2DDD2;border-radius:4px;padding:4px 6px;background:#FBFAF7;cursor:pointer" style-hover="color:#B4762F;border-color:#D6CFBF">⌘K</div>
         <div style="font:500 10px/1 'JetBrains Mono',monospace;color:#8A857C;border:1px solid #E2DDD2;border-radius:4px;padding:4px 6px;background:#FBFAF7">⌘⏎</div>
       </div>
     </div>
@@ -656,6 +657,135 @@
 
       </div>
     </div>
+
+    <sc-if value="{{ paletteOpen }}">
+      <div onClick="{{ closePalette }}" style="position:absolute;inset:0;background:rgba(52,48,42,.22);backdrop-filter:blur(1.5px);display:flex;justify-content:center;align-items:flex-start;padding-top:96px;z-index:20">
+        <div onClick="{{ stop }}" style="width:660px;display:flex;flex-direction:column;background:#FBFAF7;border:1px solid #CFC8B8;border-radius:10px;box-shadow:0 24px 60px -20px rgba(33,31,27,.4);overflow:hidden">
+
+          <div style="flex:none;display:flex;align-items:center;gap:10px;padding:13px 15px;border-bottom:1px solid #EAE6DC">
+            <div style="position:relative;width:20px;height:20px;flex:none">
+              <div style="position:absolute;left:1px;top:0;width:6px;height:6px;border-radius:50%;background:#B4762F"></div>
+              <div style="position:absolute;right:1px;top:0;width:6px;height:6px;border-radius:50%;background:#B4762F"></div>
+              <div style="position:absolute;left:2px;top:4px;width:16px;height:16px;border-radius:50% 50% 46% 46%;background:#C98B3E"></div>
+              <div style="position:absolute;left:5px;top:9px;width:3px;height:3px;border-radius:50%;background:#3B3325"></div>
+              <div style="position:absolute;left:12px;top:9px;width:3px;height:3px;border-radius:50%;background:#3B3325"></div>
+            </div>
+            <input value="{{ paletteQuery }}" onChange="{{ onPaletteInput }}" placeholder="Search tables, columns, saved queries, history…" style="flex:1;border:0;outline:0;background:transparent;font:400 14px/1 'JetBrains Mono',monospace;color:#211F1B" />
+            <span onClick="{{ closePalette }}" style="font:500 10px/1 'JetBrains Mono',monospace;color:#8A857C;border:1px solid #E2DDD2;border-radius:4px;padding:4px 6px;cursor:pointer">esc</span>
+          </div>
+
+          <div style="flex:none;display:flex;gap:3px;padding:8px 12px;border-bottom:1px solid #EDEAE2;background:#F7F5F0">
+            <div onClick="{{ setScopeAll }}" style="padding:5px 9px;border-radius:5px;background:#F0E5D2;font:500 10px/1 'JetBrains Mono',monospace;color:#8E5A1E;cursor:pointer">all</div>
+            <div onClick="{{ setScopeTables }}" style="padding:5px 9px;border-radius:5px;font:400 10px/1 'JetBrains Mono',monospace;color:#6D6862;cursor:pointer" style-hover="background:#EFEDE6">tables <span style="color:#B0AAA0">t:</span></div>
+            <div onClick="{{ setScopeColumns }}" style="padding:5px 9px;border-radius:5px;font:400 10px/1 'JetBrains Mono',monospace;color:#6D6862;cursor:pointer" style-hover="background:#EFEDE6">columns <span style="color:#B0AAA0">c:</span></div>
+            <div onClick="{{ setScopeHistory }}" style="padding:5px 9px;border-radius:5px;font:400 10px/1 'JetBrains Mono',monospace;color:#6D6862;cursor:pointer" style-hover="background:#EFEDE6">history <span style="color:#B0AAA0">h:</span></div>
+            <div onClick="{{ setScopeSaved }}" style="padding:5px 9px;border-radius:5px;font:400 10px/1 'JetBrains Mono',monospace;color:#6D6862;cursor:pointer" style-hover="background:#EFEDE6">saved <span style="color:#B0AAA0">@</span></div>
+          </div>
+
+          <div style="flex:none;height:404px;overflow:auto;padding:8px 8px 10px">
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 8px 5px">
+              <span style="font:600 9px/1 'JetBrains Mono',monospace;letter-spacing:.12em;color:#A59F93">TABLES · PUBLIC</span>
+              <span style="font:400 9px/1 'JetBrains Mono',monospace;color:#C0BAAE">4 of 14</span>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:1px">
+              <div onClick="{{ openTable }}" style="display:grid;grid-template-columns:16px 1fr 84px 96px;gap:10px;align-items:center;padding:7px 9px;border-radius:6px;background:#F0E5D2;cursor:pointer">
+                <div style="width:5px;height:5px;background:#B4762F"></div>
+                <span style="font:500 12px/1 'JetBrains Mono',monospace;color:#211F1B"><span style="background:#E7CFA3;border-radius:2px">us</span>ers</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#8A857C">18.4k rows</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#B4762F;text-align:right">open ⏎</span>
+              </div>
+              <div onClick="{{ openTable }}" style="display:grid;grid-template-columns:16px 1fr 84px 96px;gap:10px;align-items:center;padding:7px 9px;border-radius:6px;cursor:pointer" style-hover="background:#F3F1EA">
+                <div style="width:5px;height:5px;background:#CFC8B8"></div>
+                <span style="font:400 12px/1 'JetBrains Mono',monospace;color:#2E2B26"><span style="background:#EFE3CC;border-radius:2px">us</span>er_settings</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#918B80">18.4k rows</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#C0BAAE;text-align:right"></span>
+              </div>
+              <div onClick="{{ openTable }}" style="display:grid;grid-template-columns:16px 1fr 84px 96px;gap:10px;align-items:center;padding:7px 9px;border-radius:6px;cursor:pointer" style-hover="background:#F3F1EA">
+                <div style="width:5px;height:5px;background:#CFC8B8"></div>
+                <span style="font:400 12px/1 'JetBrains Mono',monospace;color:#2E2B26">acco<span style="background:#EFE3CC;border-radius:2px">us</span>tics_test</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#918B80">12 rows</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#C0BAAE;text-align:right"></span>
+              </div>
+              <div onClick="{{ openTable }}" style="display:grid;grid-template-columns:16px 1fr 84px 96px;gap:10px;align-items:center;padding:7px 9px;border-radius:6px;cursor:pointer" style-hover="background:#F3F1EA">
+                <div style="width:5px;height:5px;border-radius:50%;border:1px solid #B8B2A6"></div>
+                <span style="font:400 12px/1 'JetBrains Mono',monospace;color:#2E2B26">active_<span style="background:#EFE3CC;border-radius:2px">us</span>ers_7d</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#918B80">view</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#C0BAAE;text-align:right"></span>
+              </div>
+            </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 8px 5px">
+              <span style="font:600 9px/1 'JetBrains Mono',monospace;letter-spacing:.12em;color:#A59F93">COLUMNS</span>
+              <span style="font:400 9px/1 'JetBrains Mono',monospace;color:#C0BAAE">3</span>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:1px">
+              <div onClick="{{ openTable }}" style="display:grid;grid-template-columns:16px 1fr 84px 96px;gap:10px;align-items:center;padding:7px 9px;border-radius:6px;cursor:pointer" style-hover="background:#F3F1EA">
+                <div style="width:6px;height:1.5px;background:#CFC8B8"></div>
+                <span style="font:400 12px/1 'JetBrains Mono',monospace;color:#2E2B26">orders.<span style="background:#EFE3CC;border-radius:2px">us</span>er_id</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#918B80">int8 · fk</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#C0BAAE;text-align:right"></span>
+              </div>
+              <div onClick="{{ openTable }}" style="display:grid;grid-template-columns:16px 1fr 84px 96px;gap:10px;align-items:center;padding:7px 9px;border-radius:6px;cursor:pointer" style-hover="background:#F3F1EA">
+                <div style="width:6px;height:1.5px;background:#CFC8B8"></div>
+                <span style="font:400 12px/1 'JetBrains Mono',monospace;color:#2E2B26">sessions.<span style="background:#EFE3CC;border-radius:2px">us</span>er_agent</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#918B80">text</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#C0BAAE;text-align:right"></span>
+              </div>
+              <div onClick="{{ openTable }}" style="display:grid;grid-template-columns:16px 1fr 84px 96px;gap:10px;align-items:center;padding:7px 9px;border-radius:6px;cursor:pointer" style-hover="background:#F3F1EA">
+                <div style="width:6px;height:1.5px;background:#CFC8B8"></div>
+                <span style="font:400 12px/1 'JetBrains Mono',monospace;color:#2E2B26">audit_log.<span style="background:#EFE3CC;border-radius:2px">us</span>er_id</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#918B80">int8 · fk</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#C0BAAE;text-align:right"></span>
+              </div>
+            </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 8px 5px">
+              <span style="font:600 9px/1 'JetBrains Mono',monospace;letter-spacing:.12em;color:#A59F93">RECENT QUERIES</span>
+              <span onClick="{{ openHistory }}" style="font:400 9px/1 'JetBrains Mono',monospace;color:#B4762F;cursor:pointer">all history →</span>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:1px">
+              <div onClick="{{ openQuery }}" style="display:grid;grid-template-columns:16px 1fr 84px 96px;gap:10px;align-items:center;padding:7px 9px;border-radius:6px;cursor:pointer" style-hover="background:#F3F1EA">
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#C0BAAE">h</span>
+                <span style="font:400 11px/1 'JetBrains Mono',monospace;color:#2E2B26;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">select * from public.<span style="background:#EFE3CC;border-radius:2px">us</span>ers order by created_at desc</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#5C8A4E">34 ms</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#B0AAA0;text-align:right">today 09:12</span>
+              </div>
+              <div onClick="{{ openQuery }}" style="display:grid;grid-template-columns:16px 1fr 84px 96px;gap:10px;align-items:center;padding:7px 9px;border-radius:6px;cursor:pointer" style-hover="background:#F3F1EA">
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#C0BAAE">h</span>
+                <span style="font:400 11px/1 'JetBrains Mono',monospace;color:#2E2B26;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">select plan, count(*) from public.<span style="background:#EFE3CC;border-radius:2px">us</span>ers group by 1</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#5C8A4E">22 ms</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#B0AAA0;text-align:right">yest. 18:04</span>
+              </div>
+              <div onClick="{{ openQuery }}" style="display:grid;grid-template-columns:16px 1fr 84px 96px;gap:10px;align-items:center;padding:7px 9px;border-radius:6px;cursor:pointer" style-hover="background:#FBF6F3">
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#C0A192">h</span>
+                <span style="font:400 11px/1 'JetBrains Mono',monospace;color:#8E4A2A;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">select * from public.<span style="background:#F2DDD1;border-radius:2px">us</span>er_setings limit 100</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#A9694A">error</span>
+                <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#C0A192;text-align:right">today 08:31</span>
+              </div>
+            </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 8px 5px">
+              <span style="font:600 9px/1 'JetBrains Mono',monospace;letter-spacing:.12em;color:#A59F93">SAVED</span>
+              <span style="font:400 9px/1 'JetBrains Mono',monospace;color:#C0BAAE">1</span>
+            </div>
+            <div onClick="{{ openQuery }}" style="display:grid;grid-template-columns:16px 1fr 84px 96px;gap:10px;align-items:center;padding:7px 9px;border-radius:6px;cursor:pointer" style-hover="background:#F3F1EA">
+              <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#C0BAAE">@</span>
+              <span style="font:400 11px/1 'JetBrains Mono',monospace;color:#2E2B26">churn_query.sql <span style="color:#B0AAA0">· pro & scale, low order count</span></span>
+              <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#918B80">6 rows</span>
+              <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#B0AAA0;text-align:right">shared</span>
+            </div>
+          </div>
+
+          <div style="flex:none;display:flex;align-items:center;gap:14px;padding:9px 14px;border-top:1px solid #EAE6DC;background:#F7F5F0;font:400 10px/1 'JetBrains Mono',monospace;color:#8A857C">
+            <span>↑↓ move</span>
+            <span>⏎ open</span>
+            <span>⌘⏎ open in new tab</span>
+            <div style="flex:1"></div>
+            <span style="color:#B0AAA0">meerkat found 11 matches for “us”</span>
+          </div>
+        </div>
+      </div>
+    </sc-if>
   </div>
 
   <div style="width:1360px;display:flex;gap:10px;flex-wrap:wrap;font:400 11px/1.6 'JetBrains Mono',monospace;color:#8A857C">
@@ -666,8 +796,16 @@
 </x-dc>
 <script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1408,&quot;height&quot;:1010}}">
 class Component extends DCLogic {
-  state = { screen: "table" };
-  go(s) { return () => this.setState({ screen: s }); }
+  state = { screen: "table", palette: false, q: "us" };
+  go(s) { return () => this.setState({ screen: s, palette: false }); }
+  componentDidMount() {
+    this._key = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); this.setState(s => ({ palette: !s.palette })); }
+      if (e.key === "Escape") this.setState({ palette: false });
+    };
+    window.addEventListener("keydown", this._key);
+  }
+  componentWillUnmount() { window.removeEventListener("keydown", this._key); }
   renderVals() {
     const s = this.state.screen;
     const crumbs = { connections: "connections", table: "users", row: "users · 1041", query: "churn_query.sql", history: "history" };
@@ -682,7 +820,21 @@ class Component extends DCLogic {
       goTable: this.go("table"),
       goRow: this.go("row"),
       goQuery: this.go("query"),
-      goHistory: this.go("history")
+      goHistory: this.go("history"),
+      paletteOpen: this.state.palette,
+      paletteQuery: this.state.q,
+      onPaletteInput: (e) => this.setState({ q: e.target.value }),
+      togglePalette: () => this.setState(st => ({ palette: !st.palette })),
+      closePalette: () => this.setState({ palette: false }),
+      stop: (e) => e.stopPropagation(),
+      openTable: this.go("table"),
+      openQuery: this.go("query"),
+      openHistory: this.go("history"),
+      setScopeAll: () => this.setState({ q: "us" }),
+      setScopeTables: () => this.setState({ q: "t:us" }),
+      setScopeColumns: () => this.setState({ q: "c:us" }),
+      setScopeHistory: () => this.setState({ q: "h:us" }),
+      setScopeSaved: () => this.setState({ q: "@churn" })
     };
   }
 }

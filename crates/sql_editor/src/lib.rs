@@ -240,7 +240,7 @@ impl SqlEditor {
             focus_handle: cx.focus_handle(),
             scroll_handle: ScrollHandle::new(),
             content,
-            placeholder: "select 1".into(),
+            placeholder: "select * from".into(),
             vocabulary,
             selected_range: end..end,
             selection_reversed: false,

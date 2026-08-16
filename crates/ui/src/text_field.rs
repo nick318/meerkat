@@ -18,6 +18,7 @@ use gpui::{
     UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, size,
 };
 use std::ops::Range;
+use std::time::Duration;
 use theme::theme;
 
 actions!(
@@ -55,11 +56,17 @@ const KEY_CONTEXT: &str = "TextField";
 /// 12px text on a 18px line: the design's form rhythm.
 const FONT_SIZE: f32 = 12.;
 const LINE_HEIGHT: f32 = 18.;
+/// The same 12-on-18 rhythm, as a ratio, for a `bare` field that sets its
+/// own text size.
+const LINE_SPACING: f32 = LINE_HEIGHT / FONT_SIZE;
 /// Keep this much room to the right of the caret, so the character being
 /// typed is never flush against the field's edge.
 const CARET_MARGIN: f32 = 2.;
 /// What a masked field paints in place of every character.
 const MASK: char = '•';
+/// How long the caret stays on, and then off. macOS blinks a caret at
+/// roughly this rate, and a field that matches it reads as a real one.
+const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
 /// Key bindings for every text field. Bind these once at startup; they are
 /// scoped to the field's key context, so they never shadow the app's own
@@ -127,6 +134,14 @@ pub struct TextField {
     placeholder: SharedString,
     /// A password field paints dots and never copies its value out.
     masked: bool,
+    /// A field with no chrome of its own, at this text size. The palette's
+    /// search line sits in a header that already draws the border and the
+    /// surface, so the field must add neither.
+    bare: Option<f32>,
+    /// What the field would finish the value with, painted faint after it
+    /// and never part of the value. Whoever owns the field decides what
+    /// that is and what accepts it; the field only shows it.
+    ghost: SharedString,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -136,6 +151,17 @@ pub struct TextField {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    /// Whether the caret is in the on half of its cycle. A caret that
+    /// never goes out reads as a window that has stopped answering.
+    blink_on: bool,
+    /// Whether the field held the focus at the last paint. The blink is
+    /// started and stopped from that edge, because focus is a property of
+    /// the window and only the render pass has one.
+    was_focused: bool,
+    /// Counts the blink cycles, so a cycle that has been replaced stops
+    /// instead of fighting the one that replaced it. Typing restarts the
+    /// cycle; two of them would beat against each other.
+    blink_epoch: usize,
 }
 
 impl EventEmitter<TextFieldEvent> for TextField {}
@@ -147,6 +173,8 @@ impl TextField {
             content: String::new(),
             placeholder: placeholder.into(),
             masked: false,
+            bare: None,
+            ghost: SharedString::default(),
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -154,12 +182,23 @@ impl TextField {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            blink_on: true,
+            was_focused: false,
+            blink_epoch: 0,
         }
     }
 
     /// Paint dots in place of the value, for a password.
     pub fn masked(mut self) -> Self {
         self.masked = true;
+        self
+    }
+
+    /// Drop the border, the surface and the padding, and shape the line at
+    /// `font_size`. For a field that sits inside a surface of its own —
+    /// the palette's search line.
+    pub fn bare(mut self, font_size: f32) -> Self {
+        self.bare = Some(font_size);
         self
     }
 
@@ -182,11 +221,73 @@ impl TextField {
         self.selection_reversed = false;
         self.marked_range = None;
         cx.emit(TextFieldEvent::Changed);
-        cx.notify();
+        self.touched(cx);
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.set_text(String::new(), cx);
+    }
+
+    /// Show what the value would be finished with, faint and after the
+    /// caret. Pass an empty string to take it away.
+    ///
+    /// It is never part of the value: nothing here accepts it, reads it
+    /// back or lets the caret into it. A masked field never shows one —
+    /// a password must not be guessed at on screen.
+    pub fn set_ghost(&mut self, ghost: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let ghost = ghost.into();
+        if self.ghost == ghost {
+            return;
+        }
+        self.ghost = ghost;
+        cx.notify();
+    }
+
+    // --- the caret's blink -----------------------------------------------
+
+    /// Show the caret and start its cycle over. Called when the field
+    /// takes the focus and after every edit or motion, so the caret is
+    /// solid while the user is working and only blinks once they stop —
+    /// the way a caret behaves in every platform field.
+    fn restart_blink(&mut self, cx: &mut Context<Self>) {
+        self.blink_on = true;
+        self.blink_epoch += 1;
+        self.schedule_blink(self.blink_epoch, cx);
+    }
+
+    /// Stop the cycle and leave the caret on, for a field that has lost
+    /// the focus. An unfocused field paints no caret at all, so what
+    /// matters here is that the timer stops waking the window.
+    fn stop_blink(&mut self) {
+        self.blink_on = true;
+        self.blink_epoch += 1;
+    }
+
+    /// Turn the caret over once, then queue the next turn. The epoch is
+    /// what ends the chain: a cycle whose epoch has moved on returns
+    /// without queueing again, so the field is never left with a timer
+    /// it does not want.
+    fn schedule_blink(&mut self, epoch: usize, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(BLINK_INTERVAL).await;
+            this.update(cx, |this, cx| {
+                if this.blink_epoch != epoch {
+                    return;
+                }
+                this.blink_on = !this.blink_on;
+                cx.notify();
+                this.schedule_blink(epoch, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Redraw, and put the caret back on show. Every edit and every
+    /// motion goes through here rather than calling `cx.notify()` itself.
+    fn touched(&mut self, cx: &mut Context<Self>) {
+        self.restart_blink(cx);
+        cx.notify();
     }
 
     // --- selection -------------------------------------------------------
@@ -203,7 +304,7 @@ impl TextField {
         let offset = clamp_offset(&self.content, offset);
         self.selected_range = offset..offset;
         self.selection_reversed = false;
-        cx.notify();
+        self.touched(cx);
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -217,7 +318,7 @@ impl TextField {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
-        cx.notify();
+        self.touched(cx);
     }
 
     fn delete_to(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -598,7 +699,7 @@ impl EntityInputHandler for TextField {
         self.selection_reversed = false;
         self.marked_range.take();
         cx.emit(TextFieldEvent::Changed);
-        cx.notify();
+        self.touched(cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -636,7 +737,7 @@ impl EntityInputHandler for TextField {
             }
         };
         cx.emit(TextFieldEvent::Changed);
-        cx.notify();
+        self.touched(cx);
     }
 
     fn bounds_for_range(
@@ -679,6 +780,17 @@ impl Render for TextField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme(cx).colors.clone();
         let focused = self.focus_handle.is_focused(window);
+        // Focus belongs to the window, and this is the one place that has
+        // one, so the blink is started and stopped from the edge here
+        // rather than from a focus listener the constructor cannot install.
+        if focused != self.was_focused {
+            self.was_focused = focused;
+            if focused {
+                self.restart_blink(cx);
+            } else {
+                self.stop_blink();
+            }
+        }
 
         div()
             .key_context(KEY_CONTEXT)
@@ -714,16 +826,24 @@ impl Render for TextField {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .w_full()
-            .px(px(10.))
-            .py(px(7.))
-            .border_1()
-            // The focused field is the one wearing the accent; every other
-            // border on the screen stays a hairline.
-            .border_color(if focused { colors.accent } else { colors.border_strong })
-            .rounded(px(6.))
-            .bg(colors.elevated)
-            .text_size(px(FONT_SIZE))
-            .line_height(px(LINE_HEIGHT))
+            .map(|field| match self.bare {
+                // A bare field draws nothing of its own: the surface
+                // around it already carries the border and the padding.
+                Some(font_size) => field
+                    .text_size(px(font_size))
+                    .line_height(px(font_size * LINE_SPACING)),
+                None => field
+                    .px(px(10.))
+                    .py(px(7.))
+                    .border_1()
+                    // The focused field is the one wearing the accent;
+                    // every other border on the screen stays a hairline.
+                    .border_color(if focused { colors.accent } else { colors.border_strong })
+                    .rounded(px(6.))
+                    .bg(colors.elevated)
+                    .text_size(px(FONT_SIZE))
+                    .line_height(px(LINE_HEIGHT)),
+            })
             .text_color(colors.text_body)
             .child(FieldElement { field: cx.entity() })
     }
@@ -739,6 +859,8 @@ struct PrepaintState {
     scroll: Pixels,
     selection: Option<PaintQuad>,
     cursor: Option<PaintQuad>,
+    /// The faint suggestion, and how far along the line it starts.
+    ghost: Option<(ShapedLine, Pixels)>,
 }
 
 impl IntoElement for FieldElement {
@@ -819,9 +941,26 @@ impl Element for FieldElement {
         let selection = (!placeholder)
             .then(|| selection_quad(field, &line, origin, bounds, colors.selection))
             .flatten();
-        let cursor = cursor_quad(cursor_x + origin.x, bounds, colors.accent);
+        // The off half of the blink simply has no caret to paint.
+        let cursor = field
+            .blink_on
+            .then(|| cursor_quad(cursor_x + origin.x, bounds, colors.accent))
+            .flatten();
 
-        PrepaintState { line, scroll, selection, cursor }
+        // The ghost hangs off the end of the value, not off the caret, so
+        // it stays put while the caret walks back through the text. It is
+        // shaped after the scroll is settled and never widens it: the
+        // value is what has to stay in view, and a long suggestion must
+        // not push it out.
+        let ghost = (!placeholder && !field.masked && !field.ghost.is_empty()).then(|| {
+            let runs = single_run(&field.ghost, style.font(), colors.text_faint, None);
+            (
+                window.text_system().shape_line(field.ghost.clone(), font_size, &runs, None),
+                line.width(),
+            )
+        });
+
+        PrepaintState { line, scroll, selection, cursor, ghost }
     }
 
     fn paint(
@@ -849,6 +988,19 @@ impl Element for FieldElement {
         let origin = point(bounds.left() - prepaint.scroll, bounds.top());
         line.paint(origin, bounds.size.height, gpui::TextAlign::Left, None, window, cx)
             .ok();
+
+        if let Some((ghost, at)) = prepaint.ghost.take() {
+            ghost
+                .paint(
+                    point(origin.x + at, origin.y),
+                    bounds.size.height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                )
+                .ok();
+        }
 
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()

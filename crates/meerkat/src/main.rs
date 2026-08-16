@@ -7,9 +7,11 @@
 
 mod connections;
 mod history;
+mod palette;
 mod root;
 mod shell;
 mod sql;
+mod switcher;
 
 use gpui::{
     App, Bounds, Focusable as _, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions,
@@ -43,13 +45,20 @@ fn main() {
 
         cx.bind_keys(sql_editor::key_bindings());
         cx.bind_keys(ui::text_field_key_bindings());
+        cx.bind_keys(palette::key_bindings());
+        cx.bind_keys(switcher::key_bindings());
+        // The workspace's keys are scoped to the workspace, not bound
+        // globally, so the palette can take ⌘⏎ for itself while it is
+        // open: GPUI gives a keystroke to the binding that matched deepest
+        // in the context stack, and the palette sits inside the shell.
         cx.bind_keys([
-            KeyBinding::new("cmd-enter", shell::RunQuery, None),
-            KeyBinding::new("cmd-t", shell::NewQuery, None),
-            KeyBinding::new("cmd-r", shell::Refresh, None),
-            KeyBinding::new("cmd-y", shell::ShowHistory, None),
-            KeyBinding::new("cmd-[", shell::PrevPage, None),
-            KeyBinding::new("cmd-]", shell::NextPage, None),
+            KeyBinding::new("cmd-enter", shell::RunQuery, Some("Shell")),
+            KeyBinding::new("cmd-t", shell::NewQuery, Some("Shell")),
+            KeyBinding::new("cmd-w", shell::CloseTab, Some("Shell")),
+            KeyBinding::new("cmd-r", shell::Refresh, Some("Shell")),
+            KeyBinding::new("cmd-y", shell::ShowHistory, Some("Shell")),
+            KeyBinding::new("cmd-[", shell::PrevPage, Some("Shell")),
+            KeyBinding::new("cmd-]", shell::NextPage, Some("Shell")),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());

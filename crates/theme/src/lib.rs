@@ -4,7 +4,7 @@
 //! Default theme: "warm paper" light — JetBrains Mono throughout, hairline
 //! 1px rules, single ochre accent. From the Meerkat design comp.
 
-use gpui::{Hsla, rgb};
+use gpui::{Hsla, rgb, rgba};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Appearance {
@@ -60,6 +60,21 @@ pub struct ThemeColors {
     pub syntax_identifier: Hsla,
     /// Selected row / active list item background.
     pub selection: Hsla,
+    /// The wash behind the part of a name the ⌘K palette matched. The only
+    /// place in the app where text carries a background of its own.
+    pub match_wash: Hsla,
+    /// The same wash on the selected palette row, which already sits on
+    /// `selection` and needs a deeper mark to stay visible.
+    pub match_strong: Hsla,
+    /// The same wash inside a palette row for a run that failed, so the
+    /// mark stays warm against `error_surface`.
+    pub match_error: Hsla,
+    /// The scrim the ⌘K palette lays over the workspace. Carries alpha:
+    /// the screen behind it must stay readable.
+    pub overlay: Hsla,
+    /// The drop shadow under a floating surface (the palette). Carries
+    /// alpha; nothing else in the app is raised off the paper.
+    pub shadow: Hsla,
     /// Success / connected.
     pub ok: Hsla,
     /// A connection that is saved but not open: the sand dot.
@@ -107,6 +122,11 @@ impl Theme {
                 syntax_literal: rgb(0x5C7A4E).into(),
                 syntax_identifier: rgb(0x3F5A6B).into(),
                 selection: rgb(0xF0E5D2).into(),
+                match_wash: rgb(0xEFE3CC).into(),
+                match_strong: rgb(0xE7CFA3).into(),
+                match_error: rgb(0xF2DDD1).into(),
+                overlay: rgba(0x34302A38).into(),
+                shadow: rgba(0x211F1B66).into(),
                 ok: rgb(0x5C8A4E).into(),
                 idle: rgb(0xCFC8B8).into(),
                 error: rgb(0x8E4A2A).into(),

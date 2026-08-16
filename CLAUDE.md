@@ -12,8 +12,8 @@ read-only PostgreSQL. In-place editing and MySQL are Phase 2.
 ## Commands
 
 ```sh
-cargo run -p meerkat                                        # connections screen
-cargo run -p meerkat -- postgres://user@host:5432/database  # straight to a database
+cargo dev                                                   # connections screen
+cargo dev postgres://user@host:5432/database                # straight to a database
 cargo check --workspace
 cargo test --workspace
 cargo test -p sql_editor completion::tests                  # one crate / one module
@@ -21,6 +21,28 @@ cargo test -p meerkat pages_order_by_the_primary_key        # one test by name
 ```
 
 `MEERKAT_DATABASE_URL` works instead of the CLI argument.
+
+`cargo dev` is an alias for `cargo run -p meerkat --`, in
+`.cargo/config.toml`. Plain `cargo run -p meerkat` does the same thing.
+
+### Signing, and why the keychain keeps asking
+
+On macOS both go through `scripts/run-signed.sh`, cargo's `runner` for the
+platform, which signs the binary before launching it.
+
+A keychain item's ACL identifies an app by its code signature, and cargo's
+output is ad-hoc signed by the linker — the identity *is* the hash of the
+binary, so it changes with every build. macOS then reads each rebuild as a
+different app and asks for the login keychain password again; "Always
+Allow" trusts one binary and the next `cargo build` throws that away.
+
+Make the certificate once, in Keychain Access: Certificate Assistant →
+Create a Certificate, named `Meerkat Dev`, type "Code Signing",
+self-signed. `MEERKAT_SIGN_IDENTITY` overrides the name. With no such
+certificate the script says so and runs the binary anyway, so a fresh
+clone still works — the prompts simply carry on.
+
+The script only signs the app. Test binaries pass through it untouched.
 
 The PostgreSQL driver tests skip themselves when no server is configured, so
 `cargo test` stays green without one. To actually run them:
@@ -43,7 +65,7 @@ UI crates may depend on data crates; the reverse is forbidden. `db_postgres`,
 
 | Crate | Role |
 |---|---|
-| `meerkat` | Binary: `main.rs` boots, `root.rs` switches screens, `connections.rs` and `shell.rs` are the two screens, `history.rs` is the query-history tab, `sql.rs` builds the app's own SQL |
+| `meerkat` | Binary: `main.rs` boots, `root.rs` switches screens, `connections.rs` and `shell.rs` are the two screens, `history.rs` is the query-history tab, `palette.rs` is the ⌘K palette, `switcher.rs` is the ⌃⇥ tab switcher, `sql.rs` builds the app's own SQL |
 | `db_client` | Engine-agnostic `Connection` trait, `Profile`, `Value`, `QueryResult`, `RowChange` |
 | `db_postgres`, `db_sqlite` | sqlx drivers behind that trait |
 | `introspect` | Schema model (`Catalog` → `Schema` → `Table` → `Column`) that drivers fill |
@@ -78,6 +100,74 @@ local SQLite, not the database, so it needs no tokio bridge and no
 generation counter. `history.rs` flattens the runs into day headings plus
 runs of one height, because `uniform_list` needs one row height. Clicking
 a run opens it in a new query tab; it never re-runs behind the user.
+
+### The ⌘K palette
+
+`palette.rs` searches only what the session already holds: the `Catalog`
+the shell introspected, and the runs it read back from the local file when
+the palette opened. Nothing there hits the database, so a keystroke costs a
+substring scan, not a query. `build()` is pure — catalog and runs in, flat
+rows out — which is what makes the matching testable without a window.
+
+Matching is a case-insensitive **substring**, not a fuzzy score, and the
+comparison lowercases ASCII only. That is deliberate: `to_ascii_lowercase`
+never changes a character's byte length, so the hit's byte range into the
+lowered copy is still valid in the original, and the row can underline the
+matched characters. Rows are ranked by where the hit sits, then by name
+length.
+
+Rows are flattened into headings plus results of one height, as the
+sidebar and the history list are, because `uniform_list` needs one row
+height. `Shell::palette` owns the state; the palette is an absolutely
+positioned child of the shell, never a window of its own, so closing it
+hands the focus straight back to the workspace.
+
+A **dot in the query names a path**. Each result carries its name in parts
+— schema, relation, and a column's own name — and the typed parts line up
+with the *end* of that path first, sliding one part further out when
+nothing hit there. So `task` finds every `task`, `dev.ta` finds
+`sample_dev_sample.task`, and a bare schema name answers with the tables
+it holds. Sliding is off for columns: a bare `task` there would return
+every column of every task table.
+
+⇥ finishes the line from the selected row (`completion()`), one part at a
+time, so ⇥⇥ walks schema then relation. It **replaces** what was typed
+rather than appending, because a hit sits anywhere inside a name — `dev`
+completes to `sample_dev_sample.`. The faint hint in the field is only
+painted when the completion happens to carry on from what was typed;
+otherwise it would lie about what ⇥ does. With nothing left to finish, ⇥
+walks the scope chips instead.
+
+Everything the palette offers ends in a `Pick`: open a relation, or open a
+statement in a query tab. A statement is never re-run behind the user, for
+the same reason the history screen does not re-run one. The comp's "saved"
+scope is not implemented — the app has no saved queries yet.
+
+**Key bindings are scoped, not global.** The shell's own keys are bound to
+the `Shell` context and the palette's to `Palette`. GPUI gives a keystroke
+to the binding that matched deepest in the context stack, so ⌘⏎ runs a
+query while the shell has focus and opens a palette row in a new tab while
+the palette is open. A binding with no context is treated as the *deepest*
+match, so binding either one globally would take the key from the other.
+
+### The ⌃⇥ tab switcher
+
+`switcher.rs` is the popup ⌃⇥ walks. The tab strip paints the tabs in the
+order they were opened; the switcher walks `Shell::order`, the same tabs by
+id with the active one at the front, so one press lands on the tab used
+before this one. Every path that changes the active tab goes through
+`Shell::activate`, which is what keeps that order true.
+
+Selection **wraps**, unlike the palette's list: a switcher is a ring, and
+one press past the end is how the user comes back to where they started.
+Nothing is switched until the user commits. **Releasing ⌃ commits**, which
+is an `on_modifiers_changed` listener on the popup; ⏎ and a click on a row
+do the same, and esc leaves the active tab where it was.
+
+The popup takes the focus while it is open, so its keys — bound to the
+`Switcher` context — outrank the query editor's ⏎ and esc. ⌃⇥ itself is
+bound twice, to `Shell` as well, because it has to open the popup when
+there is none.
 
 ### Async bridge
 

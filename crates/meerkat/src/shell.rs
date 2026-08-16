@@ -12,9 +12,9 @@
 use db_client::{Connection, Profile, QueryResult};
 use db_postgres::{Label, PostgresConnection};
 use gpui::{
-    AnyElement, App, Context, Div, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, SharedString, Stateful, UniformListScrollHandle, Window, actions, div, prelude::*,
-    px, uniform_list,
+    AnyElement, App, BoxShadow, Context, Div, ElementId, Entity, EventEmitter, FocusHandle,
+    Focusable, FontWeight, ModifiersChangedEvent, ScrollStrategy, SharedString, Stateful,
+    Subscription, UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
 };
 use introspect::{Catalog, Table, TableKind};
 use results_grid::{GridData, GridState, grid};
@@ -22,15 +22,20 @@ use sql_editor::{Kind, Name, SqlEditor, Vocabulary};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
-use storage::{HistoryFilter, NewRun, RunSource, Store};
+use storage::{HistoryFilter, NewRun, QueryRun, RunSource, Store};
 use theme::{FONT_FAMILY, ThemeColors, theme};
-use ui::{accent_button, card, format_count, format_millis, section_label, status_dot, table_glyph};
+use ui::{
+    TextField, TextFieldEvent, accent_button, card, format_count, format_millis, meerkat_mark,
+    section_label, status_dot, table_glyph,
+};
 
 use crate::connections::unix_now;
 use crate::history::{self, HistoryRow, OnOpenRun};
+use crate::palette::{self, OnPick, Pick, Scope};
 use crate::sql::{PAGE_SIZE, page_query};
+use crate::switcher::{self, Entry};
 
-actions!(meerkat, [RunQuery, NewQuery, Refresh, PrevPage, NextPage, ShowHistory]);
+actions!(meerkat, [RunQuery, NewQuery, CloseTab, Refresh, PrevPage, NextPage, ShowHistory]);
 
 const SIDEBAR_WIDTH: f32 = 246.;
 const EDITOR_HEIGHT: f32 = 250.;
@@ -58,6 +63,9 @@ pub struct Shell {
     label: Option<Label>,
     tabs: Vec<Tab>,
     active: usize,
+    /// The same tabs by id, most recently used first. The strip paints the
+    /// order they were opened in; ⌃⇥ walks this one.
+    order: Vec<u64>,
     next_id: u64,
     /// The local file that remembers what this session ran. `None` when
     /// it could not be opened; the history screen then says so instead of
@@ -68,6 +76,48 @@ pub struct Shell {
     /// built from the URL the app was started with. A password never
     /// reaches it.
     scope: String,
+    /// The ⌘K palette, while it is open. It lives on the shell rather than
+    /// in a window of its own, so closing it cannot leave the workspace
+    /// without focus.
+    palette: Option<Palette>,
+    /// The ⌃⇥ tab switcher, while it is open. It lives beside the palette,
+    /// and for the same reason.
+    switcher: Option<Switcher>,
+}
+
+/// The open switcher: the tabs it walks, frozen when it opened, and where
+/// the selection sits in them. Nothing is switched until the user commits,
+/// so the shell's own `active` is untouched until then.
+struct Switcher {
+    /// The popup holds the focus while it is open, so its keys — ⏎, esc
+    /// and ⌃⇥ itself — outrank the query editor's.
+    focus_handle: FocusHandle,
+    /// Tab ids, most recently used first, as they were when it opened. It
+    /// must not re-sort under the user mid-walk.
+    order: Vec<u64>,
+    selected: usize,
+    scroll: UniformListScrollHandle,
+}
+
+/// The open palette: what was typed, what it found, and where the
+/// selection is.
+struct Palette {
+    query: Entity<TextField>,
+    /// The scope chip that is lit. A `t:` typed into the line overrides it
+    /// for as long as it is there.
+    chip: Scope,
+    /// This connection's runs, read from the local file once when the
+    /// palette opened. Searching them again per keystroke is a filter over
+    /// this vector, not another read.
+    runs: Rc<Vec<QueryRun>>,
+    rows: Rc<Vec<palette::Row>>,
+    /// How many results matched before the section caps cut the list.
+    matches: usize,
+    /// Index into `rows` of the selected result. It always points at a
+    /// result, never at a heading.
+    selected: usize,
+    scroll: UniformListScrollHandle,
+    _subscriptions: Vec<Subscription>,
 }
 
 /// What the workspace was opened on: a URL from the command line, or a
@@ -187,10 +237,13 @@ impl Shell {
             label: None,
             tabs: Vec::new(),
             active: 0,
+            order: Vec::new(),
             next_id: 1,
             store,
             store_error,
             scope: scope_of(&target),
+            palette: None,
+            switcher: None,
         };
         shell.connect(target, cx);
         shell
@@ -257,11 +310,26 @@ impl Shell {
     }
 
     fn open_table(&mut self, schema: String, table: String, cx: &mut Context<Self>) {
-        if let Some(ix) = self.tabs.iter().position(|tab| match tab {
-            Tab::Table(t) => t.schema == schema && t.table == table,
-            Tab::Query(_) | Tab::History(_) => false,
-        }) {
-            self.active = ix;
+        self.open_table_in(schema, table, false, cx);
+    }
+
+    /// Open a table, or focus the tab that already holds it. `new_tab` is
+    /// the palette's ⌘⏎: give me another view of this one, so two pages of
+    /// the same table can sit side by side.
+    fn open_table_in(
+        &mut self,
+        schema: String,
+        table: String,
+        new_tab: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !new_tab
+            && let Some(ix) = self.tabs.iter().position(|tab| match tab {
+                Tab::Table(t) => t.schema == schema && t.table == table,
+                Tab::Query(_) | Tab::History(_) => false,
+            })
+        {
+            self.activate(ix);
             cx.notify();
             return;
         }
@@ -288,7 +356,7 @@ impl Shell {
             scroll: GridState::new(),
             generation: 0,
         }));
-        self.active = self.tabs.len() - 1;
+        self.activate(self.tabs.len() - 1);
         self.load_page(id, 0, cx);
     }
 
@@ -353,7 +421,7 @@ impl Shell {
     }
 
     fn new_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_query_with("select 1 as x, now() as t", window, cx);
+        self.new_query_with("select * from ", window, cx);
     }
 
     /// Open a query tab on a statement. The history screen opens a run
@@ -377,7 +445,7 @@ impl Shell {
             scroll: GridState::new(),
             generation: 0,
         }));
-        self.active = self.tabs.len() - 1;
+        self.activate(self.tabs.len() - 1);
         cx.notify();
     }
 
@@ -463,7 +531,7 @@ impl Shell {
     /// history tab is enough: it is a view of one file, not of a query.
     fn open_history(&mut self, cx: &mut Context<Self>) {
         if let Some(ix) = self.tabs.iter().position(|tab| matches!(tab, Tab::History(_))) {
-            self.active = ix;
+            self.activate(ix);
             let id = self.tabs[ix].id();
             self.load_history(id, cx);
             return;
@@ -478,7 +546,7 @@ impl Shell {
             error: None,
             scroll: UniformListScrollHandle::new(),
         }));
-        self.active = self.tabs.len() - 1;
+        self.activate(self.tabs.len() - 1);
         self.load_history(id, cx);
     }
 
@@ -544,11 +612,300 @@ impl Shell {
         self.load_history(tab_id, cx);
     }
 
-    fn close_tab(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+    // --- the ⌘K palette --------------------------------------------------
+
+    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            self.close_palette(window, cx);
+        } else {
+            self.open_palette(window, cx);
+        }
+    }
+
+    /// Open the palette on everything the session already holds: the
+    /// catalog it introspected, and the runs it reads back here. Reading
+    /// the runs is a local SQLite call, so it stays on this thread — the
+    /// tokio bridge is for the database, not for the file beside it.
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = cx.new(|cx| {
+            TextField::new("Search tables, columns and history…", cx)
+                .bare(palette::INPUT_FONT_SIZE)
+        });
+        let subscriptions = vec![cx.subscribe_in(&query, window, Self::on_palette_event)];
+        window.focus(&query.focus_handle(cx), cx);
+
+        let runs = self
+            .store
+            .as_ref()
+            .and_then(|store| store.list_history(&self.scope, HistoryFilter::default()).ok())
+            .unwrap_or_default();
+
+        self.palette = Some(Palette {
+            query,
+            chip: Scope::All,
+            runs: Rc::new(runs),
+            rows: Rc::new(Vec::new()),
+            matches: 0,
+            selected: 0,
+            scroll: UniformListScrollHandle::new(),
+            _subscriptions: subscriptions,
+        });
+        self.rebuild_palette(cx);
+    }
+
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette = None;
+        // The workspace must take the focus back, or the key bindings have
+        // nowhere to dispatch once the palette is gone.
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Search again and keep the selection on a result. The rows change
+    /// under the selection with every keystroke, so it goes back to the
+    /// first result rather than trying to follow what was there before.
+    fn rebuild_palette(&mut self, cx: &mut Context<Self>) {
+        let Some(palette) = &self.palette else { return };
+        let typed = palette.query.read(cx).text().to_string();
+        let (scope, needle) = palette::parse(&typed, palette.chip);
+        let found = palette::build(
+            self.catalog.as_ref(),
+            &palette.runs,
+            scope,
+            needle,
+            history::today(),
+        );
+
+        let Some(palette) = &mut self.palette else { return };
+        palette.selected = found.rows.iter().position(|row| row.pick().is_some()).unwrap_or(0);
+        palette.rows = Rc::new(found.rows);
+        palette.matches = found.matches;
+        palette.scroll.scroll_to_item(palette.selected, ScrollStrategy::Top);
+        self.update_ghost(cx);
+        cx.notify();
+    }
+
+    /// Show what ⇥ would finish the line with, faint and after the caret.
+    ///
+    /// Only when the completion carries on from what was typed. A hit
+    /// sits anywhere in a name, so accepting one often rewrites the line
+    /// instead of extending it — and a hint that says otherwise lies.
+    fn update_ghost(&mut self, cx: &mut Context<Self>) {
+        let Some(palette) = &self.palette else { return };
+        let typed = palette.query.read(cx).text().to_string();
+        let (_, needle) = palette::parse(&typed, palette.chip);
+        let ghost = palette::completion(&palette.rows, palette.selected, needle)
+            .and_then(|completed| completed.strip_prefix(needle).map(str::to_string))
+            .unwrap_or_default();
+        palette.query.update(cx, |field, cx| field.set_ghost(ghost, cx));
+    }
+
+    /// Take the selected row's real name into the search line, so the next
+    /// thing typed narrows inside it. Reports whether there was anything
+    /// to take.
+    fn complete_palette(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(palette) = &self.palette else { return false };
+        let typed = palette.query.read(cx).text().to_string();
+        let (_, needle) = palette::parse(&typed, palette.chip);
+        let Some(completed) = palette::completion(&palette.rows, palette.selected, needle) else {
+            return false;
+        };
+        // Whatever came before the needle — a `t:` and any space after it
+        // — is the user's and stays.
+        let kept = &typed[..typed.len() - needle.len()];
+        let line = format!("{kept}{completed}");
+        // Setting the text emits `Changed`, which searches again, so the
+        // list is already following the completed line by the time this
+        // returns.
+        palette.query.update(cx, |field, cx| field.set_text(line, cx));
+        true
+    }
+
+    /// Move the selection to the next result in that direction, stepping
+    /// over the headings. It stops at the ends rather than wrapping: a
+    /// list that jumps back to the top loses the reader's place.
+    fn step_palette(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(palette) = &mut self.palette else { return };
+        let mut ix = palette.selected;
+        loop {
+            let next = if forward { ix + 1 } else { ix.checked_sub(1).unwrap_or(usize::MAX) };
+            let Some(row) = palette.rows.get(next) else { return };
+            ix = next;
+            if row.pick().is_some() {
+                break;
+            }
+        }
+        palette.selected = ix;
+        palette.scroll.scroll_to_item(ix, ScrollStrategy::Center);
+        // ⇥ finishes the line from the selection, so moving it changes
+        // what the hint offers.
+        self.update_ghost(cx);
+        cx.notify();
+    }
+
+    fn set_palette_scope(&mut self, chip: Scope, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(palette) = &mut self.palette else { return };
+        palette.chip = chip;
+        // A chip is only meaningful while the line has the focus.
+        let query = palette.query.clone();
+        window.focus(&query.focus_handle(cx), cx);
+        self.rebuild_palette(cx);
+    }
+
+    /// Open what the selection points at.
+    fn open_palette_selection(&mut self, new_tab: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(palette) = &self.palette else { return };
+        let Some(pick) = palette.rows.get(palette.selected).and_then(|row| row.pick()) else {
+            return;
+        };
+        self.open_pick(pick, new_tab, window, cx);
+    }
+
+    fn open_pick(&mut self, pick: Pick, new_tab: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // The palette closes first, so the tab it opens is the thing that
+        // holds the focus afterwards.
+        self.close_palette(window, cx);
+        match pick {
+            Pick::Table { schema, table } => self.open_table_in(schema, table, new_tab, cx),
+            // A run comes back editable, never re-run behind the user, for
+            // the same reason the history screen opens one that way.
+            Pick::Query(statement) => self.new_query_with(&statement, window, cx),
+        }
+    }
+
+    fn on_palette_event(
+        &mut self,
+        _field: &Entity<TextField>,
+        event: &TextFieldEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TextFieldEvent::Changed => self.rebuild_palette(cx),
+            TextFieldEvent::Submit => self.open_palette_selection(false, window, cx),
+            TextFieldEvent::Cancel => self.close_palette(window, cx),
+            // Tab finishes the line from the selected row. With nothing
+            // left to finish it walks the scope chips instead, the way it
+            // walks the fields of the connection form.
+            TextFieldEvent::NextField => {
+                if self.complete_palette(cx) {
+                    return;
+                }
+                let Some(palette) = &self.palette else { return };
+                let here = Scope::ALL.iter().position(|scope| *scope == palette.chip).unwrap_or(0);
+                let next = Scope::ALL[(here + 1) % Scope::ALL.len()];
+                self.set_palette_scope(next, window, cx);
+            }
+        }
+    }
+
+    // --- the ⌃⇥ tab switcher ---------------------------------------------
+
+    /// Move the switcher's selection, opening it on the active tab first
+    /// when it is closed. One press therefore lands on the tab used before
+    /// this one, which is what ⌃⇥ means everywhere else.
+    ///
+    /// It stays out of the way while the palette is up: that dialog is
+    /// already the one taking keys.
+    fn step_switcher(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            return;
+        }
+        if self.switcher.is_none() {
+            // With one tab there is nothing to switch to, and a popup
+            // saying so would only be in the way.
+            if self.tabs.len() < 2 {
+                return;
+            }
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle, cx);
+            self.switcher = Some(Switcher {
+                focus_handle,
+                order: self.order.clone(),
+                selected: 0,
+                scroll: UniformListScrollHandle::new(),
+            });
+        }
+        let Some(switcher) = &mut self.switcher else { return };
+        switcher.selected = switcher::step(switcher.order.len(), switcher.selected, forward);
+        switcher.scroll.scroll_to_item(switcher.selected, ScrollStrategy::Center);
+        cx.notify();
+    }
+
+    /// Switch to the selected tab and close the popup. Releasing ⌃ ends up
+    /// here, as ⏎ and a click on a row do.
+    fn confirm_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(switcher) = self.switcher.take() else { return };
+        let picked = switcher.order.get(switcher.selected).copied();
+        if let Some(ix) = picked.and_then(|id| self.tabs.iter().position(|tab| tab.id() == id)) {
+            self.activate(ix);
+        }
+        self.focus_active_tab(window, cx);
+        cx.notify();
+    }
+
+    /// Leave the active tab where it was.
+    fn cancel_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher.take().is_none() {
+            return;
+        }
+        self.focus_active_tab(window, cx);
+        cx.notify();
+    }
+
+    /// The open tabs in the order the switcher walks them, ready to paint.
+    fn switcher_entries(&self, switcher: &Switcher) -> Vec<Entry> {
+        switcher
+            .order
+            .iter()
+            .filter_map(|id| self.tabs.iter().find(|tab| tab.id() == *id))
+            .map(|tab| Entry {
+                id: tab.id(),
+                title: tab.title(),
+                detail: match tab {
+                    Tab::Table(tab) if tab.kind == TableKind::View => "view".into(),
+                    Tab::Table(_) => "table".into(),
+                    Tab::Query(_) => "query".into(),
+                    Tab::History(_) => "history".into(),
+                },
+                table: matches!(tab, Tab::Table(tab) if tab.kind == TableKind::Table),
+            })
+            .collect()
+    }
+
+    /// Close one tab and hand the focus to whatever takes its place. The
+    /// active index counts tabs, not ids, so closing a tab to the left of
+    /// the active one has to walk it back or the selection jumps.
+    fn close_tab(&mut self, tab_id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.tabs.iter().position(|tab| tab.id() == tab_id) else { return };
         self.tabs.remove(ix);
-        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        switcher::forget(&mut self.order, tab_id);
+        if ix < self.active {
+            self.active -= 1;
+        }
+        self.activate(self.active.min(self.tabs.len().saturating_sub(1)));
+        self.focus_active_tab(window, cx);
         cx.notify();
+    }
+
+    /// Make one tab the active one, and remember that it was the last one
+    /// used. Every path that changes the active tab goes through here, or
+    /// ⌃⇥ walks an order that does not match the session.
+    fn activate(&mut self, ix: usize) {
+        let Some(tab) = self.tabs.get(ix) else { return };
+        let id = tab.id();
+        self.active = ix;
+        switcher::touch(&mut self.order, id);
+    }
+
+    /// A query tab types into its editor, so it wants the focus itself;
+    /// everything else leaves it on the shell, where the shell's own keys
+    /// are bound.
+    fn focus_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.tabs.get(self.active) {
+            Some(Tab::Query(tab)) => window.focus(&tab.editor.focus_handle(cx), cx),
+            _ => window.focus(&self.focus_handle, cx),
+        }
     }
 
     fn step_page(&mut self, forward: bool, cx: &mut Context<Self>) {
@@ -609,6 +966,12 @@ impl Shell {
         self.new_query(window, cx);
     }
 
+    fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let id = tab.id();
+        self.close_tab(id, window, cx);
+    }
+
     fn on_refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
         self.refresh_active(cx);
     }
@@ -623,6 +986,68 @@ impl Shell {
 
     fn on_show_history(&mut self, _: &ShowHistory, _: &mut Window, cx: &mut Context<Self>) {
         self.open_history(cx);
+    }
+
+    fn on_toggle_palette(
+        &mut self,
+        _: &palette::Toggle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_palette(window, cx);
+    }
+
+    fn on_palette_prev(&mut self, _: &palette::SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_palette(false, cx);
+    }
+
+    fn on_palette_next(&mut self, _: &palette::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_palette(true, cx);
+    }
+
+    fn on_palette_new_tab(
+        &mut self,
+        _: &palette::OpenInNewTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_palette_selection(true, window, cx);
+    }
+
+    fn on_switcher_next(
+        &mut self,
+        _: &switcher::Next,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.step_switcher(true, window, cx);
+    }
+
+    fn on_switcher_prev(
+        &mut self,
+        _: &switcher::Prev,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.step_switcher(false, window, cx);
+    }
+
+    fn on_switcher_confirm(
+        &mut self,
+        _: &switcher::Confirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm_switcher(window, cx);
+    }
+
+    fn on_switcher_cancel(
+        &mut self,
+        _: &switcher::Cancel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_switcher(window, cx);
     }
 }
 
@@ -761,10 +1186,15 @@ impl Render for Shell {
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::on_run_query))
             .on_action(cx.listener(Self::on_new_query))
+            .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_refresh))
             .on_action(cx.listener(Self::on_prev_page))
             .on_action(cx.listener(Self::on_next_page))
             .on_action(cx.listener(Self::on_show_history))
+            .on_action(cx.listener(Self::on_toggle_palette))
+            .on_action(cx.listener(Self::on_switcher_next))
+            .on_action(cx.listener(Self::on_switcher_prev))
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -789,6 +1219,8 @@ impl Render for Shell {
                             .child(self.status_strip(&colors, cx)),
                     ),
             )
+            .children(self.palette_overlay(&colors, cx))
+            .children(self.switcher_overlay(&colors, cx))
     }
 }
 
@@ -857,19 +1289,19 @@ impl Shell {
                     .child("‹ connections"),
             )
             .child(trail)
+            // The way into the palette, where the comp puts it: beside the
+            // ⌘⏎ badge, and clickable, because a badge that only tells you
+            // about a shortcut is a badge that teaches nothing.
             .child(
-                div()
-                    .px(px(6.))
-                    .py(px(4.))
-                    .border_1()
-                    .border_color(colors.border_strong)
-                    .rounded(px(4.))
-                    .bg(colors.window)
-                    .text_size(px(10.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(colors.text_muted)
-                    .child("⌘⏎"),
+                key_badge("⌘K", colors)
+                    .id("open-palette")
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(colors.accent).border_color(colors.text_faint))
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.toggle_palette(window, cx)
+                    })),
             )
+            .child(key_badge("⌘⏎", colors))
     }
 
     fn database_name(&self) -> SharedString {
@@ -1051,7 +1483,7 @@ impl Shell {
                 .border_color(colors.border)
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _event, window, cx| {
-                    this.active = ix;
+                    this.activate(ix);
                     if let Some(Tab::Query(tab)) = this.tabs.get(ix) {
                         window.focus(&tab.editor.focus_handle(cx), cx);
                     }
@@ -1079,8 +1511,8 @@ impl Shell {
                         .text_color(colors.text_faint)
                         .cursor_pointer()
                         .hover(|s| s.text_color(colors.error))
-                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                            this.close_tab(id, cx);
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            this.close_tab(id, window, cx);
                         }))
                         .child("×"),
                 );
@@ -1511,6 +1943,339 @@ impl Shell {
             }))
     }
 
+    /// The palette, over everything. It is an absolutely positioned child
+    /// of the shell rather than a window of its own, so it cannot outlive
+    /// the workspace it searches, and closing it hands the focus straight
+    /// back.
+    fn palette_overlay(
+        &self,
+        colors: &ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        let palette = self.palette.as_ref()?;
+
+        Some(
+            div()
+                .id("palette-scrim")
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .size_full()
+                .flex()
+                .justify_center()
+                .items_start()
+                .pt(px(palette::TOP_MARGIN))
+                .bg(colors.overlay)
+                // Nothing behind the scrim may be clicked or hovered
+                // through it, or the grid reacts to a click meant to
+                // dismiss the palette.
+                .occlude()
+                .on_click(cx.listener(|this, _event, window, cx| this.close_palette(window, cx)))
+                .child(
+                    div()
+                        .id("palette")
+                        .key_context(palette::KEY_CONTEXT)
+                        .on_action(cx.listener(Self::on_palette_prev))
+                        .on_action(cx.listener(Self::on_palette_next))
+                        .on_action(cx.listener(Self::on_palette_new_tab))
+                        // A click inside the dialog is not a click on the
+                        // scrim, so it must not close it.
+                        .occlude()
+                        .w(px(palette::WIDTH))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(colors.border_strong)
+                        .rounded(px(10.))
+                        .bg(colors.elevated)
+                        .shadow(vec![
+                            BoxShadow::new(px(0.), px(24.), colors.shadow)
+                                .blur_radius(px(60.))
+                                .spread_radius(px(-20.)),
+                        ])
+                        .child(self.palette_header(palette, colors, cx))
+                        .child(self.palette_chips(palette, colors, cx))
+                        .child(self.palette_list(palette, colors, cx))
+                        .child(self.palette_footer(palette, colors, cx)),
+                ),
+        )
+    }
+
+    fn palette_header(&self, palette: &Palette, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(15.))
+            .py(px(13.))
+            .border_b_1()
+            .border_color(colors.border)
+            .child(meerkat_mark(20., cx))
+            .child(div().flex_1().min_w(px(0.)).child(palette.query.clone()))
+            .child(
+                key_badge("esc", colors)
+                    .id("close-palette")
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(colors.accent))
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.close_palette(window, cx)
+                    })),
+            )
+    }
+
+    fn palette_chips(&self, palette: &Palette, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
+        // The chip that is lit is the one the search is actually running
+        // in, so a typed `t:` lights the tables chip too.
+        let (scope, _) = palette::parse(palette.query.read(cx).text(), palette.chip);
+        let mut row = div()
+            .flex_none()
+            .flex()
+            .gap(px(3.))
+            .px(px(12.))
+            .py(px(8.))
+            .border_b_1()
+            .border_color(colors.hairline)
+            .bg(colors.panel);
+        for chip in Scope::ALL {
+            row = row.child(palette::scope_chip(chip, chip == scope, colors).on_click(
+                cx.listener(move |this, _event, window, cx| {
+                    this.set_palette_scope(chip, window, cx)
+                }),
+            ));
+        }
+        row
+    }
+
+    fn palette_list(&self, palette: &Palette, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
+        if palette.rows.is_empty() {
+            return div()
+                .h(px(palette::LIST_HEIGHT))
+                .flex_none()
+                .px(px(17.))
+                .pt(px(14.))
+                .text_size(px(11.))
+                .text_color(colors.text_faint)
+                .child(if self.catalog.is_some() {
+                    "nothing here goes by that name"
+                } else {
+                    "reading the catalog…"
+                });
+        }
+
+        let rows = palette.rows.clone();
+        let selected = palette.selected;
+        let on_pick: OnPick = {
+            let shell = cx.entity().downgrade();
+            Rc::new(move |pick, new_tab, window, cx| {
+                shell
+                    .update(cx, |shell: &mut Shell, cx| {
+                        shell.open_pick(pick, new_tab, window, cx)
+                    })
+                    .ok();
+            })
+        };
+
+        let mut list = uniform_list("palette-rows", rows.len(), move |range, _window, cx| {
+            let colors = theme(cx).colors.clone();
+            range
+                .map(|ix| {
+                    palette::palette_row(ix, &rows[ix], ix == selected, &on_pick, &colors, cx)
+                })
+                .collect::<Vec<_>>()
+        });
+        list.style().restrict_scroll_to_axis = Some(true);
+
+        div()
+            .h(px(palette::LIST_HEIGHT))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .px(px(8.))
+            .py(px(8.))
+            .child(list.track_scroll(&palette.scroll).flex_1().min_h(px(0.)))
+    }
+
+    fn palette_footer(&self, palette: &Palette, colors: &ThemeColors, cx: &App) -> Div {
+        let hint = |keys: &'static str, what: &'static str| {
+            div()
+                .flex()
+                .gap(px(5.))
+                .child(div().text_color(colors.text_secondary).child(keys))
+                .child(what)
+        };
+        let (_, needle) = palette::parse(palette.query.read(cx).text(), palette.chip);
+        // What the search found, in the comp's own words. With nothing
+        // typed there is no count worth saying, only what to do next.
+        let found = match (needle.is_empty(), palette.matches) {
+            (true, _) => "type to search tables, columns and history".to_string(),
+            (false, 0) => format!("meerkat found nothing for “{needle}”"),
+            (false, 1) => format!("meerkat found 1 match for “{needle}”"),
+            (false, n) => format!("meerkat found {n} matches for “{needle}”"),
+        };
+
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(14.))
+            .px(px(14.))
+            .py(px(9.))
+            .border_t_1()
+            .border_color(colors.border)
+            .bg(colors.panel)
+            .text_size(px(10.))
+            .text_color(colors.text_muted)
+            .child(hint("↑↓", "move"))
+            .child(hint("⇥", "complete"))
+            .child(hint("⏎", "open"))
+            .child(hint("⌘⏎", "new tab"))
+            .child(div().flex_1())
+            .child(div().text_color(colors.text_faint).truncate().child(found))
+    }
+
+    /// The ⌃⇥ switcher, over everything. It takes the focus while it is
+    /// open — that is what lets ⏎ and esc reach it rather than the query
+    /// editor — and hands it back to the tab it settles on.
+    fn switcher_overlay(
+        &self,
+        colors: &ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        let switcher = self.switcher.as_ref()?;
+        let entries = Rc::new(self.switcher_entries(switcher));
+        if entries.is_empty() {
+            return None;
+        }
+        let selected = switcher.selected;
+        let height = (entries.len() as f32 * switcher::ROW_HEIGHT).min(switcher::MAX_LIST_HEIGHT);
+
+        let on_pick: switcher::OnPick = {
+            let shell = cx.entity().downgrade();
+            Rc::new(move |id, window, cx| {
+                shell
+                    .update(cx, |shell: &mut Shell, cx| {
+                        if let Some(ix) = shell.tabs.iter().position(|tab| tab.id() == id) {
+                            shell.switcher = None;
+                            shell.activate(ix);
+                            shell.focus_active_tab(window, cx);
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+            })
+        };
+
+        let rows = entries.clone();
+        let mut list = uniform_list("switcher-rows", entries.len(), move |range, _window, cx| {
+            let colors = theme(cx).colors.clone();
+            range
+                .map(|ix| {
+                    switcher::switcher_row(ix, &rows[ix], ix == selected, &on_pick, &colors, cx)
+                })
+                .collect::<Vec<_>>()
+        });
+        list.style().restrict_scroll_to_axis = Some(true);
+
+        Some(
+            div()
+                .id("switcher-scrim")
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .size_full()
+                .flex()
+                .justify_center()
+                .items_start()
+                .pt(px(switcher::TOP_MARGIN))
+                .bg(colors.overlay)
+                // Nothing behind the scrim may be clicked through it.
+                .occlude()
+                .on_click(cx.listener(|this, _event, window, cx| this.cancel_switcher(window, cx)))
+                .child(
+                    div()
+                        .id("switcher")
+                        .key_context(switcher::KEY_CONTEXT)
+                        .track_focus(&switcher.focus_handle)
+                        .on_action(cx.listener(Self::on_switcher_next))
+                        .on_action(cx.listener(Self::on_switcher_prev))
+                        .on_action(cx.listener(Self::on_switcher_confirm))
+                        .on_action(cx.listener(Self::on_switcher_cancel))
+                        // Letting ⌃ go is what commits, the way it does in
+                        // every other tab switcher.
+                        .on_modifiers_changed(cx.listener(
+                            |this, event: &ModifiersChangedEvent, window, cx| {
+                                if !event.modifiers.control {
+                                    this.confirm_switcher(window, cx);
+                                }
+                            },
+                        ))
+                        .occlude()
+                        .w(px(switcher::WIDTH))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(colors.border_strong)
+                        .rounded(px(10.))
+                        .bg(colors.elevated)
+                        .shadow(vec![
+                            BoxShadow::new(px(0.), px(24.), colors.shadow)
+                                .blur_radius(px(60.))
+                                .spread_radius(px(-20.)),
+                        ])
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(15.))
+                                .py(px(10.))
+                                .border_b_1()
+                                .border_color(colors.border)
+                                .child(section_label("OPEN TABS", cx)),
+                        )
+                        .child(
+                            div()
+                                .h(px(height))
+                                .flex_none()
+                                .flex()
+                                .flex_col()
+                                .px(px(8.))
+                                .py(px(8.))
+                                .child(
+                                    list.track_scroll(&switcher.scroll).flex_1().min_h(px(0.)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(14.))
+                                .px(px(14.))
+                                .py(px(9.))
+                                .border_t_1()
+                                .border_color(colors.border)
+                                .bg(colors.panel)
+                                .text_size(px(10.))
+                                .text_color(colors.text_muted)
+                                .child("⌃⇥ next")
+                                .child("⌃⇧⇥ back")
+                                .child("release ⌃ to switch")
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .text_color(colors.text_faint)
+                                        .child(match entries.len() {
+                                            1 => "1 tab".to_string(),
+                                            n => format!("{n} tabs"),
+                                        }),
+                                ),
+                        ),
+                ),
+        )
+    }
+
     fn page_link(
         &self,
         label: &'static str,
@@ -1635,6 +2400,22 @@ fn catalog_row(
             }
         }
     }
+}
+
+/// A keystroke, in the bordered pill the comp puts one in.
+fn key_badge(keys: &'static str, colors: &ThemeColors) -> Div {
+    div()
+        .flex_none()
+        .px(px(6.))
+        .py(px(4.))
+        .border_1()
+        .border_color(colors.border_strong)
+        .rounded(px(4.))
+        .bg(colors.window)
+        .text_size(px(10.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(colors.text_muted)
+        .child(keys)
 }
 
 /// The design's error tone: warm surface, warm border, warm text.

@@ -723,6 +723,7 @@ fn shortcuts(colors: &ThemeColors, cx: &App) -> Div {
                 .text_size(px(11.))
                 .text_color(colors.text_secondary)
                 .child(line("new query", "⌘T"))
+                .child(line("close tab", "⌘W"))
                 .child(line("run query", "⌘⏎"))
                 .child(line("refresh", "⌘R"))
                 .child(line("page back / forward", "⌘[ ⌘]")),

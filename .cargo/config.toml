@@ -1,0 +1,13 @@
+# `cargo dev postgres://...` builds, signs and launches the app.
+[alias]
+dev = ["run", "-p", "meerkat", "--"]
+
+# Everything cargo runs on macOS goes through the wrapper, so a plain
+# `cargo run -p meerkat` is signed as well. The script only signs the app
+# itself and passes test binaries straight through. See scripts/run-signed.sh
+# for why an unsigned binary makes the keychain ask on every rebuild.
+#
+# The path holds a separator, so cargo resolves it against this file's
+# directory rather than the shell's.
+[target.'cfg(target_os = "macos")']
+runner = "scripts/run-signed.sh"
