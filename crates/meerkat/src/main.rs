@@ -64,7 +64,6 @@ fn main() {
             KeyBinding::new("ctrl-shift-tab", shell::PrevTab, Some("Shell")),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
-        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
 
         let bounds = Bounds::centered(None, size(px(1360.), px(880.)), cx);
         let window = cx
@@ -80,12 +79,25 @@ fn main() {
                 |window, cx| cx.new(|cx| Root::new(target.clone(), window, cx)),
             )
             .expect("failed to open the main window");
+        let window_handle = window;
+
+        // A session's tabs are written back as they change, but the last
+        // keystrokes in an editor are not: ⌘Q and the window's close
+        // button both drop the shell, so each one saves on the way out.
+        cx.on_action(move |_: &Quit, cx: &mut App| {
+            window.update(cx, |root, _window, cx| root.remember(cx)).ok();
+            cx.quit();
+        });
 
         // The screen must hold focus from the first frame, or the key
         // bindings above have nowhere to dispatch.
         window
             .update(cx, |root, window, cx| {
                 window.focus(&root.focus_handle(cx), cx);
+                window.on_window_should_close(cx, move |_window, cx| {
+                    window_handle.update(cx, |root, _window, cx| root.remember(cx)).ok();
+                    true
+                });
             })
             .expect("failed to focus the main window");
         cx.activate(true);

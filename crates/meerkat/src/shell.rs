@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
-use storage::{HistoryFilter, NewRun, QueryRun, RunSource, Store};
+use storage::{HistoryFilter, NewRun, QueryRun, RunSource, SavedTab, SavedTabs, Store};
 use theme::{FONT_FAMILY, ThemeColors, theme};
 use ui::scrollbar::{self, DragState, Scrollbar};
 use ui::{
@@ -120,6 +120,11 @@ pub struct Shell {
     /// in a window of its own, so closing it cannot leave the workspace
     /// without focus.
     palette: Option<Palette>,
+    /// True while the session reopens the tabs it was left with. The
+    /// restore builds the strip one tab at a time, and every one of those
+    /// steps would otherwise write a half-built strip back over the saved
+    /// one — a restore that stopped halfway would lose the rest.
+    restoring: bool,
     /// Held for as long as the shell lives, so the filter line keeps
     /// reporting what was typed into it.
     _subscriptions: Vec<Subscription>,
@@ -262,6 +267,13 @@ impl Shell {
         // running behind it replaces it when it lands. A store that cannot
         // be read is a miss, not an error: the session works without it.
         let cached = store.as_ref().and_then(|store| store.cached_catalog(&scope).ok().flatten());
+        // What this connection was left with. It is read here, beside the
+        // catalog, for the same reason: a local SQLite row, so the strip
+        // is painted on the first frame rather than after a round trip.
+        let saved = store
+            .as_ref()
+            .and_then(|store| store.saved_tabs(&scope).ok())
+            .unwrap_or_default();
         let catalog_filter =
             cx.new(|cx| TextField::new("filter schemas and tables…", cx).bare(FILTER_FONT_SIZE));
         let subscriptions = vec![cx.subscribe_in(&catalog_filter, window, Self::on_filter_event)];
@@ -289,17 +301,122 @@ impl Shell {
             store_error,
             scope,
             palette: None,
+            restoring: false,
             _subscriptions: subscriptions,
         };
         if let Some(catalog) = cached {
             shell.apply_catalog(catalog, cx);
         }
         shell.connect(target, cx);
-        // A session opens on an empty query tab rather than on the first
-        // table: it needs no catalog and no round trip, so the user can
-        // type while the connection is still being made.
-        shell.new_query(window, cx);
+        if saved.tabs.is_empty() {
+            // A session opens on an empty query tab rather than on the
+            // first table: it needs no catalog and no round trip, so the
+            // user can type while the connection is still being made.
+            shell.new_query(window, cx);
+        } else {
+            shell.restore_tabs(saved, window, cx);
+        }
         shell
+    }
+
+    // --- the tabs a connection was left with ------------------------------
+
+    /// Open the tabs this connection had last time, in the order the strip
+    /// had them.
+    ///
+    /// A query tab comes back on its statement and waits: a restored
+    /// session must not run a hundred statements at the user, for the same
+    /// reason the history screen never re-runs one. A table tab is the
+    /// paged view, so it asks for its page — and asks for it through the
+    /// usual path, which leaves the tab loading until the connection lands.
+    fn restore_tabs(&mut self, saved: SavedTabs, window: &mut Window, cx: &mut Context<Self>) {
+        self.restoring = true;
+        for tab in saved.tabs {
+            match tab {
+                SavedTab::Query { title, statement, relation } => {
+                    self.new_query_with(&statement, window, cx);
+                    if let Some(Tab::Query(tab)) = self.tabs.last_mut() {
+                        if !title.is_empty() {
+                            tab.title = title.into();
+                        }
+                        tab.relation = relation;
+                    }
+                }
+                SavedTab::Table { schema, table, page } => {
+                    self.restore_table(schema, table, page, cx)
+                }
+                SavedTab::History => self.open_history(cx),
+            }
+        }
+        self.restoring = false;
+        // An empty strip is not a session: a file that held nothing this
+        // shell could open still opens on a query tab.
+        if self.tabs.is_empty() {
+            self.new_query(window, cx);
+            return;
+        }
+        self.activate(saved.active.min(self.tabs.len() - 1), cx);
+        self.focus_active_tab(window, cx);
+    }
+
+    /// Put back a paged table tab. It is built here rather than through
+    /// `open_table_in` because that one needs the catalog to name the
+    /// table's kind, and the catalog may still be on its way — a tab the
+    /// user had open is opened whether or not the shell can describe it
+    /// yet.
+    fn restore_table(&mut self, schema: String, table: String, page: usize, cx: &mut Context<Self>) {
+        let model = self.table_model(&schema, &table);
+        let kind = model.map_or(TableKind::Table, |model| model.kind);
+        let approx_rows = model.and_then(|model| model.approx_rows);
+        let id = self.take_id();
+        self.tabs.push(Tab::Table(TableTab {
+            id,
+            schema,
+            table,
+            kind,
+            data: empty_grid(),
+            page,
+            approx_rows,
+            elapsed: None,
+            loading: false,
+            error: None,
+            selected: None,
+            scroll: GridState::new(),
+            generation: 0,
+        }));
+        self.activate(self.tabs.len() - 1, cx);
+        self.load_page(id, page, cx);
+    }
+
+    /// Write the strip back to the local file, so the next session on this
+    /// connection opens on it. Every path that changes what is open, what
+    /// a query tab holds, or which tab is in front comes through here.
+    ///
+    /// A strip that cannot be written is not worth interrupting a session
+    /// over, so the error is dropped — as the history's is.
+    pub fn remember_tabs(&self, cx: &App) {
+        if self.restoring {
+            return;
+        }
+        let Some(store) = &self.store else { return };
+        let tabs: Vec<SavedTab> = self
+            .tabs
+            .iter()
+            .map(|tab| match tab {
+                Tab::Table(tab) => SavedTab::Table {
+                    schema: tab.schema.clone(),
+                    table: tab.table.clone(),
+                    page: tab.page,
+                },
+                Tab::Query(tab) => SavedTab::Query {
+                    title: tab.title.to_string(),
+                    statement: tab.editor.read(cx).text().to_string(),
+                    relation: tab.relation.clone(),
+                },
+                Tab::History(_) => SavedTab::History,
+            })
+            .collect();
+        store.save_tabs(&self.scope, &tabs, self.active).ok();
     }
 
     // --- the sidebar's catalog list --------------------------------------
@@ -555,6 +672,9 @@ impl Shell {
             tab.title = format!("{schema}.{table}").into();
             tab.relation = Some((schema.to_string(), table.to_string()));
         }
+        // The name and the relation land after the tab was opened, so the
+        // strip is written back once more with them on it.
+        self.remember_tabs(cx);
         self.run_active_query(cx);
     }
 
@@ -574,7 +694,7 @@ impl Shell {
                 Tab::Query(_) | Tab::History(_) => false,
             })
         {
-            self.activate(ix);
+            self.activate(ix, cx);
             cx.notify();
             return;
         }
@@ -601,7 +721,7 @@ impl Shell {
             scroll: GridState::new(),
             generation: 0,
         }));
-        self.activate(self.tabs.len() - 1);
+        self.activate(self.tabs.len() - 1, cx);
         self.load_page(id, 0, cx);
     }
 
@@ -629,6 +749,7 @@ impl Shell {
             tab.selected = None;
             tab.loading = !failed;
             tab.error = failed.then(|| NOT_CONNECTED.to_string());
+            self.remember_tabs(cx);
             cx.notify();
             return;
         };
@@ -644,6 +765,10 @@ impl Shell {
         tab.selected = None;
         tab.generation += 1;
         let generation = tab.generation;
+
+        // The page a table tab sits on is part of what the next session
+        // reopens, so it is written back as it turns.
+        self.remember_tabs(cx);
 
         let recorded = sql.clone();
         let task = run_sql(connection, sql, cx);
@@ -704,7 +829,7 @@ impl Shell {
             scroll: GridState::new(),
             generation: 0,
         }));
-        self.activate(self.tabs.len() - 1);
+        self.activate(self.tabs.len() - 1, cx);
         cx.notify();
     }
 
@@ -735,6 +860,9 @@ impl Shell {
         let generation = tab.generation;
 
         let recorded = sql;
+        // The buffer has been edited since the tab was opened, and this is
+        // the moment the user says it is worth something.
+        self.remember_tabs(cx);
         let task = run_statements(connection, statements, cx);
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
@@ -797,7 +925,7 @@ impl Shell {
     /// history tab is enough: it is a view of one file, not of a query.
     fn open_history(&mut self, cx: &mut Context<Self>) {
         if let Some(ix) = self.tabs.iter().position(|tab| matches!(tab, Tab::History(_))) {
-            self.activate(ix);
+            self.activate(ix, cx);
             let id = self.tabs[ix].id();
             self.load_history(id, cx);
             return;
@@ -812,7 +940,7 @@ impl Shell {
             error: None,
             scroll: UniformListScrollHandle::new(),
         }));
-        self.activate(self.tabs.len() - 1);
+        self.activate(self.tabs.len() - 1, cx);
         self.load_history(id, cx);
     }
 
@@ -1077,7 +1205,7 @@ impl Shell {
         if self.palette.is_some() || self.tabs.len() < 2 {
             return;
         }
-        self.activate(step_wrapping(self.tabs.len(), self.active, forward));
+        self.activate(step_wrapping(self.tabs.len(), self.active, forward), cx);
         self.focus_active_tab(window, cx);
         cx.notify();
     }
@@ -1091,18 +1219,23 @@ impl Shell {
         if ix < self.active {
             self.active -= 1;
         }
-        self.activate(self.active.min(self.tabs.len().saturating_sub(1)));
+        self.activate(self.active.min(self.tabs.len().saturating_sub(1)), cx);
+        // Closing the last tab leaves nothing to activate, so the strip is
+        // written back here rather than only from `activate`.
+        self.remember_tabs(cx);
         self.focus_active_tab(window, cx);
         cx.notify();
     }
 
     /// Make one tab the active one. Every path that changes the active tab
-    /// goes through here.
-    fn activate(&mut self, ix: usize) {
+    /// goes through here, which is also what makes this the place the
+    /// strip is written back from.
+    fn activate(&mut self, ix: usize, cx: &App) {
         if self.tabs.get(ix).is_none() {
             return;
         }
         self.active = ix;
+        self.remember_tabs(cx);
     }
 
     /// A query tab types into its editor, so it wants the focus itself;
@@ -1471,7 +1604,11 @@ impl Shell {
                     .text_color(colors.text_muted)
                     .cursor_pointer()
                     .hover(|s| s.text_color(colors.accent))
-                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        // The shell is dropped from here, and with it every
+                        // editor buffer. Write the strip back while there
+                        // is still something to read it from.
+                        this.remember_tabs(cx);
                         cx.emit(ShellEvent::Close);
                     }))
                     .child("‹ connections"),
@@ -1762,7 +1899,7 @@ impl Shell {
                 .border_color(colors.border)
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _event, window, cx| {
-                    this.activate(ix);
+                    this.activate(ix, cx);
                     if let Some(Tab::Query(tab)) = this.tabs.get(ix) {
                         window.focus(&tab.editor.focus_handle(cx), cx);
                     }

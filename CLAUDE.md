@@ -164,6 +164,37 @@ results grid uses. It reads the plain `ScrollHandle` that
 `UniformListScrollHandle` keeps inside itself, and is painted outside the
 scrolling list, or it would scroll away with it.
 
+### The tabs a connection was left with
+
+A session reopens the tabs it was closed with. `open_tabs` in the local
+store holds one row per tab, keyed by the same *scope* the history and
+the catalog cache use, so tabs come back per connection: leaving a shell
+and choosing that connection again paints the strip it had. `Shell::new`
+reads the rows synchronously, beside the cached catalog, and opens on
+them; with no rows it opens on the one empty query tab as before.
+
+**Only what is needed to open a tab again is kept — never a result
+set.** A query tab is remembered by its statement, its name and the
+relation it was opened on, and comes back *waiting*: restoring a session
+must not fire a hundred statements at the user, for the reason the
+history screen does not re-run one either. A table tab is the paged
+view, so it is remembered by its page and asks for it through
+`load_page` — which leaves it loading until the connection lands, the
+path a table opened from the cached catalog already takes.
+
+`storage::TAB_LIMIT` is 100. Above that the **front** of the strip goes:
+the newest tabs are the ones worth reopening, and `active` moves with
+what is left.
+
+`Shell::remember_tabs` writes the whole strip back at once, and
+`Shell::activate` — which every path that changes the active tab already
+goes through — is the main caller. The editor's buffer is the one thing
+that changes without touching the strip, so a run, a tab switch and
+every way out of the shell save as well: "‹ connections", ⌘Q, and the
+window's close button through `on_window_should_close`. `restoring`
+guards the rebuild, or each restored tab would write a half-built strip
+over the saved one.
+
 ### Query history
 
 Every run — a table page the app built as well as a statement the user

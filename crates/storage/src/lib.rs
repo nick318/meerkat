@@ -1,4 +1,5 @@
-//! Local app state: connection profiles, window layout, query history.
+//! Local app state: connection profiles, window layout, query history,
+//! and the tabs each connection had open.
 //! Stored in a SQLite file under the user data directory (Zed `db` pattern).
 
 use anyhow::{Context as _, Result};
@@ -15,6 +16,12 @@ pub struct Store {
 /// an audit log, so the file stays small: every insert drops the oldest
 /// rows above this count.
 const HISTORY_LIMIT: usize = 500;
+
+/// How many tabs one connection restores. A session that has been left
+/// open for a week can hold hundreds of tabs, and reopening all of them
+/// would page every table in the database at once. The newest tabs — the
+/// end of the strip — are the ones kept.
+pub const TAB_LIMIT: usize = 100;
 
 /// A saved profile plus what the connections screen remembers about it:
 /// when it was last opened, and what the last successful probe saw. The
@@ -83,6 +90,30 @@ pub struct HistoryFilter {
     pub limit: usize,
 }
 
+/// One tab as the file remembers it: enough to open it again, and
+/// nothing more. A result set is never kept — a restored query tab shows
+/// its statement and waits, because the app does not re-run a statement
+/// behind the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavedTab {
+    /// The paged table view, on the page it was left on.
+    Table { schema: String, table: String, page: usize },
+    /// A query tab: its statement, the name on the strip, and the
+    /// relation it was opened on, when it came from the sidebar.
+    Query { title: String, statement: String, relation: Option<(String, String)> },
+    /// The query-history tab. It is a view of this file, so it carries
+    /// no state worth keeping.
+    History,
+}
+
+/// What one connection had open, in strip order, and which of those tabs
+/// was in front.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedTabs {
+    pub tabs: Vec<SavedTab>,
+    pub active: usize,
+}
+
 impl Default for HistoryFilter {
     fn default() -> Self {
         Self { user_only: false, errors_only: false, since: None, limit: HISTORY_LIMIT }
@@ -126,6 +157,18 @@ impl Store {
                 scope TEXT PRIMARY KEY,
                 catalog TEXT NOT NULL,
                 cached_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS open_tabs (
+                scope TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT,
+                schema TEXT,
+                relation TEXT,
+                page INTEGER,
+                statement TEXT,
+                active INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (scope, position)
             );",
         )?;
         let store = Self { conn };
@@ -277,6 +320,112 @@ impl Store {
 
     pub fn forget_catalog(&self, scope: &str) -> Result<()> {
         self.conn.execute("DELETE FROM catalog_cache WHERE scope = ?1", [scope])?;
+        Ok(())
+    }
+
+    // --- open tabs --------------------------------------------------------
+
+    /// The tabs this connection had open, in strip order. A row the model
+    /// no longer understands is dropped rather than reported: a session
+    /// must open even when the file holds something older.
+    pub fn saved_tabs(&self, scope: &str) -> Result<SavedTabs> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, title, schema, relation, page, statement, active
+               FROM open_tabs
+              WHERE scope = ?1
+              ORDER BY position",
+        )?;
+        let rows = stmt.query_map([scope], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+
+        let mut tabs = SavedTabs::default();
+        for row in rows {
+            let (kind, title, schema, relation, page, statement, active) = row?;
+            let tab = match kind.as_str() {
+                "table" => match (schema, relation) {
+                    (Some(schema), Some(table)) => SavedTab::Table {
+                        schema,
+                        table,
+                        page: page.unwrap_or(0).max(0) as usize,
+                    },
+                    _ => continue,
+                },
+                "query" => SavedTab::Query {
+                    title: title.unwrap_or_default(),
+                    statement: statement.unwrap_or_default(),
+                    relation: schema.zip(relation),
+                },
+                "history" => SavedTab::History,
+                _ => continue,
+            };
+            if active != 0 {
+                tabs.active = tabs.tabs.len();
+            }
+            tabs.tabs.push(tab);
+        }
+        Ok(tabs)
+    }
+
+    /// Replace what this connection had open. The whole set is written at
+    /// once, in one transaction, because a half-written strip is worse
+    /// than the strip it replaced.
+    ///
+    /// Above `TAB_LIMIT` the oldest tabs — the front of the strip — go,
+    /// and `active` moves with what is left.
+    pub fn save_tabs(&self, scope: &str, tabs: &[SavedTab], active: usize) -> Result<()> {
+        let dropped = tabs.len().saturating_sub(TAB_LIMIT);
+        let kept = &tabs[dropped..];
+        let active = active.saturating_sub(dropped);
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM open_tabs WHERE scope = ?1", [scope])?;
+        for (position, tab) in kept.iter().enumerate() {
+            let (kind, title, schema, relation, page, statement) = match tab {
+                SavedTab::Table { schema, table, page } => (
+                    "table",
+                    None,
+                    Some(schema.as_str()),
+                    Some(table.as_str()),
+                    Some(*page as i64),
+                    None,
+                ),
+                SavedTab::Query { title, statement, relation } => (
+                    "query",
+                    Some(title.as_str()),
+                    relation.as_ref().map(|(schema, _)| schema.as_str()),
+                    relation.as_ref().map(|(_, table)| table.as_str()),
+                    None,
+                    Some(statement.as_str()),
+                ),
+                SavedTab::History => ("history", None, None, None, None, None),
+            };
+            tx.execute(
+                "INSERT INTO open_tabs
+                    (scope, position, kind, title, schema, relation, page, statement, active)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    scope,
+                    position as i64,
+                    kind,
+                    title,
+                    schema,
+                    relation,
+                    page,
+                    statement,
+                    (position == active) as i64,
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -580,6 +729,91 @@ mod tests {
             .query_row("SELECT count(*) FROM catalog_cache", [], |row| row.get(0))
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn the_open_tabs_come_back_in_strip_order() {
+        let store = store_at("tabs.sqlite");
+        let tabs = vec![
+            SavedTab::Query {
+                title: "query 1".into(),
+                statement: "select 1".into(),
+                relation: None,
+            },
+            SavedTab::Query {
+                title: "public.users".into(),
+                statement: "select * from \"public\".\"users\" limit 500;".into(),
+                relation: Some(("public".into(), "users".into())),
+            },
+            SavedTab::Table { schema: "public".into(), table: "orders".into(), page: 3 },
+            SavedTab::History,
+        ];
+        store.save_tabs("prod", &tabs, 2).unwrap();
+        store.save_tabs("staging", &[SavedTab::History], 0).unwrap();
+
+        let read = store.saved_tabs("prod").unwrap();
+        assert_eq!(read.tabs, tabs);
+        assert_eq!(read.active, 2);
+        // One connection's tabs never show up under another.
+        assert_eq!(store.saved_tabs("staging").unwrap().tabs, [SavedTab::History]);
+    }
+
+    #[test]
+    fn saving_the_tabs_replaces_the_last_set() {
+        let store = store_at("tabs-replace.sqlite");
+        let query = |sql: &str| SavedTab::Query {
+            title: "query".into(),
+            statement: sql.into(),
+            relation: None,
+        };
+        store.save_tabs("prod", &[query("select 1"), query("select 2")], 1).unwrap();
+        store.save_tabs("prod", &[query("select 3")], 0).unwrap();
+
+        let read = store.saved_tabs("prod").unwrap();
+        assert_eq!(read.tabs, [query("select 3")]);
+        assert_eq!(read.active, 0);
+    }
+
+    #[test]
+    fn only_the_newest_tabs_are_kept() {
+        let store = store_at("tabs-limit.sqlite");
+        let tabs: Vec<SavedTab> = (0..TAB_LIMIT + 10)
+            .map(|ix| SavedTab::Query {
+                title: format!("query {ix}"),
+                statement: format!("select {ix}"),
+                relation: None,
+            })
+            .collect();
+        store.save_tabs("prod", &tabs, tabs.len() - 1).unwrap();
+
+        let read = store.saved_tabs("prod").unwrap();
+        assert_eq!(read.tabs.len(), TAB_LIMIT);
+        // The front of the strip goes, and the selection moves with what
+        // is left.
+        assert_eq!(read.tabs[0], tabs[10]);
+        assert_eq!(read.active, TAB_LIMIT - 1);
+    }
+
+    #[test]
+    fn a_tab_the_model_no_longer_understands_is_dropped() {
+        let store = store_at("tabs-stale.sqlite");
+        store
+            .conn
+            .execute(
+                "INSERT INTO open_tabs (scope, position, kind, active) VALUES (?1, 0, 'diagram', 1)",
+                ["prod"],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO open_tabs (scope, position, kind, active) VALUES (?1, 1, 'history', 0)",
+                ["prod"],
+            )
+            .unwrap();
+
+        let read = store.saved_tabs("prod").unwrap();
+        assert_eq!(read.tabs, [SavedTab::History]);
     }
 
     #[test]

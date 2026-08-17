@@ -46,6 +46,15 @@ impl Root {
         Self { screen: Screen::Workspace(workspace), _subscription: subscription }
     }
 
+    /// Write an open workspace's tabs back to the local file. The window
+    /// closing and ⌘Q both drop the shell without going through the
+    /// "‹ connections" way out, so they call this first.
+    pub fn remember(&self, cx: &App) {
+        if let Screen::Workspace(workspace) = &self.screen {
+            workspace.read(cx).remember_tabs(cx);
+        }
+    }
+
     fn on_connections_event(
         &mut self,
         _screen: &Entity<Connections>,
