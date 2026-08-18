@@ -14,9 +14,19 @@
 //! sleeping server, spend a connection slot, or ask the keychain for a
 //! password nobody asked it to use. A probe — connect, read the server
 //! version, disconnect on the tokio runtime — runs only when the user
-//! asks for it: saving a new connection, or clicking a row that failed.
+//! asks for it: saving a connection, or the "test" and "retry" actions.
 //! The version it read is cached in the store, so the next launch paints
 //! "read-only · PG 17.2" without a socket.
+//!
+//! The list selects before it acts, after the "select, then act" comp.
+//! A click selects a row and the bar over the list serves the selection:
+//! connect, edit, test, forget. ⏎ or a double click connects, ↑↓ move
+//! the selection, ⌘I edits. One bar for the actions keeps the rows
+//! dense, and the keyboard never needs the mouse.
+//!
+//! Editing reuses the new-connection form, prefilled from the profile.
+//! The saved password never comes back into the form; a password field
+//! left empty keeps the one in the keychain.
 
 use chrono::Local;
 use db_client::{Connection, Engine, Profile};
@@ -28,15 +38,19 @@ use gpui::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use storage::{SavedConnection, Store};
 use theme::{FONT_FAMILY, ThemeColors, theme};
-use ui::{TextField, TextFieldEvent, accent_button, meerkat_mark, section_label, status_dot};
+use ui::{
+    TextField, TextFieldEvent, accent_button, meerkat_mark, section_label, status_dot,
+    toolbar_button,
+};
 
 /// The comp's reading column: the list never stretches over a wide window.
 const COLUMN_WIDTH: f32 = 900.;
 /// Empty on a row that is up, so it costs nothing until a probe fails
 /// and needs the room for the error.
-const STATUS_WIDTH: f32 = 220.;
+const STATUS_WIDTH: f32 = 200.;
 const MODE_WIDTH: f32 = 130.;
-const ACTION_WIDTH: f32 = 76.;
+const HOST_WIDTH: f32 = 230.;
+const LAST_WIDTH: f32 = 80.;
 /// The search line sits beside the section label, so it takes a fixed
 /// share of that row rather than all of it.
 const SEARCH_WIDTH: f32 = 300.;
@@ -45,10 +59,21 @@ const SEARCH_WIDTH: f32 = 300.;
 /// app, so it cannot take the key from a workspace that is open.
 const KEY_CONTEXT: &str = "Connections";
 
-actions!(connections, [FocusSearch]);
+actions!(
+    connections,
+    [FocusSearch, SelectNext, SelectPrevious, OpenSelected, EditSelected]
+);
 
 pub fn key_bindings() -> Vec<KeyBinding> {
-    vec![KeyBinding::new("cmd-f", FocusSearch, Some(KEY_CONTEXT))]
+    vec![
+        KeyBinding::new("cmd-f", FocusSearch, Some(KEY_CONTEXT)),
+        // The walk follows the list, and ⏎ connects: the keyboard path
+        // the comp promises with "↑↓ move · ⏎ connect · ⌘I edit".
+        KeyBinding::new("down", SelectNext, Some(KEY_CONTEXT)),
+        KeyBinding::new("up", SelectPrevious, Some(KEY_CONTEXT)),
+        KeyBinding::new("enter", OpenSelected, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-i", EditSelected, Some(KEY_CONTEXT)),
+    ]
 }
 
 pub enum ConnectionsEvent {
@@ -66,6 +91,9 @@ pub struct Connections {
     /// The search line over the saved connections. It filters the list
     /// that is already in memory; it never reaches a server.
     search: Entity<TextField>,
+    /// The selected row, by profile id so it survives a reload. A click
+    /// selects; only ⏎, the connect button or a double click opens.
+    selected: Option<String>,
     form: Option<Form>,
     /// Unix seconds when the screen opened, so "3d ago" stays put while
     /// the user reads it.
@@ -88,14 +116,18 @@ enum Probe {
     Failed(String),
 }
 
-/// The "+ new connection" form: where the database is, and who connects.
-/// The URL may carry credentials too; the two fields win over it, so a
-/// pasted URL can be corrected without editing the string.
+/// The connection form: where the database is, and who connects. It
+/// serves both "+ new connection" and "edit ⌘I"; `editing` carries the
+/// profile id an edit writes back to. The URL may carry credentials too;
+/// the two fields win over it, so a pasted URL can be corrected without
+/// editing the string.
 struct Form {
     name: Entity<TextField>,
     url: Entity<TextField>,
     user: Entity<TextField>,
     password: Entity<TextField>,
+    /// The profile this form edits; `None` saves a new one.
+    editing: Option<String>,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
@@ -123,6 +155,7 @@ impl Connections {
             error,
             rows: Vec::new(),
             search,
+            selected: None,
             form: None,
             now: unix_now(),
             _subscriptions: vec![subscription],
@@ -200,7 +233,84 @@ impl Connections {
             }
             Err(error) => self.error = Some(error.to_string()),
         }
+        self.ensure_selection();
         cx.notify();
+    }
+
+    /// Keep the selection on the row it was on; a selection that points
+    /// at nothing (first load, a forgotten row) falls to the first row,
+    /// so the action bar always serves something when there are rows.
+    fn ensure_selection(&mut self) {
+        let still_there = self
+            .selected
+            .as_ref()
+            .is_some_and(|id| self.rows.iter().any(|row| row.saved.profile.id == *id));
+        if !still_there {
+            self.selected = self.rows.first().map(|row| row.saved.profile.id.clone());
+        }
+    }
+
+    fn selected_row(&self) -> Option<&Row> {
+        let id = self.selected.as_ref()?;
+        self.rows.iter().find(|row| row.saved.profile.id == *id)
+    }
+
+    fn select(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.selected = Some(id.to_string());
+        cx.notify();
+    }
+
+    /// ↑↓ walk the rows the search leaves on screen, clamped at the ends:
+    /// a short list is not a ring, and the edge is where the eye stops.
+    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let ids: Vec<String> =
+            self.matching(cx).iter().map(|row| row.saved.profile.id.clone()).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let here = self.selected.as_ref().and_then(|id| ids.iter().position(|x| x == id));
+        let next = match here {
+            Some(ix) => (ix as isize + delta).clamp(0, ids.len() as isize - 1) as usize,
+            None => 0,
+        };
+        self.selected = Some(ids[next].clone());
+        cx.notify();
+    }
+
+    fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selection(1, cx);
+    }
+
+    fn select_previous(&mut self, _: &SelectPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selection(-1, cx);
+    }
+
+    fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.selected.clone() {
+            self.connect(&id, cx);
+        }
+    }
+
+    fn edit_selected(&mut self, _: &EditSelected, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.selected.clone() {
+            self.open_edit(&id, window, cx);
+        }
+    }
+
+    /// ⏎, the connect button and a double click all land here. A row
+    /// that is down retries rather than opening a workspace that cannot
+    /// paint anything.
+    fn connect(&mut self, id: &str, cx: &mut Context<Self>) {
+        let failed = self
+            .rows
+            .iter()
+            .find(|row| row.saved.profile.id == id)
+            .is_some_and(|row| matches!(row.state, Probe::Failed(_)));
+        if failed {
+            self.probe(id, cx);
+        } else {
+            self.open(id, cx);
+        }
     }
 
     /// Connect, read the server version, drop the connection. The row
@@ -282,16 +392,45 @@ impl Connections {
         cx.emit(ConnectionsEvent::Open(profile));
     }
 
-    // --- the new connection form -----------------------------------------
+    // --- the connection form (new, and edit) ------------------------------
 
     fn open_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.form.is_some() {
             return;
         }
+        self.form = Some(self.build_form(None, window, cx));
+        cx.notify();
+    }
+
+    /// Edit reuses the same form, prefilled from the profile. The saved
+    /// password stays in the keychain: it never comes back on screen, and
+    /// an empty password field on save keeps it as it is.
+    fn open_edit(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.rows.iter().find(|row| row.saved.profile.id == id) else {
+            return;
+        };
+        let profile = row.saved.profile.clone();
+        self.form = Some(self.build_form(Some(&profile), window, cx));
+        cx.notify();
+    }
+
+    fn build_form(
+        &mut self,
+        prefill: Option<&Profile>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Form {
         let name = cx.new(|cx| TextField::new("prod", cx));
         let url = cx.new(|cx| TextField::new("postgres://host:5432/database", cx));
         let user = cx.new(|cx| TextField::new("postgres", cx));
         let password = cx.new(|cx| TextField::new("", cx).masked());
+        if let Some(profile) = prefill {
+            name.update(cx, |field, cx| field.set_text(profile.name.clone(), cx));
+            url.update(cx, |field, cx| field.set_text(profile_url(profile).to_string(), cx));
+            if let Some(who) = profile.user.clone() {
+                user.update(cx, |field, cx| field.set_text(who, cx));
+            }
+        }
         let subscriptions = vec![
             cx.subscribe_in(&name, window, Self::on_field_event),
             cx.subscribe_in(&url, window, Self::on_field_event),
@@ -299,9 +438,15 @@ impl Connections {
             cx.subscribe_in(&password, window, Self::on_field_event),
         ];
         window.focus(&name.focus_handle(cx), cx);
-        self.form =
-            Some(Form { name, url, user, password, error: None, _subscriptions: subscriptions });
-        cx.notify();
+        Form {
+            name,
+            url,
+            user,
+            password,
+            editing: prefill.map(|profile| profile.id.clone()),
+            error: None,
+            _subscriptions: subscriptions,
+        }
     }
 
     fn close_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -338,7 +483,9 @@ impl Connections {
         }
     }
 
-    /// Turn the form into a saved profile, then probe it. The screen stays
+    /// Turn the form into a saved profile, then probe it. An edit keeps
+    /// the profile's id, so the store row, the keychain entry, the
+    /// history and the cached catalog all stay its. The screen stays
     /// where it is, so a connection that does not answer says so in its
     /// own row rather than in a dead workspace.
     fn save_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -353,6 +500,7 @@ impl Connections {
             form.user.read(cx).trimmed().to_string(),
             form.password.read(cx).text().to_string(),
         );
+        let id = form.editing.clone().unwrap_or_else(new_id);
         if url.is_empty() {
             self.set_form_error("a connection needs a URL", cx);
             return;
@@ -362,21 +510,21 @@ impl Connections {
             return;
         };
 
-        let (mut profile, url_password) =
-            match db_postgres::profile_from_url(&new_id(), &name, &url) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    self.set_form_error(error.to_string(), cx);
-                    return;
-                }
-            };
+        let (mut profile, url_password) = match db_postgres::profile_from_url(&id, &name, &url) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.set_form_error(error.to_string(), cx);
+                return;
+            }
+        };
         let password = merge_credentials(&mut profile, &user, &typed_password, url_password);
         if let Err(error) = store.save_profile(&profile) {
             self.set_form_error(error.to_string(), cx);
             return;
         }
         // The password leaves the URL here and goes to the keychain, so
-        // the profiles file never carries it.
+        // the profiles file never carries it. `None` writes nothing, which
+        // is what lets an edit keep the password it already has.
         if let Some(password) = password
             && let Err(error) = secrets::set_password(&profile.id, &password)
         {
@@ -385,6 +533,7 @@ impl Connections {
 
         let id = profile.id.clone();
         self.close_form(window, cx);
+        self.selected = Some(id.clone());
         self.reload(cx);
         self.probe(&id, cx);
     }
@@ -411,6 +560,10 @@ impl Render for Connections {
             .track_focus(&self.focus_handle(cx))
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::focus_search))
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::open_selected))
+            .on_action(cx.listener(Self::edit_selected))
             .size_full()
             .bg(colors.window)
             .font_family(FONT_FAMILY)
@@ -472,8 +625,42 @@ impl Connections {
     }
 
     fn list(&self, colors: &ThemeColors, window: &Window, cx: &mut Context<Self>) -> Div {
-        let matching = self.matching(cx);
         let searching = !self.search.read(cx).is_empty();
+
+        // One card holds it all: the action bar over the selection, the
+        // column headings, the rows, and the footer with "+ new
+        // connection" and the keys. The rows carry no chrome of their
+        // own, which is what keeps them dense.
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(colors.border_strong)
+            .rounded(px(8.))
+            .bg(colors.elevated)
+            .overflow_hidden();
+        if let Some(bar) = self.action_bar(colors, cx) {
+            card = card.child(bar);
+        }
+        card = card.child(self.header_row(colors));
+        for row in self.matching(cx) {
+            card = card.child(self.row(row, colors, cx));
+        }
+
+        // A filter that hides everything must say so, or the screen reads
+        // as a store that lost its connections.
+        if searching && self.matching(cx).is_empty() {
+            card = card.child(
+                div()
+                    .px(px(13.))
+                    .py(px(12.))
+                    .text_size(px(11.))
+                    .text_color(colors.text_muted)
+                    .child("no connection matches the search"),
+            );
+        }
+        card = card.child(self.footer(colors, cx));
+
         let mut list = div()
             .flex()
             .flex_col()
@@ -488,47 +675,171 @@ impl Connections {
                     // The line holds its place whatever the list holds, so
                     // it does not appear and disappear under the pointer.
                     .child(self.search_line(colors, window, cx)),
-            );
+            )
+            .child(card);
 
-        for row in matching {
-            list = list.child(self.row(row, colors, cx));
+        if let Some(form) = &self.form {
+            list = list.child(self.form_card(form, colors, cx));
         }
+        list
+    }
 
-        // A filter that hides everything must say so, or the screen reads
-        // as a store that lost its connections.
-        if searching && self.matching(cx).is_empty() {
-            list = list.child(
-                div()
-                    .px(px(16.))
-                    .py(px(14.))
-                    .text_size(px(11.))
-                    .text_color(colors.text_muted)
-                    .child("no connection matches the search"),
-            );
-        }
+    /// The bar over the list. It serves the selected row — connect, edit,
+    /// test, forget — so the rows themselves stay free of buttons, and
+    /// there is one place to look for what ⏎ will do.
+    fn action_bar(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Option<Div> {
+        let row = self.selected_row()?;
+        let id = row.saved.profile.id.clone();
+        let failed = matches!(row.state, Probe::Failed(_));
 
-        match &self.form {
-            Some(form) => list.child(self.form_card(form, colors, cx)),
-            None => list.child(
+        let meta = match &row.state {
+            Probe::Failed(error) => {
+                let seen = match row.saved.last_opened {
+                    Some(at) => format!("last seen {}", ago(self.now - at)),
+                    None => "never opened".to_string(),
+                };
+                format!("{} · {seen}", first_line(error))
+            }
+            Probe::Probing => format!("{} · connecting…", profile_url(&row.saved.profile)),
+            _ => {
+                let server = row
+                    .saved
+                    .server
+                    .clone()
+                    .map(|server| format!(" · {server}"))
+                    .unwrap_or_default();
+                format!("{} · read-only{server}", profile_url(&row.saved.profile))
+            }
+        };
+
+        let connect_label = match &row.state {
+            Probe::Probing => "…",
+            Probe::Failed(_) => "retry ⏎",
+            _ => "connect ⏎",
+        };
+
+        let (connect_id, edit_id, test_id, forget_id) =
+            (id.clone(), id.clone(), id.clone(), id);
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(12.))
+                .py(px(8.))
+                .bg(colors.panel)
+                .border_b_1()
+                .border_color(colors.border)
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(if failed { colors.error } else { colors.text })
+                        .flex_none()
+                        .child(row.saved.profile.name.clone()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_size(px(10.))
+                        .text_color(if failed { colors.error_secondary } else { colors.text_muted })
+                        .truncate()
+                        .child(meta),
+                )
+                .child(
+                    accent_button(connect_label, cx)
+                        .id("connect-selected")
+                        .text_size(px(10.))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.connect(&connect_id, cx);
+                        })),
+                )
+                .child(
+                    toolbar_button("edit ⌘I", cx)
+                        .id("edit-selected")
+                        .text_size(px(10.))
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            this.open_edit(&edit_id, window, cx);
+                        })),
+                )
+                .child(
+                    toolbar_button("test", cx)
+                        .id("test-selected")
+                        .text_size(px(10.))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.probe(&test_id, cx);
+                        })),
+                )
+                .child(
+                    // Forgetting a connection drops the profile and its
+                    // keychain password. The database itself is untouched.
+                    // `toolbar_button` already carries a hover style, and
+                    // GPUI panics on a second one.
+                    toolbar_button("forget", cx)
+                        .id("forget-selected")
+                        .text_size(px(10.))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.forget(&forget_id, cx);
+                        })),
+                ),
+        )
+    }
+
+    /// The column headings, on the rows' own grid so they line up.
+    fn header_row(&self, colors: &ThemeColors) -> Div {
+        let heading = |text: &'static str| {
+            div()
+                .text_size(px(9.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(colors.text_faint)
+                .child(text)
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .px(px(13.))
+            .h(px(26.))
+            .border_b_1()
+            .border_color(colors.border_strong)
+            .child(div().w(px(9.)).flex_none())
+            .child(div().flex_1().min_w(px(0.)).child(heading("NAME")))
+            .child(div().w(px(HOST_WIDTH)).flex_none().child(heading("HOST")))
+            .child(div().w(px(STATUS_WIDTH)).flex_none().child(heading("STATUS")))
+            .child(div().w(px(MODE_WIDTH)).flex_none().child(heading("MODE")))
+            .child(div().w(px(LAST_WIDTH)).flex_none().text_right().child(heading("LAST USED")))
+    }
+
+    /// The card's last line: the way to a new connection, and the keys
+    /// the list answers to.
+    fn footer(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
+        let key = |text: &'static str| {
+            div().text_size(px(10.)).text_color(colors.text_faint).child(text)
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .px(px(13.))
+            .py(px(8.))
+            .bg(colors.panel)
+            .border_t_1()
+            .border_color(colors.border)
+            .child(
                 div()
                     .id("new-connection")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(8.))
-                    .p(px(13.))
-                    .border_1()
-                    .border_dashed()
-                    .border_color(colors.border_strong)
-                    .rounded(px(8.))
-                    .text_size(px(11.))
-                    .text_color(colors.text_muted)
+                    .text_size(px(10.))
+                    .text_color(colors.accent)
                     .cursor_pointer()
-                    .hover(|s| s.border_color(colors.accent).text_color(colors.accent))
+                    .hover(|s| s.text_color(colors.accent_deep))
                     .on_click(cx.listener(|this, _event, window, cx| this.open_form(window, cx)))
                     .child("+ new connection"),
-            ),
-        }
+            )
+            .child(div().flex_1())
+            .child(key("↑↓ move"))
+            .child(key("⏎ connect"))
+            .child(key("⌘I edit"))
     }
 
     /// The search line: a bare field inside a surface of the screen's own,
@@ -567,9 +878,10 @@ impl Connections {
     fn row(&self, row: &Row, colors: &ThemeColors, cx: &mut Context<Self>) -> Stateful<Div> {
         let failed = matches!(row.state, Probe::Failed(_));
         let id = row.saved.profile.id.clone();
+        let selected = self.selected.as_deref() == Some(id.as_str());
 
-        // Failure recolours the whole row, the way the comp does: warm
-        // surface, warm border, warm text.
+        // Failure recolours the row's text, the way the comp does: warm
+        // ink over the shared surface, no surface of its own.
         let (name_color, url_color, meta_color, dot) = match &row.state {
             Probe::Ready { .. } => {
                 (colors.text, colors.text_muted, colors.text_muted, colors.ok)
@@ -605,64 +917,66 @@ impl Connections {
                 .clone()
                 .map(|server| format!("read-only · {server}"))
                 .unwrap_or_default(),
-            Probe::Failed(_) => match row.saved.last_opened {
-                Some(at) => format!("last seen {}", ago(self.now - at)),
-                None => "never opened".to_string(),
-            },
+            // The failure itself is in the status column; the mode of a
+            // row that is down is not worth a word.
+            Probe::Failed(_) => String::new(),
         };
 
-        let (action, action_color) = match &row.state {
-            Probe::Ready { .. } | Probe::Idle => ("open →", colors.accent),
-            Probe::Probing => ("…", colors.text_faint),
-            Probe::Failed(_) => ("retry", colors.error_secondary),
+        let last = match row.saved.last_opened {
+            Some(at) => ago(self.now - at),
+            None => "—".to_string(),
         };
 
-        let retry = failed;
-        let forget_id = id.clone();
-        let card = div()
+        let mut card = div()
             .id(ElementId::Name(format!("connection-{id}").into()))
+            .relative()
             .flex()
             .items_center()
-            .gap(px(16.))
-            .px(px(16.))
-            .py(px(14.))
-            .border_1()
-            .border_color(if failed { colors.error_border } else { colors.border })
-            .rounded(px(8.))
-            .bg(if failed { colors.error_surface } else { colors.elevated })
+            .gap(px(12.))
+            .px(px(13.))
+            .h(px(34.))
+            .border_b_1()
+            .border_color(colors.hairline)
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                // A row that is down retries rather than opening a
-                // workspace that cannot paint anything.
-                if retry {
-                    this.probe(&id, cx);
+            // A click selects; only a double click opens. The bar over
+            // the list is where a single click's actions live.
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
+                if event.click_count() >= 2 {
+                    this.connect(&id, cx);
                 } else {
-                    this.open(&id, cx);
+                    this.select(&id, cx);
                 }
-            }))
-            .child(div().w(px(9.)).flex_none().child(status_dot_of(dot)))
+            }));
+
+        if selected {
+            card = card.bg(colors.selection).child(
+                // The comp's accent rail: painted over the row's left
+                // edge, so the columns keep their alignment.
+                div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(colors.accent),
+            );
+        } else {
+            card = card.hover(|s| s.bg(colors.panel));
+        }
+
+        card.child(div().w(px(9.)).flex_none().child(status_dot_of(dot)))
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(name_color)
-                            .truncate()
-                            .child(row.saved.profile.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(url_color)
-                            .truncate()
-                            .child(profile_url(&row.saved.profile)),
-                    ),
+                    .text_size(px(12.))
+                    .font_weight(if selected { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                    .text_color(name_color)
+                    .truncate()
+                    .child(row.saved.profile.name.clone()),
+            )
+            .child(
+                div()
+                    .w(px(HOST_WIDTH))
+                    .flex_none()
+                    .text_size(px(11.))
+                    .text_color(url_color)
+                    .truncate()
+                    .child(profile_url(&row.saved.profile)),
             )
             .child(
                 div()
@@ -684,40 +998,21 @@ impl Connections {
             )
             .child(
                 div()
-                    .w(px(ACTION_WIDTH))
+                    .w(px(LAST_WIDTH))
                     .flex_none()
-                    .text_size(px(11.))
-                    .text_color(action_color)
-                    .text_right()
-                    .child(action),
-            )
-            .child(
-                // Forgetting a connection drops the profile and its
-                // keychain password. The database itself is untouched.
-                div()
-                    .id(ElementId::Name(format!("forget-{forget_id}").into()))
-                    .flex_none()
-                    .text_size(px(12.))
+                    .text_size(px(10.))
                     .text_color(colors.text_faint)
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(colors.error))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.forget(&forget_id, cx);
-                    }))
-                    .child("×"),
-            );
-
-        if failed {
-            card.hover(|s| s.border_color(colors.error_mark))
-        } else {
-            card.hover(|s| s.border_color(colors.accent))
-        }
+                    .text_right()
+                    .truncate()
+                    .child(last),
+            )
     }
 
     fn form_card(&self, form: &Form, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
         let label = |text: &'static str| {
             div().text_size(px(10.)).text_color(colors.text_muted).child(text)
         };
+        let editing = form.editing.is_some();
 
         div()
             .flex()
@@ -728,7 +1023,10 @@ impl Connections {
             .border_color(colors.border_strong)
             .rounded(px(8.))
             .bg(colors.panel)
-            .child(section_label("NEW CONNECTION", cx))
+            .child(section_label(
+                if editing { "EDIT CONNECTION" } else { "NEW CONNECTION" },
+                cx,
+            ))
             .child(
                 div()
                     .flex()
@@ -792,8 +1090,13 @@ impl Connections {
                             .flex_1()
                             .text_size(px(10.))
                             .text_color(colors.text_faint)
-                            // Say where the password goes before it is typed.
-                            .child("the password goes to the OS keychain, not to the profiles file"),
+                            // Say where the password goes before it is typed,
+                            // and on an edit, what leaving it empty means.
+                            .child(if editing {
+                                "an empty password keeps the saved one; a typed one replaces it in the OS keychain"
+                            } else {
+                                "the password goes to the OS keychain, not to the profiles file"
+                            }),
                     )
                     .child(
                         div()
