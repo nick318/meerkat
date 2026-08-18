@@ -34,6 +34,11 @@ pub struct SavedConnection {
     pub last_opened: Option<i64>,
     /// Server description, as the driver reports it ("PG 16.2").
     pub server: Option<String>,
+    /// The environment tag the user gave the connection ("prod",
+    /// "staging"). Free text; the connections screen groups by it. It is
+    /// a label on the saved row, not a connection parameter, so it lives
+    /// here and not on `Profile`.
+    pub env: Option<String>,
 }
 
 /// Who asked for a statement. The history screen can hide the pages the
@@ -158,6 +163,10 @@ impl Store {
                 catalog TEXT NOT NULL,
                 cached_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS ui_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS open_tabs (
                 scope TEXT NOT NULL,
                 position INTEGER NOT NULL,
@@ -186,7 +195,7 @@ impl Store {
         };
         // `tables` and `views` were dropped from the screen; an older file
         // keeps those columns, and nothing reads them.
-        for (column, kind) in [("last_opened", "INTEGER"), ("server", "TEXT")] {
+        for (column, kind) in [("last_opened", "INTEGER"), ("server", "TEXT"), ("env", "TEXT")] {
             if !existing.iter().any(|name| name == column) {
                 self.conn
                     .execute_batch(&format!("ALTER TABLE profiles ADD COLUMN {column} {kind}"))?;
@@ -231,7 +240,7 @@ impl Store {
     pub fn list_connections(&self) -> Result<Vec<SavedConnection>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, engine, host, port, database, user,
-                    last_opened, server
+                    last_opened, server, env
              FROM profiles
              ORDER BY last_opened IS NULL, last_opened DESC, name",
         )?;
@@ -248,9 +257,43 @@ impl Store {
                 },
                 last_opened: row.get(7)?,
                 server: row.get(8)?,
+                env: row.get(9)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// A small on/off remembered across launches ("group by env"). The
+    /// `ui_state` table is a key-value bag for exactly this: screen
+    /// state too small to deserve a table, too annoying to lose.
+    pub fn flag(&self, key: &str, default: bool) -> bool {
+        self.conn
+            .query_row("SELECT value FROM ui_state WHERE key = ?1", [key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()
+            .ok()
+            .flatten()
+            .map(|value| value == "1")
+            .unwrap_or(default)
+    }
+
+    pub fn set_flag(&self, key: &str, value: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO ui_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, if value { "1" } else { "0" }],
+        )?;
+        Ok(())
+    }
+
+    /// Tag a connection with an environment ("prod", "staging"), or take
+    /// the tag away with `None`. The tag is display metadata, so it is
+    /// written beside the profile rather than through `save_profile`.
+    pub fn set_env(&self, id: &str, env: Option<&str>) -> Result<()> {
+        self.conn
+            .execute("UPDATE profiles SET env = ?2 WHERE id = ?1", rusqlite::params![id, env])?;
+        Ok(())
     }
 
     /// Remember that the user opened this connection, so it sorts to the
@@ -601,6 +644,29 @@ mod tests {
         assert_eq!(saved[0].profile.name, "Prod");
         assert_eq!(saved[0].server.as_deref(), Some("PG 16.2"));
         assert_eq!(saved[0].last_opened, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn an_env_tag_survives_the_next_save_and_can_be_taken_away() {
+        let store = store_at("env.sqlite");
+        let profile = Profile {
+            id: "p1".into(),
+            name: "Local PG".into(),
+            engine: Engine::Postgres,
+            host: Some("localhost".into()),
+            port: Some(5432),
+            database: "app".into(),
+            user: Some("nick".into()),
+        };
+        store.save_profile(&profile).unwrap();
+        store.set_env("p1", Some("prod")).unwrap();
+
+        // An edit writes the profile again; the tag must stay.
+        store.save_profile(&profile).unwrap();
+        assert_eq!(store.list_connections().unwrap()[0].env.as_deref(), Some("prod"));
+
+        store.set_env("p1", None).unwrap();
+        assert_eq!(store.list_connections().unwrap()[0].env, None);
     }
 
     fn store_at(name: &str) -> Store {

@@ -18,6 +18,16 @@
 //! The version it read is cached in the store, so the next launch paints
 //! "read-only · PG 17.2" without a socket.
 //!
+//! The rows come grouped by an environment tag the user gives a
+//! connection in the form. The set of tags is closed — prod, staging,
+//! dev — because the tags exist to be compared across connections, and
+//! free text would give every database its own spelling of "prod". The
+//! tag is a label on the saved row, never a connection parameter.
+//! Groups follow the form's own order with the untagged rows last; with
+//! no tag anywhere the headings disappear and the list reads flat. The
+//! "group by env" switch beside the search turns the grouping off, and
+//! the store remembers the choice across launches.
+//!
 //! The list selects before it acts, after the "select, then act" comp.
 //! A click selects a row and the bar over the list serves the selection:
 //! connect, edit, test, forget. ⏎ or a double click connects, ↑↓ move
@@ -59,6 +69,60 @@ const SEARCH_WIDTH: f32 = 300.;
 /// app, so it cannot take the key from a workspace that is open.
 const KEY_CONTEXT: &str = "Connections";
 
+/// Where the "group by env" switch keeps its state across launches.
+const GROUP_BY_ENV_KEY: &str = "connections.group_by_env";
+
+/// The three environments a connection can be tagged with. The set is
+/// closed on purpose: the tags exist to be compared across connections,
+/// and free text would give every database its own spelling of "prod".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Env {
+    Prod,
+    Staging,
+    Dev,
+}
+
+impl Env {
+    /// The form's order, and the groups' order.
+    const ALL: [Env; 3] = [Env::Prod, Env::Staging, Env::Dev];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Env::Prod => "prod",
+            Env::Staging => "staging",
+            Env::Dev => "dev",
+        }
+    }
+
+    /// A stored tag this build does not know reads as untagged, never as
+    /// an error: the file may have been written by a newer build.
+    fn parse(tag: Option<&str>) -> Option<Env> {
+        match tag?.trim().to_ascii_lowercase().as_str() {
+            "prod" => Some(Env::Prod),
+            "staging" => Some(Env::Staging),
+            "dev" => Some(Env::Dev),
+            _ => None,
+        }
+    }
+
+    fn dot(self, colors: &ThemeColors) -> gpui::Hsla {
+        match self {
+            Env::Prod => colors.env_prod,
+            Env::Staging => colors.env_staging,
+            Env::Dev => colors.env_dev,
+        }
+    }
+
+    /// The selected chip's wash behind that dot.
+    fn surface(self, colors: &ThemeColors) -> gpui::Hsla {
+        match self {
+            Env::Prod => colors.env_prod_surface,
+            Env::Staging => colors.env_staging_surface,
+            Env::Dev => colors.env_dev_surface,
+        }
+    }
+}
+
 actions!(
     connections,
     [FocusSearch, SelectNext, SelectPrevious, OpenSelected, EditSelected]
@@ -94,6 +158,9 @@ pub struct Connections {
     /// The selected row, by profile id so it survives a reload. A click
     /// selects; only ⏎, the connect button or a double click opens.
     selected: Option<String>,
+    /// Whether the list stands in environment groups or reads flat, as
+    /// the "group by env" switch says. The store remembers it.
+    group_by_env: bool,
     form: Option<Form>,
     /// Unix seconds when the screen opened, so "3d ago" stays put while
     /// the user reads it.
@@ -126,6 +193,8 @@ struct Form {
     url: Entity<TextField>,
     user: Entity<TextField>,
     password: Entity<TextField>,
+    /// The environment tag, picked from the chips; `None` is untagged.
+    env: Option<Env>,
     /// The profile this form edits; `None` saves a new one.
     editing: Option<String>,
     error: Option<String>,
@@ -149,6 +218,8 @@ impl Connections {
         };
         let search = cx.new(|cx| TextField::new("name, host, port or database", cx).bare(11.));
         let subscription = cx.subscribe_in(&search, window, Self::on_search_event);
+        let group_by_env =
+            store.as_ref().map(|store| store.flag(GROUP_BY_ENV_KEY, true)).unwrap_or(true);
         let mut screen = Self {
             focus_handle: cx.focus_handle(),
             store,
@@ -156,6 +227,7 @@ impl Connections {
             rows: Vec::new(),
             search,
             selected: None,
+            group_by_env,
             form: None,
             now: unix_now(),
             _subscriptions: vec![subscription],
@@ -260,11 +332,35 @@ impl Connections {
         cx.notify();
     }
 
-    /// ↑↓ walk the rows the search leaves on screen, clamped at the ends:
-    /// a short list is not a ring, and the edge is where the eye stops.
+    fn toggle_grouping(&mut self, cx: &mut Context<Self>) {
+        self.group_by_env = !self.group_by_env;
+        if let Some(store) = &self.store {
+            // Losing the choice on a crash is not worth interrupting anyone.
+            store.set_flag(GROUP_BY_ENV_KEY, self.group_by_env).ok();
+        }
+        cx.notify();
+    }
+
+    /// The rows in the order the screen paints them: grouped when the
+    /// switch says so, flat otherwise. ↑↓ and the list must agree on
+    /// this order, or the selection would jump.
+    fn visible_ids(&self, cx: &App) -> Vec<String> {
+        if self.group_by_env {
+            group_by_env(self.matching(cx))
+                .into_iter()
+                .flat_map(|(_, rows)| rows)
+                .map(|row| row.saved.profile.id.clone())
+                .collect()
+        } else {
+            self.matching(cx).into_iter().map(|row| row.saved.profile.id.clone()).collect()
+        }
+    }
+
+    /// ↑↓ walk the rows the search leaves on screen, in the order the
+    /// screen paints them, clamped at the ends: a short list is not a
+    /// ring, and the edge is where the eye stops.
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let ids: Vec<String> =
-            self.matching(cx).iter().map(|row| row.saved.profile.id.clone()).collect();
+        let ids = self.visible_ids(cx);
         if ids.is_empty() {
             return;
         }
@@ -402,21 +498,21 @@ impl Connections {
         cx.notify();
     }
 
-    /// Edit reuses the same form, prefilled from the profile. The saved
+    /// Edit reuses the same form, prefilled from the saved row. The saved
     /// password stays in the keychain: it never comes back on screen, and
     /// an empty password field on save keeps it as it is.
     fn open_edit(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(row) = self.rows.iter().find(|row| row.saved.profile.id == id) else {
             return;
         };
-        let profile = row.saved.profile.clone();
-        self.form = Some(self.build_form(Some(&profile), window, cx));
+        let saved = row.saved.clone();
+        self.form = Some(self.build_form(Some(&saved), window, cx));
         cx.notify();
     }
 
     fn build_form(
         &mut self,
-        prefill: Option<&Profile>,
+        prefill: Option<&SavedConnection>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Form {
@@ -424,7 +520,8 @@ impl Connections {
         let url = cx.new(|cx| TextField::new("postgres://host:5432/database", cx));
         let user = cx.new(|cx| TextField::new("postgres", cx));
         let password = cx.new(|cx| TextField::new("", cx).masked());
-        if let Some(profile) = prefill {
+        if let Some(saved) = prefill {
+            let profile = &saved.profile;
             name.update(cx, |field, cx| field.set_text(profile.name.clone(), cx));
             url.update(cx, |field, cx| field.set_text(profile_url(profile).to_string(), cx));
             if let Some(who) = profile.user.clone() {
@@ -443,9 +540,19 @@ impl Connections {
             url,
             user,
             password,
-            editing: prefill.map(|profile| profile.id.clone()),
+            env: Env::parse(prefill.and_then(|saved| saved.env.as_deref())),
+            editing: prefill.map(|saved| saved.profile.id.clone()),
             error: None,
             _subscriptions: subscriptions,
+        }
+    }
+
+    /// A chip toggles: clicking the tag the form already has takes it
+    /// away, so untagged needs no fourth chip.
+    fn set_form_env(&mut self, env: Env, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.form {
+            form.env = if form.env == Some(env) { None } else { Some(env) };
+            cx.notify();
         }
     }
 
@@ -500,6 +607,7 @@ impl Connections {
             form.user.read(cx).trimmed().to_string(),
             form.password.read(cx).text().to_string(),
         );
+        let env = form.env;
         let id = form.editing.clone().unwrap_or_else(new_id);
         if url.is_empty() {
             self.set_form_error("a connection needs a URL", cx);
@@ -518,7 +626,10 @@ impl Connections {
             }
         };
         let password = merge_credentials(&mut profile, &user, &typed_password, url_password);
-        if let Err(error) = store.save_profile(&profile) {
+        if let Err(error) = store
+            .save_profile(&profile)
+            .and_then(|()| store.set_env(&profile.id, env.map(Env::as_str)))
+        {
             self.set_form_error(error.to_string(), cx);
             return;
         }
@@ -643,8 +754,23 @@ impl Connections {
             card = card.child(bar);
         }
         card = card.child(self.header_row(colors));
-        for row in self.matching(cx) {
-            card = card.child(self.row(row, colors, cx));
+        if self.group_by_env {
+            // With no tag anywhere the headings say nothing, so they are
+            // left out and the list reads flat even with the switch on.
+            let groups = group_by_env(self.matching(cx));
+            let tagged = groups.iter().any(|(env, _)| env.is_some());
+            for (env, rows) in groups {
+                if tagged {
+                    card = card.child(self.group_heading(env, colors));
+                }
+                for row in rows {
+                    card = card.child(self.row(row, colors, cx));
+                }
+            }
+        } else {
+            for row in self.matching(cx) {
+                card = card.child(self.row(row, colors, cx));
+            }
         }
 
         // A filter that hides everything must say so, or the screen reads
@@ -672,9 +798,17 @@ impl Connections {
                     .justify_between()
                     .gap(px(12.))
                     .child(section_label("CONNECTIONS", cx))
-                    // The line holds its place whatever the list holds, so
-                    // it does not appear and disappear under the pointer.
-                    .child(self.search_line(colors, window, cx)),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .child(self.env_switch(colors, cx))
+                            // The line holds its place whatever the list
+                            // holds, so it does not appear and disappear
+                            // under the pointer.
+                            .child(self.search_line(colors, window, cx)),
+                    ),
             )
             .child(card);
 
@@ -738,6 +872,25 @@ impl Connections {
                         .flex_none()
                         .child(row.saved.profile.name.clone()),
                 )
+                .children(Env::parse(row.saved.env.as_deref()).map(|env| {
+                    // The selection's tag, as a small chip: the heading
+                    // that says it may be off screen.
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .px(px(5.))
+                        .py(px(2.))
+                        .border_1()
+                        .border_color(colors.border_strong)
+                        .rounded(px(4.))
+                        .text_size(px(8.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.text_muted)
+                        .child(status_dot(env.dot(colors)).size(px(5.)))
+                        .child(env.as_str().to_ascii_uppercase())
+                }))
                 .child(
                     div()
                         .flex_1()
@@ -784,6 +937,72 @@ impl Connections {
                         })),
                 ),
         )
+    }
+
+    /// One environment's heading over its rows, in the section-label
+    /// voice the sidebar uses for its groups. The dot carries the
+    /// environment's own color; the untagged group has none.
+    fn group_heading(&self, env: Option<Env>, colors: &ThemeColors) -> Div {
+        let text = match env {
+            Some(env) => env.as_str().to_ascii_uppercase(),
+            None => "UNTAGGED".to_string(),
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .px(px(13.))
+            .pt(px(10.))
+            .pb(px(5.))
+            .border_b_1()
+            .border_color(colors.hairline)
+            .text_size(px(9.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(colors.text_faint)
+            .children(env.map(|env| status_dot(env.dot(colors)).size(px(5.))))
+            .child(text)
+    }
+
+    /// The "group by env" switch: a small pill whose knob sits at the
+    /// end the state is. It flips the list between environment groups
+    /// and the flat store order.
+    fn env_switch(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Stateful<Div> {
+        let on = self.group_by_env;
+        let mut knob = div()
+            .w(px(20.))
+            .h(px(11.))
+            .rounded_full()
+            .px(px(2.))
+            .flex()
+            .items_center()
+            .flex_none()
+            .bg(if on { colors.accent } else { colors.border_strong })
+            .child(div().size(px(7.)).rounded_full().bg(colors.window));
+        if on {
+            knob = knob.justify_end();
+        }
+        div()
+            .id("group-by-env")
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(7.))
+            .px(px(9.))
+            .py(px(5.))
+            .border_1()
+            .border_color(colors.border)
+            .rounded(px(6.))
+            .bg(colors.panel)
+            .cursor_pointer()
+            .hover(|s| s.border_color(colors.border_strong))
+            .on_click(cx.listener(|this, _event, _window, cx| this.toggle_grouping(cx)))
+            .child(knob)
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(if on { colors.text_secondary } else { colors.text_muted })
+                    .child("group by env"),
+            )
     }
 
     /// The column headings, on the rows' own grid so they line up.
@@ -1008,6 +1227,44 @@ impl Connections {
             )
     }
 
+    /// One environment chip in the form: a dot in the environment's own
+    /// color and its name. The selected chip wears the environment's
+    /// wash; clicking it again takes the tag away.
+    fn env_chip(
+        &self,
+        env: Env,
+        selected: bool,
+        colors: &ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let chip = div()
+            .id(ElementId::Name(format!("env-{}", env.as_str()).into()))
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(7.))
+            .py(px(7.))
+            .border_1()
+            .rounded(px(7.))
+            .cursor_pointer()
+            .text_size(px(11.))
+            .on_click(cx.listener(move |this, _event, _window, cx| this.set_form_env(env, cx)))
+            .child(status_dot(env.dot(colors)))
+            .child(env.as_str());
+        if selected {
+            chip.border_color(env.dot(colors))
+                .bg(env.surface(colors))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(colors.text)
+        } else {
+            chip.border_color(colors.border_strong)
+                .bg(colors.elevated)
+                .text_color(colors.text_secondary)
+                .hover(|s| s.border_color(colors.text_faint))
+        }
+    }
+
     fn form_card(&self, form: &Form, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
         let label = |text: &'static str| {
             div().text_size(px(10.)).text_color(colors.text_muted).child(text)
@@ -1075,6 +1332,22 @@ impl Connections {
                             .gap(px(5.))
                             .child(label("password"))
                             .child(form.password.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.))
+                    .child(label("environment tag"))
+                    .child(div().flex().gap(px(8.)).children(
+                        Env::ALL.map(|env| self.env_chip(env, form.env == Some(env), colors, cx)),
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(colors.text_faint)
+                            .child("Prod-tagged connections get a warning before any write."),
                     ),
             )
             .children(form.error.clone().map(|error| {
@@ -1199,23 +1472,46 @@ fn merge_credentials(
     }
 }
 
+/// Group the rows the search left by their environment tag, in the
+/// form's own order — prod, staging, dev — with the untagged rows
+/// closing the list: a tag was given to stand out, so an untagged row
+/// must not stand first.
+fn group_by_env(rows: Vec<&Row>) -> Vec<(Option<Env>, Vec<&Row>)> {
+    let mut groups: Vec<(Option<Env>, Vec<&Row>)> = Vec::new();
+    for row in rows {
+        let env = Env::parse(row.saved.env.as_deref());
+        match groups.iter_mut().find(|(key, _)| *key == env) {
+            Some((_, list)) => list.push(row),
+            None => groups.push((env, vec![row])),
+        }
+    }
+    groups.sort_by_key(|(key, _)| match key {
+        Some(Env::Prod) => 0,
+        Some(Env::Staging) => 1,
+        Some(Env::Dev) => 2,
+        None => 3,
+    });
+    groups
+}
+
 /// Does this connection answer the search line? `query` must already be
 /// lowercased, as `matching` hands it over.
 ///
-/// The haystack is the name, the URL the row paints, and the user, so a
-/// port ("5433"), a host, a database name or the name the user gave the
-/// connection all find it. Every word must hit, so a second word narrows
-/// the list rather than widening it.
+/// The haystack is the name, the URL the row paints, the user and the
+/// environment tag, so a port ("5433"), a host, a database name, the
+/// name the user gave the connection or "prod" all find it. Every word
+/// must hit, so a second word narrows the list rather than widening it.
 fn matches_query(saved: &SavedConnection, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
     let profile = &saved.profile;
     let haystack = format!(
-        "{} {} {}",
+        "{} {} {} {}",
         profile.name,
         profile_url(profile),
-        profile.user.clone().unwrap_or_default()
+        profile.user.clone().unwrap_or_default(),
+        saved.env.clone().unwrap_or_default()
     )
     .to_ascii_lowercase();
     query.split_whitespace().all(|word| haystack.contains(word))
@@ -1334,7 +1630,51 @@ mod tests {
             },
             last_opened: None,
             server: None,
+            env: None,
         }
+    }
+
+    #[test]
+    fn the_search_line_matches_the_environment_tag() {
+        let mut saved = saved_connection("api", Some("db.internal"), Some(5432), "meerkat", "ada");
+        saved.env = Some("prod".into());
+        assert!(matches_query(&saved, "prod"));
+        assert!(!matches_query(&saved, "staging"));
+    }
+
+    #[test]
+    fn groups_follow_the_forms_env_order_and_untagged_close_the_list() {
+        let rows: Vec<Row> = [
+            ("scratch", None),
+            ("local", Some("dev")),
+            ("api", Some("Prod")),
+            ("replica", Some("staging")),
+            ("billing", Some("prod")),
+        ]
+        .into_iter()
+        .map(|(name, env)| {
+            let mut saved = saved_connection(name, None, None, "db", "ada");
+            saved.env = env.map(str::to_string);
+            Row { saved, state: Probe::Idle }
+        })
+        .collect();
+
+        let groups = group_by_env(rows.iter().collect());
+        let keys: Vec<Option<Env>> = groups.iter().map(|(key, _)| *key).collect();
+        // The groups stand in the form's order whatever the store order
+        // was, "Prod" and "prod" are one group, and untagged is last
+        // even though the store listed it first.
+        assert_eq!(keys, [Some(Env::Prod), Some(Env::Staging), Some(Env::Dev), None]);
+        let prod: Vec<&str> =
+            groups[0].1.iter().map(|row| row.saved.profile.name.as_str()).collect();
+        assert_eq!(prod, ["api", "billing"]);
+    }
+
+    #[test]
+    fn a_tag_from_a_newer_build_reads_as_untagged() {
+        assert_eq!(Env::parse(Some(" Prod ")), Some(Env::Prod));
+        assert_eq!(Env::parse(Some("qa")), None);
+        assert_eq!(Env::parse(None), None);
     }
 
     #[test]

@@ -75,6 +75,15 @@ pub struct ThemeColors {
     /// The drop shadow under a floating surface (the palette). Carries
     /// alpha; nothing else in the app is raised off the paper.
     pub shadow: Hsla,
+    /// Environment tag dots and chips: prod warns in warm clay, staging
+    /// holds the middle in gold, dev rests in green. The `_surface`
+    /// partner is the selected chip's wash behind that dot.
+    pub env_prod: Hsla,
+    pub env_prod_surface: Hsla,
+    pub env_staging: Hsla,
+    pub env_staging_surface: Hsla,
+    pub env_dev: Hsla,
+    pub env_dev_surface: Hsla,
     /// Success / connected.
     pub ok: Hsla,
     /// A connection that is saved but not open: the sand dot.
@@ -127,6 +136,12 @@ impl Theme {
                 match_error: rgb(0xF2DDD1).into(),
                 overlay: rgba(0x34302A38).into(),
                 shadow: rgba(0x211F1B66).into(),
+                env_prod: rgb(0xA9694A).into(),
+                env_prod_surface: rgb(0xF7EAE1).into(),
+                env_staging: rgb(0xC9A44A).into(),
+                env_staging_surface: rgb(0xF5EDD8).into(),
+                env_dev: rgb(0x5C8A4E).into(),
+                env_dev_surface: rgb(0xEBF1E6).into(),
                 ok: rgb(0x5C8A4E).into(),
                 idle: rgb(0xCFC8B8).into(),
                 error: rgb(0x8E4A2A).into(),
