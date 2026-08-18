@@ -32,6 +32,7 @@ use ui::{
 };
 
 use crate::connections::unix_now;
+use crate::env::Env;
 use crate::history::{self, HistoryRow, OnOpenRun};
 use crate::palette::{self, OnPick, Pick, Scope};
 use crate::sql::{PAGE_SIZE, browse_query, page_query};
@@ -116,6 +117,10 @@ pub struct Shell {
     /// built from the URL the app was started with. A password never
     /// reaches it.
     scope: String,
+    /// The environment tag the profile wears, read once on the way in:
+    /// it colors the window frame, so a prod session can never be
+    /// mistaken for a dev one. A command-line URL has no tag.
+    env: Option<Env>,
     /// The ⌘K palette, while it is open. It lives on the shell rather than
     /// in a window of its own, so closing it cannot leave the workspace
     /// without focus.
@@ -262,6 +267,15 @@ impl Shell {
             Err(error) => (None, Some(error.to_string())),
         };
         let scope = scope_of(&target);
+        let env = match &target {
+            Target::Profile(profile) => Env::parse(
+                store
+                    .as_ref()
+                    .and_then(|store| store.env_of(&profile.id).ok().flatten())
+                    .as_deref(),
+            ),
+            Target::Url(_) => None,
+        };
         // The catalog this connection had when it was last open. It paints
         // the sidebar and feeds completion straight away; the introspection
         // running behind it replaces it when it lands. A store that cannot
@@ -300,6 +314,7 @@ impl Shell {
             store,
             store_error,
             scope,
+            env,
             palette: None,
             restoring: false,
             _subscriptions: subscriptions,
@@ -1503,7 +1518,36 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme(cx).colors.clone();
 
-        div()
+        // The comp's environment frame: a tagged session wears its ring
+        // around the whole window, with a hairline of the same family
+        // just inside it. An untagged session wears nothing.
+        let mut content = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(self.breadcrumb_bar(&colors, cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(self.sidebar(&colors, cx))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(self.tab_strip(&colors, cx))
+                            .child(self.pane(&colors, window, cx))
+                            .child(self.status_strip(&colors, cx)),
+                    ),
+            );
+        if let Some(env) = self.env {
+            content = content.border_1().border_color(env.inner(&colors));
+        }
+
+        let mut root = div()
             .key_context("Shell")
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::on_run_query))
@@ -1522,26 +1566,11 @@ impl Render for Shell {
             .size_full()
             .bg(colors.window)
             .font_family(FONT_FAMILY)
-            .text_color(colors.text_body)
-            .child(self.breadcrumb_bar(&colors, cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .child(self.sidebar(&colors, cx))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(self.tab_strip(&colors, cx))
-                            .child(self.pane(&colors, window, cx))
-                            .child(self.status_strip(&colors, cx)),
-                    ),
-            )
-            .children(self.palette_overlay(&colors, cx))
+            .text_color(colors.text_body);
+        if let Some(env) = self.env {
+            root = root.border_3().border_color(env.ring(&colors));
+        }
+        root.child(content).children(self.palette_overlay(&colors, cx))
     }
 }
 
@@ -1584,6 +1613,12 @@ impl Shell {
             _ => {}
         }
 
+        // A tagged session tints the whole bar with the environment's
+        // wash and rules it with the same family, the way the comp does.
+        let (bar_bg, bar_rule) = match self.env {
+            Some(env) => (env.surface(colors), env.inner(colors)),
+            None => (colors.panel, colors.border),
+        };
         div()
             .h(px(38.))
             .flex_none()
@@ -1592,8 +1627,8 @@ impl Shell {
             .px(px(12.))
             .gap(px(14.))
             .border_b_1()
-            .border_color(colors.border)
-            .bg(colors.panel)
+            .border_color(bar_rule)
+            .bg(bar_bg)
             .text_size(px(11.))
             // The way back to the connections screen, where the comp puts
             // the window controls.
@@ -1613,6 +1648,20 @@ impl Shell {
                     }))
                     .child("‹ connections"),
             )
+            .children(self.env.map(|env| {
+                // The badge names the frame: PROD in the ring's own
+                // color, so the tint never has to be decoded from memory.
+                div()
+                    .flex_none()
+                    .px(px(9.))
+                    .py(px(4.))
+                    .rounded(px(5.))
+                    .bg(env.ring(colors))
+                    .text_size(px(10.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.window)
+                    .child(env.as_str().to_ascii_uppercase())
+            }))
             .child(trail)
             // The way into the palette, where the comp puts it: beside the
             // ⌘⏎ badge, and clickable, because a badge that only tells you

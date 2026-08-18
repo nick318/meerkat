@@ -6,6 +6,7 @@
 //! the saved connections and takes new ones.
 
 mod connections;
+mod env;
 mod history;
 mod palette;
 mod root;

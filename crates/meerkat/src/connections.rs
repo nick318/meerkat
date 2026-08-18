@@ -38,6 +38,7 @@
 //! The saved password never comes back into the form; a password field
 //! left empty keeps the one in the keychain.
 
+use crate::env::Env;
 use chrono::Local;
 use db_client::{Connection, Engine, Profile};
 use db_postgres::PostgresConnection;
@@ -71,57 +72,6 @@ const KEY_CONTEXT: &str = "Connections";
 
 /// Where the "group by env" switch keeps its state across launches.
 const GROUP_BY_ENV_KEY: &str = "connections.group_by_env";
-
-/// The three environments a connection can be tagged with. The set is
-/// closed on purpose: the tags exist to be compared across connections,
-/// and free text would give every database its own spelling of "prod".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Env {
-    Prod,
-    Staging,
-    Dev,
-}
-
-impl Env {
-    /// The form's order, and the groups' order.
-    const ALL: [Env; 3] = [Env::Prod, Env::Staging, Env::Dev];
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Env::Prod => "prod",
-            Env::Staging => "staging",
-            Env::Dev => "dev",
-        }
-    }
-
-    /// A stored tag this build does not know reads as untagged, never as
-    /// an error: the file may have been written by a newer build.
-    fn parse(tag: Option<&str>) -> Option<Env> {
-        match tag?.trim().to_ascii_lowercase().as_str() {
-            "prod" => Some(Env::Prod),
-            "staging" => Some(Env::Staging),
-            "dev" => Some(Env::Dev),
-            _ => None,
-        }
-    }
-
-    fn dot(self, colors: &ThemeColors) -> gpui::Hsla {
-        match self {
-            Env::Prod => colors.env_prod,
-            Env::Staging => colors.env_staging,
-            Env::Dev => colors.env_dev,
-        }
-    }
-
-    /// The selected chip's wash behind that dot.
-    fn surface(self, colors: &ThemeColors) -> gpui::Hsla {
-        match self {
-            Env::Prod => colors.env_prod_surface,
-            Env::Staging => colors.env_staging_surface,
-            Env::Dev => colors.env_dev_surface,
-        }
-    }
-}
 
 actions!(
     connections,
@@ -888,7 +838,7 @@ impl Connections {
                         .text_size(px(8.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(colors.text_muted)
-                        .child(status_dot(env.dot(colors)).size(px(5.)))
+                        .child(status_dot(env.ring(colors)).size(px(5.)))
                         .child(env.as_str().to_ascii_uppercase())
                 }))
                 .child(
@@ -959,7 +909,7 @@ impl Connections {
             .text_size(px(9.))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(colors.text_faint)
-            .children(env.map(|env| status_dot(env.dot(colors)).size(px(5.))))
+            .children(env.map(|env| status_dot(env.ring(colors)).size(px(5.))))
             .child(text)
     }
 
@@ -1250,17 +1200,17 @@ impl Connections {
             .cursor_pointer()
             .text_size(px(11.))
             .on_click(cx.listener(move |this, _event, _window, cx| this.set_form_env(env, cx)))
-            .child(status_dot(env.dot(colors)))
+            .child(status_dot(env.ring(colors)))
             .child(env.as_str());
         if selected {
-            chip.border_color(env.dot(colors))
+            chip.border_color(env.ring(colors))
                 .bg(env.surface(colors))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(colors.text)
+                .text_color(env.text(colors))
         } else {
-            chip.border_color(colors.border_strong)
+            chip.border_color(colors.border)
                 .bg(colors.elevated)
-                .text_color(colors.text_secondary)
+                .text_color(colors.text_muted)
                 .hover(|s| s.border_color(colors.text_faint))
         }
     }
@@ -1344,10 +1294,14 @@ impl Connections {
                         Env::ALL.map(|env| self.env_chip(env, form.env == Some(env), colors, cx)),
                     ))
                     .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(colors.text_faint)
-                            .child("Prod-tagged connections get a warning before any write."),
+                        div().text_size(px(10.)).text_color(colors.text_faint).child(
+                            // The note names the frame the tag brings, so
+                            // the frame never has to explain itself.
+                            match form.env {
+                                Some(env) => env.form_note(),
+                                None => "An untagged connection wears no frame.",
+                            },
+                        ),
                     ),
             )
             .children(form.error.clone().map(|error| {
@@ -1668,13 +1622,6 @@ mod tests {
         let prod: Vec<&str> =
             groups[0].1.iter().map(|row| row.saved.profile.name.as_str()).collect();
         assert_eq!(prod, ["api", "billing"]);
-    }
-
-    #[test]
-    fn a_tag_from_a_newer_build_reads_as_untagged() {
-        assert_eq!(Env::parse(Some(" Prod ")), Some(Env::Prod));
-        assert_eq!(Env::parse(Some("qa")), None);
-        assert_eq!(Env::parse(None), None);
     }
 
     #[test]

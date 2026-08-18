@@ -75,15 +75,23 @@ pub struct ThemeColors {
     /// The drop shadow under a floating surface (the palette). Carries
     /// alpha; nothing else in the app is raised off the paper.
     pub shadow: Hsla,
-    /// Environment tag dots and chips: prod warns in warm clay, staging
-    /// holds the middle in gold, dev rests in green. The `_surface`
-    /// partner is the selected chip's wash behind that dot.
+    /// Environment tags: prod warns in clay, staging holds the middle in
+    /// sand, dev rests in green. Each carries four tones from the comp:
+    /// the ring (dots, badges, the window frame), the inner hairline just
+    /// inside that frame, the surface wash (selected chip, framed top
+    /// bar), and the text that sits on the wash.
     pub env_prod: Hsla,
+    pub env_prod_inner: Hsla,
     pub env_prod_surface: Hsla,
+    pub env_prod_text: Hsla,
     pub env_staging: Hsla,
+    pub env_staging_inner: Hsla,
     pub env_staging_surface: Hsla,
+    pub env_staging_text: Hsla,
     pub env_dev: Hsla,
+    pub env_dev_inner: Hsla,
     pub env_dev_surface: Hsla,
+    pub env_dev_text: Hsla,
     /// Success / connected.
     pub ok: Hsla,
     /// A connection that is saved but not open: the sand dot.
@@ -136,12 +144,18 @@ impl Theme {
                 match_error: rgb(0xF2DDD1).into(),
                 overlay: rgba(0x34302A38).into(),
                 shadow: rgba(0x211F1B66).into(),
-                env_prod: rgb(0xA9694A).into(),
-                env_prod_surface: rgb(0xF7EAE1).into(),
-                env_staging: rgb(0xC9A44A).into(),
-                env_staging_surface: rgb(0xF5EDD8).into(),
+                env_prod: rgb(0xB4552A).into(),
+                env_prod_inner: rgb(0xE8C6B2).into(),
+                env_prod_surface: rgb(0xFBEFE8).into(),
+                env_prod_text: rgb(0x8E4A2A).into(),
+                env_staging: rgb(0xC79B2E).into(),
+                env_staging_inner: rgb(0xEBDCAE).into(),
+                env_staging_surface: rgb(0xFBF6E7).into(),
+                env_staging_text: rgb(0x7A6420).into(),
                 env_dev: rgb(0x5C8A4E).into(),
-                env_dev_surface: rgb(0xEBF1E6).into(),
+                env_dev_inner: rgb(0xCBDEC2).into(),
+                env_dev_surface: rgb(0xF1F7EE).into(),
+                env_dev_text: rgb(0x3F6032).into(),
                 ok: rgb(0x5C8A4E).into(),
                 idle: rgb(0xCFC8B8).into(),
                 error: rgb(0x8E4A2A).into(),

@@ -287,6 +287,17 @@ impl Store {
         Ok(())
     }
 
+    /// The environment tag of one profile, for the shell to read on its
+    /// way in: the frame it wears is decided once, when the session
+    /// opens. An unknown id reads as untagged.
+    pub fn env_of(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT env FROM profiles WHERE id = ?1", [id], |row| row.get(0))
+            .optional()?
+            .flatten())
+    }
+
     /// Tag a connection with an environment ("prod", "staging"), or take
     /// the tag away with `None`. The tag is display metadata, so it is
     /// written beside the profile rather than through `save_profile`.
