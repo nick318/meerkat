@@ -13,7 +13,7 @@ use db_client::{Connection, Profile, QueryResult};
 use db_postgres::{Label, PostgresConnection};
 use gpui::{
     AnyElement, App, BoxShadow, Context, Div, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, ScrollStrategy, SharedString, Stateful, Subscription,
+    Focusable, FontWeight, Pixels, ScrollStrategy, SharedString, Stateful, Subscription,
     UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
 };
 use introspect::{Catalog, Table, TableKind};
@@ -1506,6 +1506,75 @@ impl Focusable for Shell {
 
 impl EventEmitter<ShellEvent> for Shell {}
 
+/// The radius macOS masks the window's bottom corners to. The
+/// environment frame curves to the same radius, or the mask would cut
+/// its corners off. Tahoe (Darwin 25, macOS 26) rounds windows to
+/// 16pt; the versions before it used 10pt. There is no public API for
+/// the value, so it is read off the OS version once.
+fn window_corner_radius() -> f32 {
+    #[cfg(target_os = "macos")]
+    {
+        static RADIUS: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+            let release = std::process::Command::new("uname")
+                .arg("-r")
+                .output()
+                .ok()
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .unwrap_or_default();
+            let major: u32 = release
+                .split('.')
+                .next()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            if major >= 25 { 16. } else { 10. }
+        });
+        *RADIUS
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        0.
+    }
+}
+
+/// The environment ring's width. The frame's `border_3` must agree.
+const RING_WIDTH: f32 = 3.;
+
+/// The environment frame, painted a second time over the content. The
+/// panels at the bottom corners are square and paint after the shell's
+/// borders, so without this pass they would cover the curved ring and
+/// hairline. No background and no listeners: it colors pixels only.
+///
+/// Both layers are positioned absolutely in the same frame, never laid
+/// out inside a border: border layout rounds to layout pixels, which
+/// slid the hairline's curve off the ring's and let the panel show
+/// through as a light arc at each corner. The hairline is also drawn a
+/// point wide of itself, tucked under the ring, so the two curves
+/// overlap instead of meeting edge to edge — an abutting seam leaks
+/// background on fractional display scales, an overlapped one cannot.
+/// The ring paints last and keeps the visible hairline to one point.
+fn frame_overlay(env: Env, radius: Pixels, colors: &ThemeColors) -> Div {
+    let tuck = px(RING_WIDTH - 1.);
+    div()
+        .absolute()
+        .inset_0()
+        .child(
+            div()
+                .absolute()
+                .inset(tuck)
+                .border_2()
+                .border_color(env.inner(colors))
+                .rounded_b((radius - tuck).max(px(0.))),
+        )
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .border_3()
+                .border_color(env.ring(colors))
+                .rounded_b(radius),
+        )
+}
+
 /// What the connecting line says before there is a connection to describe.
 fn describe(target: &Target) -> String {
     match target {
@@ -1521,6 +1590,21 @@ impl Render for Shell {
         // The comp's environment frame: a tagged session wears its ring
         // around the whole window, with a hairline of the same family
         // just inside it. An untagged session wears nothing.
+        //
+        // macOS masks the window to rounded bottom corners, so a square
+        // ring loses its corners to that mask. The ring and the hairline
+        // curve to the same radius instead — except in fullscreen, where
+        // the mask is square. The panels at the bottom corners stay
+        // square and paint after the borders, so `frame_overlay` repaints
+        // both curves on top of them.
+        //
+        // The ring's border lives on `framed`, never on `root`: an
+        // absolutely positioned child is placed in its parent's padding
+        // box, so a border on `root` would shove `frame_overlay` inward
+        // by the ring's own width. `root` still rounds its background,
+        // which keeps the corners outside the ring dark under the mask.
+        let radius = if window.is_fullscreen() { px(0.) } else { px(window_corner_radius()) };
+        let inner_radius = (radius - px(RING_WIDTH)).max(px(0.));
         let mut content = div()
             .size_full()
             .flex()
@@ -1544,7 +1628,15 @@ impl Render for Shell {
                     ),
             );
         if let Some(env) = self.env {
-            content = content.border_1().border_color(env.inner(&colors));
+            content = content
+                .border_1()
+                .border_color(env.inner(&colors))
+                .rounded_b(inner_radius);
+        }
+
+        let mut framed = div().size_full().flex().flex_col().child(content);
+        if let Some(env) = self.env {
+            framed = framed.border_3().border_color(env.ring(&colors)).rounded_b(radius);
         }
 
         let mut root = div()
@@ -1567,10 +1659,12 @@ impl Render for Shell {
             .bg(colors.window)
             .font_family(FONT_FAMILY)
             .text_color(colors.text_body);
-        if let Some(env) = self.env {
-            root = root.border_3().border_color(env.ring(&colors));
+        if self.env.is_some() {
+            root = root.rounded_b(radius);
         }
-        root.child(content).children(self.palette_overlay(&colors, cx))
+        root.child(framed)
+            .children(self.env.map(|env| frame_overlay(env, radius, &colors)))
+            .children(self.palette_overlay(&colors, cx))
     }
 }
 
