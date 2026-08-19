@@ -105,6 +105,12 @@ pub struct Shell {
     /// Every name in the catalog, for the editor's colouring.
     vocabulary: Arc<Vocabulary>,
     label: Option<Label>,
+    /// What the user called this connection, from the profile. It names the
+    /// session everywhere the shell names it, because the name is what the
+    /// user chose to recognise the connection by — two profiles often point
+    /// at the same database name on different hosts. A command-line URL has
+    /// no profile and so no name, and falls back to the database.
+    name: Option<SharedString>,
     tabs: Vec<Tab>,
     active: usize,
     next_id: u64,
@@ -308,6 +314,7 @@ impl Shell {
             relation_total: 0,
             vocabulary: Arc::new(Vocabulary::default()),
             label: None,
+            name: connection_name(&target),
             tabs: Vec::new(),
             active: 0,
             next_id: 1,
@@ -1583,6 +1590,17 @@ fn describe(target: &Target) -> String {
     }
 }
 
+/// The name the session goes by. A profile's own name, empty names aside; a
+/// command-line URL has none, and the database name stands in for it.
+fn connection_name(target: &Target) -> Option<SharedString> {
+    match target {
+        Target::Profile(profile) if !profile.name.trim().is_empty() => {
+            Some(profile.name.clone().into())
+        }
+        _ => None,
+    }
+}
+
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme(cx).colors.clone();
@@ -1681,7 +1699,7 @@ impl Shell {
             .child(
                 div()
                     .text_color(colors.text_secondary)
-                    .child(self.database_name()),
+                    .child(self.session_name()),
             );
         match self.tabs.get(self.active) {
             Some(Tab::Table(tab)) => {
@@ -1772,7 +1790,12 @@ impl Shell {
             .child(key_badge("⌘⏎", colors))
     }
 
-    fn database_name(&self) -> SharedString {
+    /// What to call this session on screen. The profile's name first, then
+    /// the database the connection reports, then the app's own name.
+    fn session_name(&self) -> SharedString {
+        if let Some(name) = &self.name {
+            return name.clone();
+        }
         match &self.label {
             Some(label) if !label.database.is_empty() => label.database.clone().into(),
             _ => "meerkat".into(),
@@ -1780,11 +1803,19 @@ impl Shell {
     }
 
     fn sidebar(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
+        // The card's second line carries whatever the first one does not.
+        // A named profile takes the title, so the database moves down here
+        // rather than leaving the screen: the user still has to know which
+        // database of that host is open.
         let (host, dot) = match (&self.label, &self.status) {
-            (Some(label), Status::Connected) => (
-                format!("{} · {}", label.host, label.port),
-                colors.ok,
-            ),
+            (Some(label), Status::Connected) => {
+                let where_it_is = format!("{} · {}", label.host, label.port);
+                let line = match (&self.name, label.database.is_empty()) {
+                    (Some(_), false) => format!("{} · {where_it_is}", label.database),
+                    _ => where_it_is,
+                };
+                (line, colors.ok)
+            }
             (_, Status::Failed(_)) => ("not connected".to_string(), colors.error),
             _ => ("connecting…".to_string(), colors.text_faint),
         };
@@ -1818,7 +1849,7 @@ impl Shell {
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(colors.text)
                                         .truncate()
-                                        .child(self.database_name()),
+                                        .child(self.session_name()),
                                 )
                                 .child(
                                     div()
@@ -2252,7 +2283,7 @@ impl Shell {
                     div()
                         .text_size(px(11.))
                         .text_color(colors.text_muted)
-                        .child(format!("{} · read-only", self.database_name())),
+                        .child(format!("{} · read-only", self.session_name())),
                 )
                 // With several statements in the buffer, say which one a
                 // run would send, so ⌘⏎ never comes as a surprise.
@@ -2341,7 +2372,7 @@ impl Shell {
                     div()
                         .text_size(px(11.))
                         .text_color(colors.text_muted)
-                        .child(format!("{} · last {HISTORY_DAYS} days", self.database_name())),
+                        .child(format!("{} · last {HISTORY_DAYS} days", self.session_name())),
                 )
                 .child(div().flex_1())
                 .child(
