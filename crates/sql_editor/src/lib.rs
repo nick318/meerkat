@@ -35,6 +35,7 @@ use highlight::Token;
 use std::ops::Range;
 use std::sync::Arc;
 use theme::theme;
+use ui::scrollbar::{self, DragState, Scrollbar};
 
 actions!(
     sql_editor,
@@ -168,6 +169,12 @@ const INDENT: &str = "  ";
 const FONT_SIZE: f32 = 12.;
 const LINE_HEIGHT: f32 = 21.;
 const GUTTER_WIDTH: f32 = 44.;
+/// One character's advance. The font is monospaced, so a line's width is
+/// its character count times this — JetBrains Mono advances 0.6em, which is
+/// exactly what the text system reports for it. It sizes the scrollable
+/// width only, so a double-width script costs a little scroll travel and
+/// nothing else.
+const CHAR_WIDTH: f32 = FONT_SIZE * 0.6;
 const TEXT_PADDING_X: f32 = 16.;
 const TEXT_PADDING_Y: f32 = 12.;
 /// Deep enough for a long editing session, bounded so a runaway paste
@@ -176,7 +183,15 @@ const UNDO_DEPTH: usize = 256;
 
 pub struct SqlEditor {
     focus_handle: FocusHandle,
+    /// Where the buffer is scrolled down to. The gutter is inside this one,
+    /// so the line numbers travel with the text.
     scroll_handle: ScrollHandle,
+    /// Where it is scrolled across to. A second container, holding the text
+    /// alone: a long line must not push the line numbers off the left of
+    /// the pane, which one container over both would do.
+    h_scroll_handle: ScrollHandle,
+    /// Which of the two scrollbars is being dragged, if either.
+    scroll_drag: DragState,
     content: String,
     placeholder: SharedString,
     vocabulary: Arc<Vocabulary>,
@@ -239,6 +254,8 @@ impl SqlEditor {
         Self {
             focus_handle: cx.focus_handle(),
             scroll_handle: ScrollHandle::new(),
+            h_scroll_handle: ScrollHandle::new(),
+            scroll_drag: DragState::default(),
             content,
             placeholder: "select * from".into(),
             vocabulary,
@@ -273,6 +290,18 @@ impl SqlEditor {
 
     pub fn line_count(&self) -> usize {
         self.content.split('\n').count()
+    }
+
+    /// The longest line, in characters. The element sizes itself by it, so
+    /// the container around it knows there is something to scroll across to.
+    ///
+    /// Characters, not shaped pixels: the font is monospaced, and measuring
+    /// it exactly would mean shaping every line a second time on every
+    /// frame, before there is a layout to shape into. The placeholder
+    /// counts when the buffer is empty, because that is what is on screen.
+    fn widest_line(&self) -> usize {
+        let text = if self.content.is_empty() { self.placeholder.as_ref() } else { &self.content };
+        text.split('\n').map(|line| line.chars().count()).max().unwrap_or(0)
     }
 
     /// Swap in the names of the connected database, so the tokenizer can
@@ -1044,6 +1073,10 @@ impl Render for SqlEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme(cx).colors.clone();
         let line_count = self.line_count();
+        // How wide the text is, and so how far there is to scroll. The
+        // element inside fills this box; the box is what the scroll
+        // container measures.
+        let text_width = TEXT_PADDING_X * 2. + self.widest_line() as f32 * CHAR_WIDTH;
 
         // The `completing` entry is what lets the completion bindings
         // outrank the caret bindings, and only while the panel is open.
@@ -1102,11 +1135,23 @@ impl Render for SqlEditor {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .size_full()
+            .relative()
             .flex()
             .text_size(px(FONT_SIZE))
             .line_height(px(LINE_HEIGHT))
             .child(
-                // Only the text scrolls; the completions panel stays put.
+                // Two scroll containers, nested, and the nesting is the
+                // point: this one scrolls **down**, and the gutter is inside
+                // it, so the line numbers travel with their lines. The one
+                // within it scrolls **across** and holds the text alone, so
+                // a long line slides under the numbers instead of pushing
+                // them off the pane. One container over both would take the
+                // gutter with it.
+                //
+                // GPUI applies a wheel gesture to every scroll container
+                // under the pointer, each on the axis it has, so the pair
+                // reads as one surface: vertical to the outer, horizontal to
+                // the inner.
                 div()
                     .id("sql-editor-text")
                     .track_scroll(&self.scroll_handle)
@@ -1133,12 +1178,73 @@ impl Render for SqlEditor {
                     )
                     .child(
                         div()
+                            .id("sql-editor-line")
+                            .track_scroll(&self.h_scroll_handle)
                             .flex_1()
                             .min_w(px(0.))
-                            .px(px(TEXT_PADDING_X))
-                            .py(px(TEXT_PADDING_Y))
-                            .child(EditorElement { editor: cx.entity() }),
+                            .overflow_x_scroll()
+                            .child(
+                                // The width is **definite**, and that is the
+                                // whole trick: a scroll container measures
+                                // the box its children ask for, and an
+                                // auto-width child inside one is measured
+                                // as the container itself — content the same
+                                // size as the viewport is content with
+                                // nothing to scroll, and so no bar. The
+                                // results grid sizes its own content the
+                                // same way. `min_w_full` keeps a short
+                                // buffer pane-wide, so a click to the right
+                                // of a line still lands in the editor.
+                                div()
+                                    .flex_none()
+                                    .w(px(text_width))
+                                    .min_w_full()
+                                    .px(px(TEXT_PADDING_X))
+                                    .py(px(TEXT_PADDING_Y))
+                                    .child(EditorElement { editor: cx.entity() }),
+                            ),
                     ),
+            )
+            // The bars are painted outside the containers they drive, or
+            // they would scroll away with the text. Both appear only when
+            // the content does not fit, which `Scrollbar::new` answers.
+            .children(
+                Scrollbar::new(
+                    true,
+                    self.scroll_handle.clone(),
+                    self.scroll_drag.clone(),
+                    colors.text_faint,
+                    colors.text_muted,
+                )
+                .map(|bar| {
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .right(px(0.))
+                        .bottom(px(0.))
+                        .w(px(scrollbar::THICKNESS))
+                        .child(bar)
+                }),
+            )
+            .children(
+                Scrollbar::new(
+                    false,
+                    self.h_scroll_handle.clone(),
+                    self.scroll_drag.clone(),
+                    colors.text_faint,
+                    colors.text_muted,
+                )
+                .map(|bar| {
+                    div()
+                        .absolute()
+                        // Start past the gutter: the bar drives the text,
+                        // and the gutter does not move sideways.
+                        .left(px(GUTTER_WIDTH))
+                        .right(px(0.))
+                        .bottom(px(0.))
+                        .h(px(scrollbar::THICKNESS))
+                        .child(bar)
+                }),
             )
     }
 }
@@ -1295,6 +1401,9 @@ struct PrepaintState {
     /// Top of the caret's line in window coordinates, so paint can pull
     /// the viewport back over it.
     cursor_top: Option<Pixels>,
+    /// The caret's left edge, likewise: a line long enough to scroll is a
+    /// line the caret can walk off the right of.
+    cursor_left: Option<Pixels>,
 }
 
 impl IntoElement for EditorElement {
@@ -1326,6 +1435,9 @@ impl Element for EditorElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let line_count = self.editor.read(cx).line_count();
         let mut style = Style::default();
+        // The element fills the box `render` sized for the longest line —
+        // that box is what the scroll container measures, so the width does
+        // not have to be worked out twice.
         style.size.width = relative(1.).into();
         style.size.height = (window.line_height() * line_count as f32).into();
         (window.request_layout(style, [], cx), ())
@@ -1386,14 +1498,21 @@ impl Element for EditorElement {
 
         let layout = EditorLayout { lines, line_starts, line_height };
 
-        let (quads, cursor, cursor_top) = if placeholder {
-            (Vec::new(), None, None)
+        let (quads, cursor, cursor_top, cursor_left) = if placeholder {
+            (Vec::new(), None, None, None)
         } else {
-            let row = row_for_offset(&layout.line_starts, editor.cursor_offset());
+            let offset = editor.cursor_offset();
+            let row = row_for_offset(&layout.line_starts, offset);
+            let column = layout
+                .lines
+                .get(row)
+                .map(|line| line.x_for_index(offset - layout.line_starts[row]))
+                .unwrap_or_default();
             (
                 selection_quads(editor, &layout, bounds, colors.selection),
                 cursor_quad(editor, &layout, bounds, colors.accent),
                 Some(bounds.top() + line_height * row as f32),
+                Some(bounds.left() + column),
             )
         };
 
@@ -1401,7 +1520,7 @@ impl Element for EditorElement {
             self.draw_completions_menu(&layout, bounds, window, cx);
         }
 
-        PrepaintState { layout: Some(layout), quads, cursor, cursor_top }
+        PrepaintState { layout: Some(layout), quads, cursor, cursor_top, cursor_left }
     }
 
     fn paint(
@@ -1439,17 +1558,17 @@ impl Element for EditorElement {
         }
 
         let line_height = layout.line_height;
-        let follow = prepaint
-            .cursor_top
-            .filter(|_| self.editor.read(cx).pending_autoscroll);
+        let following = self.editor.read(cx).pending_autoscroll;
+        let follow = prepaint.cursor_top.filter(|_| following);
+        let follow_x = prepaint.cursor_left.filter(|_| following);
 
         self.editor.update(cx, |editor, _| {
             editor.last_layout = Some(layout);
             editor.last_bounds = Some(bounds);
         });
 
-        if let Some(cursor_top) = follow {
-            self.follow_cursor(cursor_top, line_height, window, cx);
+        if follow.is_some() || follow_x.is_some() {
+            self.follow_cursor(follow, follow_x, line_height, window, cx);
         }
     }
 }
@@ -1501,41 +1620,75 @@ impl EditorElement {
         window.defer_draw(menu, point(x, y), 1, None);
     }
 
-    /// Pull the viewport back over the caret after it moved out of sight.
-    /// A new offset only takes effect on the next frame, so ask for one.
+    /// Pull the viewport back over the caret after it moved out of sight,
+    /// **down and across**: the caret walks off the right of a long line as
+    /// readily as off the bottom of a long buffer.
+    ///
+    /// A new offset only takes effect on the next frame, so ask for one —
+    /// and only when something actually moved, or the editor would refresh
+    /// itself for ever.
     fn follow_cursor(
         &self,
-        cursor_top: Pixels,
+        cursor_top: Option<Pixels>,
+        cursor_left: Option<Pixels>,
         line_height: Pixels,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (scroll_handle, viewport) = {
+        let (rows, columns) = {
             let editor = self.editor.read(cx);
-            (editor.scroll_handle.clone(), editor.scroll_handle.bounds())
+            (editor.scroll_handle.clone(), editor.h_scroll_handle.clone())
         };
-        if viewport.size.height <= px(0.) {
-            return;
+        let mut moved = false;
+
+        let viewport = rows.bounds();
+        if let Some(cursor_top) = cursor_top
+            && viewport.size.height > px(0.)
+        {
+            // Keep the editor's padding visible above and below the caret,
+            // so it never sits flush against the edge of the pane.
+            let above = cursor_top - px(TEXT_PADDING_Y);
+            let below = cursor_top + line_height + px(TEXT_PADDING_Y);
+            let mut offset = rows.offset();
+            if above < viewport.top() {
+                offset.y += viewport.top() - above;
+            } else if below > viewport.bottom() {
+                offset.y -= below - viewport.bottom();
+            }
+            offset.y = offset.y.min(px(0.));
+            if offset.y != rows.offset().y {
+                rows.set_offset(offset);
+                moved = true;
+            }
         }
 
-        // Keep the editor's padding visible above and below the caret, so
-        // it never sits flush against the edge of the pane.
-        let above = cursor_top - px(TEXT_PADDING_Y);
-        let below = cursor_top + line_height + px(TEXT_PADDING_Y);
-        let mut offset = scroll_handle.offset();
-        if above < viewport.top() {
-            offset.y += viewport.top() - above;
-        } else if below > viewport.bottom() {
-            offset.y -= below - viewport.bottom();
-        } else {
-            self.editor.update(cx, |editor, _| editor.pending_autoscroll = false);
-            return;
+        let viewport = columns.bounds();
+        if let Some(cursor_left) = cursor_left
+            && viewport.size.width > px(0.)
+        {
+            // A caret sitting exactly on the right edge is a caret the user
+            // cannot see, so it keeps the text padding beside it as well —
+            // and one column of slack, so typing at the end of a long line
+            // slides the view along rather than following a character late.
+            let left = cursor_left - px(TEXT_PADDING_X);
+            let right = cursor_left + px(TEXT_PADDING_X);
+            let mut offset = columns.offset();
+            if left < viewport.left() {
+                offset.x += viewport.left() - left;
+            } else if right > viewport.right() {
+                offset.x -= right - viewport.right();
+            }
+            offset.x = offset.x.min(px(0.));
+            if offset.x != columns.offset().x {
+                columns.set_offset(offset);
+                moved = true;
+            }
         }
-        offset.y = offset.y.min(px(0.));
 
-        scroll_handle.set_offset(offset);
         self.editor.update(cx, |editor, _| editor.pending_autoscroll = false);
-        window.refresh();
+        if moved {
+            window.refresh();
+        }
     }
 }
 
