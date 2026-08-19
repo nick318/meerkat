@@ -312,23 +312,29 @@ clay. ⌘⏎ runs, ⌘. stops. The escalation is the point: the button that ends
 a backend must not look like the button that starts a query.
 
 **The server does the stopping, not the app.** Dropping the future would
-leave the statement running on the server, so `execute_reporting` asks the
-server for `pg_backend_pid()` before it sends the statement (one round trip,
-once per run) and reports it through a `ReportRun` callback. `Connection::
-stop` then sends `pg_cancel_backend` — the statement comes back as SQLSTATE
-57014 — or `pg_terminate_backend`, which closes the backend and the
-connection with it. That is why terminate is the *second* press.
+leave the statement running on the server, so a run has to name the backend
+it is on. A query tab's session knows that from the moment it opens; the
+pooled path — table pages — asks for `pg_backend_pid()` before it sends the
+statement, because a pooled connection is a different backend each time.
+`Connection::stop` then sends `pg_cancel_backend` — the statement comes
+back as SQLSTATE 57014 — or `pg_terminate_backend`, which closes the
+backend and the connection with it. That is why terminate is the *second*
+press.
 
-Both go out on a **different pooled connection**, so `MAX_CONNECTIONS` is
-one over what the tabs need: waiting for a free connection would mean
-waiting for the statement the user just asked to stop.
+Both go out on the **app pool**, never a session's: waiting for a free
+connection would mean waiting for the statement the user just asked to
+stop. See "A tab is a session" for why that reserve is a pool of its own.
 
-The backend id is shared with the tokio task as an `Arc<AtomicI32>`, 0 for
-"not yet". A stop pressed in the round trip before the id lands waits for it
-on the background executor rather than doing nothing — a stop that silently
-did nothing is the worst thing that button can do. `Live` belongs to the
-run, not to the request, so both presses keep the same start time: the timer
-must not restart because the user asked twice.
+`Live::backend` is an `Option<RunId>`, filled in before the run leaves.
+**`None` is not a gap in what is known**: it says the tab's session is
+still opening, and *no statement is out*, so there is nothing on the server
+to cancel. A stop pressed there marks the run `Cancelling`, and the open
+lands into a run that then does not start — the run is called off rather
+than chased. That is why the stop needs no waiting: before sessions the id
+arrived one round trip *into* the run, and the wait loop existed to cover
+exactly that window. `Live` belongs to the run, not to the request, so both
+presses keep the same start time: the timer must not restart because the
+user asked twice.
 
 A stopped run comes back as the server's own refusal. The tab paints
 CANCELLED instead of an error strip, because the user is who asked — but
@@ -344,9 +350,257 @@ Table pages are not cancellable — they are `LIMIT 500` and the design puts
 the button in the query toolbar.
 
 The RUNNING line says "the server has the statement", not the comp's
-"streaming · N rows buffered": `execute` collects the whole result, so there
-is no buffered count to report without lying. When streaming lands, that
-line is where it shows up.
+"streaming · N rows buffered". The driver does stream the rows now (see
+below), but it hands the result over in one piece at the end, so there is
+still no buffered count to report without lying. A count needs the driver to
+report *progress*, not merely to stream; that line is where it shows up.
+
+### A tab is a session
+
+**The tab is a session in the user's head, so it has to be one on the
+wire.** Statements sent on whichever pooled connection happened to be free
+cannot see each other's `SET`, cannot share a `BEGIN`, and cannot read a
+temp table the statement before them made. Nothing short of one connection
+per tab fixes that: replaying the settings would mean parsing the user's
+SQL, and no amount of parsing replays a temp table or an open transaction.
+
+`db_client::Session` is that connection. `Connection::open_session` pins one
+and hands it back; a query tab holds it in `QueryTab::session` from its
+**first run** onwards — never before, so a strip of a hundred restored tabs
+costs the server nothing until the user asks one of them a question. Every
+statement of a buffer then goes down that one connection, in order, so
+`BEGIN; SELECT …;` in one buffer means what it reads as.
+
+**Two pools, and the split is the point.** `APP_CONNECTIONS` (3) serves
+what the app does for itself — introspection, table pages, and every
+`pg_cancel_backend`. `SESSION_CONNECTIONS` (8) is the ceiling on live tabs.
+Stopping a run must never wait for a free connection, because the
+connection it would wait for is the statement the user asked to stop; a
+reserve written as a comment over one shared pool would be a reserve until
+the day it was not. Both pools are built from the same `PgConnectOptions`,
+so a session's startup packet is the app's — one read-only flag, no second
+story about what a connection may do. The session pool connects lazily.
+
+The session knows its **backend at open**, not one round trip into each
+run, so a stop or a close has something to aim at from the moment a run
+leaves. The `statement_timeout` probe rides the same trip and is likewise
+paid once per session. Only a tab's very first run still races.
+
+**A failed statement must not cost the session.** A syntax error does not
+end a transaction, so `RunOutcome` carries the session back beside the
+result and the tab keeps it either way — `session` is `None` only when
+opening it is what failed. Dropping it on error would lose whatever the
+user had set *and* hand the pool a connection with an open transaction.
+
+**Closing a tab rolls back.** Not for the server's sake — a closing socket
+already rolls a transaction back, at once, with no timeout involved — but
+for the **pool's**: that connection is about to be reused and must not
+carry the user's half-finished transaction to whoever acquires it next.
+`ROLLBACK` is sent whether or not a transaction is open, because it costs
+one round trip to send and one to ask; outside a transaction Postgres
+answers "there is no transaction in progress" and carries on. A connection
+that fails to *answer* is detached and closed rather than pooled — closing
+is itself a rollback, so there is no state left stuck.
+
+Leaving the shell and quitting need none of this: the pool dies with them.
+
+**A session must survive being dropped off the runtime.** sqlx returns a
+pooled connection to its pool by *spawning onto tokio* when the last handle
+drops, and spawning off the runtime panics — inside an Objective-C callback
+that cannot unwind, so the process aborts. The last `Arc<dyn Session>` is
+routinely dropped on the UI thread: "‹ connections" drops the shell, every
+tab and every session inside a mouse-up. So `impl Drop` on each session
+**detaches** the connection first; a bare `PgConnection` drops by closing
+its socket, which needs no runtime. It is the fallback, not the ordinary
+path — `close` gives the connection back properly from inside a tokio task
+and leaves `Drop` nothing to do. Both drivers have a test that drops a
+session on a plain `std::thread`, which is what the UI thread looks like to
+sqlx.
+
+**Sessions are given back when nobody is using them.** `IDLE_SESSION` is
+ten minutes and `Shell::sweep_idle_sessions` runs every `IDLE_TICK` — one
+loop for the window, as the run timer is, and it ends itself once the last
+session has gone, so a workspace on no connections does not keep waking up
+to notice that. A laptop left open overnight must not hold every connection
+against a shared server for a window nobody is looking at.
+
+`db_client::MAX_SESSIONS` (8) is the ceiling, known to both ends: the
+driver sizes its session pool by it, and `Shell::make_room_for_session`
+checks it before asking for one too many. Over the cap, the session that
+has gone longest without a question is given back. **Two states are never
+taken**: a run in flight is using its connection, and a transaction would
+be rolled away with nobody asking — the very thing the close dialog exists
+to refuse to do quietly. So a tab sitting mid-transaction keeps its
+connection however long it waits, and the cap gives way instead: with
+nothing spare the run is refused outright, naming both ways out, rather
+than left to wait out the pool's connect timeout and come back with a
+message about connections.
+
+The policy is three plain functions over `SessionState` — `spare`,
+`idle_sessions`, `evictable` — so it can be argued with in a test rather
+than in a running window.
+
+**Every taking-back is visible.** `QueryTab::session_ended` puts
+`session ended · a run opens a new one` in the toolbar until the next run,
+because a `search_path` that reset an hour later must be explainable rather
+than a mystery. Beside it, `IN TRANSACTION` in the accent's family marks
+the state where everything the tab does is inside something a close would
+roll back. Neither mark says "a session is open": that is the ordinary case
+and needs no badge.
+
+### Closing something that is still running
+
+**Closing a socket is not a cancel.** Postgres notices the client is gone
+when the backend next writes, which a long `SELECT` may not do for minutes.
+So a close that abandons a run leaves the server working for a window that
+is not there any more, and nobody is told. That is what the confirmation is
+for — not tidiness.
+
+`Shell::guard_close` is the guard, and it answers `true` for "go ahead" or
+`false` for "the dialog is up, and the close happens when the user says so".
+**Every way out calls it.** There are four, and only one of them is ⌘W:
+
+| Way out | Asks about |
+|---|---|
+| ⌘W, or the × on a tab | that tab |
+| "‹ connections" | every tab |
+| ⌘Q | every tab |
+| the window's close button | every tab |
+
+The last two reach the shell through `Root::guard_quit`.
+`on_window_should_close` wants a yes or no on the spot and the question
+takes a person to answer, so it answers **no** and puts the dialog up;
+agreeing to it quits from there. A guard wired only to ⌘W would be a lie in
+the other three.
+
+A close that loses nothing never asks. **Two things count**: a run still in
+flight, and a transaction still open. Each gets its own line, because they
+are lost in different ways — a run the server can be asked to give up, a
+transaction it throws away — and one line cannot stand for the other. A tab
+in both states says both. Nothing else counts: the editor's buffer is
+already written back, and a result on screen is one the statement above it
+will fetch again. A dialog the user meets every time is one they learn to
+dismiss.
+
+**The transaction is known before it is asked about.** `Session::
+in_transaction` reads `pg_stat_activity` from the *app* pool — not from the
+session, whose connection may be busy with the very run in question, and
+which refuses every statement once its transaction has gone wrong: the
+session in the state most worth reporting is the one that cannot report it.
+`idle in transaction` and `idle in transaction (aborted)` both count.
+
+`Shell::refresh_transaction` reads it **after every run**, off the run's
+path, and caches it on the tab. The cache is exact rather than a guess: the
+connection is pinned to one tab, so nothing but that tab's own statements
+can change what it is in. Reading it at close time instead would mean a
+close that waits on a round trip before it can decide what to ask.
+
+⌘⏎ ends the runs, ⏎ and ⎋ both keep what is open, and the scrim does not
+dismiss on a click — unlike the palette's, because a stray click must not
+answer a question about ending server work. The ending button is clay and
+filled, the tone the terminate button wears. `confirm_copy` is pure, so the
+three ways out cannot drift into saying three unrelated things, and the
+wording is testable without a window.
+
+On confirm the runs are cancelled with `pg_cancel_backend`, the same call
+the stop button sends. **⌘Q waits for those requests and the other two do
+not**: quitting drops the tokio runtime, so a cancel that has not left yet
+never leaves. Closing a tab must not wait on the network, so its requests
+are detached — and detaching is required, not tidy: `Tokio::spawn` aborts
+its future when the handle is dropped.
+
+A close during a session's *opening* cancels nothing, and needs to cancel
+nothing: no statement has been sent. The tab goes, and the run that was
+about to leave never does.
+
+### How much a result may weigh
+
+A typed statement is the user's, so `SELECT * FROM big_table` with no
+`LIMIT` is a statement the app must survive rather than refuse. The rows are
+**streamed and capped**, in `db_client::RowSink`:
+
+- `MAX_BYTES` is 256 MB of decoded values per result.
+- `MAX_CELL_BYTES` is 1 MB of any one value. A cut `Text` ends in `…`.
+
+**The cap is on memory, not on rows.** A row count is only a proxy for what
+runs the process out of room, and a poor one: 120,000 two-column rows cost
+about 60 MB, and 120,000 rows of wide `jsonb` cost gigabytes. One number
+cannot bound both, so the bound is the resource itself — and a narrow result
+of a few hundred thousand rows comes back whole, which is the point.
+
+**Nothing rewrites the user's SQL.** Injecting a `LIMIT` breaks on CTEs,
+`UNION` and statements that are not `SELECT`, and it would put SQL in
+`query_history` that the user never wrote. The bound is on what comes back.
+
+A row that would carry the result past the cap is dropped and the result is
+marked `truncated`; a result that ends exactly on the cap is whole, not
+truncated. The first row is always kept, or one huge row would come back as
+an empty grid. `QueryResult::truncated` is `Ok`, never an error: the
+statement did not fail, the app declined to hold the rest. The query tab
+says so beside the row count, in the accent's family rather than the error's.
+
+**The cap stops the server too.** Dropping the stream would bound this
+process and nothing else — sqlx must read every remaining row off the wire
+before the connection is usable again, so the server would go on building
+and sending a result nobody will read. So the Postgres driver sends
+`pg_cancel_backend` at the cap, the same call the stop button sends, and
+then drains what is still in flight. That is why every run has to name its
+backend: a session knows it from the moment it opens, and the pooled path
+pays a round trip for it, so even a run nothing is watching can be stopped.
+`collect_capped` is the one place that streams, caps, cancels and drains,
+and both paths go through it. SQLite needs none of it — the rows come from
+a local file, so dropping the stream ends the work.
+
+`Limits` is a field on the connection, and `with_limits` is for the tests: a
+cap of a few kilobytes is reached in a query that takes no time, where the
+real one would want gigabytes of fixture.
+
+### How long a run may take
+
+`STATEMENT_TIMEOUT` is 30 seconds, and **only when nothing else has set
+one**. A viewer must not leave a statement on a shared server for ever
+because a window is open somewhere.
+
+**Postgres says where a setting came from**, which is what makes "only when
+nothing else has" answerable: `pg_settings.source` reads `default` when
+nothing anywhere named a value, and otherwise names the level that did —
+`user` for `ALTER ROLE`, `database`, `configuration file`, `client` for a
+startup option in the connection URL, `session` for a `SET` the user typed.
+So the driver defers to every one of those, including a deliberate `0`,
+which `default` would never report. `current_setting()` cannot tell those
+apart: it answers `0` for "nobody asked" and for "somebody asked for none".
+
+The ask rides the round trip that already reads the backend id, so the guard
+costs nothing:
+
+```sql
+SELECT pg_backend_pid(),
+       (SELECT set_config('statement_timeout', $1, false)
+          WHERE (SELECT source FROM pg_settings
+                  WHERE name = 'statement_timeout') = 'default')
+```
+
+`set_config(.., false)` *is* `SET`, and the `WHERE` is what makes it
+conditional — a `DO` block could not, because `SET` inside one is scoped to
+the block. The subquery answers NULL when somebody else already set the
+value.
+
+**It is not a startup option, though `default_transaction_read_only` is.** A
+startup option outranks `ALTER ROLE`, so asking for one would quietly
+overrule the DBA, and it is fixed before the connect, so it cannot depend on
+what the server turns out to say. The read-only flag has the opposite need:
+it is a promise, so it must survive `RESET ALL`, and there is nothing on the
+server to defer to. A timeout is a guard, not a promise — a `RESET ALL`
+washes it off that pooled connection and the next run puts it back, because
+every run asks.
+
+Two things follow. A timed-out statement comes back as **SQLSTATE 57014**,
+the same code as a cancel, because it is the same event from the server's
+side; the tab paints it as an error rather than as CANCELLED, since `Run`
+is `Running` and not `Cancelling`, and the server's own message says
+"statement timeout". And the `SET` is session-level on a pooled connection,
+so an `introspect` that lands on a connection a run has used inherits the
+timeout, though introspection never asks for one itself.
 
 ### The read-only session
 

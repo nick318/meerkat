@@ -6,7 +6,7 @@
 //! no sockets open.
 
 use crate::connections::{Connections, ConnectionsEvent};
-use crate::shell::{Shell, ShellEvent, Target};
+use crate::shell::{Close, Shell, ShellEvent, Target};
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, Subscription, Window, div, prelude::*,
 };
@@ -52,6 +52,19 @@ impl Root {
     pub fn remember(&self, cx: &App) {
         if let Screen::Workspace(workspace) = &self.screen {
             workspace.read(cx).remember_tabs(cx);
+        }
+    }
+
+    /// Ask the workspace whether the app may go. `false` means it put a
+    /// question on screen instead, and will quit itself if the user says
+    /// so — ⌘Q and the window's close button both end every tab at once,
+    /// so neither may skip the guard the tab strip goes through.
+    pub fn guard_quit(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match &self.screen {
+            Screen::Workspace(workspace) => workspace
+                .update(cx, |shell, cx| shell.guard_close(Close::Window, window, cx)),
+            // The connections screen holds no runs.
+            Screen::Connections(_) => true,
         }
     }
 

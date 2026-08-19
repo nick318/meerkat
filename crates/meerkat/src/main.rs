@@ -47,6 +47,7 @@ fn main() {
         cx.bind_keys(ui::text_field_key_bindings());
         cx.bind_keys(connections::key_bindings());
         cx.bind_keys(palette::key_bindings());
+        cx.bind_keys(shell::confirm_key_bindings());
         // The workspace's keys are scoped to the workspace, not bound
         // globally, so the palette can take ⌘⏎ for itself while it is
         // open: GPUI gives a keystroke to the binding that matched deepest
@@ -88,7 +89,18 @@ fn main() {
         // A session's tabs are written back as they change, but the last
         // keystrokes in an editor are not: ⌘Q and the window's close
         // button both drop the shell, so each one saves on the way out.
+        //
+        // Both also end every run at once, so both ask first. `guard_quit`
+        // answering `false` means the workspace has put the question on
+        // screen and will quit itself if the user agrees — so this returns
+        // and does not.
         cx.on_action(move |_: &Quit, cx: &mut App| {
+            let go = window
+                .update(cx, |root, window, cx| root.guard_quit(window, cx))
+                .unwrap_or(true);
+            if !go {
+                return;
+            }
             window.update(cx, |root, _window, cx| root.remember(cx)).ok();
             cx.quit();
         });
@@ -98,7 +110,17 @@ fn main() {
         window
             .update(cx, |root, window, cx| {
                 window.focus(&root.focus_handle(cx), cx);
+                // The platform wants a yes or no on the spot, and the
+                // question takes a person to answer. So a close with runs
+                // out answers "no" and puts the dialog up; agreeing to it
+                // quits from there.
                 window.on_window_should_close(cx, move |_window, cx| {
+                    let go = window_handle
+                        .update(cx, |root, window, cx| root.guard_quit(window, cx))
+                        .unwrap_or(true);
+                    if !go {
+                        return false;
+                    }
                     window_handle.update(cx, |root, _window, cx| root.remember(cx)).ok();
                     true
                 });

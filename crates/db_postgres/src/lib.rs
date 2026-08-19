@@ -13,25 +13,75 @@
 use anyhow::Context as _;
 use async_trait::async_trait;
 use db_client::{
-    Connection, Profile, QueryResult, ReportRun, Result, RowChange, RunId, Stop, Value,
+    Connection, Limits, Profile, QueryResult, Result, RowChange, RowSink, RunId, Session, Stop,
+    Value,
 };
+use futures::TryStreamExt as _;
 use introspect::{Catalog, Column, Schema, Table, TableKind};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
 use sqlx::{Column as _, Executor as _, Row as _, TypeInfo as _, ValueRef as _};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
-/// Pages of 500 rows plus one query tab at a time: a small pool is enough,
-/// and it keeps the connection count polite on shared servers. One slot
-/// over what the tabs need, because stopping a run needs a connection of
-/// its own — waiting for a free one would mean waiting for the very
-/// statement the user asked to stop.
-const MAX_CONNECTIONS: u32 = 5;
+/// Two pools, and the split is the point.
+///
+/// `APP_CONNECTIONS` serves what the app does for itself: introspection,
+/// table pages, and — the one that matters — `pg_cancel_backend`. Stopping
+/// a run must never wait for a free connection, because the connection it
+/// would be waiting for is the very statement the user asked to stop.
+///
+/// `db_client::MAX_SESSIONS` is the ceiling on live tabs, one pinned
+/// connection each, and the app knows the same number — see it there.
+/// Keeping them in a pool of their own is what stops a wall of open tabs
+/// from starving the app's own work; a reserve written as a comment over
+/// one shared pool would be a reserve until the day it was not.
+const APP_CONNECTIONS: u32 = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// SQLSTATE for `query_canceled`. The server answers a statement
+/// `pg_cancel_backend` reached with it — and a statement its own
+/// `statement_timeout` ran out on, which is the same event from the
+/// server's side: it gave the statement up.
+const QUERY_CANCELED: &str = "57014";
+
+/// How long a run may take before the server gives it up, when nothing else
+/// has an opinion. A viewer must not leave a statement on a shared server
+/// for ever because a window is open somewhere.
+const STATEMENT_TIMEOUT: &str = "30s";
+
 pub struct PostgresConnection {
+    /// The app's own work: introspection, table pages, and every cancel.
     pool: PgPool,
+    /// One pinned connection per open session. See `APP_CONNECTIONS`.
+    sessions: PgPool,
     label: Label,
+    limits: Limits,
+    /// What a run's `statement_timeout` is set to **when nothing else has
+    /// set one**, asked for beside the backend id: once per session, or
+    /// once per run on the pooled path, where every run is a new backend.
+    ///
+    /// Postgres says where a setting came from: `pg_settings.source` reads
+    /// `default` only when nothing anywhere named a value. A role
+    /// (`ALTER ROLE ... SET`) reads `user`, a database `database`, the
+    /// config file `configuration file`, a startup option in the connection
+    /// URL `client`, and a `SET` the user typed `session`. So the app can
+    /// tell its own silence apart from somebody's choice, and it defers to
+    /// every one of those — including a deliberate `0`, which `default`
+    /// would never report.
+    ///
+    /// This is why the timeout is **not** a startup option, though
+    /// `default_transaction_read_only` is. A startup option outranks
+    /// `ALTER ROLE`, so asking for one would quietly overrule the DBA — and
+    /// it is fixed before the connect, so it cannot be conditional on what
+    /// the server turns out to say. The read-only flag has the opposite
+    /// need: it is a promise, so it must survive `RESET ALL`, and there is
+    /// nothing on the server to defer to.
+    ///
+    /// The trade is that a `RESET ALL` washes the guard off that pooled
+    /// connection. The next run puts it back, because every run asks — a
+    /// timeout is a guard, not a promise.
+    statement_timeout: String,
 }
 
 /// What the header and the sidebar card say about this connection. The
@@ -107,12 +157,42 @@ impl PostgresConnection {
             options
         };
         let pool = PgPoolOptions::new()
-            .max_connections(MAX_CONNECTIONS)
+            .max_connections(APP_CONNECTIONS)
             .acquire_timeout(CONNECT_TIMEOUT)
-            .connect_with(options)
+            .connect_with(options.clone())
             .await
             .with_context(|| format!("failed to connect to {}", label.host))?;
-        Ok(Self { pool, label })
+        // The same options, so a session's startup packet is the app's:
+        // one read-only flag, one set of parameters, no second story about
+        // what this connection may do. Lazily connected — a session pool
+        // that opened eight sockets to serve nobody would be worse than
+        // the pooling it replaces.
+        let sessions = PgPoolOptions::new()
+            .max_connections(db_client::MAX_SESSIONS as u32)
+            .acquire_timeout(CONNECT_TIMEOUT)
+            .connect_lazy_with(options);
+        Ok(Self {
+            pool,
+            sessions,
+            label,
+            limits: Limits::default(),
+            statement_timeout: STATEMENT_TIMEOUT.to_string(),
+        })
+    }
+
+    /// Hold a smaller result than the app's own budget. Only the tests need
+    /// this: a cap of a few kilobytes is reached in a query that takes no
+    /// time, where the real one would want gigabytes of fixture.
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Give up a run sooner than [`STATEMENT_TIMEOUT`] would. For the tests,
+    /// which cannot wait out thirty seconds to watch one land.
+    pub fn with_statement_timeout(mut self, timeout: &str) -> Self {
+        self.statement_timeout = timeout.to_string();
+        self
     }
 
     pub fn label(&self) -> &Label {
@@ -245,49 +325,45 @@ impl Connection for PostgresConnection {
         Ok(format!("PG {}", short_version(&version)))
     }
 
+    /// The app's own statements — table pages — on a pooled connection,
+    /// which is a different backend every time. So the id is asked for
+    /// per run here, where a session asks once: the cap has to be able to
+    /// cancel the statement it stopped reading, even when nothing is
+    /// watching the run.
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
-        let rows: Vec<PgRow> = sqlx::query(sql).fetch_all(&self.pool).await?;
-        self.collect(sql, rows).await
-    }
-
-    /// One connection is taken out of the pool and kept for the whole
-    /// statement, because the backend id only means anything while that
-    /// connection is the one running it. Asking the server for the id costs
-    /// one round trip before the statement starts; that is the price of
-    /// being able to stop it, and it is paid once per run.
-    async fn execute_reporting(&self, sql: &str, report: ReportRun) -> Result<QueryResult> {
         let mut conn = self.pool.acquire().await.context("no connection to run the statement")?;
-        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *conn)
-            .await
-            .context("failed to read the backend id")?;
-        report(RunId(pid));
-        let rows: Vec<PgRow> = sqlx::query(sql).fetch_all(&mut *conn).await?;
-        // The connection goes back to the pool here, before the rows are
-        // decoded: decoding is this process's work, not the server's.
+        let backend = prepare_run(&mut *conn, &self.statement_timeout).await?;
+        let result = collect_capped(&mut conn, &self.pool, backend, sql, self.limits).await;
+        // The connection goes back to the pool here.
         drop(conn);
-        self.collect(sql, rows).await
+        result
     }
 
-    /// `pg_cancel_backend` asks the backend to give up its statement, which
-    /// comes back to the runner as SQLSTATE 57014. `pg_terminate_backend`
-    /// closes the backend outright, and sqlx then throws that connection
-    /// away — which is why it is the second press.
-    ///
-    /// Both go out on a *different* connection: the one being stopped is
-    /// busy, and waiting for it would be waiting for the thing the user
-    /// just asked to stop.
-    async fn stop(&self, run: RunId, how: Stop) -> Result<bool> {
-        let sql = match how {
-            Stop::Cancel => "SELECT pg_cancel_backend($1)",
-            Stop::Terminate => "SELECT pg_terminate_backend($1)",
-        };
-        let accepted: Option<bool> = sqlx::query_scalar(sql)
-            .bind(run.0)
-            .fetch_one(&self.pool)
+    /// One pinned connection out of the session pool, its backend read
+    /// once, and its timeout asked for once. Everything a tab runs after
+    /// this goes down that connection, which is what makes a `SET`, a
+    /// `BEGIN` and a temp table mean anything from one run to the next.
+    async fn open_session(&self) -> Result<Arc<dyn Session>> {
+        let mut conn = self
+            .sessions
+            .acquire()
             .await
-            .context("failed to ask the server to stop the statement")?;
-        Ok(accepted.unwrap_or(false))
+            .context("no connection left for another session — close a tab")?;
+        let backend = prepare_run(&mut *conn, &self.statement_timeout).await?;
+        Ok(Arc::new(PostgresSession {
+            app: self.pool.clone(),
+            conn: futures::lock::Mutex::new(Some(conn)),
+            backend,
+            limits: self.limits,
+        }))
+    }
+
+    /// Always on the **app** pool, never a session's: the connection being
+    /// stopped is busy, and waiting for it would be waiting for the thing
+    /// the user just asked to stop. That reserve is why the two pools are
+    /// separate.
+    async fn stop(&self, run: RunId, how: Stop) -> Result<bool> {
+        cancel(&self.pool, run, how).await
     }
 
     async fn apply(&self, _changes: &[RowChange]) -> Result<u64> {
@@ -295,38 +371,210 @@ impl Connection for PostgresConnection {
     }
 }
 
-impl PostgresConnection {
-    /// Turn the rows a statement returned into a `QueryResult`, naming the
-    /// columns even when no row came back to name them.
-    async fn collect(&self, sql: &str, rows: Vec<PgRow>) -> Result<QueryResult> {
-        let Some(first) = rows.first() else {
-            // No rows came back, so the row metadata cannot name the
-            // columns. Ask the server to describe the statement instead,
-            // so an empty result still renders its headers. DDL and other
-            // statements without a result set simply describe to nothing.
-            let columns = match self.pool.describe(sql).await {
-                Ok(described) => described
-                    .columns()
-                    .iter()
-                    .map(|c| c.name().to_string())
-                    .collect(),
-                Err(_) => Vec::new(),
-            };
-            return Ok(QueryResult { columns, rows: Vec::new(), rows_affected: 0 });
-        };
+/// One tab's pinned connection.
+///
+/// `execute` takes `&self` because the tab shares the session behind an
+/// `Arc`, and sqlx wants `&mut PgConnection`, so the connection sits behind
+/// an async mutex. It is never contended in practice: a tab runs one
+/// statement at a time. The `Option` is what `close` empties.
+struct PostgresSession {
+    /// The *app's* pool, not the session's. A cancel must go out on a
+    /// connection that is not the one being cancelled.
+    app: PgPool,
+    conn: futures::lock::Mutex<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>>,
+    backend: RunId,
+    limits: Limits,
+}
 
-        let columns = first.columns().iter().map(|c| c.name().to_string()).collect();
-        let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
+#[async_trait]
+impl Session for PostgresSession {
+    fn backend(&self) -> Option<RunId> {
+        Some(self.backend)
+    }
+
+    async fn execute(&self, sql: &str) -> Result<QueryResult> {
+        let mut held = self.conn.lock().await;
+        let conn = held.as_mut().context("this tab's session is closed")?;
+        collect_capped(conn, &self.app, self.backend, sql, self.limits).await
+    }
+
+    /// Asked of `pg_stat_activity` from the **app** pool, never of the
+    /// session itself. Two reasons: the session's connection may be busy
+    /// with a statement, and asking it would have to queue behind exactly
+    /// the run whose state is in question; and a transaction that has gone
+    /// wrong refuses every statement until it is rolled back, so a session
+    /// in the state most worth reporting is the one that could not answer.
+    ///
+    /// `idle in transaction` and `idle in transaction (aborted)` both
+    /// count — a rollback is what leaves either one.
+    async fn in_transaction(&self) -> Result<bool> {
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM pg_stat_activity WHERE pid = $1")
+                .bind(self.backend.0)
+                .fetch_optional(&self.app)
+                .await
+                .context("failed to read what the session is doing")?
+                .flatten();
+        Ok(state.is_some_and(|state| state.starts_with("idle in transaction")))
+    }
+
+    async fn close(&self) {
+        let Some(mut conn) = self.conn.lock().await.take() else { return };
+        // Sent whether or not a transaction is open, because it costs one
+        // round trip to send and one to ask. Outside a transaction Postgres
+        // answers "there is no transaction in progress" and carries on, so
+        // the session never has to know which it is in.
+        match sqlx::query("ROLLBACK").execute(&mut *conn).await {
+            // Clean, so the pool may have it back.
+            Ok(_) => drop(conn),
+            // Not clean, or not answering. Take it out of the pool for
+            // good rather than hand the next tab a connection whose state
+            // nobody knows; dropping the detached connection closes it,
+            // and closing is itself a rollback.
+            Err(_) => drop(conn.detach()),
+        }
+    }
+}
+
+/// A session may reach its last handle on **any** thread, and in this app
+/// that thread is usually the UI one: leaving a workspace drops the shell,
+/// every tab, and every session, inside a mouse-up.
+///
+/// sqlx returns a pooled connection to its pool by spawning onto tokio
+/// when the last handle drops. Spawning off the runtime panics — and it
+/// panics inside an Objective-C callback that cannot unwind, so the whole
+/// process aborts. Detaching takes the connection out of the pool's hands
+/// first, and a bare `PgConnection` drops by closing its socket, which
+/// needs no runtime at all.
+///
+/// So this is the *fallback*, not the ordinary path: `close` gives the
+/// connection back properly, from inside a tokio task, and leaves nothing
+/// here to do. What reaches this is a session nobody closed — which is a
+/// session whose pool is being dropped in the same breath.
+impl Drop for PostgresSession {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.get_mut().take() {
+            drop(conn.detach());
+        }
+    }
+}
+
+/// Ask the server for the backend id, and for the timeout in the same
+/// round trip. `set_config(.., false)` is `SET`, and the `WHERE` is what
+/// makes it conditional — see `statement_timeout` on the connection for
+/// why it is asked for that way rather than as a startup option.
+///
+/// A session pays this once, at open. The pooled path pays it once per
+/// run, because a pooled connection is a different backend each time.
+async fn prepare_run(conn: &mut sqlx::PgConnection, timeout: &str) -> Result<RunId> {
+    let (pid, _applied): (i32, Option<String>) = sqlx::query_as(
+        "SELECT pg_backend_pid(), \
+         (SELECT set_config('statement_timeout', $1, false) \
+            WHERE (SELECT source FROM pg_settings \
+                    WHERE name = 'statement_timeout') = 'default')",
+    )
+    .bind(timeout)
+    .fetch_one(&mut *conn)
+    .await
+    .context("failed to read the backend id")?;
+    Ok(RunId(pid))
+}
+
+/// Run one statement and collect it, up to `limits`.
+///
+/// The rows are **streamed** and decoded one at a time, so the process
+/// holds one row plus whatever the sink has kept — never the whole result.
+/// `fetch_all` held both the raw rows and the decoded ones at once, which
+/// is how `SELECT *` over a large table took the app down.
+///
+/// `app` is the pool used to cancel and to describe: both must reach the
+/// server while `conn` is busy with the statement, so neither may be `conn`.
+async fn collect_capped(
+    conn: &mut sqlx::PgConnection,
+    app: &PgPool,
+    backend: RunId,
+    sql: &str,
+    limits: Limits,
+) -> Result<QueryResult> {
+    let mut sink = RowSink::new(limits);
+    {
+        let mut rows = sqlx::query(sql).fetch(&mut *conn);
+        while let Some(row) = rows.try_next().await? {
+            if !sink.has_columns() {
+                sink.columns(row.columns().iter().map(|c| c.name().to_string()).collect());
+            }
             let mut values = Vec::with_capacity(row.columns().len());
             for i in 0..row.columns().len() {
-                values.push(decode(row, i)?);
+                values.push(decode(&row, i)?);
             }
-            out.push(values);
+            if !sink.push(values) {
+                // The budget is spent. Dropping the stream here would bound
+                // *this* process and nothing else: sqlx must read every
+                // remaining row off the wire before the connection can be
+                // used again, so the server would go on building and
+                // sending the whole result. Ask it to stop instead — the
+                // same `pg_cancel_backend` the stop button sends.
+                let stopped = cancel(app, backend, Stop::Cancel).await.unwrap_or(false);
+                drain(&mut rows, stopped).await?;
+                break;
+            }
         }
-
-        Ok(QueryResult { columns, rows: out, rows_affected: 0 })
     }
+
+    if !sink.has_columns() {
+        // No rows came back, so the row metadata cannot name the columns.
+        // Ask the server to describe the statement instead, so an empty
+        // result still renders its headers. DDL and other statements
+        // without a result set simply describe to nothing.
+        if let Ok(described) = app.describe(sql).await {
+            sink.columns(described.columns().iter().map(|c| c.name().to_string()).collect());
+        }
+    }
+    Ok(sink.finish())
+}
+
+/// `pg_cancel_backend` asks the backend to give up its statement, which
+/// comes back to the runner as SQLSTATE 57014. `pg_terminate_backend`
+/// closes the backend outright, and sqlx then throws that connection away —
+/// which is why it is the second press.
+async fn cancel(pool: &PgPool, run: RunId, how: Stop) -> Result<bool> {
+    let sql = match how {
+        Stop::Cancel => "SELECT pg_cancel_backend($1)",
+        Stop::Terminate => "SELECT pg_terminate_backend($1)",
+    };
+    let accepted: Option<bool> = sqlx::query_scalar(sql)
+        .bind(run.0)
+        .fetch_one(pool)
+        .await
+        .context("failed to ask the server to stop the statement")?;
+    Ok(accepted.unwrap_or(false))
+}
+
+/// Read out whatever the server still sends after a cancel, throwing it
+/// away, until the statement ends. Nothing is decoded and nothing is kept,
+/// so this costs bandwidth, not memory — and the connection comes back to
+/// the pool usable rather than owing the server a result.
+///
+/// `stopped` says the cancel was accepted, and only then is `57014` the
+/// answer we asked for rather than news. Any other error is the server's own
+/// and is reported.
+async fn drain(
+    rows: &mut futures::stream::BoxStream<'_, sqlx::Result<PgRow>>,
+    stopped: bool,
+) -> Result<()> {
+    loop {
+        match rows.try_next().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => return Ok(()),
+            Err(error) if stopped && is_cancelled(&error) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// Whether an error is the server saying it gave up the statement.
+fn is_cancelled(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(db) if db.code().as_deref() == Some(QUERY_CANCELED))
 }
 
 fn build_catalog(tables: Vec<TableRow>, columns: Vec<ColumnRow>, keys: Vec<KeyRow>) -> Catalog {
@@ -444,6 +692,7 @@ fn format_offset_date_time(dt: sqlx::types::time::OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use db_client::{MAX_BYTES, MAX_CELL_BYTES};
 
     /// These tests need a live server. Set `MEERKAT_TEST_PG_URL` to a
     /// database the test may create and drop a schema in; without it the
@@ -584,41 +833,36 @@ mod tests {
         assert_eq!(conn.execute("SELECT 1 AS x").await.unwrap().rows[0][0], Value::Int(1));
     }
 
-    /// The whole point of `execute_reporting`: a statement that would run
-    /// for half a minute is stopped in the middle, from another connection,
-    /// with only the id it reported.
+    /// The whole point of the backend id: a statement that would run for
+    /// half a minute is stopped in the middle, from another connection,
+    /// with only the id the session named when it opened.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_running_statement_can_be_cancelled_from_outside() {
         let Some(url) = test_url() else { return };
         let conn = std::sync::Arc::new(PostgresConnection::connect(&url).await.unwrap());
+        let session = conn.open_session().await.unwrap();
+        // The whole race is gone: a session names its backend before it is
+        // ever asked to run anything, so a stop has an id to aim at from
+        // the moment the run leaves. There is nothing to poll for.
+        let id = session.backend().unwrap();
 
-        let seen = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
-        let report: ReportRun = {
-            let seen = seen.clone();
-            std::sync::Arc::new(move |id: RunId| {
-                seen.store(id.0, std::sync::atomic::Ordering::Relaxed)
-            })
-        };
         let runner = {
-            let conn = conn.clone();
-            tokio::spawn(async move { conn.execute_reporting("SELECT pg_sleep(30)", report).await })
+            let session = session.clone();
+            tokio::spawn(async move { session.execute("SELECT pg_sleep(30)").await })
         };
-
         let started = std::time::Instant::now();
-        let pid = loop {
-            let pid = seen.load(std::sync::atomic::Ordering::Relaxed);
-            if pid != 0 {
-                break pid;
-            }
-            assert!(started.elapsed() < Duration::from_secs(5), "no backend id was reported");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        // Let the statement reach the server before asking it to stop.
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert!(conn.stop(RunId(pid), Stop::Cancel).await.unwrap(), "the server refused the cancel");
+        assert!(conn.stop(id, Stop::Cancel).await.unwrap(), "the server refused the cancel");
         let error = runner.await.unwrap().unwrap_err().to_string();
         assert!(error.contains("canceling statement"), "{error}");
         // It slept for 30 seconds and this test did not.
         assert!(started.elapsed() < Duration::from_secs(10), "the cancel did not land");
+
+        // The session outlives a cancelled statement, as the tab holding
+        // it expects: a cancel ends the statement, not the connection.
+        assert_eq!(session.execute("SELECT 1 AS x").await.unwrap().rows[0][0], Value::Int(1));
     }
 
     /// The second press. A terminated backend takes its connection with
@@ -629,36 +873,258 @@ mod tests {
     async fn a_running_statement_can_be_terminated() {
         let Some(url) = test_url() else { return };
         let conn = std::sync::Arc::new(PostgresConnection::connect(&url).await.unwrap());
+        let session = conn.open_session().await.unwrap();
+        let id = session.backend().unwrap();
 
-        let seen = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
-        let report: ReportRun = {
-            let seen = seen.clone();
-            std::sync::Arc::new(move |id: RunId| {
-                seen.store(id.0, std::sync::atomic::Ordering::Relaxed)
-            })
-        };
         let runner = {
-            let conn = conn.clone();
-            tokio::spawn(async move { conn.execute_reporting("SELECT pg_sleep(30)", report).await })
+            let session = session.clone();
+            tokio::spawn(async move { session.execute("SELECT pg_sleep(30)").await })
         };
-
         let started = std::time::Instant::now();
-        let pid = loop {
-            let pid = seen.load(std::sync::atomic::Ordering::Relaxed);
-            if pid != 0 {
-                break pid;
-            }
-            assert!(started.elapsed() < Duration::from_secs(5), "no backend id was reported");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert!(conn.stop(RunId(pid), Stop::Terminate).await.unwrap());
+        assert!(conn.stop(id, Stop::Terminate).await.unwrap());
         assert!(runner.await.unwrap().is_err(), "the statement outlived its backend");
         assert!(started.elapsed() < Duration::from_secs(10), "the terminate did not land");
 
-        // The pool is still good afterwards: it throws the dead connection
-        // away and opens another.
+        // The app pool is still good afterwards: it throws the dead
+        // connection away and opens another.
         assert_eq!(conn.execute("SELECT 1 AS x").await.unwrap().rows[0][0], Value::Int(1));
+    }
+
+    /// The requirement the cap is sized for: a narrow result of 120,000
+    /// rows is not a large result, and nothing must cut it short.
+    #[tokio::test]
+    async fn a_hundred_and_twenty_thousand_narrow_rows_come_back_whole() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+
+        let result = conn
+            .execute("SELECT g, g::text AS label FROM generate_series(1, 120000) g")
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 120_000);
+        assert!(!result.truncated, "120,000 narrow rows were capped");
+    }
+
+    /// The shape that used to take the app down. The read stops at the
+    /// budget, the statement comes back `Ok` marked truncated rather than as
+    /// an error, and the connection is still good afterwards — the cancel
+    /// that ended it must not poison the pool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_result_past_the_budget_is_capped_not_failed() {
+        let Some(url) = test_url() else { return };
+        let limits = Limits { max_bytes: 64 * 1024, max_cell_bytes: MAX_CELL_BYTES };
+        let conn = PostgresConnection::connect(&url).await.unwrap().with_limits(limits);
+
+        // Ten million rows, of which the budget holds a few hundred.
+        let result = conn
+            .execute("SELECT g, repeat('x', 100) FROM generate_series(1, 10000000) g")
+            .await
+            .unwrap();
+        assert!(result.truncated, "the result was not marked truncated");
+        assert!(!result.rows.is_empty(), "a capped result must still show rows");
+        assert!(result.rows.len() < 10_000_000, "the whole result came back");
+        assert_eq!(result.columns.len(), 2);
+
+        assert_eq!(conn.execute("SELECT 1 AS x").await.unwrap().rows[0][0], Value::Int(1));
+    }
+
+    /// One value must not eat the whole budget. The cut value says it was
+    /// cut, so the cell is not read as the whole string.
+    #[tokio::test]
+    async fn one_huge_value_is_cut_to_the_cell_cap() {
+        let Some(url) = test_url() else { return };
+        let limits = Limits { max_bytes: MAX_BYTES, max_cell_bytes: 4096 };
+        let conn = PostgresConnection::connect(&url).await.unwrap().with_limits(limits);
+
+        let result = conn.execute("SELECT repeat('x', 2000000) AS wide").await.unwrap();
+        let cell = &result.rows[0][0];
+        let Value::Text(text) = cell else { panic!("not text: {cell:?}") };
+        assert_eq!(text.len(), 4096 + '…'.len_utf8());
+        assert!(text.ends_with('…'));
+        // One row, and it fitted: the cell cap is not the byte cap.
+        assert!(!result.truncated);
+    }
+
+    /// A run nobody set a timeout for gets the app's, and the server is
+    /// what ends it — the message is the server's own.
+    #[tokio::test]
+    async fn a_run_gets_the_apps_timeout_when_nothing_else_set_one() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap().with_statement_timeout("100ms");
+
+        let error = conn.execute("SELECT pg_sleep(5)").await.unwrap_err().to_string();
+        assert!(error.contains("statement timeout"), "{error}");
+        // The connection is still good: a timeout ends the statement, not
+        // the backend.
+        assert_eq!(conn.execute("SELECT 1 AS x").await.unwrap().rows[0][0], Value::Int(1));
+    }
+
+    /// The question the guard has to answer: was this the user's choice or
+    /// nobody's? A timeout in the connection URL reads as `client` in
+    /// `pg_settings.source`, so the app leaves it alone — even though its
+    /// own is a hundred times shorter.
+    #[tokio::test]
+    async fn a_timeout_the_session_was_opened_with_is_left_alone() {
+        let Some(url) = test_url() else { return };
+        let joiner = if url.contains('?') { '&' } else { '?' };
+        let url = format!("{url}{joiner}options=-c%20statement_timeout%3D20s");
+        let conn = PostgresConnection::connect(&url).await.unwrap().with_statement_timeout("100ms");
+
+        // Well past the app's 100 ms, well inside the session's own 20 s.
+        conn.execute("SELECT pg_sleep(0.5)").await.unwrap();
+        let result = conn
+            .execute("SELECT setting, source FROM pg_settings WHERE name = 'statement_timeout'")
+            .await
+            .unwrap();
+        assert_eq!(result.rows[0][0], Value::Text("20000".to_string()));
+        assert_eq!(result.rows[0][1], Value::Text("client".to_string()));
+    }
+
+    /// What the session is for. Two statements a buffer sends in turn are
+    /// one connection apart, so the second sees what the first set. On the
+    /// pool this was luck: each statement took whichever connection was
+    /// free, and `SET` reached whichever backend that was.
+    #[tokio::test]
+    async fn a_statement_sees_what_the_statement_before_it_set() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+        let session = conn.open_session().await.unwrap();
+
+        session.execute("SET statement_timeout = '5min'").await.unwrap();
+        let result = session
+            .execute("SELECT setting, source FROM pg_settings WHERE name = 'statement_timeout'")
+            .await
+            .unwrap();
+        assert_eq!(result.rows[0][0], Value::Text("300000".to_string()));
+        assert_eq!(result.rows[0][1], Value::Text("session".to_string()));
+
+        // ...and a second session is a second connection, so it is not
+        // carrying the first one's settings.
+        let other = conn.open_session().await.unwrap();
+        let result = other
+            .execute("SELECT setting FROM pg_settings WHERE name = 'statement_timeout'")
+            .await
+            .unwrap();
+        assert_ne!(result.rows[0][0], Value::Text("300000".to_string()));
+    }
+
+    /// A transaction spans statements, which is the thing the pool could
+    /// not do at all: `BEGIN` on one connection and the next statement on
+    /// another is not a transaction, it is two.
+    #[tokio::test]
+    async fn a_transaction_spans_the_statements_of_a_session() {
+        let Some(url) = test_url() else { return };
+        // Writable, because a temp table is a write.
+        let conn = PostgresConnection::connect_url(&url, false).await.unwrap();
+        let session = conn.open_session().await.unwrap();
+
+        session.execute("BEGIN").await.unwrap();
+        session.execute("CREATE TEMP TABLE meerkat_session_probe (id int)").await.unwrap();
+        session.execute("INSERT INTO meerkat_session_probe VALUES (1), (2)").await.unwrap();
+        let result = session.execute("SELECT count(*) FROM meerkat_session_probe").await.unwrap();
+        assert_eq!(result.rows[0][0], Value::Int(2));
+
+        session.execute("ROLLBACK").await.unwrap();
+        // The table went with the transaction, and the session is still
+        // good enough to say so.
+        let error =
+            session.execute("SELECT * FROM meerkat_session_probe").await.unwrap_err().to_string();
+        assert!(error.contains("meerkat_session_probe"), "{error}");
+    }
+
+    /// Closing rolls back, and the point is the **pool**, not the server:
+    /// a closing socket already rolls a transaction back. This connection
+    /// is about to be reused, and must not carry the user's half-finished
+    /// transaction to whatever acquires it next.
+    #[tokio::test]
+    async fn closing_a_session_rolls_its_transaction_back() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+        let session = conn.open_session().await.unwrap();
+        let pid = session.backend().expect("a Postgres session knows its backend").0;
+
+        session.execute("BEGIN").await.unwrap();
+        session.execute("SELECT 1").await.unwrap();
+        assert_eq!(backend_state(&conn, pid).await, "idle in transaction");
+
+        session.close().await;
+        assert_eq!(backend_state(&conn, pid).await, "idle");
+
+        // And it says so rather than pretending to run.
+        let error = session.execute("SELECT 1").await.unwrap_err().to_string();
+        assert!(error.contains("closed"), "{error}");
+    }
+
+    /// What the close dialog asks before it asks the user. It is read from
+    /// the app pool, so it answers about a session that has stopped being
+    /// able to answer for itself.
+    #[tokio::test]
+    async fn a_session_says_whether_it_is_in_a_transaction() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+        let session = conn.open_session().await.unwrap();
+
+        assert!(!session.in_transaction().await.unwrap());
+        session.execute("BEGIN").await.unwrap();
+        assert!(session.in_transaction().await.unwrap());
+
+        // A transaction that has gone wrong refuses every statement until
+        // it is rolled back, so the session in the state most worth
+        // reporting is the one that cannot report it. Asking elsewhere is
+        // what makes this answerable at all.
+        assert!(session.execute("SELECT no_such_column").await.is_err());
+        assert!(session.in_transaction().await.unwrap());
+
+        session.execute("ROLLBACK").await.unwrap();
+        assert!(!session.in_transaction().await.unwrap());
+    }
+
+    /// A session may reach its last `Arc` **anywhere**, and for this app
+    /// that anywhere is the UI thread: leaving a workspace drops the shell,
+    /// every tab, and every session, on a mouse-up.
+    ///
+    /// sqlx returns a pooled connection to its pool by spawning onto tokio
+    /// when the last handle drops, and spawning off the runtime panics —
+    /// inside an Objective-C callback that cannot unwind, so the process
+    /// aborts. A session has to survive being dropped by whoever is
+    /// holding it last.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_may_be_dropped_off_the_runtime() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+        let session = conn.open_session().await.unwrap();
+        session.execute("SELECT 1").await.unwrap();
+
+        // A thread with no runtime of its own: the UI thread, as far as
+        // sqlx is concerned.
+        std::thread::spawn(move || drop(session)).join().unwrap();
+
+        // The pool is unharmed and still hands out sessions.
+        conn.open_session().await.unwrap().execute("SELECT 1").await.unwrap();
+    }
+
+    /// A statement that fails must not cost the session. The tab keeps it
+    /// across an error, so a typo does not silently end a transaction.
+    #[tokio::test]
+    async fn a_failed_statement_leaves_the_session_usable() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+        let session = conn.open_session().await.unwrap();
+
+        assert!(session.execute("SELECT * FROM no_such_table_here").await.is_err());
+        assert_eq!(session.execute("SELECT 1 AS x").await.unwrap().rows[0][0], Value::Int(1));
+    }
+
+    /// What another connection sees this backend doing. It is read from
+    /// the *app* pool, so it answers whether or not the session is busy.
+    async fn backend_state(conn: &PostgresConnection, pid: i32) -> String {
+        let result = conn
+            .execute(&format!("SELECT state FROM pg_stat_activity WHERE pid = {pid}"))
+            .await
+            .unwrap();
+        result.rows[0][0].display()
     }
 
     #[tokio::test]
@@ -708,6 +1174,7 @@ mod tests {
         let error = profile_from_url("p1", "prod", "not a url").unwrap_err();
         assert!(error.to_string().contains("not a valid PostgreSQL URL"), "{error}");
     }
+
 
     #[test]
     fn the_server_version_reads_short() {

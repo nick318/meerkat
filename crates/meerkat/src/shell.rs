@@ -9,7 +9,7 @@
 //! and a reply that does not carry the tab's current generation is thrown
 //! away. Without that, a slow first page would overwrite a fast second one.
 
-use db_client::{Connection, Profile, QueryResult, ReportRun, RunId, Stop};
+use db_client::{Connection, Profile, QueryResult, RunId, Session, Stop};
 use db_postgres::{Label, PostgresConnection};
 use gpui::{
     AnyElement, App, BoxShadow, Context, Div, ElementId, Entity, EventEmitter, FocusHandle,
@@ -22,7 +22,6 @@ use sql_editor::{Kind, Name, SqlEditor, Vocabulary};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 use storage::{HistoryFilter, NewRun, QueryRun, RunSource, SavedTab, SavedTabs, Store};
 use theme::{FONT_FAMILY, ThemeColors, theme};
@@ -50,9 +49,30 @@ actions!(
         NextPage,
         ShowHistory,
         NextTab,
-        PrevTab
+        PrevTab,
+        ConfirmClose,
+        CancelClose
     ]
 );
+
+/// The confirmation's own key context. Scoped, like the palette's: while
+/// the dialog is up it is the deepest match, so ⌘⏎ answers it rather than
+/// running a query behind it.
+pub const CONFIRM_KEY_CONTEXT: &str = "Confirm";
+
+/// Key bindings for the close confirmation.
+///
+/// ⏎ and ⎋ both keep what is open. The destructive answer takes ⌘⏎ — the
+/// deliberate chord, the same one that means "do it" everywhere else in
+/// the app. A dialog that ends server work on a stray ⏎ is a dialog the
+/// user learns to fear.
+pub fn confirm_key_bindings() -> Vec<gpui::KeyBinding> {
+    vec![
+        gpui::KeyBinding::new("cmd-enter", ConfirmClose, Some(CONFIRM_KEY_CONTEXT)),
+        gpui::KeyBinding::new("enter", CancelClose, Some(CONFIRM_KEY_CONTEXT)),
+        gpui::KeyBinding::new("escape", CancelClose, Some(CONFIRM_KEY_CONTEXT)),
+    ]
+}
 
 const SIDEBAR_WIDTH: f32 = 246.;
 const EDITOR_HEIGHT: f32 = 250.;
@@ -77,11 +97,17 @@ const TIMER_TICK: Duration = Duration::from_millis(100);
 /// again on every one of them would be noise: the timer is there to say a
 /// query is taking a while, so it says nothing until one is.
 const TIMER_DELAY: Duration = Duration::from_secs(1);
-/// How long a stop waits for the driver to say which backend the run is
-/// on, and how often it looks. The id lands one round trip after the run
-/// starts, so this is a wait for a race, not for a server.
-const STOP_WAIT: Duration = Duration::from_secs(5);
-const STOP_POLL: Duration = Duration::from_millis(20);
+/// How long a tab's session may sit unused before it is handed back, and
+/// how often the sweep looks. Ten minutes is long enough that a session is
+/// still there when the user comes back from a meeting having left a tab
+/// mid-thought, and short enough that a laptop left open overnight is not
+/// holding eight backends on a shared server.
+const IDLE_SESSION: Duration = Duration::from_secs(600);
+const IDLE_TICK: Duration = Duration::from_secs(60);
+/// The close confirmation's geometry. Narrower than the palette and
+/// higher up the window: it is a sentence and two answers, not a list.
+const CONFIRM_WIDTH: f32 = 420.;
+const CONFIRM_TOP_MARGIN: f32 = 140.;
 /// The tab strip is one row tall, as the comp draws it.
 const TAB_STRIP_HEIGHT: f32 = 34.;
 /// A tab is never squeezed below this, so the strip reads as a row of
@@ -161,9 +187,14 @@ pub struct Shell {
     /// in a window of its own, so closing it cannot leave the workspace
     /// without focus.
     palette: Option<Palette>,
+    /// The close the user is being asked about, while the dialog is up.
+    confirm: Option<Confirm>,
     /// True while a repaint loop is running for the query timers. Runs come
     /// and go in several tabs at once; the loop belongs to the window.
     timing: bool,
+    /// True while the idle-session sweep is running. One loop for the
+    /// window, and only while there is a session to sweep.
+    sweeping: bool,
     /// True while the session reopens the tabs it was left with. The
     /// restore builds the strip one tab at a time, and every one of those
     /// steps would otherwise write a half-built strip back over the saved
@@ -193,6 +224,43 @@ struct Palette {
     selected: usize,
     scroll: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
+}
+
+/// One "stop this run" request on its way to the server.
+type StopTask = gpui::Task<Result<anyhow::Result<bool>, gpui_tokio::JoinError>>;
+
+/// A close the user has to agree to, because it would end work the server
+/// is still doing.
+///
+/// Closing the socket is not a cancel: Postgres notices a client is gone
+/// when the backend next writes, which a long `SELECT` may not do for
+/// minutes. So a close that abandons a run leaves the server working for
+/// a window that is not there any more — and the user is never told.
+struct Confirm {
+    what: Close,
+    /// The tabs whose runs this close would stop, by name.
+    running: Vec<SharedString>,
+    /// The tabs whose open transactions this close would roll back. One of
+    /// the two lists is always filled: with nothing to lose, no question.
+    open: Vec<SharedString>,
+    /// The dialog holds the focus while it is up, so its key context is
+    /// the deepest one and answers the keystroke.
+    focus: FocusHandle,
+}
+
+/// Which way out is being confirmed.
+///
+/// There are four ways out of a session and only one of them is ⌘W, so a
+/// guard wired to the tab alone would be a lie in the other three: the
+/// two here that drop every tab at once, and the × on the tab strip.
+#[derive(Clone, Copy)]
+pub enum Close {
+    /// ⌘W, or the × on a tab.
+    Tab(u64),
+    /// "‹ connections". The shell is dropped, and every tab with it.
+    Shell,
+    /// ⌘Q, or the window's close button.
+    Window,
 }
 
 /// What the workspace was opened on: a URL from the command line, or a
@@ -249,6 +317,10 @@ struct QueryTab {
     editor: Entity<SqlEditor>,
     data: Rc<GridData>,
     has_result: bool,
+    /// Whether the memory cap ended the read before the server ran out of
+    /// rows. The result line says so, because a grid that stops at an
+    /// arbitrary row must not read as the whole answer.
+    truncated: bool,
     /// How many statements the last run sent, so the result strip can say
     /// which set is on screen.
     statements_run: usize,
@@ -257,6 +329,33 @@ struct QueryTab {
     /// Where the tab's last run got to. It drives the run button, the
     /// timer beside it and the result line, which is why all three agree.
     run: Run,
+    /// Whether this tab's session is sitting inside a transaction the user
+    /// began, as of its last run.
+    ///
+    /// Read after every run rather than at the moment it is wanted,
+    /// because the moment it is wanted is a close — and a close cannot
+    /// wait on a round trip to find out what to ask. The cache is exact,
+    /// not a guess: the connection is pinned to this tab, so nothing but
+    /// this tab's own statements can change what it is in.
+    in_transaction: bool,
+    /// When this tab last used its session. Only a run counts: reading a
+    /// result on screen costs the server nothing, and a connection held
+    /// open for a tab nobody is asking anything is the thing the sweep
+    /// exists to give back.
+    last_used: Instant,
+    /// Whether the last session this tab had was taken back rather than
+    /// closed with the tab. The toolbar says so until the next run, which
+    /// opens another — a `search_path` that reset must be explainable.
+    session_ended: bool,
+    /// This tab's own connection, from its first run onwards.
+    ///
+    /// It is what makes a `SET`, a `BEGIN` and a temp table mean anything
+    /// from one statement to the next: the tab is a session in the user's
+    /// head, so it is one on the wire. A run that fails hands the session
+    /// back all the same — a syntax error does not end a transaction, and
+    /// dropping the session here would both lose the user's state and
+    /// return an uncommitted connection to the pool.
+    session: Option<Arc<dyn Session>>,
     scroll: GridState,
     generation: u64,
 }
@@ -268,7 +367,10 @@ struct QueryTab {
 /// the same thing in each — the design's own `qIdle` groups them too.
 enum Run {
     Idle,
-    /// The statement is out. ⌘. asks the server to give it up.
+    /// The statement is out — or, with no backend yet, the tab's session
+    /// is still opening and the statement has not left. ⌘. covers both:
+    /// it asks the server to give the statement up, or it calls the run
+    /// off before it starts.
     Running(Live),
     /// A cancel has gone to the server and the statement has not come back
     /// yet. A second ⌘. terminates the backend instead of asking it
@@ -279,18 +381,21 @@ enum Run {
 }
 
 /// A run in flight.
+#[derive(Clone, Copy)]
 struct Live {
     /// When it started, for the timer in the toolbar. Wall clock is not
     /// wanted here: the timer measures a wait, not a time of day.
     started: Instant,
-    /// The backend the statement is on, written by the tokio task as each
-    /// statement starts and read by the UI when the user asks to stop.
-    /// Zero means the driver has not said yet — one round trip's worth of
-    /// window, which `stop_active_query` waits out rather than ignoring.
+    /// The backend the statement is on, known before the run leaves —
+    /// because it belongs to the tab's session, not to the request.
     ///
-    /// An atomic rather than a channel because there is nothing to wake:
-    /// whoever wants the id wants the latest one, and only then.
-    backend: Arc<AtomicI32>,
+    /// `None` says the session is still opening, and that is not a gap in
+    /// what is known: **no statement is out yet**, so there is nothing on
+    /// the server to cancel. A stop pressed here calls the run off instead,
+    /// which is why it needs no waiting and no atomic. Before sessions the
+    /// id arrived one round trip *into* the run, and the difference is the
+    /// whole reason a stop used to have to wait for a race.
+    backend: Option<RunId>,
 }
 
 impl Run {
@@ -409,6 +514,8 @@ impl Shell {
             scope,
             env,
             palette: None,
+            confirm: None,
+            sweeping: false,
             timing: false,
             restoring: false,
             _subscriptions: subscriptions,
@@ -931,10 +1038,18 @@ impl Shell {
             editor,
             data: empty_grid(),
             has_result: false,
+            truncated: false,
             statements_run: 0,
             elapsed: None,
             error: None,
             run: Run::Idle,
+            in_transaction: false,
+            last_used: Instant::now(),
+            session_ended: false,
+            // Opened on the tab's first run, never here: a strip of a
+            // hundred restored tabs must cost the server nothing until the
+            // user asks one of them a question.
+            session: None,
             scroll: GridState::new(),
             generation: 0,
         }));
@@ -969,9 +1084,28 @@ impl Shell {
             return;
         }
         let tab_id = tab.id;
-        let backend = Arc::new(AtomicI32::new(0));
-        tab.run = Run::Running(Live { started: Instant::now(), backend: backend.clone() });
+        let session = tab.session.clone();
+        // A tab about to open its first session may be the one too many.
+        // Give back the session that has gone longest without a question;
+        // with nothing spare to give, say so here rather than let the pool
+        // wait out its connect timeout and answer with something about
+        // connections.
+        if session.is_none() && !self.make_room_for_session(cx) {
+            let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else { return };
+            tab.error = Some(NO_SESSION_LEFT.to_string());
+            cx.notify();
+            return;
+        }
+        let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else { return };
+        // The backend is the *session's*, so it is known before the run
+        // leaves — there is no id to wait for any more. A tab running for
+        // the first time has no session yet, and `None` says so: the run
+        // is alive, and nothing is out on the server to stop.
+        let backend = session.as_ref().and_then(|session| session.backend());
+        tab.run = Run::Running(Live { started: Instant::now(), backend });
         tab.error = None;
+        tab.last_used = Instant::now();
+        tab.session_ended = false;
         tab.generation += 1;
         let generation = tab.generation;
 
@@ -979,7 +1113,7 @@ impl Shell {
         // The buffer has been edited since the tab was opened, and this is
         // the moment the user says it is worth something.
         self.remember_tabs(cx);
-        let task = run_statements(connection, statements, backend, cx);
+        let task = run_statements(connection, session, statements, tab_id, generation, cx);
         self.start_timer(cx);
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
@@ -994,12 +1128,25 @@ impl Shell {
                 // but the history still keeps what the server said.
                 let stopped = matches!(tab.run, Run::Cancelling(_));
                 let waited = tab.run.live().map(|live| live.started.elapsed().as_millis());
-                let run = match flatten(outcome) {
+                let RunOutcome { session, result } = outcome;
+                // Kept whether the run worked or not. A failed statement
+                // does not end a transaction, and throwing the session away
+                // here would lose whatever the tab had set — and hand the
+                // pool a connection with an open transaction on it.
+                if session.is_some() {
+                    tab.session = session;
+                }
+                // The sweep counts from the end of a run, not the start:
+                // a statement that took nine minutes has not left its
+                // session idle for nine minutes.
+                tab.last_used = Instant::now();
+                let run = match result {
                     Ok((result, elapsed, ran)) => {
                         tab.run = Run::Idle;
                         let rows = result.rows.len() as u64;
                         tab.elapsed = Some(elapsed);
                         tab.has_result = true;
+                        tab.truncated = result.truncated;
                         tab.statements_run = ran;
                         tab.data = Rc::new(GridData::new(result.columns, result.rows));
                         Outcome { elapsed: Some(elapsed), rows: Some(rows), error: None }
@@ -1012,12 +1159,16 @@ impl Shell {
                             tab.error = Some(error.clone());
                         }
                         tab.has_result = false;
+                        tab.truncated = false;
                         tab.data = empty_grid();
                         Outcome { elapsed: None, rows: None, error: Some(error) }
                     }
                 };
                 this.record_run(&recorded, RunSource::User, &run);
                 this.reload_open_history(cx);
+                this.refresh_transaction(tab_id, cx);
+                // There is a session now, so there is something to sweep.
+                this.start_session_timer(cx);
                 cx.notify();
             })
             .ok();
@@ -1046,30 +1197,18 @@ impl Shell {
         // because the user asked twice. A terminate therefore leaves the
         // state where the cancel put it, and the server's reply is still
         // what ends the run.
-        let (backend, started) = (live.backend.clone(), live.started);
+        let live = *live;
         let (tab_id, generation) = (tab.id, tab.generation);
-        tab.run = Run::Cancelling(Live { started, backend: backend.clone() });
+        tab.run = Run::Cancelling(live);
         cx.notify();
 
+        // No backend means the tab's session is still opening and nothing
+        // has been sent. Marking the run `Cancelling` **is** the stop: the
+        // open lands into a run that then does not start. There is no id
+        // to wait for, because there is nothing to wait for it to reach.
+        let Some(id) = live.backend else { return };
+
         cx.spawn(async move |this, cx| {
-            // The backend id lands one round trip after a run starts, so a
-            // stop pressed the instant a run began can arrive first. Wait
-            // it out on the background executor rather than dropping the
-            // request — a stop that silently did nothing is the worst of
-            // the three things this button can do.
-            let mut waited = Duration::ZERO;
-            let id = loop {
-                let id = backend.load(Ordering::Relaxed);
-                if id != 0 {
-                    break Some(RunId(id));
-                }
-                if waited >= STOP_WAIT {
-                    break None;
-                }
-                cx.background_executor().timer(STOP_POLL).await;
-                waited += STOP_POLL;
-            };
-            let Some(id) = id else { return };
             let Ok(task) = this.update(cx, |_, cx| {
                 gpui_tokio::Tokio::spawn(cx, async move { connection.stop(id, how).await })
             }) else {
@@ -1091,6 +1230,122 @@ impl Shell {
                 })
                 .ok();
             }
+        })
+        .detach();
+    }
+
+    // --- sessions ---------------------------------------------------------
+
+    /// Every open session, as the sweep and the cap need to see it.
+    fn session_states(&self) -> Vec<SessionState> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| match tab {
+                Tab::Query(tab) if tab.session.is_some() => Some(SessionState {
+                    tab_id: tab.id,
+                    running: tab.run.in_flight(),
+                    in_transaction: tab.in_transaction,
+                    idle: tab.last_used.elapsed(),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Hand back sessions nobody has used for `IDLE_SESSION`.
+    fn sweep_idle_sessions(&mut self, cx: &mut Context<Self>) {
+        for tab_id in idle_sessions(&self.session_states(), IDLE_SESSION) {
+            self.end_session(tab_id, cx);
+        }
+    }
+
+    /// Make room for one more session by giving back the one that has gone
+    /// longest without a question. `false` means every session is busy or
+    /// holding a transaction, and the caller must say so rather than ask
+    /// for one too many: the pool would make it wait out the connect
+    /// timeout and then answer with a message about connections, for
+    /// something the app could see coming.
+    fn make_room_for_session(&mut self, cx: &mut Context<Self>) -> bool {
+        let states = self.session_states();
+        if states.len() < db_client::MAX_SESSIONS {
+            return true;
+        }
+        match evictable(&states) {
+            Some(tab_id) => {
+                self.end_session(tab_id, cx);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Take one tab's session back: rolled back, returned to the pool, and
+    /// the tab told so it can say why its next run starts fresh.
+    fn end_session(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else { return };
+        let Some(session) = tab.session.take() else { return };
+        tab.session_ended = true;
+        gpui_tokio::Tokio::spawn(cx, async move { session.close().await }).detach();
+        cx.notify();
+    }
+
+    /// Sweep for idle sessions while there are any. One loop for the
+    /// window, as the run timer is, and it ends itself when the last
+    /// session has gone — a workspace sitting on no connections must not
+    /// keep waking up to notice that.
+    fn start_session_timer(&mut self, cx: &mut Context<Self>) {
+        if self.sweeping {
+            return;
+        }
+        self.sweeping = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(IDLE_TICK).await;
+                let more = this.update(cx, |this, cx| {
+                    this.sweep_idle_sessions(cx);
+                    let more = this.tabs.iter().any(
+                        |tab| matches!(tab, Tab::Query(tab) if tab.session.is_some()),
+                    );
+                    if !more {
+                        this.sweeping = false;
+                    }
+                    more
+                });
+                if !matches!(more, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Ask what the tab's session is now in, after a run has changed it.
+    ///
+    /// It runs **after** the result is on screen and on a connection of
+    /// the app's own, so it costs the run nothing. The answer is worth
+    /// having early because the moment it is wanted — a close — cannot
+    /// wait for a round trip to decide what to ask the user.
+    ///
+    /// A session that cannot answer is left as it was rather than reported
+    /// as clean: the safe reading of a missing answer is the careful one.
+    fn refresh_transaction(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else { return };
+        let Some(session) = tab.session.clone() else { return };
+        cx.spawn(async move |this, cx| {
+            let Ok(task) = this.update(cx, |_, cx| {
+                gpui_tokio::Tokio::spawn(cx, async move { session.in_transaction().await })
+            }) else {
+                return;
+            };
+            let Ok(open) = flatten(task.await) else { return };
+            this.update(cx, |this, cx| {
+                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return };
+                if tab.in_transaction != open {
+                    tab.in_transaction = open;
+                    cx.notify();
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -1442,12 +1697,163 @@ impl Shell {
         cx.notify();
     }
 
+    // --- closing a session -----------------------------------------------
+
+    /// Ask before a close that would end work the server is still doing.
+    ///
+    /// `true` means go ahead now. `false` means the dialog is up, and the
+    /// close happens — or does not — when the user answers. **Every way out
+    /// calls this**, which is what makes the guard true rather than a
+    /// warning the ⌘W path happens to show.
+    ///
+    /// A close that loses nothing never asks. Only a run in flight counts:
+    /// an editor's buffer is already written back, and a tab with a result
+    /// on screen loses a result the statement above it will fetch again.
+    pub fn guard_close(
+        &mut self,
+        what: Close,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.confirm.is_some() {
+            // One question at a time. A second ⌘W while the dialog is up is
+            // the user repeating themselves, not asking something new.
+            return false;
+        }
+        let (running, open) = self.work_ended_by(what);
+        if running.is_empty() && open.is_empty() {
+            return true;
+        }
+        // The palette must not be left underneath: two overlays both taking
+        // keys, and only one of them the one being answered.
+        if self.palette.is_some() {
+            self.close_palette(window, cx);
+        }
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        self.confirm = Some(Confirm { what, running, open, focus });
+        cx.notify();
+        false
+    }
+
+    /// What a close would end, by tab name: the runs still out, and the
+    /// transactions still open. A tab can be in both lists.
+    fn work_ended_by(&self, what: Close) -> (Vec<SharedString>, Vec<SharedString>) {
+        let mut running = Vec::new();
+        let mut open = Vec::new();
+        for tab in self.tabs.iter().filter(|tab| match what {
+            Close::Tab(id) => tab.id() == id,
+            Close::Shell | Close::Window => true,
+        }) {
+            let Tab::Query(tab) = tab else { continue };
+            if tab.run.in_flight() {
+                running.push(tab.title.clone());
+            }
+            if tab.in_transaction {
+                open.push(tab.title.clone());
+            }
+        }
+        (running, open)
+    }
+
+    /// Ask the server to give up every run this close would end, and hand
+    /// the requests back rather than detaching them here: quitting has to
+    /// wait for them, and closing a tab must not.
+    ///
+    /// The backend id lands one round trip after a run starts, so a close
+    /// inside that window finds no id and cannot ask. It is a race the
+    /// stop button waits out and this cannot — the tab is going away — and
+    /// the session work closes it for good, because a session knows its
+    /// backend from the moment it opens.
+    fn cancel_runs(&mut self, what: Close, cx: &mut Context<Self>) -> Vec<StopTask> {
+        let Some(connection) = self.connection.clone() else { return Vec::new() };
+        let mut stops = Vec::new();
+        for tab in self.tabs.iter_mut().filter(|tab| match what {
+            Close::Tab(id) => tab.id() == id,
+            Close::Shell | Close::Window => true,
+        }) {
+            let Tab::Query(tab) = tab else { continue };
+            let Some(live) = tab.run.live() else { continue };
+            let Some(id) = live.backend else {
+                // The session is still opening, so nothing is out on the
+                // server. Dropping the tab is all the stopping there is.
+                continue;
+            };
+            // The tab says CANCELLING while the request is out. It matters
+            // on the way to a quit, where the tabs stay on screen until the
+            // cancels land — closing a tab takes the tab with it, and this
+            // says nothing to nobody.
+            tab.run = Run::Cancelling(*live);
+            let connection = connection.clone();
+            stops.push(gpui_tokio::Tokio::spawn(cx, async move {
+                connection.stop(id, Stop::Cancel).await
+            }));
+        }
+        stops
+    }
+
+    /// Do the close the user agreed to.
+    fn proceed_close(&mut self, what: Close, window: &mut Window, cx: &mut Context<Self>) {
+        let stops = self.cancel_runs(what, cx);
+        match what {
+            Close::Tab(id) => {
+                // Detached, because a tab closing must not wait on the
+                // network. Dropping the task instead would abort it —
+                // `Tokio::spawn` cancels its future when the handle goes.
+                for stop in stops {
+                    stop.detach();
+                }
+                self.close_tab(id, window, cx);
+            }
+            Close::Shell => {
+                for stop in stops {
+                    stop.detach();
+                }
+                // The shell is dropped from here, and with it every editor
+                // buffer. Write the strip back while there is still
+                // something to read it from.
+                self.remember_tabs(cx);
+                cx.emit(ShellEvent::Close);
+            }
+            Close::Window => {
+                self.remember_tabs(cx);
+                // This one *is* waited for. Quitting drops the tokio
+                // runtime, so a cancel that has not left yet never leaves,
+                // and the statement outlives the app that started it.
+                cx.spawn(async move |_, cx| {
+                    for stop in stops {
+                        stop.await.ok();
+                    }
+                    cx.update(|cx| cx.quit());
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn close_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm = None;
+        // The workspace takes the focus back, or the shell's keys have
+        // nowhere to dispatch once the dialog is gone.
+        self.focus_active_tab(window, cx);
+        cx.notify();
+    }
+
     /// Close one tab and hand the focus to whatever takes its place. The
     /// active index counts tabs, not ids, so closing a tab to the left of
     /// the active one has to walk it back or the selection jumps.
     fn close_tab(&mut self, tab_id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.tabs.iter().position(|tab| tab.id() == tab_id) else { return };
-        self.tabs.remove(ix);
+        let closed = self.tabs.remove(ix);
+        // The tab's connection goes back to the pool, so it is rolled back
+        // first: whatever acquires it next must not inherit a transaction
+        // the user left open here. Leaving the shell needs none of this —
+        // the pool dies with it, and a closing socket is itself a rollback.
+        if let Tab::Query(closed) = &closed {
+            if let Some(session) = closed.session.clone() {
+                gpui_tokio::Tokio::spawn(cx, async move { session.close().await }).detach();
+            }
+        }
         if ix < self.active {
             self.active -= 1;
         }
@@ -1545,7 +1951,19 @@ impl Shell {
     fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active) else { return };
         let id = tab.id();
-        self.close_tab(id, window, cx);
+        if self.guard_close(Close::Tab(id), window, cx) {
+            self.close_tab(id, window, cx);
+        }
+    }
+
+    fn on_confirm_close(&mut self, _: &ConfirmClose, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(confirm) = self.confirm.take() else { return };
+        cx.notify();
+        self.proceed_close(confirm.what, window, cx);
+    }
+
+    fn on_cancel_close(&mut self, _: &CancelClose, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_confirm(window, cx);
     }
 
     fn on_refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
@@ -1684,37 +2102,131 @@ fn run_sql(
     })
 }
 
+/// What a run hands back: the tab's session, and how the statements went.
+///
+/// The two are separate because they fail separately. A statement that
+/// errors leaves the session perfectly good — and still holding whatever
+/// the user set on it — so the session comes back either way, and is
+/// `None` only when opening it is what failed.
+struct RunOutcome {
+    session: Option<Arc<dyn Session>>,
+    result: Result<(QueryResult, u128, usize), String>,
+}
+
+impl RunOutcome {
+    /// The shell went away mid-run. Nothing will read this, and the pool
+    /// it belonged to is going with it.
+    fn abandoned() -> Self {
+        Self { session: None, result: Err("the workspace closed".to_string()) }
+    }
+}
+
+/// What a run says for itself when ⌘. reached it before it had left. The
+/// tab paints CANCELLED, as it does for a run the server gave up, because
+/// it is the same answer to the same question.
+const CALLED_OFF: &str = "the run was called off before it started";
+
+/// Said when every session is busy or holding a transaction and this tab
+/// wanted one too. It names the two ways out, because the app cannot pick
+/// either of them on the user's behalf: both lose something.
+const NO_SESSION_LEFT: &str =
+    "every connection is in use — close a tab, or end a transaction, and run again";
+
 /// Run a buffer's statements in order and keep the last result that has
 /// columns, so a trailing `create table` does not blank a grid the SELECT
 /// before it filled. The first statement to fail stops the run and its
 /// error is what the user sees.
-#[allow(clippy::type_complexity)]
+///
+/// **All of them go down one connection, in order**, so `BEGIN; SELECT …;`
+/// in one buffer means what it reads as. Before sessions each statement
+/// took whichever pooled connection was free, and the second one could not
+/// see what the first had done.
 fn run_statements(
     connection: Arc<dyn Connection>,
+    session: Option<Arc<dyn Session>>,
     statements: Vec<String>,
-    backend: Arc<AtomicI32>,
+    tab_id: u64,
+    generation: u64,
     cx: &mut Context<Shell>,
-) -> gpui::Task<Result<anyhow::Result<(QueryResult, u128, usize)>, gpui_tokio::JoinError>> {
-    // Each statement gets its own connection out of the pool, so each one
-    // runs on its own backend. The slot holds whichever is current, which
-    // is the one a stop has to reach; the one before it has already
-    // finished, and stopping it would be stopping nothing.
-    let report: ReportRun = Arc::new(move |id: RunId| {
-        backend.store(id.0, Ordering::Relaxed);
-    });
-    gpui_tokio::Tokio::spawn(cx, async move {
-        let started = Instant::now();
-        let mut last = QueryResult::default();
-        let mut ran = 0;
-        for statement in &statements {
-            let result = connection.execute_reporting(statement, report.clone()).await?;
-            ran += 1;
-            if !result.columns.is_empty() {
-                last = result;
+) -> gpui::Task<RunOutcome> {
+    cx.spawn(async move |this, cx| {
+        // The tab's session, opening one if this is its first run. The
+        // open is its own step rather than the first thing inside the run,
+        // so the tab knows its backend before a statement is ever sent.
+        let session = match session {
+            Some(session) => session,
+            None => {
+                let opening = this.update(cx, |_, cx| {
+                    gpui_tokio::Tokio::spawn(cx, async move { connection.open_session().await })
+                });
+                let Ok(opening) = opening else { return RunOutcome::abandoned() };
+                match flatten(opening.await) {
+                    Ok(session) => session,
+                    Err(error) => return RunOutcome { session: None, result: Err(error) },
+                }
             }
+        };
+
+        // The tab learns where its session is the moment there is one, so
+        // every stop and every close from here on has a backend to name.
+        //
+        // It is also where a run called off while the session was opening
+        // ends. Nothing was sent, so calling it off costs the server
+        // nothing — which is why a stop in that window needs no waiting.
+        let go = this.update(cx, |this, cx| {
+            let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return false };
+            if tab.generation != generation {
+                return false;
+            }
+            tab.session = Some(session.clone());
+            if let Run::Running(live) = &mut tab.run {
+                live.backend = session.backend();
+            }
+            cx.notify();
+            !matches!(tab.run, Run::Cancelling(_))
+        });
+        if !matches!(go, Ok(true)) {
+            return RunOutcome { session: Some(session), result: Err(CALLED_OFF.to_string()) };
         }
-        anyhow::Ok((last, started.elapsed().as_millis(), ran))
+
+        let running = this.update(cx, |_, cx| {
+            gpui_tokio::Tokio::spawn(cx, async move {
+                let outcome = execute_all(&session, &statements).await;
+                (session, outcome)
+            })
+        });
+        let Ok(running) = running else { return RunOutcome::abandoned() };
+        match running.await {
+            Ok((session, result)) => RunOutcome { session: Some(session), result },
+            Err(join) => RunOutcome {
+                session: None,
+                result: Err(format!("the query was interrupted: {join}")),
+            },
+        }
     })
+}
+
+/// Send a buffer's statements in turn, keeping the last result that has
+/// columns. The first failure ends the run.
+async fn execute_all(
+    session: &Arc<dyn Session>,
+    statements: &[String],
+) -> Result<(QueryResult, u128, usize), String> {
+    let started = Instant::now();
+    let mut last = QueryResult::default();
+    let mut ran = 0;
+    for statement in statements {
+        match session.execute(statement).await {
+            Ok(result) => {
+                ran += 1;
+                if !result.columns.is_empty() {
+                    last = result;
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok((last, started.elapsed().as_millis(), ran))
 }
 
 /// Collapse "the tokio task died" and "the query failed" into one message.
@@ -1906,6 +2418,9 @@ impl Render for Shell {
         root.child(framed)
             .children(self.env.map(|env| frame_overlay(env, radius, &colors)))
             .children(self.palette_overlay(&colors, cx))
+            // Last, so it paints over the palette on the one frame where
+            // both could be up.
+            .children(self.confirm_overlay(&colors, cx))
     }
 }
 
@@ -1974,12 +2489,13 @@ impl Shell {
                     .text_color(colors.text_muted)
                     .cursor_pointer()
                     .hover(|s| s.text_color(colors.accent))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        // The shell is dropped from here, and with it every
-                        // editor buffer. Write the strip back while there
-                        // is still something to read it from.
-                        this.remember_tabs(cx);
-                        cx.emit(ShellEvent::Close);
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        // Leaving drops every tab at once, so it asks about
+                        // all of them — `proceed_close` writes the strip
+                        // back before the shell goes.
+                        if this.guard_close(Close::Shell, window, cx) {
+                            this.proceed_close(Close::Shell, window, cx);
+                        }
                     }))
                     .child("‹ connections"),
             )
@@ -2407,7 +2923,9 @@ impl Shell {
                         .cursor_pointer()
                         .hover(|s| s.text_color(colors.error))
                         .on_click(cx.listener(move |this, _event, window, cx| {
-                            this.close_tab(id, window, cx);
+                            if this.guard_close(Close::Tab(id), window, cx) {
+                                this.close_tab(id, window, cx);
+                            }
                         }))
                         .child("×"),
                 );
@@ -2669,9 +3187,18 @@ impl Shell {
         // The design's four result lines. Each one says what is true of the
         // run *now*, so the line and the button never disagree.
         let (label, summary, ink) = match &tab.run {
-            // No streaming yet — `execute` collects the whole result — so
-            // there is no row count to report while a run is out. The line
-            // says what it can: the run is alive, and how to end it.
+            // The driver streams the rows, but it hands the result over in
+            // one piece at the end, so there is still no row count to report
+            // while a run is out. The line says what it can: the run is
+            // alive, and how to end it. A count would need the driver to
+            // report progress, not merely to stream.
+            // With no backend the tab's session is still opening, and the
+            // line must not claim the server has anything: it does not.
+            Run::Running(live) if live.backend.is_none() => (
+                "RUNNING",
+                "opening this tab's session · ⌘. calls it off".to_string(),
+                colors.accent_deep,
+            ),
             Run::Running(_) => (
                 "RUNNING",
                 "the server has the statement · ⌘. stops it".to_string(),
@@ -2679,9 +3206,9 @@ impl Shell {
             ),
             Run::Cancelling(live) => (
                 "CANCELLING",
-                match live.backend.load(Ordering::Relaxed) {
-                    0 => "cancel sent · waiting for the server to acknowledge".to_string(),
-                    pid => format!(
+                match live.backend {
+                    None => "the run was called off before it left".to_string(),
+                    Some(RunId(pid)) => format!(
                         "cancel sent to backend pid {pid} · \
                          waiting for the server to acknowledge"
                     ),
@@ -2736,6 +3263,7 @@ impl Shell {
                         .text_color(colors.text_muted)
                         .child(format!("{} · {}", self.session_name(), self.mode_word())),
                 )
+                .children(session_mark(tab, colors))
                 // With several statements in the buffer, say which one a
                 // run would send, so ⌘⏎ never comes as a surprise.
                 .children(run_scope(tab, cx).map(|scope| {
@@ -2769,7 +3297,8 @@ impl Shell {
                 .text_size(px(10.))
                 .text_color(ink)
                 .child(div().font_weight(FontWeight::SEMIBOLD).text_color(ink).child(label))
-                .child(summary),
+                .child(summary)
+                .children(cap_note(tab, colors)),
         )
         .child(grid(
             format!("tab-{}", tab.id),
@@ -2997,6 +3526,145 @@ impl Shell {
     /// of the shell rather than a window of its own, so it cannot outlive
     /// the workspace it searches, and closing it hands the focus straight
     /// back.
+    /// The close confirmation. The palette's pattern — an absolutely
+    /// positioned child of the shell, never a window of its own — so
+    /// answering it hands the focus straight back to the workspace.
+    ///
+    /// The scrim does **not** dismiss on a click, unlike the palette's. A
+    /// stray click must not be an answer to a question about ending server
+    /// work; ⎋ is the way out, and it says so.
+    fn confirm_overlay(
+        &self,
+        colors: &ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        let confirm = self.confirm.as_ref()?;
+        let (title, body, keep, act) =
+            confirm_copy(confirm.what, &confirm.running, &confirm.open);
+        // Every tab the close would touch, named once even when it is in
+        // both lists.
+        let mut named: Vec<String> = Vec::new();
+        for name in confirm.running.iter().chain(confirm.open.iter()) {
+            let name = name.to_string();
+            if !named.contains(&name) {
+                named.push(name);
+            }
+        }
+
+        Some(
+            div()
+                .id("confirm-scrim")
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .size_full()
+                .flex()
+                .justify_center()
+                .items_start()
+                .pt(px(CONFIRM_TOP_MARGIN))
+                .bg(colors.overlay)
+                .occlude()
+                .child(
+                    div()
+                        .id("confirm")
+                        .key_context(CONFIRM_KEY_CONTEXT)
+                        .track_focus(&confirm.focus)
+                        .on_action(cx.listener(Self::on_confirm_close))
+                        .on_action(cx.listener(Self::on_cancel_close))
+                        .occlude()
+                        .w(px(CONFIRM_WIDTH))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.))
+                        .p(px(18.))
+                        .border_1()
+                        .border_color(colors.border_strong)
+                        .rounded(px(10.))
+                        .bg(colors.elevated)
+                        .shadow(vec![
+                            BoxShadow::new(px(0.), px(24.), colors.shadow)
+                                .blur_radius(px(60.))
+                                .spread_radius(px(-20.)),
+                        ])
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(colors.text)
+                                .child(title),
+                        )
+                        .children(body.into_iter().map(|line| {
+                            div().text_size(px(11.)).text_color(colors.text_secondary).child(line)
+                        }))
+                        // With more than one tab at stake, name them: the
+                        // user is about to end work they cannot see from
+                        // here.
+                        .children((named.len() > 1).then(|| {
+                            div()
+                                .text_size(px(11.))
+                                .text_color(colors.text_muted)
+                                .truncate()
+                                .child(named.join(", "))
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .pt(px(4.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(10.))
+                                        .text_color(colors.text_faint)
+                                        .child("⌘⏎ confirms · ⎋ or ⏎ keeps"),
+                                )
+                                .child(
+                                    div()
+                                        .id("confirm-keep")
+                                        .px(px(12.))
+                                        .py(px(5.))
+                                        .border_1()
+                                        .border_color(colors.border_strong)
+                                        .rounded(px(6.))
+                                        .text_size(px(11.))
+                                        .text_color(colors.text)
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(colors.panel))
+                                        .on_click(cx.listener(|this, _event, window, cx| {
+                                            this.close_confirm(window, cx)
+                                        }))
+                                        .child(keep),
+                                )
+                                .child(
+                                    // Clay and filled, the tone the
+                                    // terminate button wears: the control
+                                    // that ends server work must not look
+                                    // like the one that keeps it.
+                                    div()
+                                        .id("confirm-act")
+                                        .px(px(12.))
+                                        .py(px(5.))
+                                        .border_1()
+                                        .border_color(colors.env_prod)
+                                        .rounded(px(6.))
+                                        .bg(colors.env_prod)
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(colors.window)
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _event, window, cx| {
+                                            let Some(confirm) = this.confirm.take() else { return };
+                                            cx.notify();
+                                            this.proceed_close(confirm.what, window, cx);
+                                        }))
+                                        .child(act),
+                                ),
+                        ),
+                ),
+        )
+    }
+
     fn palette_overlay(
         &self,
         colors: &ThemeColors,
@@ -3512,6 +4180,156 @@ fn key_badge(keys: &'static str, colors: &ThemeColors) -> Div {
         .child(keys)
 }
 
+/// What the close confirmation says: title, body, the keeping answer, the
+/// ending one.
+///
+/// Pure, so the wording is testable without a window — and so the three
+/// ways out cannot drift into saying three unrelated things. The body
+/// names what happens on the *server*, because that is what the user
+/// cannot see and cannot undo.
+type ConfirmCopy = (String, Vec<String>, &'static str, &'static str);
+
+fn confirm_copy(what: Close, running: &[SharedString], open: &[SharedString]) -> ConfirmCopy {
+    let (title, verb, keep, act) = match what {
+        Close::Tab(_) => {
+            let named = running.first().or_else(|| open.first());
+            let first = named.map(|name| name.to_string()).unwrap_or_default();
+            (format!("Close “{first}”?"), "Closing the tab", "Keep tab", "Close it")
+        }
+        Close::Shell => {
+            ("Leave this connection?".to_string(), "Leaving", "Stay", "Leave anyway")
+        }
+        Close::Window => ("Quit Meerkat?".to_string(), "Quitting", "Stay", "Quit anyway"),
+    };
+
+    // One line per thing at stake, because they are lost in different
+    // ways: a run the server can be asked to give up, a transaction it
+    // throws away. A close that said only "are you sure" would be telling
+    // the user nothing they could not already see.
+    let mut body = Vec::new();
+    if !running.is_empty() {
+        body.push(if running.len() == 1 {
+            format!(
+                "“{}” is still running a statement. {verb} asks the server to stop it.",
+                running[0]
+            )
+        } else {
+            format!(
+                "{} tabs are still running statements. {verb} asks the server to stop them.",
+                running.len()
+            )
+        });
+    }
+    if !open.is_empty() {
+        // "rolls it back" and nothing more dramatic: the session is
+        // read-only unless the user said otherwise, so a rollback often
+        // costs nothing but the transaction itself. Saying the work is
+        // lost would be a warning the app cannot always stand behind.
+        body.push(if open.len() == 1 {
+            format!("“{}” has a transaction open. {verb} rolls it back.", open[0])
+        } else {
+            format!("{} tabs have transactions open. {verb} rolls them back.", open.len())
+        });
+    }
+    (title, body, keep, act)
+}
+
+/// One open session, as the sweep and the cap need to see it. Kept apart
+/// from the tab so the policy below is a function of plain values, and can
+/// be argued with in a test rather than in a running window.
+#[derive(Clone, Copy, Debug)]
+struct SessionState {
+    tab_id: u64,
+    running: bool,
+    in_transaction: bool,
+    idle: Duration,
+}
+
+/// Whether a session may be taken back at all.
+///
+/// A run in flight is using it. **A transaction is the one that must never
+/// be taken**: handing the connection back rolls the user's work away with
+/// nobody asking, which is exactly what the close dialog exists to refuse
+/// to do quietly. So a tab mid-transaction keeps its connection however
+/// long it sits there, and the cap is what gives way instead.
+fn spare(state: &SessionState) -> bool {
+    !state.running && !state.in_transaction
+}
+
+/// The sessions nobody has used for `after`.
+///
+/// A laptop left open overnight must not hold every connection against a
+/// shared server for a window nobody is looking at. The cost of being
+/// wrong is small and visible: the tab says the session ended, and its
+/// next run opens another.
+fn idle_sessions(states: &[SessionState], after: Duration) -> Vec<u64> {
+    states
+        .iter()
+        .filter(|state| spare(state) && state.idle >= after)
+        .map(|state| state.tab_id)
+        .collect()
+}
+
+/// Which session to give back when one more is wanted: the one that has
+/// gone longest without a question. `None` means none may be taken, and
+/// the caller must refuse rather than pick a session that is holding
+/// something.
+fn evictable(states: &[SessionState]) -> Option<u64> {
+    states.iter().filter(|state| spare(state)).max_by_key(|state| state.idle).map(|s| s.tab_id)
+}
+
+/// What the toolbar says about the tab's own connection, when there is
+/// anything to say.
+///
+/// Two states earn a mark, and neither is "a session is open" — that is
+/// the ordinary case and needs no badge. **IN TRANSACTION** is a state the
+/// user has to be able to see, because everything the tab does is inside
+/// it and closing the tab rolls it back. **session ended** explains a
+/// reset the user did not ask for: the sweep took the connection back, so
+/// a `search_path` set an hour ago is gone, and a mark is the difference
+/// between that and a mystery.
+///
+/// In transaction wins when both are true — but they cannot be: a session
+/// holding a transaction is the one thing the sweep never takes.
+fn session_mark(tab: &QueryTab, colors: &ThemeColors) -> Option<Div> {
+    let (text, ink) = if tab.in_transaction {
+        ("IN TRANSACTION", colors.accent_deep)
+    } else if tab.session_ended {
+        ("session ended · a run opens a new one", colors.text_faint)
+    } else {
+        return None;
+    };
+    Some(
+        div()
+            .flex_none()
+            .text_size(px(11.))
+            .font_weight(if tab.in_transaction { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+            .text_color(ink)
+            .child(text),
+    )
+}
+
+/// The clause the result line adds when the memory cap ended the read.
+///
+/// It is in the accent's family, not the error's: nothing failed, and the
+/// rows on screen are real rows. The app declined to hold the rest. Only an
+/// idle run says it — while a run is out, the grid still shows the result
+/// before it, and that result's cap is not news about this one.
+fn cap_note(tab: &QueryTab, colors: &ThemeColors) -> Option<Div> {
+    if !tab.truncated || tab.run.in_flight() {
+        return None;
+    }
+    Some(
+        div()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(colors.accent_deep)
+            .child(format!(
+                "capped at {} MB · select fewer columns, or add a LIMIT",
+                db_client::MAX_BYTES / 1024 / 1024
+            )),
+    )
+}
+
 /// The design's error tone: warm surface, warm border, warm text.
 fn error_strip(message: String, colors: &ThemeColors) -> Div {
     div()
@@ -3545,6 +4363,115 @@ mod tests {
 
     fn relation(name: &str, kind: TableKind) -> Table {
         Table { name: name.to_string(), kind, columns: Vec::new(), primary_key: Vec::new(), approx_rows: None }
+    }
+
+    fn names(names: &[&str]) -> Vec<SharedString> {
+        names.iter().map(|name| SharedString::from(name.to_string())).collect()
+    }
+
+    /// Each way out names itself and names what it ends. The three must
+    /// not drift into saying three unrelated things, which is the whole
+    /// reason the copy is one function.
+    #[test]
+    fn the_confirmation_names_the_way_out_it_is_guarding() {
+        let one = names(&["query 3"]);
+        let none: Vec<SharedString> = Vec::new();
+
+        let (title, body, keep, act) = confirm_copy(Close::Tab(7), &one, &none);
+        assert_eq!(title, "Close “query 3”?");
+        assert!(body[0].contains("stop it"), "{body:?}");
+        assert_eq!((keep, act), ("Keep tab", "Close it"));
+
+        let (title, _, keep, act) = confirm_copy(Close::Shell, &one, &none);
+        assert_eq!(title, "Leave this connection?");
+        assert_eq!((keep, act), ("Stay", "Leave anyway"));
+
+        let (title, _, _, act) = confirm_copy(Close::Window, &one, &none);
+        assert_eq!(title, "Quit Meerkat?");
+        assert_eq!(act, "Quit anyway");
+
+        // A tab with only a transaction open is still named in the title:
+        // the dialog must say which tab it is asking about.
+        let (title, body, ..) = confirm_copy(Close::Tab(7), &none, &one);
+        assert_eq!(title, "Close “query 3”?");
+        assert_eq!(body, vec!["“query 3” has a transaction open. Closing the tab rolls it back."]);
+    }
+
+    /// Leaving with one run out names it; leaving with several counts
+    /// them, and the dialog lists the names underneath.
+    #[test]
+    fn the_confirmation_counts_what_it_would_end() {
+        let none: Vec<SharedString> = Vec::new();
+
+        let body = confirm_copy(Close::Window, &names(&["query 3"]), &none).1;
+        assert_eq!(
+            body,
+            vec!["“query 3” is still running a statement. Quitting asks the server to stop it."]
+        );
+
+        let body = confirm_copy(Close::Shell, &names(&["query 3", "query 7"]), &none).1;
+        assert_eq!(
+            body,
+            vec!["2 tabs are still running statements. Leaving asks the server to stop them."]
+        );
+
+        let body = confirm_copy(Close::Shell, &none, &names(&["a", "b", "c"])).1;
+        assert_eq!(body, vec!["3 tabs have transactions open. Leaving rolls them back."]);
+    }
+
+    /// A tab can be both, and then the dialog says both — they are lost in
+    /// different ways, so one line cannot stand for the other.
+    #[test]
+    fn the_confirmation_says_both_when_both_are_true() {
+        let one = names(&["query 3"]);
+        let (_, body, _, act) = confirm_copy(Close::Tab(7), &one, &one);
+        assert_eq!(body.len(), 2, "{body:?}");
+        assert!(body[0].contains("asks the server to stop it"), "{body:?}");
+        assert!(body[1].contains("rolls it back"), "{body:?}");
+        assert_eq!(act, "Close it");
+    }
+
+    fn session(tab_id: u64, idle_secs: u64) -> SessionState {
+        SessionState {
+            tab_id,
+            running: false,
+            in_transaction: false,
+            idle: Duration::from_secs(idle_secs),
+        }
+    }
+
+    #[test]
+    fn the_sweep_takes_back_what_has_gone_unused() {
+        let states = vec![session(1, 900), session(2, 60), session(3, 601)];
+        assert_eq!(idle_sessions(&states, IDLE_SESSION), vec![1, 3]);
+        // Ten minutes on the nose is not yet ten minutes past.
+        assert_eq!(idle_sessions(&[session(1, 599)], IDLE_SESSION), Vec::<u64>::new());
+    }
+
+    /// The two states a session is never taken in. A run is using it; a
+    /// transaction would be rolled away with nobody asking, which is the
+    /// thing the close dialog exists to refuse to do quietly.
+    #[test]
+    fn the_sweep_never_takes_a_busy_or_transacting_session() {
+        let running = SessionState { running: true, ..session(1, 9000) };
+        let holding = SessionState { in_transaction: true, ..session(2, 9000) };
+        assert_eq!(idle_sessions(&[running, holding], IDLE_SESSION), Vec::<u64>::new());
+        assert_eq!(evictable(&[running, holding]), None);
+    }
+
+    /// The cap gives back the session that has gone longest without a
+    /// question — and refuses rather than pick one that is holding
+    /// something, because both ways out of that cost the user something
+    /// the app may not choose for them.
+    #[test]
+    fn the_cap_gives_back_the_longest_idle_session() {
+        let states = vec![session(1, 30), session(2, 300), session(3, 120)];
+        assert_eq!(evictable(&states), Some(2));
+
+        let held = vec![SessionState { in_transaction: true, ..session(1, 9000) }, {
+            SessionState { running: true, ..session(2, 9000) }
+        }];
+        assert_eq!(evictable(&held), None);
     }
 
     #[test]

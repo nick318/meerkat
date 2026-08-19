@@ -2,15 +2,20 @@
 
 use anyhow::Context as _;
 use async_trait::async_trait;
-use db_client::{Connection, QueryResult, Result, RowChange, Value};
+use db_client::{
+    Connection, Limits, QueryResult, Result, RowChange, RowSink, RunId, Session, Value,
+};
+use futures::TryStreamExt as _;
 use introspect::{Catalog, Column, Schema, Table, TableKind};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqliteRow};
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 
 pub struct SqliteConnection {
     pool: SqlitePool,
+    limits: Limits,
 }
 
 impl SqliteConnection {
@@ -20,17 +25,94 @@ impl SqliteConnection {
         let pool = SqlitePool::connect_with(options)
             .await
             .with_context(|| format!("failed to open {}", path.display()))?;
-        Ok(Self { pool })
+        Ok(Self { pool, limits: Limits::default() })
     }
 
     pub async fn open_in_memory() -> Result<Self> {
         let pool = SqlitePool::connect("sqlite::memory:").await?;
-        Ok(Self { pool })
+        Ok(Self { pool, limits: Limits::default() })
+    }
+
+    /// Hold a smaller result than the app's own budget. See the Postgres
+    /// driver's version: it is for the tests.
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
+    }
+}
+
+/// One tab's pinned connection. The same shape as the Postgres one and
+/// for the same reason — a `PRAGMA` and a temp table belong to the
+/// connection that made them — minus everything about cancelling: the rows
+/// come from a file on this machine, so there is no backend to reach into.
+struct SqliteSession {
+    conn: futures::lock::Mutex<Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>>,
+    limits: Limits,
+}
+
+#[async_trait]
+impl Session for SqliteSession {
+    fn backend(&self) -> Option<RunId> {
+        None
+    }
+
+    async fn execute(&self, sql: &str) -> Result<QueryResult> {
+        let mut held = self.conn.lock().await;
+        let conn = held.as_mut().context("this tab's session is closed")?;
+        let mut sink = RowSink::new(self.limits);
+        let mut rows = sqlx::query(sql).fetch(&mut **conn);
+        while let Some(row) = rows.try_next().await? {
+            if !sink.has_columns() {
+                sink.columns(row.columns().iter().map(|c| c.name().to_string()).collect());
+            }
+            let mut values = Vec::with_capacity(row.columns().len());
+            for i in 0..row.columns().len() {
+                values.push(decode(&row, i)?);
+            }
+            if !sink.push(values) {
+                break;
+            }
+        }
+        drop(rows);
+        Ok(sink.finish())
+    }
+
+    async fn close(&self) {
+        let Some(mut conn) = self.conn.lock().await.take() else { return };
+        match sqlx::query("ROLLBACK").execute(&mut *conn).await {
+            Ok(_) => drop(conn),
+            // SQLite answers "cannot rollback - no transaction is active",
+            // which is the ordinary case and not a reason to throw the
+            // connection away. Only a connection that failed to *answer*
+            // leaves the pool.
+            Err(sqlx::Error::Database(_)) => drop(conn),
+            Err(_) => drop(conn.detach()),
+        }
+    }
+}
+
+/// The same fallback the Postgres session needs, and for the same reason:
+/// sqlx returns a pooled connection by spawning onto tokio, and the last
+/// handle to a session is usually dropped on the UI thread, which has no
+/// runtime. See `impl Drop for PostgresSession`.
+impl Drop for SqliteSession {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.get_mut().take() {
+            drop(conn.detach());
+        }
     }
 }
 
 #[async_trait]
 impl Connection for SqliteConnection {
+    async fn open_session(&self) -> Result<Arc<dyn Session>> {
+        let conn = self.pool.acquire().await.context("no connection for the session")?;
+        Ok(Arc::new(SqliteSession {
+            conn: futures::lock::Mutex::new(Some(conn)),
+            limits: self.limits,
+        }))
+    }
+
     async fn introspect(&self) -> Result<Catalog> {
         let names: Vec<(String, String)> = sqlx::query_as(
             "SELECT name, type FROM sqlite_master \
@@ -90,23 +172,26 @@ impl Connection for SqliteConnection {
         Ok(format!("SQLite {version}"))
     }
 
+    /// Streamed and capped by memory, as the Postgres driver is. There is
+    /// no cancel to send: the rows come from a file on this machine, so
+    /// dropping the stream ends the work rather than leaving a server to
+    /// finish a result nobody will read.
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
-        let rows: Vec<SqliteRow> = sqlx::query(sql).fetch_all(&self.pool).await?;
-        let Some(first) = rows.first() else {
-            return Ok(QueryResult::default());
-        };
-
-        let columns = first.columns().iter().map(|c| c.name().to_string()).collect();
-        let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
+        let mut sink = RowSink::new(self.limits);
+        let mut rows = sqlx::query(sql).fetch(&self.pool);
+        while let Some(row) = rows.try_next().await? {
+            if !sink.has_columns() {
+                sink.columns(row.columns().iter().map(|c| c.name().to_string()).collect());
+            }
             let mut values = Vec::with_capacity(row.columns().len());
             for i in 0..row.columns().len() {
-                values.push(decode(row, i)?);
+                values.push(decode(&row, i)?);
             }
-            out.push(values);
+            if !sink.push(values) {
+                break;
+            }
         }
-
-        Ok(QueryResult { columns, rows: out, rows_affected: 0 })
+        Ok(sink.finish())
     }
 
     async fn apply(&self, _changes: &[RowChange]) -> Result<u64> {
@@ -154,5 +239,35 @@ mod tests {
         assert_eq!(result.columns, vec!["id", "name"]);
         assert_eq!(result.rows[0][1], Value::Text("ada".to_string()));
         assert_eq!(result.rows[1][0], Value::Int(2));
+    }
+
+    /// A session is one connection, so a temp table made by one statement
+    /// is there for the next — and gone once the session closes.
+    #[tokio::test]
+    async fn a_session_keeps_what_its_statements_made() {
+        let conn = SqliteConnection::open_in_memory().await.unwrap();
+        let session = conn.open_session().await.unwrap();
+
+        session.execute("CREATE TEMP TABLE probe (id INTEGER)").await.unwrap();
+        session.execute("INSERT INTO probe VALUES (1), (2)").await.unwrap();
+        let result = session.execute("SELECT count(*) FROM probe").await.unwrap();
+        assert_eq!(result.rows[0][0], Value::Int(2));
+
+        session.close().await;
+        let error = session.execute("SELECT 1").await.unwrap_err().to_string();
+        assert!(error.contains("closed"), "{error}");
+    }
+
+    /// See `impl Drop for SqliteSession`: the UI thread has no tokio
+    /// runtime, and sqlx returns a pooled connection by spawning onto one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_may_be_dropped_off_the_runtime() {
+        let conn = SqliteConnection::open_in_memory().await.unwrap();
+        let session = conn.open_session().await.unwrap();
+        session.execute("SELECT 1").await.unwrap();
+
+        std::thread::spawn(move || drop(session)).join().unwrap();
+
+        conn.open_session().await.unwrap().execute("SELECT 1").await.unwrap();
     }
 }
