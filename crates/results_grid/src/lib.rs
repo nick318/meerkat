@@ -56,9 +56,8 @@ const TICK: &str = "✓";
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hit {
     /// A cell. `extend` is ⇧ held, which grows the range instead of starting
-    /// a new one; `detail` is the second click of a double click, which is
-    /// what opens the row drawer.
-    Cell { cell: Cell, extend: bool, detail: bool },
+    /// a new one.
+    Cell { cell: Cell, extend: bool },
     /// The gutter beside a row: tick it, or with ⇧ tick everything back to
     /// the last row ticked.
     Pick { row: usize, through: bool },
@@ -532,11 +531,7 @@ fn data_row(
         }
         if let Some(on_hit) = on_hit.clone() {
             cell = cell.on_click(move |event, window, cx| {
-                let hit = Hit::Cell {
-                    cell: Cell::new(ix, column),
-                    extend: event.modifiers().shift,
-                    detail: event.click_count() >= 2,
-                };
+                let hit = Hit::Cell { cell: Cell::new(ix, column), extend: event.modifiers().shift };
                 on_hit(hit, window, cx);
             });
         }

@@ -233,8 +233,7 @@ kept in step with the row list, and `uniform_list` gives nothing to keep
 it in step with. A table page numbers from where the page starts, so the
 gutter counts `page * PAGE_SIZE + 1` upwards rather than from 1 again.
 
-⌘C and the drawer's "copy row" write **CSV**, one line per row, by RFC
-4180's rules. **Ticked rows win over the range and are copied whole**,
+⌘C writes **CSV**, one line per row, by RFC 4180's rules. **Ticked rows win over the range and are copied whole**,
 because that is what ticking them said. No header line either way: a copy
 pastes back exactly what was marked. A NULL copies as an empty field,
 since pasting the word `NULL` would make it data, and a value holding a
@@ -246,42 +245,14 @@ rather than the whole result.
 A selection is a set of indices into the rows on screen, so **anything
 that replaces the rows clears it**: a page turn, a refresh, a run.
 
-The keys are bound to the `Shell` context, never globally: a query tab's
-editor takes the arrows for its own cursor while it holds the focus, and
-it holds the focus until a click in the result says the grid is what the
-keys are for. Arrows move, ⇧ with them extends, ⌘ with them goes as far
-as it goes, ⌘A takes everything, space ticks the cursor's row — ↓ then
-space walks a result and picks out of it without the mouse — and ⎋ takes
-one thing away at a time.
-
-### The row drawer
-
-A grid answers "what is in this table". A row of eleven columns, three of
-them `jsonb`, is not a question a 28px line can answer. So a **double
-click on a cell** opens the row it is in down the side of the pane, as
-the comp's row detail does: a label and a value per column, `⌘I` for the
-same thing from the keyboard.
-
-It holds a row *index*, not a copy of the row, so a refresh cannot leave
-the grid and the drawer disagreeing. It **follows the cursor** — walking
-rows walks the drawer, and clicking a drawer field puts the cursor on
-that cell, so the two views never say different things about where the
-user is. Its ↑ and ↓ call the same `Shell::step_cursor` the arrow keys
-do.
-
-A key names a row better than its place on a page does: the name survives
-a re-sort, a refresh and a page turn, where "row 12" survives none of
-them. So the heading is `users · id 1041` where there is a primary key
-and the statement returned it, and `users · row 512` where there is not.
-`drawer_title` and `key_values` are pure, so the wording is testable
-without a window. A query tab's statement is the user's, so it may return
-columns no catalog describes: the drawer matches by name and says nothing
-where it finds nothing.
-
-This milestone is read-only, so the drawer is a **view, not a form** —
-the comp's commit bar arrives with in-place editing in Phase 2. "copy row"
-sends the whole row in the shape ⌘C uses for a ticked one, without
-disturbing what the user has marked.
+The keys live in `GRID_KEY_CONTEXT`, never the shell's: the SQL editor's
+element sits *inside* the shell's, so a bare `space` bound there would eat
+the spaces out of the user's SQL. The grid holds a focus of its own —
+`Shell::grid_focus` — which a table tab takes when it opens and a query
+tab takes on the first click in its result. Arrows move, ⇧ with them
+extends, ⌘ with them goes as far as it goes, ⌘A takes everything, space
+ticks the cursor's row — ↓ then space walks a result and picks out of it
+without the mouse — and ⎋ drops what is marked.
 
 ### Query history
 

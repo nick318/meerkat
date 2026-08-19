@@ -9,16 +9,16 @@
 //! and a reply that does not carry the tab's current generation is thrown
 //! away. Without that, a slow first page would overwrite a fast second one.
 
-use db_client::{Connection, Profile, QueryResult, RunId, Session, Stop, Value};
+use db_client::{Connection, Profile, QueryResult, RunId, Session, Stop};
 use db_postgres::{Label, PostgresConnection};
 use gpui::{
     AnyElement, App, BoxShadow, ClipboardItem, Context, Div, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, Hsla, Pixels, ScrollHandle, ScrollStrategy, SharedString,
+    FocusHandle, Focusable, FontWeight, Hsla, Pixels, ScrollStrategy, SharedString,
     Stateful, Subscription, UniformListScrollHandle, Window, actions, div, prelude::*, px,
     uniform_list,
 };
 use introspect::{Catalog, Table, TableKind};
-use results_grid::{Cell, Extent, Grid, GridData, GridState, Hit, Selection, Step, clipboard_text};
+use results_grid::{Extent, Grid, GridData, GridState, Hit, Selection, Step, clipboard_text};
 use sql_editor::{Kind, Name, SqlEditor, Vocabulary};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -68,7 +68,6 @@ actions!(
         SelectAll,
         CopySelection,
         TogglePick,
-        ShowRow,
         ClearSelection
     ]
 );
@@ -132,9 +131,6 @@ const IDLE_TICK: Duration = Duration::from_secs(60);
 /// higher up the window: it is a sentence and two answers, not a list.
 const CONFIRM_WIDTH: f32 = 420.;
 const CONFIRM_TOP_MARGIN: f32 = 140.;
-/// The row drawer's width, from the comp. Wide enough for a `jsonb` object
-/// read down the box rather than along it, which is the reason it exists.
-const DRAWER_WIDTH: f32 = 352.;
 /// The tab strip is one row tall, as the comp draws it.
 const TAB_STRIP_HEIGHT: f32 = 34.;
 /// A tab is never squeezed below this, so the strip reads as a row of
@@ -341,33 +337,9 @@ struct TableTab {
     /// range around it, and the rows ticked in the gutter. A page is a
     /// different set of rows, so turning the page clears it.
     selection: Selection,
-    /// The row drawer, while one is open.
-    drawer: Option<Drawer>,
     /// Scroll position, kept across the re-render after every page.
     scroll: GridState,
     generation: u64,
-}
-
-/// One row, read down the side instead of across.
-///
-/// A grid answers "what is in this table"; a row of eleven columns, three of
-/// them `jsonb`, is not a question a 28px line can answer. So a double click
-/// on a cell opens the row it is in as a column of labelled fields — the
-/// comp's own row detail, and the reason a cell click and a cell double
-/// click do different things.
-///
-/// It holds a row index rather than a copy of the row: the drawer is a view
-/// of what the grid holds, so a refresh cannot leave the two disagreeing.
-struct Drawer {
-    row: usize,
-    /// Where the field list is scrolled, kept across re-renders.
-    scroll: ScrollHandle,
-}
-
-impl Drawer {
-    fn new(row: usize) -> Self {
-        Self { row, scroll: ScrollHandle::new() }
-    }
 }
 
 struct QueryTab {
@@ -423,7 +395,6 @@ struct QueryTab {
     /// What the user has marked in the result. A run replaces the rows, so
     /// it clears with them.
     selection: Selection,
-    drawer: Option<Drawer>,
     scroll: GridState,
     generation: u64,
 }
@@ -530,13 +501,11 @@ impl Tab {
             Tab::Table(tab) => Some(Marked {
                 data: &tab.data,
                 selection: &mut tab.selection,
-                drawer: &mut tab.drawer,
                 scroll: &tab.scroll,
             }),
             Tab::Query(tab) => Some(Marked {
                 data: &tab.data,
                 selection: &mut tab.selection,
-                drawer: &mut tab.drawer,
                 scroll: &tab.scroll,
             }),
             Tab::History(_) => None,
@@ -545,11 +514,10 @@ impl Tab {
 }
 
 /// A tab's result, borrowed field by field, so one key press can read the
-/// rows, move the selection, follow it with the drawer and scroll to it.
+/// rows, move the selection and scroll to where it went.
 struct Marked<'a> {
     data: &'a Rc<GridData>,
     selection: &'a mut Selection,
-    drawer: &'a mut Option<Drawer>,
     scroll: &'a GridState,
 }
 
@@ -704,7 +672,6 @@ impl Shell {
             loading: false,
             error: None,
             selection: Selection::default(),
-            drawer: None,
             scroll: GridState::new(),
             generation: 0,
         }));
@@ -1042,7 +1009,6 @@ impl Shell {
             loading: false,
             error: None,
             selection: Selection::default(),
-            drawer: None,
             scroll: GridState::new(),
             generation: 0,
         }));
@@ -1072,7 +1038,6 @@ impl Shell {
         let Some(connection) = connection else {
             tab.page = page;
             tab.selection.clear();
-            tab.drawer = None;
             tab.loading = !failed;
             tab.error = failed.then(|| NOT_CONNECTED.to_string());
             self.remember_tabs(cx);
@@ -1091,7 +1056,6 @@ impl Shell {
         // A page is a different set of rows, and a selection points at rows
         // by index: what was marked cannot be carried over to them.
         tab.selection.clear();
-        tab.drawer = None;
         tab.generation += 1;
         let generation = tab.generation;
 
@@ -1164,7 +1128,6 @@ impl Shell {
             // user asks one of them a question.
             session: None,
             selection: Selection::default(),
-            drawer: None,
             scroll: GridState::new(),
             generation: 0,
         }));
@@ -1268,7 +1231,6 @@ impl Shell {
                         // selection points at rows by index. Marks from the
                         // last answer can only point at these ones wrongly.
                         tab.selection.clear();
-                        tab.drawer = None;
                         Outcome { elapsed: Some(elapsed), rows: Some(rows), error: None }
                     }
                     Err(error) => {
@@ -1282,7 +1244,6 @@ impl Shell {
                         tab.truncated = false;
                         tab.data = empty_grid();
                         tab.selection.clear();
-                        tab.drawer = None;
                         Outcome { elapsed: None, rows: None, error: Some(error) }
                     }
                 };
@@ -2060,47 +2021,17 @@ impl Shell {
 
     // --- the selection ---------------------------------------------------
 
-    /// Move the cursor, and take the drawer and the scroll position with it.
+    /// Move the cursor, and take the scroll position with it.
     ///
-    /// One function for every way the cursor moves — the arrow keys, ⇧ with
-    /// them, and the drawer's own ↑ and ↓ — so a cursor that has walked off
-    /// the bottom of the pane is always scrolled back into view, whichever
-    /// of them moved it.
+    /// One function for every way the cursor moves — the arrow keys and ⇧
+    /// with them — so a cursor that has walked off the edge of the pane is
+    /// always brought back into view, whichever key moved it.
     fn step_cursor(&mut self, step: Step, extend: bool, cx: &mut Context<Self>) {
         let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else { return };
         let extent = Extent::of(marked.data);
         let Some(cell) = marked.selection.step(step, extend, extent) else { return };
         marked.scroll.reveal(cell, marked.data);
-        if let Some(drawer) = marked.drawer {
-            drawer.row = cell.row;
-        }
         cx.notify();
-    }
-
-    /// Put the cursor on one cell, from outside the grid: a click on a
-    /// drawer field.
-    fn focus_cell(&mut self, tab_id: u64, cell: Cell, cx: &mut Context<Self>) {
-        let Some(marked) = self.tab_mut(tab_id).and_then(Tab::marked) else { return };
-        marked.selection.focus(cell);
-        cx.notify();
-    }
-
-    fn close_drawer(&mut self, tab_id: u64, cx: &mut Context<Self>) {
-        let Some(marked) = self.tab_mut(tab_id).and_then(Tab::marked) else { return };
-        *marked.drawer = None;
-        cx.notify();
-    }
-
-    /// The drawer's "copy row": the whole row, in the shape ⌘C uses for a
-    /// ticked one. Ticking the row and copying it would say the same thing;
-    /// the button says it without disturbing what the user has marked.
-    fn copy_row(&mut self, tab_id: u64, row: usize, cx: &mut Context<Self>) {
-        let Some(marked) = self.tab_mut(tab_id).and_then(Tab::marked) else { return };
-        let mut one = Selection::default();
-        one.toggle_pick(row);
-        if let Some(text) = clipboard_text(marked.data, &one) {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-        }
     }
 
     // --- actions ---------------------------------------------------------
@@ -2182,29 +2113,10 @@ impl Shell {
         cx.notify();
     }
 
-    /// ⌘I opens the drawer on the row the cursor is on, and closes it again.
-    /// The comp names the key in the palette, and the double click is the
-    /// same thing under the mouse.
-    fn on_show_row(&mut self, _: &ShowRow, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else { return };
-        let Some(cursor) = marked.selection.cursor() else { return };
-        *marked.drawer = match marked.drawer.take() {
-            Some(_) => None,
-            None => Some(Drawer::new(cursor.row)),
-        };
-        cx.notify();
-    }
-
-    /// ⎋ takes one thing away at a time: the drawer while it is open, the
-    /// marks after that. A key that did both at once would leave the user
-    /// pressing it and losing more than they meant to.
+    /// ⎋ drops what is marked.
     fn on_clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
         let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else { return };
-        if marked.drawer.is_some() {
-            *marked.drawer = None;
-        } else {
-            marked.selection.clear();
-        }
+        marked.selection.clear();
         cx.notify();
     }
 
@@ -2584,49 +2496,6 @@ fn frame_overlay(env: Env, radius: Pixels, colors: &ThemeColors) -> Div {
         )
 }
 
-/// What the drawer calls the row it is showing.
-///
-/// A primary key names a row better than its place on a page does — the row
-/// keeps that name after a re-sort, a refresh or a page turn, and "row 12"
-/// keeps nothing. So a relation with a key is titled by it, the comp's own
-/// `users · id 1041`. Without a key, or with one the statement did not
-/// return, the number on the page is all there is to go on.
-///
-/// Pure, so the wording is testable without a window.
-fn drawer_title(relation: Option<&str>, key: &[(String, String)], number: usize) -> String {
-    let subject = if key.is_empty() {
-        format!("row {number}")
-    } else {
-        key.iter()
-            .map(|(name, value)| format!("{name} {value}"))
-            .collect::<Vec<_>>()
-            .join(" · ")
-    };
-    match relation {
-        Some(relation) => format!("{relation} · {subject}"),
-        None => subject,
-    }
-}
-
-/// The primary key's columns and what this row holds in them, in key order.
-///
-/// Empty when the relation has no key, when the shell has no catalog for it,
-/// or when the statement did not return the key's columns: a `select email
-/// from users` cannot be titled by an id it never asked for.
-fn key_values(model: Option<&Table>, data: &GridData, row: usize) -> Vec<(String, String)> {
-    let Some(model) = model else { return Vec::new() };
-    let values = data.rows.get(row);
-    model
-        .primary_key
-        .iter()
-        .filter_map(|name| {
-            let column = data.columns.iter().position(|held| held == name)?;
-            let value = values?.get(column)?;
-            Some((name.clone(), value.display()))
-        })
-        .collect()
-}
-
 /// What the connecting line says before there is a connection to describe.
 fn describe(target: &Target) -> String {
     match target {
@@ -2731,7 +2600,6 @@ impl Render for Shell {
             .on_action(cx.listener(Self::on_select_all))
             .on_action(cx.listener(Self::on_copy_selection))
             .on_action(cx.listener(Self::on_toggle_pick))
-            .on_action(cx.listener(Self::on_show_row))
             .on_action(cx.listener(Self::on_clear_selection))
             .relative()
             .flex()
@@ -3297,29 +3165,28 @@ impl Shell {
             Some(Tab::Table(tab)) => pane
                 .child(self.table_toolbar(tab, colors, cx))
                 .children(tab.error.clone().map(|error| error_strip(error, colors)))
-                .child(self.result_body(tab.id, colors, cx)),
+                .child(self.result_body(tab.id, cx)),
             Some(Tab::Query(tab)) => self.query_pane(pane, tab, colors, cx),
             Some(Tab::History(tab)) => self.history_pane(pane, tab, colors, cx),
             None => pane.child(self.placeholder(colors, window)),
         }
     }
 
-    /// The grid, and the row drawer beside it when one is open. Both kinds
-    /// of tab that show a result render through here, so the drawer opens in
-    /// the same place and behaves the same way in each.
-    fn result_body(&self, tab_id: u64, colors: &ThemeColors, cx: &Context<Self>) -> Div {
+    /// The grid, in a focus and a key context of its own. Both kinds of tab
+    /// that show a result render through here, so the keys reach the grid the
+    /// same way in each.
+    fn result_body(&self, tab_id: u64, cx: &Context<Self>) -> Div {
         let Some(tab) = self.tabs.iter().find(|tab| tab.id() == tab_id) else { return div() };
-        let (data, selection, scroll, drawer, first_row) = match tab {
+        let (data, selection, scroll, first_row) = match tab {
             Tab::Table(tab) => (
                 &tab.data,
                 &tab.selection,
                 &tab.scroll,
-                tab.drawer.as_ref(),
                 // A page is a window on the table, so the gutter counts
                 // from where the page starts rather than from 1 again.
                 tab.page * PAGE_SIZE + 1,
             ),
-            Tab::Query(tab) => (&tab.data, &tab.selection, &tab.scroll, tab.drawer.as_ref(), 1),
+            Tab::Query(tab) => (&tab.data, &tab.selection, &tab.scroll, 1),
             Tab::History(_) => return div(),
         };
 
@@ -3336,9 +3203,6 @@ impl Shell {
                     .on_hit(self.hit_handler(tab_id, cx))
                     .render(cx),
             )
-            .children(drawer.map(|drawer| {
-                self.row_drawer(tab, drawer, data, first_row, colors, cx)
-            }))
     }
 
     /// Everything a click in the grid can mean, in one place.
@@ -3355,23 +3219,11 @@ impl Shell {
                 let Some(marked) = tab.marked() else { return };
                 let extent = Extent::of(marked.data);
                 match hit {
-                    Hit::Cell { cell, extend, detail } => {
+                    Hit::Cell { cell, extend } => {
                         if extend {
                             marked.selection.extend_to(cell);
                         } else {
                             marked.selection.focus(cell);
-                        }
-                        // A double click asks for the row itself. The first
-                        // click of it has already put the cursor on the
-                        // cell, so this only opens the drawer.
-                        if detail {
-                            *marked.drawer = Some(Drawer::new(cell.row));
-                        } else if let Some(drawer) = marked.drawer {
-                            // An open drawer follows the cursor: it is a
-                            // view of the row the cursor is on, so clicking
-                            // another row must not leave it showing the one
-                            // before.
-                            drawer.row = cell.row;
                         }
                     }
                     Hit::Pick { row, through } => {
@@ -3395,250 +3247,6 @@ impl Shell {
             })
             .ok();
         })
-    }
-
-    /// One row read down the side: a label and a value per column, the
-    /// comp's row detail. It is a **view**, not a form — this milestone is
-    /// read-only, so there is no commit bar under it yet.
-    fn row_drawer(
-        &self,
-        tab: &Tab,
-        drawer: &Drawer,
-        data: &Rc<GridData>,
-        first_row: usize,
-        colors: &ThemeColors,
-        cx: &Context<Self>,
-    ) -> Div {
-        let tab_id = tab.id();
-        let model = self.relation_model(tab);
-        let number = first_row + drawer.row;
-        let title = drawer_title(
-            model.map(|model| model.name.as_str()),
-            &key_values(model, data, drawer.row),
-            number,
-        );
-        let values = data.rows.get(drawer.row);
-        let rows = data.rows.len();
-        let row = drawer.row;
-
-        let mut fields = div()
-            .id(ElementId::Name(format!("drawer-{tab_id}").into()))
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .track_scroll(&drawer.scroll)
-            .px(px(14.))
-            .py(px(12.))
-            .flex()
-            .flex_col()
-            .gap(px(11.));
-        for (ix, name) in data.columns.iter().enumerate() {
-            let column = model.and_then(|model| model.columns.iter().find(|c| &c.name == name));
-            let is_key = model.is_some_and(|model| model.primary_key.iter().any(|k| k == name));
-            let mut label = name.to_ascii_uppercase();
-            if let Some(column) = column {
-                label.push_str(" · ");
-                label.push_str(&column.data_type.to_ascii_uppercase());
-            }
-            if is_key {
-                label.push_str(" · PK");
-            }
-            fields = fields.child(self.drawer_field(
-                tab_id,
-                Cell::new(row, ix),
-                label,
-                values.and_then(|values| values.get(ix)),
-                is_key,
-                colors,
-                cx,
-            ));
-        }
-
-        div()
-            .w(px(DRAWER_WIDTH))
-            .flex_none()
-            .flex()
-            .flex_col()
-            .border_l_1()
-            .border_color(colors.border)
-            .bg(colors.panel)
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .px(px(14.))
-                    .py(px(11.))
-                    .border_b_1()
-                    .border_color(colors.hairline)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(colors.text)
-                            .truncate()
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .id("drawer-close")
-                            .flex_none()
-                            .text_size(px(13.))
-                            .text_color(colors.text_faint)
-                            .cursor_pointer()
-                            .hover(|s| s.text_color(colors.text))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.close_drawer(tab_id, cx)
-                            }))
-                            .child("×"),
-                    ),
-            )
-            .child(fields)
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .px(px(14.))
-                    .py(px(10.))
-                    .border_t_1()
-                    .border_color(colors.border)
-                    .text_size(px(10.))
-                    .text_color(colors.text_muted)
-                    .child(div().flex_1().child(format!("row {number} of {rows}")))
-                    // The drawer follows the cursor, so walking rows walks
-                    // the drawer: these two are the same keys under the
-                    // mouse.
-                    .child(self.drawer_step("drawer-prev", "↑", Step::Up, colors, cx))
-                    .child(self.drawer_step("drawer-next", "↓", Step::Down, colors, cx))
-                    .child(
-                        div()
-                            .id("drawer-copy")
-                            .px(px(9.))
-                            .py(px(5.))
-                            .border_1()
-                            .border_color(colors.border_strong)
-                            .rounded(px(6.))
-                            .bg(colors.elevated)
-                            .text_size(px(11.))
-                            .text_color(colors.text_secondary)
-                            .cursor_pointer()
-                            .hover(|s| s.border_color(colors.text_faint))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.copy_row(tab_id, row, cx)
-                            }))
-                            .child("copy row"),
-                    ),
-            )
-    }
-
-    /// One field in the drawer: what the column is called, and what this row
-    /// has in it. Clicking it puts the grid's cursor on that cell, so the
-    /// two views agree about where the user is.
-    fn drawer_field(
-        &self,
-        tab_id: u64,
-        cell: Cell,
-        label: String,
-        value: Option<&Value>,
-        is_key: bool,
-        colors: &ThemeColors,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
-        let null = matches!(value, None | Some(Value::Null));
-        let text = value.map(|value| value.display()).unwrap_or_default();
-        // A long value or a `jsonb` object is read down the box, not along
-        // it: this is the view that exists because a 28px line could not
-        // hold it.
-        let lines: Vec<String> = text.lines().map(str::to_string).collect();
-        let block = lines.len() > 1 || text.chars().count() > 40;
-
-        let mut box_ = div()
-            .px(px(9.))
-            .py(px(7.))
-            .border_1()
-            .border_color(colors.border)
-            .rounded(px(6.))
-            // A key is what the row is, not something to be read as data
-            // the same way as the rest: the comp mutes it.
-            .bg(if is_key { colors.hairline } else { colors.elevated })
-            .text_size(px(if block { 11. } else { 12. }))
-            .text_color(match (null, is_key) {
-                (true, _) => colors.text_faint,
-                (_, true) => colors.text_muted,
-                _ => colors.text_body,
-            });
-        if null {
-            box_ = box_.child("NULL");
-        } else if block {
-            box_ = box_.flex().flex_col().children(
-                lines.into_iter().map(|line| div().whitespace_normal().child(line)),
-            );
-        } else {
-            box_ = box_.truncate().child(text);
-        }
-
-        div()
-            .id(ElementId::Name(format!("field-{tab_id}-{}", cell.column).into()))
-            .flex()
-            .flex_col()
-            .gap(px(4.))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.focus_cell(tab_id, cell, cx)
-            }))
-            .child(section_label(label, cx))
-            .child(box_)
-    }
-
-    /// The drawer's own ↑ and ↓. They move the grid's cursor, which is what
-    /// the drawer follows: one row, one place it can be.
-    fn drawer_step(
-        &self,
-        id: &'static str,
-        glyph: &'static str,
-        step: Step,
-        colors: &ThemeColors,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
-        div()
-            .id(id)
-            .px(px(7.))
-            .py(px(4.))
-            .border_1()
-            .border_color(colors.border_strong)
-            .rounded(px(6.))
-            .bg(colors.elevated)
-            .text_size(px(11.))
-            .text_color(colors.text_secondary)
-            .cursor_pointer()
-            .hover(|s| s.border_color(colors.text_faint))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.step_cursor(step, false, cx)
-            }))
-            .child(glyph)
-    }
-
-    /// The catalog's description of the relation a tab's rows came from,
-    /// when the shell has one.
-    ///
-    /// A query tab remembers the relation it was opened on, but the
-    /// statement is the user's from there on: it may return other columns,
-    /// or none of them. So the drawer matches columns by name and says
-    /// nothing about the ones it cannot find.
-    fn relation_model(&self, tab: &Tab) -> Option<&Table> {
-        match tab {
-            Tab::Table(tab) => self.table_model(&tab.schema, &tab.table),
-            Tab::Query(tab) => {
-                let (schema, relation) = tab.relation.as_ref()?;
-                self.table_model(schema, relation)
-            }
-            Tab::History(_) => None,
-        }
     }
 
     fn table_toolbar(&self, tab: &TableTab, colors: &ThemeColors, cx: &Context<Self>) -> Div {
@@ -3944,7 +3552,7 @@ impl Shell {
                 .child(summary)
                 .children(cap_note(tab, colors)),
         )
-        .child(self.result_body(tab.id, colors, cx))
+        .child(self.result_body(tab.id, cx))
     }
 
     /// The history screen: a heading, the comp's two chips, and the list
@@ -5080,45 +4688,6 @@ mod tests {
         assert!(body[0].contains("asks the server to stop it"), "{body:?}");
         assert!(body[1].contains("rolls it back"), "{body:?}");
         assert_eq!(act, "Close it");
-    }
-
-    /// A key names a row; where there is no key, its place on the page has
-    /// to stand in for one — and a table page counts from where the page
-    /// starts, so the number is the row's own, not its index.
-    #[test]
-    fn the_drawer_titles_a_row_by_its_key_when_it_has_one() {
-        let key = vec![("id".to_string(), "1041".to_string())];
-        assert_eq!(drawer_title(Some("users"), &key, 12), "users · id 1041");
-        assert_eq!(drawer_title(Some("users"), &[], 512), "users · row 512");
-        // A query tab's result may belong to no relation the shell knows.
-        assert_eq!(drawer_title(None, &[], 3), "row 3");
-
-        // A composite key is named in key order, both parts of it.
-        let composite = vec![
-            ("region".to_string(), "eu".to_string()),
-            ("user_id".to_string(), "7".to_string()),
-        ];
-        assert_eq!(drawer_title(Some("members"), &composite, 1), "members · region eu · user_id 7");
-    }
-
-    /// A statement that did not return the key cannot be titled by it. The
-    /// drawer says what it has instead of inventing a name.
-    #[test]
-    fn a_key_the_statement_left_out_names_nothing() {
-        let mut model = relation("users", TableKind::Table);
-        model.primary_key = vec!["id".to_string()];
-        let data = GridData::new(
-            vec!["email".to_string()],
-            vec![vec![Value::Text("ida@northwind.io".into())]],
-        );
-        assert!(key_values(Some(&model), &data, 0).is_empty());
-
-        let data = GridData::new(vec!["id".to_string()], vec![vec![Value::Int(1041)]]);
-        assert_eq!(key_values(Some(&model), &data, 0), vec![("id".to_string(), "1041".to_string())]);
-        // No catalog for the relation, and no row at that index: neither is
-        // an error, and neither names a row.
-        assert!(key_values(None, &data, 0).is_empty());
-        assert!(key_values(Some(&model), &data, 9).is_empty());
     }
 
     fn session(tab_id: u64, idle_secs: u64) -> SessionState {

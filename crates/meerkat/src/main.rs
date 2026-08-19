@@ -94,8 +94,6 @@ fn main() {
             // Space ticks the row the cursor is on: ↓ then space walks a
             // result and picks out of it without the mouse.
             KeyBinding::new("space", shell::TogglePick, Some(shell::GRID_KEY_CONTEXT)),
-            // ⌘I opens the row drawer, the key the comp's palette names.
-            KeyBinding::new("cmd-i", shell::ShowRow, Some(shell::GRID_KEY_CONTEXT)),
             KeyBinding::new("escape", shell::ClearSelection, Some(shell::GRID_KEY_CONTEXT)),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
