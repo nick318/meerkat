@@ -1160,11 +1160,24 @@ impl Render for SqlEditor {
                     .h_full()
                     .overflow_y_scroll()
                     .flex()
+                    // `items_start`, and it is load-bearing: a flex row
+                    // stretches its children to the line's height by
+                    // default, so a buffer of forty lines would still lay
+                    // out as boxes the height of the pane — content the same
+                    // size as the viewport is content with nothing to
+                    // scroll, and no bar. It is the vertical twin of the
+                    // definite width below.
+                    .items_start()
                     .child(
                         // Line-number gutter, right-aligned against the rule.
                         div()
                             .w(px(GUTTER_WIDTH))
                             .flex_none()
+                            // ...and with the stretch gone, both columns
+                            // keep the pane's height as a floor, so their
+                            // backgrounds and the rule between them still
+                            // reach the bottom of a short buffer.
+                            .min_h(relative(1.))
                             .py(px(TEXT_PADDING_Y))
                             .pr(px(10.))
                             .bg(colors.panel)
@@ -1199,6 +1212,7 @@ impl Render for SqlEditor {
                                     .flex_none()
                                     .w(px(text_width))
                                     .min_w_full()
+                                    .min_h(relative(1.))
                                     .px(px(TEXT_PADDING_X))
                                     .py(px(TEXT_PADDING_Y))
                                     .child(EditorElement { editor: cx.entity() }),
