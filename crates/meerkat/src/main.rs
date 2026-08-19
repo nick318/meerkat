@@ -67,6 +67,36 @@ fn main() {
             // both keys are bound to the shell and nowhere else.
             KeyBinding::new("ctrl-tab", shell::NextTab, Some("Shell")),
             KeyBinding::new("ctrl-shift-tab", shell::PrevTab, Some("Shell")),
+            // The grid's own keys, in the grid's own context — never the
+            // shell's. The SQL editor's element sits *inside* the shell's,
+            // so a key bound to the shell is matched before the keystroke
+            // can reach the editor's text input: a bare `space` bound there
+            // would eat the spaces out of the user's SQL. `ResultGrid` is
+            // in the stack only while the grid holds the focus, which a
+            // table tab does from the moment it opens and a query tab does
+            // from the first click in its result.
+            KeyBinding::new("up", shell::SelectUp, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new("down", shell::SelectDown, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new("left", shell::SelectLeft, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new("right", shell::SelectRight, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new("shift-up", shell::ExtendUp, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new("shift-down", shell::ExtendDown, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new("shift-left", shell::ExtendLeft, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new("shift-right", shell::ExtendRight, Some(shell::GRID_KEY_CONTEXT)),
+            // ⌘ with an arrow means "as far as it goes" on this platform,
+            // and it means the same here.
+            KeyBinding::new("cmd-left", shell::SelectRowStart, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new("cmd-right", shell::SelectRowEnd, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new("cmd-up", shell::SelectFirstRow, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new("cmd-down", shell::SelectLastRow, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new("cmd-a", shell::SelectAll, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new("cmd-c", shell::CopySelection, Some(shell::GRID_KEY_CONTEXT)),
+            // Space ticks the row the cursor is on: ↓ then space walks a
+            // result and picks out of it without the mouse.
+            KeyBinding::new("space", shell::TogglePick, Some(shell::GRID_KEY_CONTEXT)),
+            // ⌘I opens the row drawer, the key the comp's palette names.
+            KeyBinding::new("cmd-i", shell::ShowRow, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new("escape", shell::ClearSelection, Some(shell::GRID_KEY_CONTEXT)),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
 

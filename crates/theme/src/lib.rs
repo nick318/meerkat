@@ -58,8 +58,14 @@ pub struct ThemeColors {
     /// and columns. Ink against the ochre keywords, so a query reads as
     /// commands in warm tones over the schema in cool ones.
     pub syntax_identifier: Hsla,
-    /// Selected row / active list item background.
+    /// Selected row / active list item background. In the results grid it
+    /// is what a *ticked* row wears, whole.
     pub selection: Hsla,
+    /// The wash under a range of cells in the results grid. Lighter than
+    /// `selection`, because three marks have to stay apart at a glance in
+    /// the same warm family: the cursor's own cell (`match_strong`), the
+    /// range around it (this), and a ticked row (`selection`).
+    pub range_surface: Hsla,
     /// The wash behind the part of a name the ⌘K palette matched. The only
     /// place in the app where text carries a background of its own.
     pub match_wash: Hsla,
@@ -157,6 +163,7 @@ impl Theme {
                 syntax_literal: rgb(0x5C7A4E).into(),
                 syntax_identifier: rgb(0x3F5A6B).into(),
                 selection: rgb(0xF0E5D2).into(),
+                range_surface: rgb(0xF8F1E3).into(),
                 match_wash: rgb(0xEFE3CC).into(),
                 match_strong: rgb(0xE7CFA3).into(),
                 match_error: rgb(0xF2DDD1).into(),

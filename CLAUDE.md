@@ -195,6 +195,94 @@ window's close button through `on_window_should_close`. `restoring`
 guards the rebuild, or each restored tab would write a half-built strip
 over the saved one.
 
+### Picking cells and rows
+
+`results_grid::Selection` holds everything the user has marked in a
+result, and the tab holds it beside the scroll position, so it survives
+the re-render after every keystroke. **Two things get marked, and they
+are not the same thing.** A *range* is a rectangle grown from the cell
+the user pressed on: it is what the arrow keys move and what ⌘C copies. A
+*pick* is a whole row ticked in the gutter — discontiguous by nature,
+which is why it is a `BTreeSet` and not a second rectangle. A tick says
+"this record"; a range says "these cells", and neither can stand for the
+other.
+
+The policy is plain functions over indices — `focus`, `extend_to`,
+`step`, `toggle_pick`, `pick_through`, `toggle_all_picks` — with no
+window and no theme in sight, so it can be argued with in a test rather
+than in a running window. The view paints what it reads there and
+decides nothing.
+
+**One callback, not five.** The grid reports where the mouse landed as
+one `Hit` — a cell (with ⇧ held, and with the second click of a double
+click), the gutter beside a row, the gutter's head, or a column header —
+and `Shell::hit_handler` turns it into a call on `Selection`. So the
+mouse and the keys move the same selection through the same code.
+
+Three marks in the same warm family, and they have to stay apart at a
+glance: the cursor's own cell wears `match_strong`, the range around it
+`range_surface`, and a ticked row `selection`, whole. **None of them
+carries a border** — a border would take a pixel out of the cell's
+content box and shift the value inside it every time the cursor moved.
+The gutter shows the row's number, and `✓` in place of it when the row is
+ticked.
+
+The **gutter scrolls sideways with the content** rather than pinning
+itself to the left edge. Pinning would need a second vertical scroller
+kept in step with the row list, and `uniform_list` gives nothing to keep
+it in step with. A table page numbers from where the page starts, so the
+gutter counts `page * PAGE_SIZE + 1` upwards rather than from 1 again.
+
+⌘C and the drawer's "copy row" write **CSV**, one line per row, by RFC
+4180's rules. **Ticked rows win over the range and are copied whole**,
+because that is what ticking them said. No header line either way: a copy
+pastes back exactly what was marked. A NULL copies as an empty field,
+since pasting the word `NULL` would make it data, and a value holding a
+comma, a quote or a line break is quoted with its own quotes doubled — or
+one cell would read as two fields, and one with a newline in it would
+shear every row below it out of line. Nothing marked copies nothing
+rather than the whole result.
+
+A selection is a set of indices into the rows on screen, so **anything
+that replaces the rows clears it**: a page turn, a refresh, a run.
+
+The keys are bound to the `Shell` context, never globally: a query tab's
+editor takes the arrows for its own cursor while it holds the focus, and
+it holds the focus until a click in the result says the grid is what the
+keys are for. Arrows move, ⇧ with them extends, ⌘ with them goes as far
+as it goes, ⌘A takes everything, space ticks the cursor's row — ↓ then
+space walks a result and picks out of it without the mouse — and ⎋ takes
+one thing away at a time.
+
+### The row drawer
+
+A grid answers "what is in this table". A row of eleven columns, three of
+them `jsonb`, is not a question a 28px line can answer. So a **double
+click on a cell** opens the row it is in down the side of the pane, as
+the comp's row detail does: a label and a value per column, `⌘I` for the
+same thing from the keyboard.
+
+It holds a row *index*, not a copy of the row, so a refresh cannot leave
+the grid and the drawer disagreeing. It **follows the cursor** — walking
+rows walks the drawer, and clicking a drawer field puts the cursor on
+that cell, so the two views never say different things about where the
+user is. Its ↑ and ↓ call the same `Shell::step_cursor` the arrow keys
+do.
+
+A key names a row better than its place on a page does: the name survives
+a re-sort, a refresh and a page turn, where "row 12" survives none of
+them. So the heading is `users · id 1041` where there is a primary key
+and the statement returned it, and `users · row 512` where there is not.
+`drawer_title` and `key_values` are pure, so the wording is testable
+without a window. A query tab's statement is the user's, so it may return
+columns no catalog describes: the drawer matches by name and says nothing
+where it finds nothing.
+
+This milestone is read-only, so the drawer is a **view, not a form** —
+the comp's commit bar arrives with in-place editing in Phase 2. "copy row"
+sends the whole row in the shape ⌘C uses for a ticked one, without
+disturbing what the user has marked.
+
 ### Query history
 
 Every run — a table page the app built as well as a statement the user
