@@ -21,6 +21,17 @@ pub struct Profile {
     pub port: Option<u16>,
     pub database: String,
     pub user: Option<String>,
+    /// Whether the session this profile opens refuses to write. It is a
+    /// connection parameter, not a label: the driver asks the server for a
+    /// read-only session, so the server is what enforces it. A profile
+    /// this build reads without the flag is read-only, because the safe
+    /// reading of a missing answer is the careful one.
+    #[serde(default = "read_only_default")]
+    pub read_only: bool,
+}
+
+fn read_only_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

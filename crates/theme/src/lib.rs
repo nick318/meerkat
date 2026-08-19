@@ -92,6 +92,13 @@ pub struct ThemeColors {
     pub env_dev_inner: Hsla,
     pub env_dev_surface: Hsla,
     pub env_dev_text: Hsla,
+    /// The read-only mark on a session that has no server to be read-only
+    /// against: a grey badge, drained of the green a live read-only
+    /// session wears. Read-only and read-write themselves borrow the dev
+    /// and prod families, so only this third state needs tones of its own.
+    pub mode_off_surface: Hsla,
+    pub mode_off_border: Hsla,
+    pub mode_off_text: Hsla,
     /// Success / connected.
     pub ok: Hsla,
     /// A connection that is saved but not open: the sand dot.
@@ -156,6 +163,9 @@ impl Theme {
                 env_dev_inner: rgb(0xCBDEC2).into(),
                 env_dev_surface: rgb(0xF1F7EE).into(),
                 env_dev_text: rgb(0x3F6032).into(),
+                mode_off_surface: rgb(0xF2F0EA).into(),
+                mode_off_border: rgb(0xE2DDD2).into(),
+                mode_off_text: rgb(0xA59F93).into(),
                 ok: rgb(0x5C8A4E).into(),
                 idle: rgb(0xCFC8B8).into(),
                 error: rgb(0x8E4A2A).into(),

@@ -13,7 +13,7 @@ use db_client::{Connection, Profile, QueryResult};
 use db_postgres::{Label, PostgresConnection};
 use gpui::{
     AnyElement, App, BoxShadow, Context, Div, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, Pixels, ScrollStrategy, SharedString, Stateful, Subscription,
+    Focusable, FontWeight, Hsla, Pixels, ScrollStrategy, SharedString, Stateful, Subscription,
     UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
 };
 use introspect::{Catalog, Table, TableKind};
@@ -27,8 +27,8 @@ use storage::{HistoryFilter, NewRun, QueryRun, RunSource, SavedTab, SavedTabs, S
 use theme::{FONT_FAMILY, ThemeColors, theme};
 use ui::scrollbar::{self, DragState, Scrollbar};
 use ui::{
-    TextField, TextFieldEvent, accent_button, card, format_count, format_millis, meerkat_mark,
-    section_label, status_dot, table_glyph,
+    TextField, TextFieldEvent, accent_button, card, format_count, format_millis, lock_glyph,
+    meerkat_mark, section_label, status_dot, table_glyph,
 };
 
 use crate::connections::unix_now;
@@ -111,6 +111,11 @@ pub struct Shell {
     /// at the same database name on different hosts. A command-line URL has
     /// no profile and so no name, and falls back to the database.
     name: Option<SharedString>,
+    /// Whether this session refuses to write. The connection asked the
+    /// server for it, so this field only *reports* it — the top bar's mark
+    /// and the two lines that name the mode read it. A command-line URL
+    /// carries no setting and is read-only.
+    read_only: bool,
     tabs: Vec<Tab>,
     active: usize,
     next_id: u64,
@@ -315,6 +320,10 @@ impl Shell {
             vocabulary: Arc::new(Vocabulary::default()),
             label: None,
             name: connection_name(&target),
+            read_only: match &target {
+                Target::Profile(profile) => profile.read_only,
+                Target::Url(_) => true,
+            },
             tabs: Vec::new(),
             active: 0,
             next_id: 1,
@@ -1774,6 +1783,7 @@ impl Shell {
                     .text_color(colors.window)
                     .child(env.as_str().to_ascii_uppercase())
             }))
+            .child(self.mode_mark(colors))
             .child(trail)
             // The way into the palette, where the comp puts it: beside the
             // ⌘⏎ badge, and clickable, because a badge that only tells you
@@ -1788,6 +1798,74 @@ impl Shell {
                     })),
             )
             .child(key_badge("⌘⏎", colors))
+    }
+
+    /// The comp's mode mark: a padlock and one word, in the top bar beside
+    /// the environment badge. It is the answer to "can this window change
+    /// the database", and it is on screen at all times because that
+    /// question must never need a click.
+    ///
+    /// Read-only wears the dev family's green and read-write the prod
+    /// family's clay — the same warning the frame gives, in the same tones,
+    /// so the two marks agree with each other. A session that never
+    /// connected has nothing to be read-only against and goes grey.
+    fn mode_mark(&self, colors: &ThemeColors) -> Div {
+        let (label, surface, border, ink) = self.mode_tones(colors);
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .px(px(8.))
+            .py(px(4.))
+            .border_1()
+            .border_color(border)
+            .rounded(px(5.))
+            .bg(surface)
+            .child(lock_glyph(ink))
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(ink)
+                    .child(label),
+            )
+    }
+
+    /// The mark's label and its three tones. A session that never
+    /// connected is grey whichever mode it asked for.
+    fn mode_tones(&self, colors: &ThemeColors) -> (&'static str, Hsla, Hsla, Hsla) {
+        match (&self.status, self.read_only) {
+            (Status::Failed(_), _) => (
+                "OFFLINE",
+                colors.mode_off_surface,
+                colors.mode_off_border,
+                colors.mode_off_text,
+            ),
+            (_, true) => (
+                "READ-ONLY",
+                colors.env_dev_surface,
+                colors.env_dev_inner,
+                colors.env_dev_text,
+            ),
+            (_, false) => (
+                "READ-WRITE",
+                colors.env_prod_surface,
+                colors.env_prod_inner,
+                colors.env_prod_text,
+            ),
+        }
+    }
+
+    /// The mark's ink on its own, for the lines that say the mode in text.
+    fn mode_ink(&self, colors: &ThemeColors) -> Hsla {
+        self.mode_tones(colors).3
+    }
+
+    /// The same fact in a word, for the lines that carry it as text: the
+    /// sidebar's foot and the query toolbar.
+    fn mode_word(&self) -> &'static str {
+        if self.read_only { "read-only" } else { "read-write" }
     }
 
     /// What to call this session on screen. The profile's name first, then
@@ -1892,7 +1970,11 @@ impl Shell {
                                     }))
                                     .child("query history"),
                             )
-                            .child(div().text_color(colors.text_faint).child("read-only")),
+                            // The foot says the mode in words, where the
+                            // comp puts it, and in the mark's own ink: the
+                            // sidebar is where a session is read, and it
+                            // must not have to be read against the top bar.
+                            .child(div().text_color(self.mode_ink(colors)).child(self.mode_word())),
                     )
                     .child(div().text_color(colors.text_faint).child(self.table_total())),
             )
@@ -2283,7 +2365,7 @@ impl Shell {
                     div()
                         .text_size(px(11.))
                         .text_color(colors.text_muted)
-                        .child(format!("{} · read-only", self.session_name())),
+                        .child(format!("{} · {}", self.session_name(), self.mode_word())),
                 )
                 // With several statements in the buffer, say which one a
                 // run would send, so ⌘⏎ never comes as a surprise.

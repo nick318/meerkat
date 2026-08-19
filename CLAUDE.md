@@ -303,6 +303,39 @@ user types reaches those builders — a typed query goes to the driver verbatim.
 Table pages are `SELECT * ... ORDER BY <pk, else first column> LIMIT 500
 OFFSET n`; the ORDER BY is what keeps paging stable.
 
+### The read-only session
+
+A typed statement goes to the driver verbatim, so `DROP TABLE` is only
+refused if something refuses it. `Profile::read_only` is that something,
+and **the server enforces it, never the app**: `connect_with` asks for
+`default_transaction_read_only=on` in the startup packet, and Postgres
+answers a write with "cannot execute DROP TABLE in a read-only
+transaction". Nothing reads the SQL, so there is no pattern to slip past.
+
+It is a **startup option, not a `SET`**, because `RESET ALL` — which
+`DISCARD ALL` runs, and a pool may — restores a parameter to the value the
+session *started* with. A `SET` would be washed away by exactly the kind of
+reset a pool does between one tab and the next.
+
+The flag defaults to **on** everywhere: a new connection in the form, a row
+an older build saved (the column reads NULL as on), and a command-line URL,
+which carries no setting to read. It is a connection parameter, so it lives
+on `Profile` — unlike the environment tag, which is a label on the store's
+row.
+
+Two limits are worth knowing. The setting is the session's *default*, so a
+statement may turn it off for itself; only a role without write rights
+closes that door. And a connection pooler that refuses the `options`
+startup parameter fails the connect — which is the right way round, because
+a read-only session that cannot be asked for must not open at all.
+
+The mode is on screen at all times: `Shell::mode_mark` paints the comp's
+padlock badge in the top bar beside the environment badge, read-only in the
+dev family's green and read-write in the prod family's clay, so the two
+marks warn in the same tones. A session that never connected goes grey
+(`mode_off_*`). The sidebar's foot and the query toolbar say the same word,
+and the connections list carries it in its MODE column.
+
 ### Drivers
 
 `db_postgres` reads `pg_catalog` (not `information_schema`) for tables and

@@ -157,6 +157,65 @@ pub fn meerkat_mark(size: f32, cx: &App) -> Div {
         )
 }
 
+/// The padlock on the session's read-only mark: a body with a shackle
+/// over it, drawn as rectangles like the meerkat, because the app carries
+/// no image assets. The comp draws it 8 wide by 9 tall beside a 10px
+/// label.
+///
+/// The shackle is a bordered box whose bottom edge is covered by the body
+/// that overlaps it, which is why nothing here has to paint three sides of
+/// a border: GPUI's border widths come in whole pixels, and a 1px ring on
+/// a 5px box is the whole drawing.
+pub fn lock_glyph(color: gpui::Hsla) -> Div {
+    div()
+        .relative()
+        .flex_none()
+        .w(px(8.))
+        .h(px(9.))
+        .child(
+            div()
+                .absolute()
+                .left(px(1.5))
+                .top(px(0.))
+                .w(px(5.))
+                .h(px(5.))
+                .border_1()
+                .border_color(color)
+                .rounded_t(px(3.)),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(0.))
+                .bottom(px(0.))
+                .w(px(8.))
+                .h(px(5.5))
+                .rounded(px(1.5))
+                .bg(color),
+        )
+}
+
+/// The comp's switch: a track with the knob at whichever end the state is.
+/// `on` fills the track with the accent, `off` leaves it the colour of a
+/// strong border — the same reading as a checkbox, in the space of a word.
+pub fn switch(on: bool, cx: &App) -> Div {
+    let colors = &theme(cx).colors;
+    let mut track = div()
+        .w(px(30.))
+        .h(px(17.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .rounded_full()
+        .p(px(2.))
+        .bg(if on { colors.accent } else { colors.border_strong })
+        .child(div().size(px(13.)).rounded_full().bg(colors.elevated));
+    if on {
+        track = track.justify_end();
+    }
+    track
+}
+
 /// A tiny square glyph marking a table row in lists (accent when active).
 pub fn table_glyph(active: bool, cx: &App) -> Div {
     let colors = &theme(cx).colors;

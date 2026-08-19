@@ -50,7 +50,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use storage::{SavedConnection, Store};
 use theme::{FONT_FAMILY, ThemeColors, theme};
 use ui::{
-    TextField, TextFieldEvent, accent_button, meerkat_mark, section_label, status_dot,
+    TextField, TextFieldEvent, accent_button, meerkat_mark, section_label, status_dot, switch,
     toolbar_button,
 };
 
@@ -145,6 +145,10 @@ struct Form {
     password: Entity<TextField>,
     /// The environment tag, picked from the chips; `None` is untagged.
     env: Option<Env>,
+    /// Whether the session this connection opens refuses to write. A new
+    /// connection starts on: the careful setting is the one nobody has to
+    /// remember to choose.
+    read_only: bool,
     /// The profile this form edits; `None` saves a new one.
     editing: Option<String>,
     error: Option<String>,
@@ -491,6 +495,7 @@ impl Connections {
             user,
             password,
             env: Env::parse(prefill.and_then(|saved| saved.env.as_deref())),
+            read_only: prefill.map(|saved| saved.profile.read_only).unwrap_or(true),
             editing: prefill.map(|saved| saved.profile.id.clone()),
             error: None,
             _subscriptions: subscriptions,
@@ -502,6 +507,13 @@ impl Connections {
     fn set_form_env(&mut self, env: Env, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.form {
             form.env = if form.env == Some(env) { None } else { Some(env) };
+            cx.notify();
+        }
+    }
+
+    fn toggle_form_read_only(&mut self, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.form {
+            form.read_only = !form.read_only;
             cx.notify();
         }
     }
@@ -558,6 +570,7 @@ impl Connections {
             form.password.read(cx).text().to_string(),
         );
         let env = form.env;
+        let read_only = form.read_only;
         let id = form.editing.clone().unwrap_or_else(new_id);
         if url.is_empty() {
             self.set_form_error("a connection needs a URL", cx);
@@ -575,6 +588,8 @@ impl Connections {
                 return;
             }
         };
+        // The URL says nothing about how careful to be; the switch does.
+        profile.read_only = read_only;
         let password = merge_credentials(&mut profile, &user, &typed_password, url_password);
         if let Err(error) = store
             .save_profile(&profile)
@@ -792,7 +807,11 @@ impl Connections {
                     .clone()
                     .map(|server| format!(" · {server}"))
                     .unwrap_or_default();
-                format!("{} · read-only{server}", profile_url(&row.saved.profile))
+                format!(
+                    "{} · {}{server}",
+                    profile_url(&row.saved.profile),
+                    mode_word(&row.saved.profile)
+                )
             }
         };
 
@@ -1075,17 +1094,18 @@ impl Connections {
             Probe::Failed(error) => first_line(error),
         };
 
+        let word = mode_word(&row.saved.profile);
         let mode = match &row.state {
             Probe::Ready { server, .. } if !server.is_empty() => {
-                format!("read-only · {server}")
+                format!("{word} · {server}")
             }
-            Probe::Ready { .. } => "read-only".to_string(),
+            Probe::Ready { .. } => word.to_string(),
             Probe::Idle | Probe::Probing => row
                 .saved
                 .server
                 .clone()
-                .map(|server| format!("read-only · {server}"))
-                .unwrap_or_default(),
+                .map(|server| format!("{word} · {server}"))
+                .unwrap_or_else(|| word.to_string()),
             // The failure itself is in the status column; the mode of a
             // row that is down is not worth a word.
             Probe::Failed(_) => String::new(),
@@ -1161,7 +1181,14 @@ impl Connections {
                     .w(px(MODE_WIDTH))
                     .flex_none()
                     .text_size(px(11.))
-                    .text_color(if failed { colors.error_faint } else { colors.text_muted })
+                    // The comp marks a guarded connection in the accent and
+                    // leaves an open one in plain ink, so the column can be
+                    // read down for the rows that are held back.
+                    .text_color(match (failed, row.saved.profile.read_only) {
+                        (true, _) => colors.error_faint,
+                        (false, true) => colors.accent_deep,
+                        (false, false) => colors.text_secondary,
+                    })
                     .truncate()
                     .child(mode),
             )
@@ -1213,6 +1240,65 @@ impl Connections {
                 .text_color(colors.text_muted)
                 .hover(|s| s.border_color(colors.text_faint))
         }
+    }
+
+    /// The comp's "safety & limits" block, with the one switch this build
+    /// has: a read-only session. The switch is not a label on the row — it
+    /// is a connection parameter, and the driver asks the server for a
+    /// read-only session, so `DROP TABLE` comes back as an error from
+    /// Postgres rather than from a guess about what the SQL meant.
+    ///
+    /// The note under it says what the flag does *not* cover, because a
+    /// guardrail that is trusted further than it reaches is worse than
+    /// none: the setting is the session's default, and a statement is free
+    /// to turn it off for itself. Only a role without write rights closes
+    /// that door.
+    fn safety_section(&self, form: &Form, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
+        let on = form.read_only;
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(9.))
+            .pt(px(12.))
+            .border_t_1()
+            .border_color(colors.border)
+            .child(section_label("SAFETY", cx))
+            .child(
+                div()
+                    .id("read-only-session")
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.toggle_form_read_only(cx)
+                    }))
+                    .child(switch(on, cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(colors.text)
+                                    .child("read-only session"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.))
+                                    .text_color(colors.text_faint)
+                                    .child(if on {
+                                        "Blocks insert, update, delete and DDL. The server refuses them, not the app."
+                                    } else {
+                                        "Every statement you type can change the database. Nothing asks twice."
+                                    }),
+                            ),
+                    ),
+            )
     }
 
     fn form_card(&self, form: &Form, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
@@ -1304,6 +1390,7 @@ impl Connections {
                         ),
                     ),
             )
+            .child(self.safety_section(form, colors, cx))
             .children(form.error.clone().map(|error| {
                 div().text_size(px(11.)).text_color(colors.error).child(error)
             }))
@@ -1389,6 +1476,12 @@ fn shortcuts(colors: &ThemeColors, cx: &App) -> Div {
 /// The comp's dot, one size up: on its own row it needs the extra pixel.
 fn status_dot_of(color: gpui::Hsla) -> Div {
     status_dot(color).size(px(9.))
+}
+
+/// What the row and the action bar call this connection's mode. The word
+/// is the same one the shell's mark carries, so the two screens agree.
+fn mode_word(profile: &Profile) -> &'static str {
+    if profile.read_only { "read-only" } else { "read-write" }
 }
 
 /// `postgres://host:port/database`, with no credentials in it.
@@ -1537,6 +1630,7 @@ mod tests {
             port: Some(5432),
             database: "meerkat".into(),
             user: Some("ada".into()),
+            read_only: true,
         };
         assert_eq!(profile_url(&profile), "postgres://db.internal:5432/meerkat");
     }
@@ -1581,6 +1675,7 @@ mod tests {
                 port,
                 database: database.into(),
                 user: Some(user.into()),
+                read_only: true,
             },
             last_opened: None,
             server: None,
@@ -1642,6 +1737,7 @@ mod tests {
             port: Some(5432),
             database: "meerkat".into(),
             user: Some("from_url".into()),
+            read_only: true,
         };
 
         // Both fields filled: the URL's credentials are replaced.

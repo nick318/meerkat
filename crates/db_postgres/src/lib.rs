@@ -1,7 +1,10 @@
 //! PostgreSQL driver, backed by sqlx.
 //!
-//! Read-only for now: [`Connection::apply`] returns an error, exactly as
-//! the SQLite driver does. Introspection reads `pg_catalog` rather than
+//! Editing is not built yet: [`Connection::apply`] returns an error,
+//! exactly as the SQLite driver does. A *typed* statement, though, goes to
+//! the server verbatim, so a session the user marked read-only asks the
+//! server for a read-only one — see `connect_with`. Introspection reads
+//! `pg_catalog` rather than
 //! `information_schema` for tables and columns, because `pg_catalog` also
 //! carries the `reltuples` row estimate and `format_type` renders the type
 //! names the way `psql` shows them. Primary keys come from
@@ -37,10 +40,19 @@ pub struct Label {
 
 impl PostgresConnection {
     /// Connect from a `postgres://user:password@host:port/database` URL.
+    /// A URL carries no saved settings, so the session is read-only: the
+    /// app must not be a way to write to a database by accident.
     pub async fn connect(url: &str) -> Result<Self> {
+        Self::connect_url(url, true).await
+    }
+
+    /// The same, saying outright whether the session may write. Only the
+    /// driver's own tests need a writable one from a URL — the app opens a
+    /// writable session from a profile, where the user chose it.
+    pub async fn connect_url(url: &str, read_only: bool) -> Result<Self> {
         let options = PgConnectOptions::from_str(url)
             .with_context(|| format!("not a valid PostgreSQL URL: {url}"))?;
-        Self::connect_with(options).await
+        Self::connect_with(options, read_only).await
     }
 
     /// Connect from a saved profile. The password comes from the OS
@@ -60,14 +72,34 @@ impl PostgresConnection {
         if let Some(password) = secrets::get_password(&profile.id)? {
             options = options.password(&password);
         }
-        Self::connect_with(options).await
+        Self::connect_with(options, profile.read_only).await
     }
 
-    async fn connect_with(options: PgConnectOptions) -> Result<Self> {
+    async fn connect_with(options: PgConnectOptions, read_only: bool) -> Result<Self> {
         let label = Label {
             database: options.get_database().unwrap_or_default().to_string(),
             host: options.get_host().to_string(),
             port: options.get_port(),
+        };
+        // A read-only session is the *server's* promise, not the app's: the
+        // startup packet asks for `default_transaction_read_only`, and
+        // `INSERT`, `UPDATE`, `DELETE` and DDL then come back as errors
+        // from Postgres itself. Nothing here reads the SQL, so there is no
+        // pattern to slip past.
+        //
+        // It goes in the startup options rather than a `SET` after connect
+        // because `RESET ALL` — which `DISCARD ALL` runs, and a pool may —
+        // restores a parameter to the value the session *started* with. A
+        // `SET` would be washed away by exactly the kind of reset a pool
+        // does between one tab and the next; a startup option survives it.
+        //
+        // A connection pooler that refuses the `options` startup parameter
+        // fails the connect. That is the right way round: a read-only
+        // session that cannot be asked for must not open at all.
+        let options = if read_only {
+            options.options([("default_transaction_read_only", "on")])
+        } else {
+            options
         };
         let pool = PgPoolOptions::new()
             .max_connections(MAX_CONNECTIONS)
@@ -117,6 +149,10 @@ pub fn profile_from_url(id: &str, name: &str, url: &str) -> Result<(Profile, Opt
         port: Some(options.get_port()),
         database,
         user: (!user.is_empty()).then_some(user),
+        // A URL says nothing about how careful to be, so the caller sets
+        // the flag from the form. Read-only is the value a new connection
+        // starts on.
+        read_only: true,
     };
     Ok((profile, password_in(url)))
 }
@@ -373,7 +409,8 @@ mod tests {
     #[tokio::test]
     async fn introspect_and_query() {
         let Some(url) = test_url() else { return };
-        let conn = PostgresConnection::connect(&url).await.unwrap();
+        // This one builds the fixture, so it is the writable session.
+        let conn = PostgresConnection::connect_url(&url, false).await.unwrap();
 
         conn.execute("DROP SCHEMA IF EXISTS meerkat_test CASCADE").await.unwrap();
         conn.execute("CREATE SCHEMA meerkat_test").await.unwrap();
@@ -476,6 +513,40 @@ mod tests {
 
         let error = conn.execute("SELECT * FROM no_such_table_here").await.unwrap_err();
         assert!(error.to_string().contains("no_such_table_here"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_session_refuses_ddl_and_still_reads() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+
+        // The server is what refuses it, so the message is the server's.
+        let error = conn
+            .execute("CREATE TABLE meerkat_read_only_probe (id int)")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("read-only transaction"), "{error}");
+
+        // Reading is the whole point of the session, and it still works.
+        assert_eq!(conn.execute("SELECT 1 AS x").await.unwrap().rows[0][0], Value::Int(1));
+    }
+
+    #[tokio::test]
+    async fn a_read_only_session_survives_a_reset_of_its_parameters() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+
+        // `RESET ALL` puts every parameter back to what the session
+        // started with. The flag is a startup option, so this is exactly
+        // what it must survive — a `SET` after connect would not.
+        conn.execute("RESET ALL").await.unwrap();
+        let error = conn
+            .execute("CREATE TABLE meerkat_read_only_probe (id int)")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("read-only transaction"), "{error}");
     }
 
     #[test]

@@ -195,7 +195,17 @@ impl Store {
         };
         // `tables` and `views` were dropped from the screen; an older file
         // keeps those columns, and nothing reads them.
-        for (column, kind) in [("last_opened", "INTEGER"), ("server", "TEXT"), ("env", "TEXT")] {
+        //
+        // `read_only` arrives NULL on every row an older build saved, and
+        // `list_connections` reads NULL as on: a connection saved before
+        // the app could be told to be careful is one nobody said could
+        // write.
+        for (column, kind) in [
+            ("last_opened", "INTEGER"),
+            ("server", "TEXT"),
+            ("env", "TEXT"),
+            ("read_only", "INTEGER"),
+        ] {
             if !existing.iter().any(|name| name == column) {
                 self.conn
                     .execute_batch(&format!("ALTER TABLE profiles ADD COLUMN {column} {kind}"))?;
@@ -209,15 +219,16 @@ impl Store {
     /// counts and the last-opened time away on every edit.
     pub fn save_profile(&self, p: &Profile) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO profiles (id, name, engine, host, port, database, user)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO profiles (id, name, engine, host, port, database, user, read_only)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 engine = excluded.engine,
                 host = excluded.host,
                 port = excluded.port,
                 database = excluded.database,
-                user = excluded.user",
+                user = excluded.user,
+                read_only = excluded.read_only",
             rusqlite::params![
                 p.id,
                 p.name,
@@ -225,7 +236,8 @@ impl Store {
                 p.host,
                 p.port,
                 p.database,
-                p.user
+                p.user,
+                p.read_only
             ],
         )?;
         Ok(())
@@ -240,7 +252,7 @@ impl Store {
     pub fn list_connections(&self) -> Result<Vec<SavedConnection>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, engine, host, port, database, user,
-                    last_opened, server, env
+                    last_opened, server, env, read_only
              FROM profiles
              ORDER BY last_opened IS NULL, last_opened DESC, name",
         )?;
@@ -254,6 +266,9 @@ impl Store {
                     port: row.get(4)?,
                     database: row.get(5)?,
                     user: row.get(6)?,
+                    // A row an older build wrote has no answer here, and
+                    // the careful reading of no answer is "do not write".
+                    read_only: row.get::<_, Option<bool>>(10)?.unwrap_or(true),
                 },
                 last_opened: row.get(7)?,
                 server: row.get(8)?,
@@ -617,6 +632,7 @@ mod tests {
                 port: Some(5432),
                 database: "app".into(),
                 user: Some("nick".into()),
+                read_only: true,
             })
             .unwrap();
 
@@ -642,6 +658,7 @@ mod tests {
             port: Some(5432),
             database: "app".into(),
             user: Some("nick".into()),
+            read_only: true,
         };
         store.save_profile(&profile).unwrap();
         store.record_probe("p1", "PG 16.2").unwrap();
@@ -668,6 +685,7 @@ mod tests {
             port: Some(5432),
             database: "app".into(),
             user: Some("nick".into()),
+            read_only: true,
         };
         store.save_profile(&profile).unwrap();
         store.set_env("p1", Some("prod")).unwrap();
@@ -678,6 +696,33 @@ mod tests {
 
         store.set_env("p1", None).unwrap();
         assert_eq!(store.list_connections().unwrap()[0].env, None);
+    }
+
+    #[test]
+    fn the_read_only_flag_round_trips_and_an_older_row_reads_as_read_only() {
+        let store = store_at("read_only.sqlite");
+        let mut profile = Profile {
+            id: "p1".into(),
+            name: "Local PG".into(),
+            engine: Engine::Postgres,
+            host: Some("localhost".into()),
+            port: Some(5432),
+            database: "app".into(),
+            user: Some("nick".into()),
+            read_only: false,
+        };
+        store.save_profile(&profile).unwrap();
+        assert!(!store.list_connections().unwrap()[0].profile.read_only);
+
+        // An edit writes the flag as well, both ways round.
+        profile.read_only = true;
+        store.save_profile(&profile).unwrap();
+        assert!(store.list_connections().unwrap()[0].profile.read_only);
+
+        // A row an older build wrote has no answer in the column. The
+        // careful reading is the one that wins.
+        store.conn.execute("UPDATE profiles SET read_only = NULL", []).unwrap();
+        assert!(store.list_connections().unwrap()[0].profile.read_only);
     }
 
     fn store_at(name: &str) -> Store {
@@ -911,6 +956,7 @@ mod tests {
                     port: Some(5432),
                     database: "app".into(),
                     user: None,
+                    read_only: true,
                 })
                 .unwrap();
         }
