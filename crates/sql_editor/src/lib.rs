@@ -1159,6 +1159,14 @@ impl Render for SqlEditor {
                     .min_w(px(0.))
                     .h_full()
                     .overflow_y_scroll()
+                    // Each container is locked to the axis it has, as the
+                    // results grid's pair are. Without it GPUI hands a
+                    // container that scrolls on one axis the delta from the
+                    // *other* when its own is zero — so a vertical gesture
+                    // would drag the text sideways as it went down. It also
+                    // holds a gesture to the axis it started on, which is
+                    // what keeps a trackpad swipe from wandering.
+                    .restrict_scroll_to_axis()
                     .flex()
                     // `items_start`, and it is load-bearing: a flex row
                     // stretches its children to the line's height by
@@ -1196,6 +1204,7 @@ impl Render for SqlEditor {
                             .flex_1()
                             .min_w(px(0.))
                             .overflow_x_scroll()
+                            .restrict_scroll_to_axis()
                             .child(
                                 // The width is **definite**, and that is the
                                 // whole trick: a scroll container measures
