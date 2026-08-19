@@ -303,6 +303,51 @@ user types reaches those builders — a typed query goes to the driver verbatim.
 Table pages are `SELECT * ... ORDER BY <pk, else first column> LIMIT 500
 OFFSET n`; the ORDER BY is what keeps paging stable.
 
+### Stopping a run
+
+A query tab's run walks the comp's four states — `Run::Idle`, `Running`,
+`Cancelling`, `Cancelled` — and one button says all of them: **run** filled
+in the accent, **stop** outlined in clay over paper, **terminate** filled in
+clay. ⌘⏎ runs, ⌘. stops. The escalation is the point: the button that ends
+a backend must not look like the button that starts a query.
+
+**The server does the stopping, not the app.** Dropping the future would
+leave the statement running on the server, so `execute_reporting` asks the
+server for `pg_backend_pid()` before it sends the statement (one round trip,
+once per run) and reports it through a `ReportRun` callback. `Connection::
+stop` then sends `pg_cancel_backend` — the statement comes back as SQLSTATE
+57014 — or `pg_terminate_backend`, which closes the backend and the
+connection with it. That is why terminate is the *second* press.
+
+Both go out on a **different pooled connection**, so `MAX_CONNECTIONS` is
+one over what the tabs need: waiting for a free connection would mean
+waiting for the statement the user just asked to stop.
+
+The backend id is shared with the tokio task as an `Arc<AtomicI32>`, 0 for
+"not yet". A stop pressed in the round trip before the id lands waits for it
+on the background executor rather than doing nothing — a stop that silently
+did nothing is the worst thing that button can do. `Live` belongs to the
+run, not to the request, so both presses keep the same start time: the timer
+must not restart because the user asked twice.
+
+A stopped run comes back as the server's own refusal. The tab paints
+CANCELLED instead of an error strip, because the user is who asked — but
+`query_history` still keeps what the server said. ⌘⏎ while a run is out does
+nothing: a second run over the first would leave the first unstoppable.
+
+`Shell::start_timer` repaints every 100 ms while any run is in flight, one
+loop for the window (`timing`), and it ends itself when the last run lands.
+The timer pill itself waits out `TIMER_DELAY` — one second — before it
+appears, so it opens at `1.0 s` and a statement that answers at once never
+raises it. It is there to say a query is taking a while.
+Table pages are not cancellable — they are `LIMIT 500` and the design puts
+the button in the query toolbar.
+
+The RUNNING line says "the server has the statement", not the comp's
+"streaming · N rows buffered": `execute` collects the whole result, so there
+is no buffered count to report without lying. When streaming lands, that
+line is where it shows up.
+
 ### The read-only session
 
 A typed statement goes to the driver verbatim, so `DROP TABLE` is only

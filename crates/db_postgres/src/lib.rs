@@ -12,7 +12,9 @@
 
 use anyhow::Context as _;
 use async_trait::async_trait;
-use db_client::{Connection, Profile, QueryResult, Result, RowChange, Value};
+use db_client::{
+    Connection, Profile, QueryResult, ReportRun, Result, RowChange, RunId, Stop, Value,
+};
 use introspect::{Catalog, Column, Schema, Table, TableKind};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
 use sqlx::{Column as _, Executor as _, Row as _, TypeInfo as _, ValueRef as _};
@@ -20,8 +22,11 @@ use std::str::FromStr;
 use std::time::Duration;
 
 /// Pages of 500 rows plus one query tab at a time: a small pool is enough,
-/// and it keeps the connection count polite on shared servers.
-const MAX_CONNECTIONS: u32 = 4;
+/// and it keeps the connection count polite on shared servers. One slot
+/// over what the tabs need, because stopping a run needs a connection of
+/// its own — waiting for a free one would mean waiting for the very
+/// statement the user asked to stop.
+const MAX_CONNECTIONS: u32 = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct PostgresConnection {
@@ -242,7 +247,58 @@ impl Connection for PostgresConnection {
 
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
         let rows: Vec<PgRow> = sqlx::query(sql).fetch_all(&self.pool).await?;
+        self.collect(sql, rows).await
+    }
 
+    /// One connection is taken out of the pool and kept for the whole
+    /// statement, because the backend id only means anything while that
+    /// connection is the one running it. Asking the server for the id costs
+    /// one round trip before the statement starts; that is the price of
+    /// being able to stop it, and it is paid once per run.
+    async fn execute_reporting(&self, sql: &str, report: ReportRun) -> Result<QueryResult> {
+        let mut conn = self.pool.acquire().await.context("no connection to run the statement")?;
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
+            .await
+            .context("failed to read the backend id")?;
+        report(RunId(pid));
+        let rows: Vec<PgRow> = sqlx::query(sql).fetch_all(&mut *conn).await?;
+        // The connection goes back to the pool here, before the rows are
+        // decoded: decoding is this process's work, not the server's.
+        drop(conn);
+        self.collect(sql, rows).await
+    }
+
+    /// `pg_cancel_backend` asks the backend to give up its statement, which
+    /// comes back to the runner as SQLSTATE 57014. `pg_terminate_backend`
+    /// closes the backend outright, and sqlx then throws that connection
+    /// away — which is why it is the second press.
+    ///
+    /// Both go out on a *different* connection: the one being stopped is
+    /// busy, and waiting for it would be waiting for the thing the user
+    /// just asked to stop.
+    async fn stop(&self, run: RunId, how: Stop) -> Result<bool> {
+        let sql = match how {
+            Stop::Cancel => "SELECT pg_cancel_backend($1)",
+            Stop::Terminate => "SELECT pg_terminate_backend($1)",
+        };
+        let accepted: Option<bool> = sqlx::query_scalar(sql)
+            .bind(run.0)
+            .fetch_one(&self.pool)
+            .await
+            .context("failed to ask the server to stop the statement")?;
+        Ok(accepted.unwrap_or(false))
+    }
+
+    async fn apply(&self, _changes: &[RowChange]) -> Result<u64> {
+        anyhow::bail!("in-place editing is not implemented yet (Phase 2)")
+    }
+}
+
+impl PostgresConnection {
+    /// Turn the rows a statement returned into a `QueryResult`, naming the
+    /// columns even when no row came back to name them.
+    async fn collect(&self, sql: &str, rows: Vec<PgRow>) -> Result<QueryResult> {
         let Some(first) = rows.first() else {
             // No rows came back, so the row metadata cannot name the
             // columns. Ask the server to describe the statement instead,
@@ -270,10 +326,6 @@ impl Connection for PostgresConnection {
         }
 
         Ok(QueryResult { columns, rows: out, rows_affected: 0 })
-    }
-
-    async fn apply(&self, _changes: &[RowChange]) -> Result<u64> {
-        anyhow::bail!("in-place editing is not implemented yet (Phase 2)")
     }
 }
 
@@ -529,6 +581,83 @@ mod tests {
         assert!(error.contains("read-only transaction"), "{error}");
 
         // Reading is the whole point of the session, and it still works.
+        assert_eq!(conn.execute("SELECT 1 AS x").await.unwrap().rows[0][0], Value::Int(1));
+    }
+
+    /// The whole point of `execute_reporting`: a statement that would run
+    /// for half a minute is stopped in the middle, from another connection,
+    /// with only the id it reported.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_running_statement_can_be_cancelled_from_outside() {
+        let Some(url) = test_url() else { return };
+        let conn = std::sync::Arc::new(PostgresConnection::connect(&url).await.unwrap());
+
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let report: ReportRun = {
+            let seen = seen.clone();
+            std::sync::Arc::new(move |id: RunId| {
+                seen.store(id.0, std::sync::atomic::Ordering::Relaxed)
+            })
+        };
+        let runner = {
+            let conn = conn.clone();
+            tokio::spawn(async move { conn.execute_reporting("SELECT pg_sleep(30)", report).await })
+        };
+
+        let started = std::time::Instant::now();
+        let pid = loop {
+            let pid = seen.load(std::sync::atomic::Ordering::Relaxed);
+            if pid != 0 {
+                break pid;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "no backend id was reported");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert!(conn.stop(RunId(pid), Stop::Cancel).await.unwrap(), "the server refused the cancel");
+        let error = runner.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("canceling statement"), "{error}");
+        // It slept for 30 seconds and this test did not.
+        assert!(started.elapsed() < Duration::from_secs(10), "the cancel did not land");
+    }
+
+    /// The second press. A terminated backend takes its connection with
+    /// it, so the runner hears about it as a broken connection rather than
+    /// as a cancelled statement — which is why the app only offers this
+    /// after a cancel has already been asked for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_running_statement_can_be_terminated() {
+        let Some(url) = test_url() else { return };
+        let conn = std::sync::Arc::new(PostgresConnection::connect(&url).await.unwrap());
+
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let report: ReportRun = {
+            let seen = seen.clone();
+            std::sync::Arc::new(move |id: RunId| {
+                seen.store(id.0, std::sync::atomic::Ordering::Relaxed)
+            })
+        };
+        let runner = {
+            let conn = conn.clone();
+            tokio::spawn(async move { conn.execute_reporting("SELECT pg_sleep(30)", report).await })
+        };
+
+        let started = std::time::Instant::now();
+        let pid = loop {
+            let pid = seen.load(std::sync::atomic::Ordering::Relaxed);
+            if pid != 0 {
+                break pid;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "no backend id was reported");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert!(conn.stop(RunId(pid), Stop::Terminate).await.unwrap());
+        assert!(runner.await.unwrap().is_err(), "the statement outlived its backend");
+        assert!(started.elapsed() < Duration::from_secs(10), "the terminate did not land");
+
+        // The pool is still good afterwards: it throws the dead connection
+        // away and opens another.
         assert_eq!(conn.execute("SELECT 1 AS x").await.unwrap().rows[0][0], Value::Int(1));
     }
 

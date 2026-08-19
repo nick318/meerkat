@@ -99,6 +99,17 @@ pub struct ThemeColors {
     pub mode_off_surface: Hsla,
     pub mode_off_border: Hsla,
     pub mode_off_text: Hsla,
+    /// The run timer while a statement is in flight: a warm pill with a
+    /// dot, in the accent's family rather than a warning's. A query that
+    /// is merely slow is not yet a problem. Its text is `accent_deep`.
+    pub running_surface: Hsla,
+    pub running_border: Hsla,
+    pub running_mark: Hsla,
+    /// A keycap sitting *inside* a filled button (the run button's ⌘⏎).
+    /// Both carry alpha, because the cap has to work over the ochre fill
+    /// and over the clay one without a tone of its own for each.
+    pub key_on_fill_surface: Hsla,
+    pub key_on_fill_border: Hsla,
     /// Success / connected.
     pub ok: Hsla,
     /// A connection that is saved but not open: the sand dot.
@@ -166,6 +177,11 @@ impl Theme {
                 mode_off_surface: rgb(0xF2F0EA).into(),
                 mode_off_border: rgb(0xE2DDD2).into(),
                 mode_off_text: rgb(0xA59F93).into(),
+                running_surface: rgb(0xFDF8EE).into(),
+                running_border: rgb(0xDCCFB4).into(),
+                running_mark: rgb(0xC98B3E).into(),
+                key_on_fill_surface: rgba(0xFFFFFF29).into(),
+                key_on_fill_border: rgba(0xFFFFFF57).into(),
                 ok: rgb(0x5C8A4E).into(),
                 idle: rgb(0xCFC8B8).into(),
                 error: rgb(0x8E4A2A).into(),

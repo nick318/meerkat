@@ -99,6 +99,13 @@ pub fn format_millis(millis: u128) -> String {
     }
 }
 
+/// A clock that is still running: always seconds with one decimal, from
+/// `0.1 s` up. Unlike `format_millis` it never switches units, because a
+/// timer that changed shape as it passed a second would read as a glitch.
+pub fn format_seconds(millis: u128) -> String {
+    format!("{:.1} s", millis as f64 / 1_000.)
+}
+
 /// The meerkat itself: two ears, a head, two eyes and a muzzle, drawn as
 /// plain rectangles so the app carries no image assets. The comp draws it
 /// at 42px; every part scales from that.
@@ -195,6 +202,32 @@ pub fn lock_glyph(color: gpui::Hsla) -> Div {
         )
 }
 
+/// The play triangle on the run button. GPUI's borders come in whole
+/// pixels on all four sides, so the CSS trick of a zero-sized box with one
+/// coloured border does not translate; this fills a real three-point path
+/// instead, which is also the only shape in the app that needs one.
+pub fn play_glyph(color: gpui::Hsla) -> impl gpui::IntoElement {
+    gpui::canvas(
+        |_bounds, _window, _cx| (),
+        move |bounds, _state, window, _cx| {
+            let mut path = gpui::Path::new(bounds.origin);
+            path.line_to(bounds.origin + gpui::point(px(0.), bounds.size.height));
+            path.line_to(
+                bounds.origin + gpui::point(bounds.size.width, bounds.size.height / 2.),
+            );
+            window.paint_path(path, color);
+        },
+    )
+    .w(px(8.))
+    .h(px(10.))
+    .flex_none()
+}
+
+/// The stop square, which the run button wears while a statement is out.
+pub fn stop_glyph(color: gpui::Hsla) -> Div {
+    div().size(px(9.)).flex_none().rounded(px(1.5)).bg(color)
+}
+
 /// The comp's switch: a track with the knob at whichever end the state is.
 /// `on` fills the track with the accent, `off` leaves it the colour of a
 /// strong border — the same reading as a checkbox, in the space of a word.
@@ -248,5 +281,15 @@ mod tests {
         assert_eq!(format_millis(34), "34 ms");
         assert_eq!(format_millis(999), "999 ms");
         assert_eq!(format_millis(1_900), "1.9 s");
+    }
+
+    #[test]
+    fn a_running_clock_never_changes_units() {
+        // What `format_millis` would call "34 ms", the timer calls "0.0 s":
+        // the unit has to hold still while the number climbs.
+        assert_eq!(format_seconds(34), "0.0 s");
+        assert_eq!(format_seconds(900), "0.9 s");
+        assert_eq!(format_seconds(1_900), "1.9 s");
+        assert_eq!(format_seconds(64_000), "64.0 s");
     }
 }

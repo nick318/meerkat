@@ -9,7 +9,7 @@
 //! and a reply that does not carry the tab's current generation is thrown
 //! away. Without that, a slow first page would overwrite a fast second one.
 
-use db_client::{Connection, Profile, QueryResult};
+use db_client::{Connection, Profile, QueryResult, ReportRun, RunId, Stop};
 use db_postgres::{Label, PostgresConnection};
 use gpui::{
     AnyElement, App, BoxShadow, Context, Div, ElementId, Entity, EventEmitter, FocusHandle,
@@ -22,13 +22,14 @@ use sql_editor::{Kind, Name, SqlEditor, Vocabulary};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{Duration, Instant};
 use storage::{HistoryFilter, NewRun, QueryRun, RunSource, SavedTab, SavedTabs, Store};
 use theme::{FONT_FAMILY, ThemeColors, theme};
 use ui::scrollbar::{self, DragState, Scrollbar};
 use ui::{
-    TextField, TextFieldEvent, accent_button, card, format_count, format_millis, lock_glyph,
-    meerkat_mark, section_label, status_dot, table_glyph,
+    TextField, TextFieldEvent, card, format_count, format_millis, format_seconds, lock_glyph,
+    meerkat_mark, play_glyph, section_label, status_dot, stop_glyph, table_glyph,
 };
 
 use crate::connections::unix_now;
@@ -39,7 +40,18 @@ use crate::sql::{PAGE_SIZE, browse_query, page_query};
 
 actions!(
     meerkat,
-    [RunQuery, NewQuery, CloseTab, Refresh, PrevPage, NextPage, ShowHistory, NextTab, PrevTab]
+    [
+        RunQuery,
+        StopQuery,
+        NewQuery,
+        CloseTab,
+        Refresh,
+        PrevPage,
+        NextPage,
+        ShowHistory,
+        NextTab,
+        PrevTab
+    ]
 );
 
 const SIDEBAR_WIDTH: f32 = 246.;
@@ -57,6 +69,19 @@ const HISTORY_DAYS: i64 = 7;
 /// cached catalog lets a session open tabs while the connect is still in
 /// flight, so this is reachable on a first keystroke.
 const NOT_CONNECTED: &str = "not connected yet";
+/// How often the toolbar's run timer repaints. The design prints tenths of
+/// a second, so this is the slowest tick that still reads as a clock.
+const TIMER_TICK: Duration = Duration::from_millis(100);
+/// How long a run has to last before the timer appears. Most statements
+/// come back in tens of milliseconds, and a pill that flashed up and out
+/// again on every one of them would be noise: the timer is there to say a
+/// query is taking a while, so it says nothing until one is.
+const TIMER_DELAY: Duration = Duration::from_secs(1);
+/// How long a stop waits for the driver to say which backend the run is
+/// on, and how often it looks. The id lands one round trip after the run
+/// starts, so this is a wait for a race, not for a server.
+const STOP_WAIT: Duration = Duration::from_secs(5);
+const STOP_POLL: Duration = Duration::from_millis(20);
 /// The tab strip is one row tall, as the comp draws it.
 const TAB_STRIP_HEIGHT: f32 = 34.;
 /// A tab is never squeezed below this, so the strip reads as a row of
@@ -136,6 +161,9 @@ pub struct Shell {
     /// in a window of its own, so closing it cannot leave the workspace
     /// without focus.
     palette: Option<Palette>,
+    /// True while a repaint loop is running for the query timers. Runs come
+    /// and go in several tabs at once; the loop belongs to the window.
+    timing: bool,
     /// True while the session reopens the tabs it was left with. The
     /// restore builds the strip one tab at a time, and every one of those
     /// steps would otherwise write a half-built strip back over the saved
@@ -226,9 +254,58 @@ struct QueryTab {
     statements_run: usize,
     elapsed: Option<u128>,
     error: Option<String>,
-    running: bool,
+    /// Where the tab's last run got to. It drives the run button, the
+    /// timer beside it and the result line, which is why all three agree.
+    run: Run,
     scroll: GridState,
     generation: u64,
+}
+
+/// The comp's four states for a query tab's run, and the whole of what the
+/// run button offers: run, stop, terminate.
+///
+/// `Idle` covers both "never run" and "finished", because the button says
+/// the same thing in each — the design's own `qIdle` groups them too.
+enum Run {
+    Idle,
+    /// The statement is out. ⌘. asks the server to give it up.
+    Running(Live),
+    /// A cancel has gone to the server and the statement has not come back
+    /// yet. A second ⌘. terminates the backend instead of asking it
+    /// nicely, which is the only reason this is a state of its own.
+    Cancelling(Live),
+    /// Stopped on the user's word, after this many milliseconds.
+    Cancelled { elapsed: u128 },
+}
+
+/// A run in flight.
+struct Live {
+    /// When it started, for the timer in the toolbar. Wall clock is not
+    /// wanted here: the timer measures a wait, not a time of day.
+    started: Instant,
+    /// The backend the statement is on, written by the tokio task as each
+    /// statement starts and read by the UI when the user asks to stop.
+    /// Zero means the driver has not said yet — one round trip's worth of
+    /// window, which `stop_active_query` waits out rather than ignoring.
+    ///
+    /// An atomic rather than a channel because there is nothing to wake:
+    /// whoever wants the id wants the latest one, and only then.
+    backend: Arc<AtomicI32>,
+}
+
+impl Run {
+    fn live(&self) -> Option<&Live> {
+        match self {
+            Run::Running(live) | Run::Cancelling(live) => Some(live),
+            Run::Idle | Run::Cancelled { .. } => None,
+        }
+    }
+
+    /// Is the server still working on this run? The timer ticks while any
+    /// tab says yes.
+    fn in_flight(&self) -> bool {
+        self.live().is_some()
+    }
 }
 
 /// The history screen, as a tab. It is a view of the local file rather
@@ -332,6 +409,7 @@ impl Shell {
             scope,
             env,
             palette: None,
+            timing: false,
             restoring: false,
             _subscriptions: subscriptions,
         };
@@ -856,7 +934,7 @@ impl Shell {
             statements_run: 0,
             elapsed: None,
             error: None,
-            running: false,
+            run: Run::Idle,
             scroll: GridState::new(),
             generation: 0,
         }));
@@ -867,6 +945,12 @@ impl Shell {
     fn run_active_query(&mut self, cx: &mut Context<Self>) {
         let connection = self.connection.clone();
         let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else { return };
+        // ⌘⏎ while the last run is still out does nothing: the key that
+        // starts a run is not the key that stops one, and a second run
+        // over the top of the first would leave the first unstoppable.
+        if tab.run.in_flight() {
+            return;
+        }
         // The tab opens before the connection does, so ⌘⏎ can arrive
         // first. Say so rather than doing nothing.
         let Some(connection) = connection else {
@@ -885,7 +969,8 @@ impl Shell {
             return;
         }
         let tab_id = tab.id;
-        tab.running = true;
+        let backend = Arc::new(AtomicI32::new(0));
+        tab.run = Run::Running(Live { started: Instant::now(), backend: backend.clone() });
         tab.error = None;
         tab.generation += 1;
         let generation = tab.generation;
@@ -894,7 +979,8 @@ impl Shell {
         // The buffer has been edited since the tab was opened, and this is
         // the moment the user says it is worth something.
         self.remember_tabs(cx);
-        let task = run_statements(connection, statements, cx);
+        let task = run_statements(connection, statements, backend, cx);
+        self.start_timer(cx);
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
             this.update(cx, |this, cx| {
@@ -902,9 +988,15 @@ impl Shell {
                 if tab.generation != generation {
                     return;
                 }
-                tab.running = false;
+                // A run the user stopped comes back as the server's own
+                // refusal. The tab says CANCELLED rather than painting that
+                // as a failure, because the user is the one who asked —
+                // but the history still keeps what the server said.
+                let stopped = matches!(tab.run, Run::Cancelling(_));
+                let waited = tab.run.live().map(|live| live.started.elapsed().as_millis());
                 let run = match flatten(outcome) {
                     Ok((result, elapsed, ran)) => {
+                        tab.run = Run::Idle;
                         let rows = result.rows.len() as u64;
                         tab.elapsed = Some(elapsed);
                         tab.has_result = true;
@@ -913,7 +1005,12 @@ impl Shell {
                         Outcome { elapsed: Some(elapsed), rows: Some(rows), error: None }
                     }
                     Err(error) => {
-                        tab.error = Some(error.clone());
+                        if stopped {
+                            tab.run = Run::Cancelled { elapsed: waited.unwrap_or_default() };
+                        } else {
+                            tab.run = Run::Idle;
+                            tab.error = Some(error.clone());
+                        }
                         tab.has_result = false;
                         tab.data = empty_grid();
                         Outcome { elapsed: None, rows: None, error: Some(error) }
@@ -927,6 +1024,110 @@ impl Shell {
         })
         .detach();
         cx.notify();
+    }
+
+    /// ⌘. and the run button while a statement is out. The first press
+    /// asks the server to give the statement up; the second closes the
+    /// backend it is on. Nothing here touches the tokio task: the task is
+    /// waiting on the server, and the server is what has to let go.
+    fn stop_active_query(&mut self, cx: &mut Context<Self>) {
+        let connection = self.connection.clone();
+        let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else { return };
+        let (how, live) = match &tab.run {
+            Run::Running(live) => (Stop::Cancel, live),
+            Run::Cancelling(live) => (Stop::Terminate, live),
+            // Nothing is out, so there is nothing to stop. ⌘. on an idle
+            // tab does nothing rather than something surprising.
+            Run::Idle | Run::Cancelled { .. } => return,
+        };
+        let Some(connection) = connection else { return };
+        // `Live` is the run, not the request, so both presses keep the same
+        // start time and the same backend: the timer must not restart
+        // because the user asked twice. A terminate therefore leaves the
+        // state where the cancel put it, and the server's reply is still
+        // what ends the run.
+        let (backend, started) = (live.backend.clone(), live.started);
+        let (tab_id, generation) = (tab.id, tab.generation);
+        tab.run = Run::Cancelling(Live { started, backend: backend.clone() });
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            // The backend id lands one round trip after a run starts, so a
+            // stop pressed the instant a run began can arrive first. Wait
+            // it out on the background executor rather than dropping the
+            // request — a stop that silently did nothing is the worst of
+            // the three things this button can do.
+            let mut waited = Duration::ZERO;
+            let id = loop {
+                let id = backend.load(Ordering::Relaxed);
+                if id != 0 {
+                    break Some(RunId(id));
+                }
+                if waited >= STOP_WAIT {
+                    break None;
+                }
+                cx.background_executor().timer(STOP_POLL).await;
+                waited += STOP_POLL;
+            };
+            let Some(id) = id else { return };
+            let Ok(task) = this.update(cx, |_, cx| {
+                gpui_tokio::Tokio::spawn(cx, async move { connection.stop(id, how).await })
+            }) else {
+                return;
+            };
+            // `Ok(false)` means the statement had already finished, which
+            // the reply will report on its own. Only a failure to *ask*
+            // is worth a word.
+            if let Err(error) = flatten(task.await) {
+                this.update(cx, |this, cx| {
+                    // The tab this stop was for, not whichever tab is in
+                    // front when the answer lands, and only while it is
+                    // still the same run.
+                    let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return };
+                    if tab.generation == generation {
+                        tab.error = Some(error);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Repaint while any run is out, so the toolbar's timer moves. One
+    /// timer for the window, not one per run: `timing` is what stops a
+    /// second run from starting a second loop, and the loop ends itself
+    /// when the last run comes back.
+    fn start_timer(&mut self, cx: &mut Context<Self>) {
+        if self.timing {
+            return;
+        }
+        self.timing = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TIMER_TICK).await;
+                let more = this.update(cx, |this, cx| {
+                    let more = this.any_run_in_flight();
+                    if !more {
+                        this.timing = false;
+                    }
+                    cx.notify();
+                    more
+                });
+                if !matches!(more, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn any_run_in_flight(&self) -> bool {
+        self.tabs.iter().any(|tab| match tab {
+            Tab::Query(tab) => tab.run.in_flight(),
+            _ => false,
+        })
     }
 
     // --- query history ---------------------------------------------------
@@ -1333,6 +1534,10 @@ impl Shell {
         self.run_active_query(cx);
     }
 
+    fn on_stop_query(&mut self, _: &StopQuery, _: &mut Window, cx: &mut Context<Self>) {
+        self.stop_active_query(cx);
+    }
+
     fn on_new_query(&mut self, _: &NewQuery, window: &mut Window, cx: &mut Context<Self>) {
         self.new_query(window, cx);
     }
@@ -1487,14 +1692,22 @@ fn run_sql(
 fn run_statements(
     connection: Arc<dyn Connection>,
     statements: Vec<String>,
+    backend: Arc<AtomicI32>,
     cx: &mut Context<Shell>,
 ) -> gpui::Task<Result<anyhow::Result<(QueryResult, u128, usize)>, gpui_tokio::JoinError>> {
+    // Each statement gets its own connection out of the pool, so each one
+    // runs on its own backend. The slot holds whichever is current, which
+    // is the one a stop has to reach; the one before it has already
+    // finished, and stopping it would be stopping nothing.
+    let report: ReportRun = Arc::new(move |id: RunId| {
+        backend.store(id.0, Ordering::Relaxed);
+    });
     gpui_tokio::Tokio::spawn(cx, async move {
         let started = Instant::now();
         let mut last = QueryResult::default();
         let mut ran = 0;
         for statement in &statements {
-            let result = connection.execute(statement).await?;
+            let result = connection.execute_reporting(statement, report.clone()).await?;
             ran += 1;
             if !result.columns.is_empty() {
                 last = result;
@@ -1670,6 +1883,7 @@ impl Render for Shell {
             .key_context("Shell")
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::on_run_query))
+            .on_action(cx.listener(Self::on_stop_query))
             .on_action(cx.listener(Self::on_new_query))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_refresh))
@@ -2319,6 +2533,132 @@ impl Shell {
             )
     }
 
+    /// The timer beside the run button. It is the only thing on screen that
+    /// says a slow query is still alive, so it is there for every state
+    /// where the server has the statement — cancelling included — but not
+    /// for the first second of one: it appears at `1.0 s` and counts from
+    /// there, so a query that answers at once never raises it at all.
+    fn run_timer(&self, tab: &QueryTab, colors: &ThemeColors) -> Option<Div> {
+        let live = tab.run.live()?;
+        let waited = live.started.elapsed();
+        if waited < TIMER_DELAY {
+            return None;
+        }
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(7.))
+                .px(px(9.))
+                .py(px(5.))
+                .border_1()
+                .border_color(colors.running_border)
+                .rounded(px(6.))
+                .bg(colors.running_surface)
+                .text_size(px(11.))
+                .text_color(colors.accent_deep)
+                .child(status_dot(colors.running_mark))
+                .child(format_seconds(waited.as_millis())),
+        )
+    }
+
+    /// One button for all three verbs, as the comp draws it: **run** filled
+    /// in the accent, **stop** outlined in clay over paper, **terminate**
+    /// filled in clay. The escalation is the point — the button that ends a
+    /// backend must not look like the button that starts a query.
+    fn run_button(
+        &self,
+        tab: &QueryTab,
+        colors: &ThemeColors,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let (verb, keys) = match tab.run {
+            Run::Idle | Run::Cancelled { .. } => ("run", "⌘⏎"),
+            Run::Running(_) => ("stop", "⌘."),
+            Run::Cancelling(_) => ("terminate", "⌘."),
+        };
+        // Paper under clay for "stop": the one state where the button is
+        // outlined rather than filled, so a run in flight reads as a
+        // question rather than as a command already given.
+        let (border, fill, ink, cap_surface, cap_border) = match tab.run {
+            Run::Idle | Run::Cancelled { .. } => (
+                colors.accent,
+                colors.accent,
+                colors.window,
+                colors.key_on_fill_surface,
+                colors.key_on_fill_border,
+            ),
+            Run::Running(_) => (
+                colors.env_prod,
+                colors.window,
+                colors.env_prod_text,
+                colors.env_prod_surface,
+                colors.env_prod_inner,
+            ),
+            Run::Cancelling(_) => (
+                colors.env_prod,
+                colors.env_prod,
+                colors.window,
+                colors.key_on_fill_surface,
+                colors.key_on_fill_border,
+            ),
+        };
+
+        let mut button = div()
+            .id("run-query")
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .pl(px(10.))
+            .pr(px(5.))
+            .py(px(4.))
+            .border_1()
+            .border_color(border)
+            .rounded(px(6.))
+            .bg(fill)
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _event, _window, cx| this.toggle_run(cx)));
+        button = if tab.run.in_flight() {
+            button.child(stop_glyph(ink))
+        } else {
+            button.child(play_glyph(ink))
+        };
+        button
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(ink)
+                    .child(verb),
+            )
+            .child(
+                // The keycap the comp puts inside the button, with the
+                // 2px bottom edge that makes it read as a key.
+                div()
+                    .px(px(6.))
+                    .py(px(4.))
+                    .border_1()
+                    .border_b_2()
+                    .border_color(cap_border)
+                    .rounded(px(5.))
+                    .bg(cap_surface)
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(ink)
+                    .child(keys),
+            )
+    }
+
+    /// The button does whichever of the two things its label says.
+    fn toggle_run(&mut self, cx: &mut Context<Self>) {
+        match self.tabs.get(self.active) {
+            Some(Tab::Query(tab)) if tab.run.in_flight() => self.stop_active_query(cx),
+            _ => self.run_active_query(cx),
+        }
+    }
+
     fn query_pane(
         &self,
         pane: Div,
@@ -2326,21 +2666,50 @@ impl Shell {
         colors: &ThemeColors,
         cx: &Context<Self>,
     ) -> Div {
-        let summary = if tab.running {
-            "running…".to_string()
-        } else if tab.has_result {
-            let statements = match tab.statements_run {
-                0 | 1 => String::new(),
-                n => format!("{n} statements · last result · "),
-            };
-            format!(
-                "{statements}{} rows · {} columns · {}",
-                tab.data.rows.len(),
-                tab.data.columns.len(),
-                tab.elapsed.map(format_millis).unwrap_or_default()
-            )
-        } else {
-            "not run yet".to_string()
+        // The design's four result lines. Each one says what is true of the
+        // run *now*, so the line and the button never disagree.
+        let (label, summary, ink) = match &tab.run {
+            // No streaming yet — `execute` collects the whole result — so
+            // there is no row count to report while a run is out. The line
+            // says what it can: the run is alive, and how to end it.
+            Run::Running(_) => (
+                "RUNNING",
+                "the server has the statement · ⌘. stops it".to_string(),
+                colors.accent_deep,
+            ),
+            Run::Cancelling(live) => (
+                "CANCELLING",
+                match live.backend.load(Ordering::Relaxed) {
+                    0 => "cancel sent · waiting for the server to acknowledge".to_string(),
+                    pid => format!(
+                        "cancel sent to backend pid {pid} · \
+                         waiting for the server to acknowledge"
+                    ),
+                },
+                colors.accent_deep,
+            ),
+            Run::Cancelled { elapsed } => (
+                "CANCELLED",
+                format!("stopped after {} · no rows kept", format_seconds(*elapsed)),
+                colors.error,
+            ),
+            Run::Idle if tab.has_result => {
+                let statements = match tab.statements_run {
+                    0 | 1 => String::new(),
+                    n => format!("{n} statements · last result · "),
+                };
+                (
+                    "RESULT",
+                    format!(
+                        "{statements}{} rows · {} columns · {}",
+                        tab.data.rows.len(),
+                        tab.data.columns.len(),
+                        tab.elapsed.map(format_millis).unwrap_or_default()
+                    ),
+                    colors.text_muted,
+                )
+            }
+            Run::Idle => ("RESULT", "not run yet".to_string(), colors.text_muted),
         };
 
         pane.child(
@@ -2373,13 +2742,8 @@ impl Shell {
                     div().text_size(px(11.)).text_color(colors.text_faint).child(scope)
                 }))
                 .child(div().flex_1())
-                .child(
-                    accent_button("run ⌘⏎", cx)
-                        .id("run-query")
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.run_active_query(cx)
-                        })),
-                ),
+                .children(self.run_timer(tab, colors))
+                .child(self.run_button(tab, colors, cx)),
         )
         .child(
             div()
@@ -2403,13 +2767,8 @@ impl Shell {
                 .border_color(colors.hairline)
                 .bg(colors.panel)
                 .text_size(px(10.))
-                .text_color(colors.text_muted)
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(colors.text)
-                        .child("RESULT"),
-                )
+                .text_color(ink)
+                .child(div().font_weight(FontWeight::SEMIBOLD).text_color(ink).child(label))
                 .child(summary),
         )
         .child(grid(

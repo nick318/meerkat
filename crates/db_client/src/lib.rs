@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use introspect::Catalog;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub type Result<T> = anyhow::Result<T>;
 
@@ -107,6 +108,29 @@ pub enum RowChange {
     },
 }
 
+/// A statement the server is running, as the server itself names it.
+/// PostgreSQL uses the backend process id; an engine with no way to reach
+/// into a running statement never hands one out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunId(pub i32);
+
+/// Called with a run's id the moment the driver knows it, which is before
+/// the statement finishes — that is the whole point. The caller keeps it to
+/// stop the run later. It takes `&RunId` by value and may be called once
+/// per statement of a multi-statement run, so it is `Fn`, not `FnOnce`.
+pub type ReportRun = Arc<dyn Fn(RunId) + Send + Sync>;
+
+/// How firmly to stop a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// Ask the server to abandon the statement. The connection lives, and
+    /// the statement comes back as an error.
+    Cancel,
+    /// Close the whole backend. The connection dies with it, which is why
+    /// it is the second press and never the first.
+    Terminate,
+}
+
 /// A live connection to one database.
 #[async_trait]
 pub trait Connection: Send + Sync {
@@ -118,8 +142,23 @@ pub trait Connection: Send + Sync {
     async fn server_version(&self) -> Result<String>;
 
     /// Run one SQL statement and collect its result.
-    /// TODO: switch to a row stream with a fetch cap and cancellation.
+    /// TODO: switch to a row stream with a fetch cap.
     async fn execute(&self, sql: &str) -> Result<QueryResult>;
+
+    /// The same, saying which run it is as soon as the server has told the
+    /// driver, so the caller can stop it while it is still going. An engine
+    /// that cannot be interrupted keeps the default and reports nothing.
+    async fn execute_reporting(&self, sql: &str, _report: ReportRun) -> Result<QueryResult> {
+        self.execute(sql).await
+    }
+
+    /// Stop a run this connection started. `Ok(false)` means the server had
+    /// nothing to stop — the statement finished on its own first, which is
+    /// a race, not an error. An engine with no cancellation always answers
+    /// `Ok(false)`.
+    async fn stop(&self, _run: RunId, _how: Stop) -> Result<bool> {
+        Ok(false)
+    }
 
     /// Apply a changeset in one transaction. Returns rows affected.
     /// Must roll back and report a conflict when an `Update` matches 0 rows.

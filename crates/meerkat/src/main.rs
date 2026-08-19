@@ -53,6 +53,9 @@ fn main() {
         // in the context stack, and the palette sits inside the shell.
         cx.bind_keys([
             KeyBinding::new("cmd-enter", shell::RunQuery, Some("Shell")),
+            // ⌘. stops the run the way it does in psql's siblings: once to
+            // ask the statement to give up, again to close the backend.
+            KeyBinding::new("cmd-.", shell::StopQuery, Some("Shell")),
             KeyBinding::new("cmd-t", shell::NewQuery, Some("Shell")),
             KeyBinding::new("cmd-w", shell::CloseTab, Some("Shell")),
             KeyBinding::new("cmd-r", shell::Refresh, Some("Shell")),
