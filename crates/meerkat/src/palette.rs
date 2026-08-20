@@ -473,6 +473,29 @@ pub fn completion(rows: &[Row], selected: usize, needle: &str) -> Option<String>
     finish(&item.path, item.named, needle)
 }
 
+/// What the search line paints faint beside what was typed, for a
+/// completion ⇥ would take. Empty when there is nothing to offer.
+///
+/// **Both forms say the same thing in the shape the line can be read in.**
+/// A completion that carries on from the query is painted as the rest of
+/// the word, so the line reads as one name: `sample_dev_` then `sample.`.
+/// One that does not carry on is the ordinary case, because a hit sits
+/// anywhere inside a name — `sam_dev` finds `sample_dev_sample` and
+/// finishes to a string that begins nowhere near it. Painting that as a
+/// suffix would read `sam_devsample_dev_sample.`, which is not a name and
+/// not what ⇥ does. So it is painted after a gap and behind the ⇥ the
+/// footer already names, as the *replacement* it is.
+///
+/// Saying nothing at all was the older answer, and it hid the completion
+/// exactly when the user could least guess it: the schema they never
+/// typed is the part worth showing.
+pub fn ghost(needle: &str, completed: &str) -> String {
+    match completed.strip_prefix(needle) {
+        Some(rest) => rest.to_string(),
+        None => format!("  ⇥ {completed}"),
+    }
+}
+
 /// Finish a query from one path, the way the palette finishes it from the
 /// selected row. The sidebar's filter asks for this, so ⇥ walks a name in
 /// the same steps wherever it is typed.
@@ -1169,6 +1192,18 @@ mod tests {
         assert_eq!(complete_path(&path, ""), None);
         // A query the path does not answer completes nothing.
         assert_eq!(complete_path(&path, "public.users"), None);
+    }
+
+    #[test]
+    fn a_hint_that_carries_on_is_a_suffix_and_the_rest_are_marked() {
+        // The line reads as one name, so the hint is the rest of it.
+        assert_eq!(ghost("sample_dev_", "sample_dev_sample."), "sample.");
+        // `sam_dev` finds the schema by its word starts, so ⇥ replaces the
+        // line. Painting the completion as a suffix would read
+        // `sam_devsample_dev_sample.`, so it is marked as what it is.
+        assert_eq!(ghost("sam_dev", "sample_dev_sample."), "  ⇥ sample_dev_sample.");
+        // The whole line typed out already: nothing carries on from it.
+        assert_eq!(ghost("sample_dev_sample.", "sample_dev_sample.task"), "task");
     }
 
     #[test]

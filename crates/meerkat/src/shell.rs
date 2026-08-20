@@ -1005,11 +1005,13 @@ impl Shell {
         self.focus_active_tab(window, cx);
     }
 
-    /// Put back a paged table tab. It is built here rather than through
-    /// `open_table_in` because that one needs the catalog to name the
-    /// table's kind, and the catalog may still be on its way — a tab the
-    /// user had open is opened whether or not the shell can describe it
-    /// yet.
+    /// Put back a paged table tab. This is the only way one is opened now:
+    /// nothing in the session starts a paged view, since the sidebar and
+    /// the palette both browse a relation in a query tab, so a table tab
+    /// comes back only where an earlier session left one. It is built here
+    /// by hand because the catalog names the table's kind and the catalog
+    /// may still be on its way — a tab the user had open is opened whether
+    /// or not the shell can describe it yet.
     fn restore_table(&mut self, schema: String, table: String, page: usize, cx: &mut Context<Self>) {
         let model = self.table_model(&schema, &table);
         let kind = model.map_or(TableKind::Table, |model| model.kind);
@@ -1101,15 +1103,14 @@ impl Shell {
         palette::complete_path(&first, needle)
     }
 
-    /// Show what ⇥ would take, faint and after the caret — but only when
-    /// it carries on from what was typed. A hit sits anywhere inside a
-    /// name, so ⇥ often rewrites the line instead of extending it, and a
-    /// hint that says otherwise lies.
+    /// Show what ⇥ would take, faint and after the value, in the shape
+    /// `palette::ghost` gives it — the rest of the word when it carries on
+    /// from the line, and `⇥ <name>` when taking it rewrites the line.
     fn update_filter_ghost(&mut self, cx: &mut Context<Self>) {
         let needle = self.catalog_filter.read(cx).trimmed().to_string();
         let ghost = self
             .filter_completion(cx)
-            .and_then(|completed| completed.strip_prefix(needle.as_str()).map(str::to_string))
+            .map(|completed| palette::ghost(&needle, &completed))
             .unwrap_or_default();
         self.catalog_filter.update(cx, |field, cx| field.set_ghost(ghost, cx));
     }
@@ -1325,51 +1326,38 @@ impl Shell {
         self.run_active_query(cx);
     }
 
-    /// Open a table, or focus the tab that already holds it. `new_tab` is
-    /// the palette's ⌘⏎: give me another view of this one, so two pages of
-    /// the same table can sit side by side.
-    fn open_table_in(
+    /// Browse a relation from the palette, or focus the tab that already
+    /// browses it. `new_tab` is the palette's ⌘⏎: give me another tab on
+    /// this one, so two statements over the same table can sit side by
+    /// side.
+    ///
+    /// A tab is the one that already browses this relation when it was
+    /// opened on it — `QueryTab::relation` is what says so. The statement
+    /// in it is the user's by then and may say anything, which is exactly
+    /// why the tab is focused rather than rewritten.
+    fn browse_table_in(
         &mut self,
-        schema: String,
-        table: String,
+        schema: &str,
+        table: &str,
         new_tab: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !new_tab
             && let Some(ix) = self.tabs.iter().position(|tab| match tab {
-                Tab::Table(t) => t.schema == schema && t.table == table,
-                Tab::Query(_) | Tab::History(_) => false,
+                Tab::Query(t) => t
+                    .relation
+                    .as_ref()
+                    .is_some_and(|(s, r)| s == schema && r == table),
+                Tab::Table(_) | Tab::History(_) => false,
             })
         {
             self.activate(ix, cx);
+            self.focus_active_tab(window, cx);
             cx.notify();
             return;
         }
-
-        let Some((kind, approx_rows)) = self
-            .table_model(&schema, &table)
-            .map(|model| (model.kind, model.approx_rows))
-        else {
-            return;
-        };
-        let id = self.take_id();
-        self.tabs.push(Tab::Table(TableTab {
-            id,
-            schema,
-            table,
-            kind,
-            data: empty_grid(),
-            page: 0,
-            approx_rows,
-            timing: None,
-            loading: false,
-            error: None,
-            selection: Selection::default(),
-            scroll: GridState::new(),
-            generation: 0,
-        }));
-        self.activate(self.tabs.len() - 1, cx);
-        self.load_page(id, 0, cx);
+        self.browse_table(schema, table, window, cx);
     }
 
     fn table_model(&self, schema: &str, table: &str) -> Option<&Table> {
@@ -2237,17 +2225,17 @@ impl Shell {
         cx.notify();
     }
 
-    /// Show what ⇥ would finish the line with, faint and after the caret.
+    /// Show what ⇥ would finish the line with, faint and after the value.
     ///
-    /// Only when the completion carries on from what was typed. A hit
-    /// sits anywhere in a name, so accepting one often rewrites the line
-    /// instead of extending it — and a hint that says otherwise lies.
+    /// `palette::ghost` decides the shape: the rest of the word when the
+    /// completion carries on from what was typed, and `⇥ <name>` when
+    /// taking it would rewrite the line instead.
     fn update_ghost(&mut self, cx: &mut Context<Self>) {
         let Some(palette) = &self.palette else { return };
         let typed = palette.query.read(cx).text().to_string();
         let (_, needle) = palette::parse(&typed, palette.chip);
         let ghost = palette::completion(&palette.rows, palette.selected, needle)
-            .and_then(|completed| completed.strip_prefix(needle).map(str::to_string))
+            .map(|completed| palette::ghost(needle, &completed))
             .unwrap_or_default();
         palette.query.update(cx, |field, cx| field.set_ghost(ghost, cx));
     }
@@ -2318,7 +2306,13 @@ impl Shell {
         // holds the focus afterwards.
         self.close_palette(window, cx);
         match pick {
-            Pick::Table { schema, table } => self.open_table_in(schema, table, new_tab, cx),
+            // A relation opens the way a click in the sidebar opens one: a
+            // query tab on `SELECT * FROM ... LIMIT 500;`, run at once. The
+            // palette answers "show me this table", and the answer is its
+            // rows with an editable statement over them.
+            Pick::Table { schema, table } => {
+                self.browse_table_in(&schema, &table, new_tab, window, cx)
+            }
             // A run comes back editable, never re-run behind the user, for
             // the same reason the history screen opens one that way.
             Pick::Query(statement) => self.new_query_with(&statement, window, cx),
@@ -3631,19 +3625,6 @@ impl Shell {
             }))
             .child(self.mode_mark(colors))
             .child(trail)
-            // The way into the palette, where the comp puts it: beside the
-            // ⌘⏎ badge, and clickable, because a badge that only tells you
-            // about a shortcut is a badge that teaches nothing.
-            .child(
-                key_badge("⌘K", colors)
-                    .id("open-palette")
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(colors.accent).border_color(colors.text_faint))
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        this.toggle_palette(window, cx)
-                    })),
-            )
-            .child(key_badge("⌘⏎", colors))
     }
 
     /// The comp's mode mark: a padlock and one word, in the top bar beside

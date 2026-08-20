@@ -148,8 +148,8 @@ relation left, ⎋ empties the line.
 ⇥ completes the line from the first match, through
 `palette::complete_path`, so a name is walked in the same steps here and
 in the palette: one part at a time, **replacing** what was typed rather
-than appending to it, and the faint hint is painted only when the
-completion happens to carry on from what is there.
+than appending to it, and the faint hint is shaped by `palette::ghost`,
+as it is in the palette.
 
 **A click on a relation opens a query tab, not a table tab.** It writes
 `sql::browse_query` — `SELECT * FROM "schema"."relation" LIMIT 500;` —
@@ -157,8 +157,19 @@ into a new tab, names the tab after the relation, and runs it at once: a
 click on a table name asks for its rows, not for a line of SQL to look
 at. From there the statement is the user's, editable and re-run with ⌘⏎.
 The tab keeps a `relation` so the sidebar can mark the row it came from.
-Every click opens another tab; the paged `Tab::Table` view is what the
-palette still opens.
+Every click opens another tab.
+
+**The palette opens a relation the same way**, through
+`Shell::browse_table_in`, because "show me this table" has one answer and
+it should not depend on which line the user asked from. ⌘⏎ there means
+another tab on the same relation; plain ⏎ focuses the tab that already
+browses it — the one whose `relation` names it — rather than opening a
+second. The statement in that tab is the user's by then, so the tab is
+focused and never rewritten.
+
+So nothing in a session starts the paged `Tab::Table` view any more. It
+lives on for the tabs an earlier session left, which `restore_table` puts
+back, and for `load_page` and the page buttons that serve them.
 
 The list carries an overlay scrollbar, `ui::scrollbar`, the one the
 results grid uses. It reads the plain `ScrollHandle` that
@@ -509,14 +520,26 @@ than over every column in the database.
 ⇥ finishes the line from the selected row (`completion()`), one part at a
 time, so ⇥⇥ walks schema then relation. It **replaces** what was typed
 rather than appending, because a hit sits anywhere inside a name — `dev`
-completes to `sample_dev_sample.`. The faint hint in the field is only
-painted when the completion happens to carry on from what was typed;
-otherwise it would lie about what ⇥ does. With nothing left to finish, ⇥
-walks the scope chips instead.
+completes to `sample_dev_sample.`. With nothing left to finish, ⇥ walks
+the scope chips instead.
+
+**The faint hint says what ⇥ would take, in one of two shapes**, and
+`palette::ghost` picks between them. A completion that carries on from
+the line is painted as the rest of the word, so the line reads as one
+name. One that does not — the ordinary case, since a hit sits anywhere
+inside a name — is painted after a gap and behind a `⇥`, as the
+*replacement* it is: `sam_dev` would otherwise read
+`sam_devsample_dev_sample.`, which is neither a name nor what ⇥ does.
+Painting nothing there was the older answer, and it hid the completion
+exactly where the user could least guess it — the schema they never
+typed is the part worth showing.
 
 Everything the palette offers ends in a `Pick`: open a relation, or open a
-statement in a query tab. A statement is never re-run behind the user, for
-the same reason the history screen does not re-run one. The comp's "saved"
+statement in a query tab. A relation opens as a browse query — the
+sidebar's path, `sql::browse_query` in a named tab, run at once — while a
+statement is never re-run behind the user, for the same reason the history
+screen does not re-run one. The difference is what was asked for: a
+relation is a request for its rows, a run is a request for the SQL. The comp's "saved"
 scope is not implemented — the app has no saved queries yet.
 
 **Key bindings are scoped, not global.** The shell's own keys are bound to
