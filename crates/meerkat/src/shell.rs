@@ -3604,8 +3604,13 @@ impl Shell {
             this.update(cx, |this: &mut Shell, cx| {
                 // A click in the result is a click outside the column-find
                 // popover, and a popover a click has landed behind is one
-                // the user is done with.
-                this.column_find = None;
+                // the user is done with. A drag is not a fresh click: the
+                // press that started it closed the popover already, and
+                // took the focus with it.
+                let dragging = matches!(hit, Hit::Drag { .. });
+                if !dragging {
+                    this.column_find = None;
+                }
                 let Some(tab) = this.tab_mut(tab_id) else { return };
                 let Some(marked) = tab.marked() else { return };
                 let extent = Extent::of(marked.data);
@@ -3625,6 +3630,10 @@ impl Shell {
                             asked_to_peek = Some(cell);
                         }
                     }
+                    // The pointer dragging over the cells is the range
+                    // growing, which is what ⇧ with an arrow key does — so
+                    // it is the same call.
+                    Hit::Drag { cell } => marked.selection.extend_to(cell),
                     Hit::Pick { row, through } => {
                         if through {
                             marked.selection.pick_through(row);
@@ -3641,7 +3650,9 @@ impl Shell {
                 // focus — and with it its own key context, which is what
                 // makes a bare `space` mean "tick this row" here and a
                 // space in the SQL there.
-                window.focus(&this.grid_focus, cx);
+                if !dragging {
+                    window.focus(&this.grid_focus, cx);
+                }
                 if let Some(cell) = asked_to_peek {
                     // After the focus, not before: the card takes the focus
                     // for itself, and ⎋ hands it back to the grid.

@@ -18,10 +18,13 @@ pub mod selection;
 pub use columns::find_columns;
 use db_client::Value;
 use gpui::{
-    App, Div, ElementId, FontWeight, Hsla, ScrollHandle, ScrollStrategy, SharedString, Stateful,
-    UniformListScrollHandle, div, prelude::*, px, uniform_list,
+    App, Bounds, Div, Element, ElementId, EntityId, FontWeight, GlobalElementId, Hsla, LayoutId,
+    MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, ScrollStrategy,
+    SharedString, Stateful, Style, UniformListScrollHandle, Window, div, point, prelude::*, px,
+    uniform_list,
 };
 pub use selection::{Cell, Extent, Rect, Selection, Step, clipboard_text};
+use std::cell::Cell as StdCell;
 use std::rc::Rc;
 use theme::theme;
 use ui::scrollbar::{self, DragState, Scrollbar};
@@ -62,6 +65,10 @@ pub enum Hit {
     /// which asks to read the whole value: a lane is capped, so a long value
     /// truncates on screen and the click is how the rest of it is asked for.
     Cell { cell: Cell, extend: bool, peek: bool },
+    /// The pointer has moved onto this cell with the button still down, so
+    /// the range grows to it. It is not a fresh click: the press that
+    /// started the drag has already taken the focus and set the anchor.
+    Drag { cell: Cell },
     /// The gutter beside a row: tick it, or with ⇧ tick everything back to
     /// the last row ticked.
     Pick { row: usize, through: bool },
@@ -81,6 +88,37 @@ pub struct GridState {
     rows: UniformListScrollHandle,
     columns: ScrollHandle,
     drag: DragState,
+    pointer: Pointer,
+}
+
+/// What the pointer is doing to the grid. Neither of these is a selection —
+/// they are the mouse's own state between one frame and the next, so they
+/// live beside the scroll position rather than in [`Selection`].
+#[derive(Clone, Default)]
+struct Pointer {
+    /// The row whose gutter the pointer is over, if any.
+    ///
+    /// A hover style paints the element it is set on, and the wash for a
+    /// whole row is painted by the *row*, which is the gutter's parent — no
+    /// style reaches upwards. So the gutter records the row it is over and
+    /// every row reads it back.
+    hover_row: Rc<StdCell<Option<usize>>>,
+    /// The left button went down on a cell and has not come up yet, so a
+    /// move grows the range instead of doing nothing.
+    dragging: Rc<StdCell<bool>>,
+    /// Where the pointer was last seen, in the window's own coordinates. A
+    /// drag held past an edge scrolls on every frame, and a frame is not a
+    /// mouse event: it has to read the position from somewhere.
+    at: Rc<StdCell<Point<Pixels>>>,
+}
+
+/// The pointer's state plus the view to repaint when it changes. Built once
+/// a frame, because the view id is only known while the frame is being
+/// built.
+#[derive(Clone)]
+struct PointerFrame {
+    pointer: Pointer,
+    view: EntityId,
 }
 
 impl GridState {
@@ -260,6 +298,16 @@ impl<'a> Grid<'a> {
             // and nothing overflows the scroll container inside it, which is
             // to say the columns stop scrolling sideways at all.
             .min_w(px(0.))
+            // The drag lives on the window, not on a hitbox, so it goes on
+            // working past the edges of the pane. It paints nothing and
+            // takes no room.
+            .children(on_hit.clone().map(|on_hit| {
+                div().absolute().w(px(0.)).h(px(0.)).child(DragSurface {
+                    data: data.clone(),
+                    state: (*state).clone(),
+                    on_hit,
+                })
+            }))
             .child(
                 div()
                     .id(ElementId::Name(format!("{id}-grid").into()))
@@ -327,6 +375,235 @@ impl<'a> Grid<'a> {
     }
 }
 
+/// A drag past the pane's edge, in pixels of scroll per frame. The floor
+/// keeps a pointer one pixel over the line moving at a readable speed; the
+/// ceiling keeps a pointer flung to the far side of the screen from
+/// crossing a 500-row page in three frames.
+const AUTOSCROLL_MIN: f32 = 6.;
+const AUTOSCROLL_MAX: f32 = 48.;
+
+/// The drag's own mouse handlers, and the frames that carry an autoscroll.
+///
+/// Both live on the **window** rather than on a hitbox, which is the
+/// scrollbar's pattern and is here for a sharper reason: the whole point of
+/// a drag past the edge is that the pointer has left the cells, so an
+/// element that only hears about its own bounds would go deaf exactly when
+/// it is needed. It also means the cells themselves carry no move handler —
+/// one listener a grid, instead of one for every cell on screen.
+///
+/// The cell under the pointer is worked out from the geometry rather than
+/// asked of the elements, for the same reason: past the edge there is no
+/// element to ask, and the nearest cell is what the drag is reaching for.
+///
+/// It paints nothing and takes no room. It is a place in the frame to hang
+/// listeners from.
+struct DragSurface {
+    data: Rc<GridData>,
+    state: GridState,
+    on_hit: OnHit,
+}
+
+impl IntoElement for DragSurface {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for DragSurface {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (window.request_layout(Style::default(), [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut Window,
+        _: &mut App,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        _: &mut App,
+    ) {
+        let pointer = self.state.pointer.clone();
+        let rows = self.state.rows_handle();
+        let columns = self.state.columns.clone();
+
+        window.on_mouse_event({
+            let (pointer, rows, columns) = (pointer.clone(), rows.clone(), columns.clone());
+            let (data, on_hit) = (self.data.clone(), self.on_hit.clone());
+            move |event: &MouseMoveEvent, phase, window, cx| {
+                if !phase.bubble() || !pointer.dragging.get() {
+                    return;
+                }
+                // A button that came up somewhere nothing here heard about
+                // ends the drag, rather than leaving it out for ever.
+                if event.pressed_button != Some(MouseButton::Left) {
+                    pointer.dragging.set(false);
+                    return;
+                }
+                pointer.at.set(event.position);
+                drag_to(event.position, &data, &rows, &columns, &on_hit, window, cx);
+            }
+        });
+
+        window.on_mouse_event({
+            let pointer = pointer.clone();
+            move |event: &MouseUpEvent, phase, _window, _cx| {
+                if phase.bubble() && event.button == MouseButton::Left {
+                    pointer.dragging.set(false);
+                }
+            }
+        });
+
+        // Past an edge with the button still down, the grid scrolls itself:
+        // the cells the user is reaching for are the ones not on screen, and
+        // a pointer held still out there sends no more events to act on. So
+        // the scroll is per *frame*, and each frame asks for the next by
+        // moving the selection, which repaints.
+        if !pointer.dragging.get() {
+            return;
+        }
+        let at = pointer.at.get();
+        let down = autoscroll_step(at.y, rows.bounds().top(), rows.bounds().bottom());
+        let across = autoscroll_step(at.x, columns.bounds().left(), columns.bounds().right());
+        let next_rows = stepped_offset(&rows, true, down);
+        let next_columns = stepped_offset(&columns, false, across);
+        // Nothing left to travel on either axis ends the loop, or a drag
+        // held past the last row would repaint for ever.
+        if next_rows.is_none() && next_columns.is_none() {
+            return;
+        }
+        let (data, on_hit) = (self.data.clone(), self.on_hit.clone());
+        window.on_next_frame(move |window, cx| {
+            if let Some(offset) = next_rows {
+                rows.set_offset(offset);
+            }
+            if let Some(offset) = next_columns {
+                columns.set_offset(offset);
+            }
+            drag_to(at, &data, &rows, &columns, &on_hit, window, cx);
+        });
+    }
+}
+
+/// Grow the range to whatever cell the pointer is over. Outside the pane
+/// that is the nearest cell, which is the one the drag is reaching for.
+fn drag_to(
+    at: Point<Pixels>,
+    data: &GridData,
+    rows: &ScrollHandle,
+    columns: &ScrollHandle,
+    on_hit: &OnHit,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let row = row_at(f32::from(at.y), f32::from(rows.bounds().top()), f32::from(rows.offset().y));
+    let column = column_at(
+        f32::from(at.x),
+        f32::from(columns.bounds().left()),
+        f32::from(columns.offset().x),
+        &data.widths,
+    );
+    let (Some(row), Some(column)) = (row.filter(|_| !data.rows.is_empty()), column) else {
+        return;
+    };
+    let cell = Cell::new(row.min(data.rows.len() - 1), column);
+    on_hit(Hit::Drag { cell }, window, cx);
+}
+
+/// Which row a pointer at `y` is over, counting from the pane's top. The
+/// scroll offset runs negative as the content moves up, so it is taken away
+/// rather than added. Above the first row answers the first row: a drag has
+/// to reach the top of the page, and there is nothing else up there.
+fn row_at(y: f32, top: f32, offset: f32) -> Option<usize> {
+    let row = ((y - top - offset) / ROW_HEIGHT).floor();
+    (row.is_finite()).then(|| row.max(0.) as usize)
+}
+
+/// Which lane a pointer at `x` is over. The gutter counts, because it
+/// scrolls with the content; a pointer over it is over the first lane, for
+/// the same reason a pointer above the first row is over the first row.
+fn column_at(x: f32, left: f32, offset: f32, widths: &[f32]) -> Option<usize> {
+    if widths.is_empty() {
+        return None;
+    }
+    let mut position = x - left - offset - GUTTER_WIDTH;
+    for (ix, width) in widths.iter().enumerate() {
+        if position < *width {
+            return Some(ix);
+        }
+        position -= width;
+    }
+    // Past the last lane's own width: the last lane takes the slack, so
+    // that is still the last lane.
+    Some(widths.len() - 1)
+}
+
+/// How far one frame of a drag scrolls, from how far the pointer is past
+/// the pane's edge. Nothing at all while the pointer is inside it — a drag
+/// that scrolled from the middle of the pane could never be made to stop.
+fn autoscroll_step(position: Pixels, low: Pixels, high: Pixels) -> f32 {
+    let (position, low, high) = (f32::from(position), f32::from(low), f32::from(high));
+    let past = if position < low {
+        position - low
+    } else if position > high {
+        position - high
+    } else {
+        return 0.;
+    };
+    past.signum() * past.abs().clamp(AUTOSCROLL_MIN, AUTOSCROLL_MAX)
+}
+
+/// Where a scroll handle lands after one frame of autoscroll, or `None`
+/// when the content cannot travel that way any further.
+fn stepped_offset(handle: &ScrollHandle, vertical: bool, step: f32) -> Option<Point<Pixels>> {
+    if step == 0. {
+        return None;
+    }
+    let offset = handle.offset();
+    let max = handle.max_offset();
+    let (travelled, furthest) = if vertical {
+        (-f32::from(offset.y), f32::from(max.y).max(0.))
+    } else {
+        (-f32::from(offset.x), f32::from(max.x).max(0.))
+    };
+    let wanted = (travelled + step).clamp(0., furthest);
+    if wanted == travelled {
+        return None;
+    }
+    Some(if vertical { point(offset.x, px(-wanted)) } else { point(px(-wanted), offset.y) })
+}
+
 /// The virtualized row list. Built here rather than inline so the axis
 /// lock can be set: `UniformList` carries an `Interactivity` but not
 /// `StatefulInteractiveElement`, so the style flag that
@@ -339,11 +616,15 @@ fn row_list(
     first_row: usize,
     on_hit: Option<OnHit>,
 ) -> impl IntoElement {
+    let pointer = state.pointer.clone();
     let mut rows = uniform_list(
         ElementId::Name(format!("{id}-rows").into()),
         data.rows.len(),
-        move |range, _window, cx| {
+        move |range, window, cx| {
             let colors = theme(cx).colors.clone();
+            // The view id is only knowable while a frame is being built,
+            // and the hover listeners need one to ask for a repaint.
+            let frame = PointerFrame { pointer: pointer.clone(), view: window.current_view() };
             range
                 .map(|ix| {
                     data_row(
@@ -352,6 +633,7 @@ fn row_list(
                         &data.widths,
                         &marks,
                         first_row,
+                        &frame,
                         on_hit.clone(),
                         &colors,
                     )
@@ -480,10 +762,16 @@ fn data_row(
     widths: &[f32],
     marks: &Selection,
     first_row: usize,
+    frame: &PointerFrame,
     on_hit: Option<OnHit>,
     colors: &theme::ThemeColors,
 ) -> Stateful<Div> {
     let picked = marks.is_picked(ix);
+    // The gutter is the one target that speaks for the whole record, so it
+    // is the one target that washes the whole row. A cell washes itself:
+    // a click there marks that cell, and a hover must say what a click
+    // would do rather than promise the row.
+    let row_hovered = frame.pointer.hover_row.get() == Some(ix);
     let mut row = div()
         .id(ix)
         .h(px(ROW_HEIGHT))
@@ -498,11 +786,8 @@ fn data_row(
         // A ticked row is washed whole: the tick is a statement about the
         // record, not about a cell in it.
         row = row.bg(colors.selection);
-    } else if marks.cursor().is_none_or(|cursor| cursor.row != ix) {
-        // Hovering says "clickable". A row the cursor is already on says
-        // something truer, so it keeps its own marks instead.
-        let hover_bg = colors.panel;
-        row = row.hover(move |s| s.bg(hover_bg));
+    } else if row_hovered {
+        row = row.bg(colors.panel);
     }
 
     // The gutter: the row's number, or the tick when it is picked.
@@ -527,9 +812,26 @@ fn data_row(
         .child(if picked { TICK.to_string() } else { (first_row + ix).to_string() });
     if let Some(on_hit) = on_hit.clone() {
         let gutter_hover = colors.hairline;
-        gutter = gutter.hover(move |s| s.bg(gutter_hover)).on_click(move |event, window, cx| {
-            on_hit(Hit::Pick { row: ix, through: event.modifiers().shift }, window, cx);
-        });
+        let hover_row = frame.pointer.hover_row.clone();
+        let view = frame.view;
+        gutter = gutter
+            .hover(move |s| s.bg(gutter_hover))
+            // The row wash is painted by the row, and no hover style
+            // reaches up to a parent — so the row is told which gutter the
+            // pointer is over, and repaints on the change.
+            .on_hover(move |hovered, _window, cx| {
+                let now = (*hovered).then_some(ix);
+                // A leave for a row that is not the marked one is the tail
+                // of a move onto another row, which has already said so.
+                if hover_row.get() == now || (!*hovered && hover_row.get() != Some(ix)) {
+                    return;
+                }
+                hover_row.set(now);
+                cx.notify(view);
+            })
+            .on_click(move |event, window, cx| {
+                on_hit(Hit::Pick { row: ix, through: event.modifiers().shift }, window, cx);
+            });
     }
     row = row.child(gutter);
 
@@ -538,6 +840,7 @@ fn data_row(
         // A row can be shorter than the header when a driver returns
         // ragged rows; lay out only what the header has room for.
         let Some(width) = widths.get(column) else { break };
+        let cursor = marks.is_cursor(ix, column);
         let mut cell = lane(div().id(column), *width, column == last)
             .px(px(12.))
             .h_full()
@@ -551,17 +854,32 @@ fn data_row(
         // the range a wash under it. Neither carries a border: a border
         // would take a pixel out of the cell's content box and shift the
         // value inside it every time the cursor moved.
-        if marks.is_cursor(ix, column) {
+        if cursor {
             cell = cell.bg(colors.match_strong).text_color(colors.text);
         } else if marks.contains(ix, column) {
             cell = cell.bg(colors.range_surface);
+        } else if !picked && !row_hovered {
+            // Hovering says "clickable", and here it says it of one cell,
+            // because one cell is what a click marks. A cell already
+            // carrying a mark says something truer, so it keeps it.
+            let hover_bg = colors.panel;
+            cell = cell.hover(move |s| s.bg(hover_bg));
         }
         if let Some(on_hit) = on_hit.clone() {
-            cell = cell.on_click(move |event, window, cx| {
+            let at = Cell::new(ix, column);
+            // On the press, not the release: a drag has to start from the
+            // cell the button went down on, and the release may be three
+            // cells away — or off the pane entirely. Where it goes from
+            // here is `DragSurface`'s, on the window.
+            let pressed = frame.pointer.dragging.clone();
+            let position = frame.pointer.at.clone();
+            cell = cell.on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                pressed.set(true);
+                position.set(event.position);
                 let hit = Hit::Cell {
-                    cell: Cell::new(ix, column),
-                    extend: event.modifiers().shift,
-                    peek: event.click_count() >= 2,
+                    cell: at,
+                    extend: event.modifiers.shift,
+                    peek: event.click_count >= 2,
                 };
                 on_hit(hit, window, cx);
             });
@@ -654,6 +972,59 @@ mod tests {
     #[test]
     fn a_lane_wider_than_the_pane_shows_its_start() {
         assert_eq!(reveal_offset(600., 500., 0., 400.), 600.);
+    }
+
+    /// A drag reads the cell out of the geometry rather than out of the
+    /// elements, because past the pane's edge there is no element to ask.
+    #[test]
+    fn a_drag_finds_the_row_under_the_pointer() {
+        // A pane whose top edge is 100px down the window, unscrolled.
+        assert_eq!(row_at(100., 100., 0.), Some(0));
+        assert_eq!(row_at(100. + ROW_HEIGHT - 0.1, 100., 0.), Some(0));
+        assert_eq!(row_at(100. + ROW_HEIGHT, 100., 0.), Some(1));
+        // Ten rows scrolled away: the offset runs negative.
+        assert_eq!(row_at(100., 100., -10. * ROW_HEIGHT), Some(10));
+        // Above the pane there is nothing but the first row to reach for.
+        assert_eq!(row_at(20., 100., 0.), Some(0));
+    }
+
+    #[test]
+    fn a_drag_finds_the_lane_under_the_pointer() {
+        let widths = [56., 100.];
+        // The gutter scrolls with the content, so it is part of the sums —
+        // and a pointer over it is over the first lane.
+        assert_eq!(column_at(10., 0., 0., &widths), Some(0));
+        assert_eq!(column_at(GUTTER_WIDTH, 0., 0., &widths), Some(0));
+        assert_eq!(column_at(GUTTER_WIDTH + 55.9, 0., 0., &widths), Some(0));
+        assert_eq!(column_at(GUTTER_WIDTH + 56., 0., 0., &widths), Some(1));
+        // The last lane takes the slack, so past its measured width is
+        // still the last lane.
+        assert_eq!(column_at(5_000., 0., 0., &widths), Some(1));
+        // Scrolled one lane across.
+        assert_eq!(column_at(GUTTER_WIDTH, 0., -56., &widths), Some(1));
+        assert_eq!(column_at(10., 0., 0., &[]), None);
+    }
+
+    /// Inside the pane a drag scrolls nothing: a drag that crept while the
+    /// pointer sat in the middle of the result could never be made to stop.
+    #[test]
+    fn a_drag_scrolls_only_once_it_is_past_the_edge() {
+        assert_eq!(autoscroll_step(px(300.), px(100.), px(500.)), 0.);
+        assert_eq!(autoscroll_step(px(100.), px(100.), px(500.)), 0.);
+        assert_eq!(autoscroll_step(px(500.), px(100.), px(500.)), 0.);
+    }
+
+    #[test]
+    fn a_drag_past_the_edge_scrolls_by_how_far_past_it_is() {
+        // A hair over the line still moves, and moves readably.
+        assert_eq!(autoscroll_step(px(501.), px(100.), px(500.)), AUTOSCROLL_MIN);
+        assert_eq!(autoscroll_step(px(99.), px(100.), px(500.)), -AUTOSCROLL_MIN);
+        // In between, the overshoot is the speed.
+        assert_eq!(autoscroll_step(px(520.), px(100.), px(500.)), 20.);
+        assert_eq!(autoscroll_step(px(80.), px(100.), px(500.)), -20.);
+        // Flung to the far side of the screen, it is still bounded.
+        assert_eq!(autoscroll_step(px(2_000.), px(100.), px(500.)), AUTOSCROLL_MAX);
+        assert_eq!(autoscroll_step(px(-900.), px(100.), px(500.)), -AUTOSCROLL_MAX);
     }
 
     /// The gutter scrolls with the content, so it counts in every lane's

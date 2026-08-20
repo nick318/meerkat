@@ -215,10 +215,64 @@ decides nothing.
 
 **One callback, not five.** The grid reports where the mouse landed as
 one `Hit` — a cell (with ⇧ held, and with the second click of a double
-click, which asks to read the value whole), the gutter beside a row, the
-gutter's head, or a column header — and `Shell::hit_handler` turns it
-into a call on `Selection`. So the mouse and the keys move the same
-selection through the same code.
+click, which asks to read the value whole), a cell the pointer has
+dragged onto, the gutter beside a row, the gutter's head, or a column
+header — and `Shell::hit_handler` turns it into a call on `Selection`. So
+the mouse and the keys move the same selection through the same code.
+
+**A hover says what a click there would do, so it is drawn on the cell.**
+A click on a cell marks that cell, so the cell alone lights up; washing
+the whole row would promise a record the click does not mark. The
+**gutter is the exception**, because it is the one target that does speak
+for the whole record: hovering it washes the row it belongs to, which is
+how the user is told the row can be ticked there.
+
+That wash is painted by the row, and a hover style paints only the
+element it is set on — no style reaches up to a parent. So `Pointer`
+holds the row the gutter is over, the gutter's `on_hover` writes it, and
+every row reads it back. It lives beside the scroll position in
+`GridState`, because it is the mouse's own state between one frame and
+the next rather than anything the user has marked.
+
+**A press and a drag draw a range.** The press lands on `Hit::Cell` and
+sets the anchor; every cell the pointer then reaches with the button
+still down lands on `Hit::Drag`, which is `extend_to` — the same call ⇧
+with an arrow key makes. It goes out on the mouse *down*, not the click,
+because a drag has to start from the cell the button went down on and the
+release may be three cells away, or off the pane entirely. `Hit::Drag` is
+the one hit that is not a fresh click, so it neither takes the focus nor
+closes the column-find popover: the press before it did both.
+
+**Everything after the press lives on the window, in `DragSurface`** —
+an element that paints nothing and takes no room, there to hang
+listeners from. That is the scrollbar's pattern, and here the reason is
+sharper than "a drag outlives its element": the whole point of dragging
+past the edge is that **the pointer has left the cells**, so handlers
+bound to a hitbox would go deaf exactly when they are needed. It also
+means no cell carries a move handler — one listener a grid, not one for
+every cell on screen.
+
+So the cell under the pointer is **worked out from the geometry**, not
+asked of the elements: `row_at` and `column_at` read it off the scroll
+offsets and the lane widths, and outside the pane they answer with the
+nearest cell, which is the one the drag is reaching for. Both are plain
+functions over numbers, so they are argued with in a test.
+
+**Past an edge, the grid scrolls itself.** A pointer held out there
+sends no further events, so the scroll cannot be driven by the mouse: it
+is one step per *frame*, `AUTOSCROLL_MIN`..`AUTOSCROLL_MAX` pixels, and
+each frame asks for the next by moving the selection, which repaints.
+The speed is the overshoot itself, floored so a pointer a hair over the
+line still moves readably and capped so a pointer flung to the far side
+of the screen does not cross a 500-row page in three frames. Inside the
+pane it scrolls **nothing**: a drag that crept while the pointer sat in
+the middle of the result could never be made to stop. When neither axis
+can travel any further the loop ends, or a drag held past the last row
+would repaint for ever.
+
+The drag ends on the button coming up anywhere in the window, and a move
+that arrives with no button held ends it too — so a release nothing here
+heard about cannot leave the grid dragging for ever.
 
 Three marks in the same warm family, and they have to stay apart at a
 glance: the cursor's own cell wears `match_strong`, the range around it
