@@ -2504,6 +2504,14 @@ impl Shell {
         self.column_find = None;
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        // A focusable element focuses itself on mouse down, and the bubble
+        // phase runs a child's handlers before its parents' — so on a double
+        // click the cell opens this card and the grid pane around it, which
+        // tracks `grid_focus`, would then take the focus straight back and
+        // leave ⎋ meaning "clear the selection". `prevent_default` is how an
+        // element says the focus is already placed; the flag is reset on the
+        // next input, so it costs nothing on the ⏎ path.
+        window.prevent_default();
         self.peek = Some(Peek { tab, cell, focus });
         // Nothing worth showing means nothing shown: an out-of-range cell
         // is a cell the result no longer has.
