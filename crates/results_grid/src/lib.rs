@@ -12,8 +12,10 @@
 //! [`Hit`], so the whole of what a click can mean is one enum the caller
 //! matches on rather than five callbacks that can disagree.
 
+pub mod columns;
 pub mod selection;
 
+pub use columns::find_columns;
 use db_client::Value;
 use gpui::{
     App, Div, ElementId, FontWeight, Hsla, ScrollHandle, ScrollStrategy, SharedString, Stateful,
@@ -55,9 +57,11 @@ const TICK: &str = "✓";
 /// turns one of these into a change on its [`Selection`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hit {
-    /// A cell. `extend` is ⇧ held, which grows the range instead of starting
-    /// a new one.
-    Cell { cell: Cell, extend: bool },
+    /// A cell. `extend` is ⇧ held, which grows the range instead of
+    /// starting a new one. `peek` is the second click of a double click,
+    /// which asks to read the whole value: a lane is capped, so a long value
+    /// truncates on screen and the click is how the rest of it is asked for.
+    Cell { cell: Cell, extend: bool, peek: bool },
     /// The gutter beside a row: tick it, or with ⇧ tick everything back to
     /// the last row ticked.
     Pick { row: usize, through: bool },
@@ -408,11 +412,18 @@ fn header_row(
 
     let last = data.columns.len().saturating_sub(1);
     let selected_columns = marks.rect().filter(|rect| rect.rows() == extent.rows.max(1));
+    let cursor_column = marks.cursor().map(|cursor| cursor.column);
     for (ix, name) in data.columns.iter().enumerate() {
         // A column reads as selected only when the range covers all of it,
         // which is what clicking its header does.
         let whole = selected_columns.is_some_and(|rect| (rect.left..=rect.right).contains(&ix));
+        // The header also says which column the cursor is in. It is the mark
+        // that survives scrolling: the cursor's own cell can be a hundred
+        // rows down the page, and after a jump to a column it is the only
+        // thing that says the jump landed.
+        let current = cursor_column == Some(ix);
         let mut cell = lane(div().id(ix), data.widths[ix], ix == last)
+            .relative()
             .px(px(12.))
             .h_full()
             .flex()
@@ -425,6 +436,22 @@ fn header_row(
         }
         if whole {
             cell = cell.bg(colors.selection).text_color(colors.accent_deep);
+        }
+        if current {
+            // Drawn as a child rather than as a bottom border, because a
+            // border carries one colour for all four sides and the left
+            // hairline has already claimed it — and because an absolutely
+            // positioned rule takes no room, so the name above it does not
+            // move as the cursor changes lane.
+            cell = cell.text_color(colors.accent_deep).child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .right(px(0.))
+                    .bottom(px(0.))
+                    .h(px(2.))
+                    .bg(colors.accent),
+            );
         }
         if let Some(on_hit) = on_hit.clone() {
             cell = cell
@@ -531,7 +558,11 @@ fn data_row(
         }
         if let Some(on_hit) = on_hit.clone() {
             cell = cell.on_click(move |event, window, cx| {
-                let hit = Hit::Cell { cell: Cell::new(ix, column), extend: event.modifiers().shift };
+                let hit = Hit::Cell {
+                    cell: Cell::new(ix, column),
+                    extend: event.modifiers().shift,
+                    peek: event.click_count() >= 2,
+                };
                 on_hit(hit, window, cx);
             });
         }

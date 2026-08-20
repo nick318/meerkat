@@ -48,6 +48,8 @@ fn main() {
         cx.bind_keys(connections::key_bindings());
         cx.bind_keys(palette::key_bindings());
         cx.bind_keys(shell::confirm_key_bindings());
+        cx.bind_keys(shell::column_find_key_bindings());
+        cx.bind_keys(shell::peek_key_bindings());
         // The workspace's keys are scoped to the workspace, not bound
         // globally, so the palette can take ⌘⏎ for itself while it is
         // open: GPUI gives a keystroke to the binding that matched deepest

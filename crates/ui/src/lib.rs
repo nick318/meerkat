@@ -223,6 +223,53 @@ pub fn play_glyph(color: gpui::Hsla) -> impl gpui::IntoElement {
     .flex_none()
 }
 
+/// The magnifier: on the "column" button, and in the search line the
+/// button opens.
+///
+/// The lens is a bordered circle, the way every other glyph here is drawn
+/// from boxes. The handle cannot be: GPUI's borders come in whole pixels on
+/// all four sides and a box cannot be turned, so the one diagonal in the
+/// app is a filled path, as the play triangle is.
+pub fn search_glyph(color: gpui::Hsla) -> Div {
+    div()
+        .relative()
+        .flex_none()
+        .w(px(11.))
+        .h(px(11.))
+        .child(
+            div()
+                .absolute()
+                .left(px(0.))
+                .top(px(0.))
+                .size(px(8.))
+                .rounded_full()
+                .border_1()
+                .border_color(color),
+        )
+        .child(div().absolute().left(px(6.)).top(px(6.)).child(lens_handle(color)))
+}
+
+/// The magnifier's handle: a stroke from one corner of a small box to the
+/// other, as a four-point path, because a line has to have a width.
+fn lens_handle(color: gpui::Hsla) -> impl gpui::IntoElement {
+    const SIZE: f32 = 5.;
+    const WIDTH: f32 = 1.3;
+    gpui::canvas(
+        |_bounds, _window, _cx| (),
+        move |bounds, _state, window, _cx| {
+            let corner = |x: f32, y: f32| bounds.origin + gpui::point(px(x), px(y));
+            let mut path = gpui::Path::new(corner(0., WIDTH));
+            path.line_to(corner(WIDTH, 0.));
+            path.line_to(corner(SIZE, SIZE - WIDTH));
+            path.line_to(corner(SIZE - WIDTH, SIZE));
+            window.paint_path(path, color);
+        },
+    )
+    .w(px(SIZE))
+    .h(px(SIZE))
+    .flex_none()
+}
+
 /// The stop square, which the run button wears while a statement is out.
 pub fn stop_glyph(color: gpui::Hsla) -> Div {
     div().size(px(9.)).flex_none().rounded(px(1.5)).bg(color)

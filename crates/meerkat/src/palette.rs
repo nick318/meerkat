@@ -1,6 +1,11 @@
 //! The ⌘K palette: one search line over everything this session can open
-//! — the tables and views in the catalog, their columns, and the queries
-//! this connection has already run.
+//! — the tables and views in the catalog, and the queries this connection
+//! has already run.
+//!
+//! It does **not** search columns. A column is part of a result, not
+//! something to open, and the palette's every row ends in "open this": a
+//! column row could only offer its table, which the table row already
+//! does. The way to a column is ⌘J over the result that has it.
 //!
 //! The palette holds no data of its own. The shell hands it the catalog it
 //! introspected and the runs it read back from the local file, and this
@@ -19,11 +24,11 @@
 //! underline honestly.
 //!
 //! A **dot in the query names a path**. Every result carries its name in
-//! parts — schema, relation, and a column's own name — and the typed parts
-//! are lined up with the *end* of that path. So `task` finds every `task`
-//! in the database, `sample_dev_sample.task` finds the one, `dev.ta` finds
-//! it without typing it out, and `task.name` finds a column without naming
-//! a schema. It is one rule; nothing about it is special-cased per section.
+//! parts — the schema and the relation — and the typed parts are lined up
+//! with the *end* of that path. So `task` finds every `task` in the
+//! database, `sample_dev_sample.task` finds the one, and `dev.ta` finds it
+//! without typing it out. It is one rule; nothing about it is
+//! special-cased per section.
 
 use chrono::{Local, NaiveDate, TimeZone};
 use gpui::{
@@ -82,24 +87,22 @@ const SCOPE_CAP: usize = 40;
 /// the name column, and the column that holds it is about this wide.
 const LABEL_CHARS: usize = 68;
 
-/// Which of the four lists the palette is searching.
+/// Which of the three lists the palette is searching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     All,
     Tables,
-    Columns,
     History,
 }
 
 impl Scope {
     /// The chips, in the order the comp draws them.
-    pub const ALL: [Scope; 4] = [Scope::All, Scope::Tables, Scope::Columns, Scope::History];
+    pub const ALL: [Scope; 3] = [Scope::All, Scope::Tables, Scope::History];
 
     pub fn label(self) -> &'static str {
         match self {
             Scope::All => "all",
             Scope::Tables => "tables",
-            Scope::Columns => "columns",
             Scope::History => "history",
         }
     }
@@ -109,17 +112,12 @@ impl Scope {
         match self {
             Scope::All => None,
             Scope::Tables => Some("t:"),
-            Scope::Columns => Some("c:"),
             Scope::History => Some("h:"),
         }
     }
 
     fn shows_tables(self) -> bool {
         matches!(self, Scope::All | Scope::Tables)
-    }
-
-    fn shows_columns(self) -> bool {
-        matches!(self, Scope::All | Scope::Columns)
     }
 
     fn shows_history(self) -> bool {
@@ -175,8 +173,8 @@ pub struct Item {
     trailing: SharedString,
     failed: bool,
     pick: Pick,
-    /// The real path this result sits at — schema, relation, and a
-    /// column's own name — and which part of it the query addressed. The
+    /// The real path this result sits at — schema and relation — and
+    /// which part of it the query addressed. The
     /// search line completes from these; the row paints only `label`.
     /// Empty for a run, which is prose rather than a path.
     path: Vec<String>,
@@ -187,8 +185,7 @@ pub struct Item {
 /// show. That is not decided per result: it depends on what the whole
 /// section found, so it waits for [`dress`].
 struct Candidate {
-    /// The name in parts, outermost first: the schema, the relation, and
-    /// a column's own name when there is one.
+    /// The name in parts, outermost first: the schema, then the relation.
     parts: Vec<String>,
     /// Where the query hit inside each part, if it hit that part at all.
     hits: Vec<Option<Range<usize>>>,
@@ -196,7 +193,7 @@ struct Candidate {
     /// user did not ask about.
     named: usize,
     /// The outermost part worth showing when nothing forces the whole
-    /// path: a relation and a column both hide their schema.
+    /// path: a relation hides its schema.
     from: usize,
     /// Whether the search line may be completed from this path. A run
     /// carries a statement, not a path, so it may not.
@@ -215,7 +212,6 @@ struct Candidate {
 enum Glyph {
     Table,
     View,
-    Column,
     Run,
 }
 
@@ -264,11 +260,6 @@ pub fn build(
         };
         push_section(&mut rows, heading, items, cap);
     }
-    if scope.shows_columns() {
-        let found = columns(catalog, needle);
-        matches += found.len();
-        push_section(&mut rows, "COLUMNS".into(), dress(found).0, cap);
-    }
     if scope.shows_history() {
         let found = history(runs, needle, today);
         matches += found.len();
@@ -279,7 +270,7 @@ pub fn build(
 }
 
 /// A heading, then that section's rows, cut to the cap. An empty section
-/// leaves no heading behind: a palette showing `COLUMNS 0` teaches nothing.
+/// leaves no heading behind: a palette showing `TABLES 0` teaches nothing.
 fn push_section(rows: &mut Vec<Row>, label: SharedString, found: Vec<Item>, cap: usize) {
     if found.is_empty() {
         return;
@@ -374,7 +365,7 @@ fn tables(catalog: Option<&Catalog>, needle: &str) -> Vec<Candidate> {
         for table in &schema.tables {
             let parts = vec![schema.name.clone(), table.name.clone()];
             // A bare schema name answers with the tables it holds.
-            let Some((hits, named)) = find_path(&parts, needle, true) else { continue };
+            let Some((hits, named)) = find_path(&parts, needle) else { continue };
             found.push(Candidate {
                 rank: rank(&hits, &table.name),
                 parts,
@@ -402,48 +393,6 @@ fn tables(catalog: Option<&Catalog>, needle: &str) -> Vec<Candidate> {
                     table: table.name.clone(),
                 },
             });
-        }
-    }
-    found.sort_by_key(|candidate| candidate.rank);
-    found
-}
-
-/// The columns the query names. A bare query matches the column's own
-/// name only: `users` already matched as a table, and matching it again
-/// for each of its columns would bury the list. `users.id` names both.
-fn columns(catalog: Option<&Catalog>, needle: &str) -> Vec<Candidate> {
-    // With no query every column in the database would match, which is
-    // thousands of rows saying nothing. Columns are what you narrow to.
-    if needle.is_empty() {
-        return Vec::new();
-    }
-    let Some(catalog) = catalog else { return Vec::new() };
-    let mut found = Vec::new();
-    for schema in &catalog.schemas {
-        for table in &schema.tables {
-            for column in &table.columns {
-                let parts =
-                    vec![schema.name.clone(), table.name.clone(), column.name.clone()];
-                let Some((hits, named)) = find_path(&parts, needle, false) else { continue };
-                found.push(Candidate {
-                    rank: rank(&hits, &column.name),
-                    parts,
-                    hits,
-                    named,
-                    // A column keeps its table — a bare `id` says nothing
-                    // — but hides its schema.
-                    from: 1,
-                    completes: true,
-                    glyph: Glyph::Column,
-                    meta: column.data_type.clone().into(),
-                    trailing: SharedString::default(),
-                    failed: false,
-                    pick: Pick::Table {
-                        schema: schema.name.clone(),
-                        table: table.name.clone(),
-                    },
-                });
-            }
         }
     }
     found.sort_by_key(|candidate| candidate.rank);
@@ -513,7 +462,7 @@ pub fn complete_path(parts: &[String], needle: &str) -> Option<String> {
     if needle.is_empty() {
         return None;
     }
-    let (_, named) = find_path(parts, needle, true)?;
+    let (_, named) = find_path(parts, needle)?;
     finish(parts, named, needle)
 }
 
@@ -543,31 +492,24 @@ fn finish(path: &[String], named: usize, needle: &str) -> Option<String> {
 /// typed part must hit its own part; a query with more parts than the name
 /// has cannot match at all.
 ///
-/// `slide` lets a query that came up empty at the end try again further
-/// out, which is how a bare schema name finds the tables it holds. It is
-/// off for columns: a bare `task` there would answer with every column of
-/// every `task` table, which is not what anyone typing it wants.
+/// A query that comes up empty at the end tries again further out, which
+/// is how a bare schema name finds the tables it holds.
 ///
 /// ```text
-/// parts:  [sample_dev_sample, task]        [public, orders, user_id]
-/// "task"                     ^hit          "user"                ^hit
-/// "dev.ta"      ^hit         ^hit          "orders.user"  ^hit    ^hit
+/// parts:  [sample_dev_sample, task]
+/// "task"                     ^hit
+/// "dev.ta"      ^hit         ^hit
 /// "dev_sample"  ^hit  (slid out one part, so the whole schema answers)
 /// ```
-fn find_path(
-    parts: &[String],
-    needle: &str,
-    slide: bool,
-) -> Option<(Vec<Option<Range<usize>>>, usize)> {
+fn find_path(parts: &[String], needle: &str) -> Option<(Vec<Option<Range<usize>>>, usize)> {
     let typed: Vec<&str> = needle.split('.').collect();
     if typed.len() > parts.len() {
         return None;
     }
     let flush = parts.len() - typed.len();
-    let outermost = if slide { 0 } else { flush };
 
     // Innermost alignment first: `task` is a table before it is a schema.
-    (outermost..=flush).rev().find_map(|named| {
+    (0..=flush).rev().find_map(|named| {
         let mut hits = vec![None; parts.len()];
         for (ix, part) in typed.iter().enumerate() {
             hits[named + ix] = Some(find(&parts[named + ix], part)?);
@@ -579,7 +521,7 @@ fn find_path(
 /// Does a path answer this query? The sidebar's filter asks the palette,
 /// so `schema.table` finds the same thing in both places.
 pub fn path_matches(parts: &[String], needle: &str) -> bool {
-    find_path(parts, needle, true).is_some()
+    find_path(parts, needle).is_some()
 }
 
 /// How a result sorts: an alignment further out first, because a name the
@@ -814,8 +756,6 @@ fn glyph(glyph: &Glyph, selected: bool, colors: &ThemeColors, cx: &App) -> gpui:
             .rounded_full()
             .border_1()
             .border_color(if selected { colors.accent } else { colors.text_faint }),
-        // A column is a slice of a table, so it is drawn as one.
-        Glyph::Column => div().w(px(6.)).h(px(2.)).bg(colors.idle),
         // The letter the history screen is reached by.
         Glyph::Run => div()
             .text_size(px(10.))
@@ -1031,13 +971,14 @@ mod tests {
         assert_eq!(labels(&results), ["[TABLES 2]", "public.task", "task_archive.orders"]);
     }
 
-    /// Sliding is for relations only. A bare word over columns must stay
-    /// on the column, or `task` answers with every column of every task
-    /// table.
+    /// A column name is not something the palette offers. Every row of it
+    /// ends in "open this", and a column has nothing of its own to open —
+    /// the way to one is ⌘J over the result that holds it.
     #[test]
-    fn a_bare_word_over_columns_stays_on_the_column() {
-        let results = build(Some(&schemas()), &[], Scope::Columns, "task", today());
+    fn a_column_name_finds_nothing() {
+        let results = build(Some(&catalog()), &[], Scope::All, "user_id", today());
         assert!(results.rows.is_empty());
+        assert_eq!(results.matches, 0);
     }
 
     #[test]
@@ -1072,32 +1013,6 @@ mod tests {
         assert_eq!(underlined(only_item(&results)), ["task"]);
     }
 
-    #[test]
-    fn a_column_is_shown_under_its_table_and_opens_it() {
-        let results = build(Some(&catalog()), &[], Scope::Columns, "user_", today());
-        assert_eq!(labels(&results), ["[COLUMNS 1]", "orders.user_id"]);
-        let item = only_item(&results);
-        // The hit is in the column, so it sits past the table's name.
-        assert_eq!(item.hits, vec![7..12]);
-        assert_eq!(
-            item.pick,
-            Pick::Table { schema: "public".to_string(), table: "orders".to_string() }
-        );
-    }
-
-    #[test]
-    fn a_dotted_query_over_columns_names_the_table_then_the_column() {
-        let results = build(Some(&schemas()), &[], Scope::Columns, "task.name", today());
-        // Three schemas hold a `task`, so every row shows its own.
-        assert_eq!(labels(&results)[1], "sample_dev_sample.task.name");
-        assert_eq!(underlined(only_item(&results)), ["task", "name"]);
-
-        // Three parts reach the schema, which a column has room for.
-        let results = build(Some(&schemas()), &[], Scope::Columns, "dev.task.na", today());
-        assert_eq!(labels(&results), ["[COLUMNS 1]", "sample_dev_sample.task.name"]);
-        assert_eq!(underlined(only_item(&results)), ["dev", "task", "na"]);
-    }
-
     /// A statement is prose, not a path: `public.users` is how the SQL
     /// itself reads, so the dot is matched literally.
     #[test]
@@ -1113,11 +1028,11 @@ mod tests {
         assert_eq!(underlined(only_item(&results)), ["public.users"]);
     }
 
+    /// An empty query is a starting point, not a dump of the schema: the
+    /// relations of one schema, under a heading that names it.
     #[test]
-    fn columns_stay_out_of_the_way_until_there_is_a_query() {
+    fn an_empty_query_lists_the_relations_and_nothing_deeper() {
         let results = build(Some(&catalog()), &[], Scope::All, "", today());
-        // Every table, no columns: an empty query is a starting point, not
-        // a dump of the schema.
         assert!(labels(&results).iter().all(|label| !label.contains('.')));
         assert!(labels(&results).contains(&"[TABLES · PUBLIC 5]".to_string()));
     }
@@ -1214,13 +1129,6 @@ mod tests {
     }
 
     #[test]
-    fn completing_a_column_reaches_its_own_name() {
-        let needle = "task.na";
-        let results = build(Some(&schemas()), &[], Scope::Columns, needle, today());
-        assert_eq!(completion(&results.rows, 1, needle).as_deref(), Some("task.name"));
-    }
-
-    #[test]
     fn there_is_nothing_to_complete_from_a_run_or_an_empty_line() {
         let results = build(None, &[run("select * from users")], Scope::History, "users", today());
         // A statement is prose, not a path.
@@ -1236,8 +1144,11 @@ mod tests {
 
     #[test]
     fn a_typed_prefix_picks_the_scope_over_the_chip() {
-        assert_eq!(parse("c: user", Scope::Tables), (Scope::Columns, "user"));
+        assert_eq!(parse("t: user", Scope::History), (Scope::Tables, "user"));
         assert_eq!(parse("h:select", Scope::All), (Scope::History, "select"));
+        // `c:` was the columns scope and is not a prefix any more, so it
+        // is searched for as text.
+        assert_eq!(parse("c:id", Scope::Tables), (Scope::Tables, "c:id"));
         assert_eq!(parse("users", Scope::Tables), (Scope::Tables, "users"));
         assert_eq!(parse("  users", Scope::All), (Scope::All, "users"));
     }

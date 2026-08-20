@@ -14,11 +14,13 @@ use db_postgres::{Label, PostgresConnection};
 use gpui::{
     AnyElement, App, BoxShadow, ClipboardItem, Context, Div, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, FontWeight, Hsla, Pixels, ScrollStrategy, SharedString,
-    Stateful, Subscription, UniformListScrollHandle, Window, actions, div, prelude::*, px,
-    uniform_list,
+    Stateful, Subscription, UniformListScrollHandle, Window, actions, deferred, div, prelude::*,
+    px, uniform_list,
 };
 use introspect::{Catalog, Table, TableKind};
-use results_grid::{Extent, Grid, GridData, GridState, Hit, Selection, Step, clipboard_text};
+use results_grid::{
+    Cell, Extent, Grid, GridData, GridState, Hit, Selection, Step, clipboard_text, find_columns,
+};
 use sql_editor::{Kind, Name, SqlEditor, Vocabulary};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -29,7 +31,7 @@ use theme::{FONT_FAMILY, ThemeColors, theme};
 use ui::scrollbar::{self, DragState, Scrollbar};
 use ui::{
     TextField, TextFieldEvent, card, format_count, format_millis, format_seconds, lock_glyph,
-    meerkat_mark, play_glyph, section_label, status_dot, stop_glyph, table_glyph,
+    meerkat_mark, play_glyph, search_glyph, section_label, status_dot, stop_glyph, table_glyph,
 };
 
 use crate::connections::unix_now;
@@ -68,7 +70,13 @@ actions!(
         SelectAll,
         CopySelection,
         TogglePick,
-        ClearSelection
+        ClearSelection,
+        FindColumn,
+        ColumnPrev,
+        ColumnNext,
+        PeekValue,
+        ClosePeek,
+        CopyPeek
     ]
 );
 
@@ -82,6 +90,51 @@ pub const GRID_KEY_CONTEXT: &str = "ResultGrid";
 /// the dialog is up it is the deepest match, so ⌘⏎ answers it rather than
 /// running a query behind it.
 pub const CONFIRM_KEY_CONTEXT: &str = "Confirm";
+
+/// The column-find popover's own key context. Scoped, like the palette's
+/// and the confirmation's: while the popover is up it is the deepest match,
+/// so ↑↓ walk what the search found rather than the result behind it.
+pub const COLUMN_FIND_KEY_CONTEXT: &str = "ColumnFind";
+
+/// Key bindings for finding a column of the result on screen.
+///
+/// ⌘J is the **shell's**, not the popover's: it has to open the thing as
+/// well as close it, and it has to work while the SQL editor holds the
+/// focus. ↑↓ belong to the popover, or they would be taken from the grid
+/// while nothing is open.
+///
+/// ⏎ and ⎋ are bound nowhere here. The search line is a `TextField`, which
+/// reports both as events of its own, so the popover answers them the way
+/// the palette does.
+pub fn column_find_key_bindings() -> Vec<gpui::KeyBinding> {
+    vec![
+        gpui::KeyBinding::new("cmd-j", FindColumn, Some("Shell")),
+        gpui::KeyBinding::new("up", ColumnPrev, Some(COLUMN_FIND_KEY_CONTEXT)),
+        gpui::KeyBinding::new("down", ColumnNext, Some(COLUMN_FIND_KEY_CONTEXT)),
+    ]
+}
+
+/// The value peek's own key context. Scoped, like every other overlay's:
+/// while the card is up ⏎ closes it, where ⏎ in the grid opened it.
+pub const PEEK_KEY_CONTEXT: &str = "ValuePeek";
+
+/// Key bindings for reading a whole value.
+///
+/// A lane is capped at [`results_grid`]'s `MAX_COLUMN_WIDTH`, so a long
+/// value truncates on screen. ⏎ over the cursor's cell asks for the rest of
+/// it; a double click in the grid asks for the same thing with the mouse.
+///
+/// ⌘C is bound here as well as in the grid, and means something narrower:
+/// **this value**, not the selection. The card is about one cell, so the
+/// key that copies from it copies one cell.
+pub fn peek_key_bindings() -> Vec<gpui::KeyBinding> {
+    vec![
+        gpui::KeyBinding::new("enter", PeekValue, Some(GRID_KEY_CONTEXT)),
+        gpui::KeyBinding::new("enter", ClosePeek, Some(PEEK_KEY_CONTEXT)),
+        gpui::KeyBinding::new("escape", ClosePeek, Some(PEEK_KEY_CONTEXT)),
+        gpui::KeyBinding::new("cmd-c", CopyPeek, Some(PEEK_KEY_CONTEXT)),
+    ]
+}
 
 /// Key bindings for the close confirmation.
 ///
@@ -131,6 +184,27 @@ const IDLE_TICK: Duration = Duration::from_secs(60);
 /// higher up the window: it is a sentence and two answers, not a list.
 const CONFIRM_WIDTH: f32 = 420.;
 const CONFIRM_TOP_MARGIN: f32 = 140.;
+/// The value peek's geometry: wider than the close dialog, because what it
+/// holds is a value rather than a sentence, and no taller than this before
+/// the value scrolls inside it.
+const PEEK_WIDTH: f32 = 640.;
+const PEEK_TOP_MARGIN: f32 = 120.;
+const PEEK_MAX_HEIGHT: f32 = 360.;
+/// How much of a value the card paints. `db_client::MAX_CELL_BYTES` lets a
+/// megabyte of text into one cell, and laying a megabyte of wrapped text out
+/// on the GPUI thread would freeze the window — so the card shows the first
+/// of it and says how much there is. ⌘C still copies the whole value: the
+/// bound is on what is *painted*, as the row cap is on what is *held*.
+const PEEK_CHARS: usize = 4_000;
+/// The column-find popover's geometry, from the comp: 290px wide, hanging
+/// straight under the button that opens it, with a list that grows to about
+/// nine rows and then scrolls.
+const COLUMN_FIND_WIDTH: f32 = 290.;
+const COLUMN_FIND_TOP: f32 = 32.;
+const COLUMN_ROW_HEIGHT: f32 = 24.;
+const COLUMN_LIST_MAX_HEIGHT: f32 = 236.;
+/// The search line inside it, a size up from the list it filters.
+const COLUMN_FIND_FONT_SIZE: f32 = 12.;
 /// The tab strip is one row tall, as the comp draws it.
 const TAB_STRIP_HEIGHT: f32 = 34.;
 /// A tab is never squeezed below this, so the strip reads as a row of
@@ -220,6 +294,12 @@ pub struct Shell {
     /// in a window of its own, so closing it cannot leave the workspace
     /// without focus.
     palette: Option<Palette>,
+    /// The column-find popover, while it is open. It searches the result the
+    /// active tab holds, so it lives beside the palette rather than on a
+    /// tab: one is open at a time, over whichever result is on screen.
+    column_find: Option<ColumnFind>,
+    /// The cell whose whole value is being read, while the card is up.
+    peek: Option<Peek>,
     /// The close the user is being asked about, while the dialog is up.
     confirm: Option<Confirm>,
     /// True while a repaint loop is running for the query timers. Runs come
@@ -257,6 +337,47 @@ struct Palette {
     selected: usize,
     scroll: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The open column-find popover: one line searched against the names of
+/// the columns the result on screen came back with.
+///
+/// **What it found is not kept here.** A run or a page turn replaces the
+/// result under the popover, and a list of lane indices remembered from the
+/// result before would point at lanes that no longer exist — so the matches
+/// are worked out from the line and the result in hand, every time they are
+/// wanted. What is kept is only where the user has walked to.
+struct ColumnFind {
+    /// The tab whose result is being searched. The popover is a control on
+    /// one result, so switching tabs closes it rather than carrying it over
+    /// to a result it was never opened on.
+    tab: u64,
+    query: Entity<TextField>,
+    /// Index into the **matches**, not into the result's columns: the list
+    /// is what ↑↓ walk. It is clamped where it is read, because the list can
+    /// grow shorter under it.
+    selected: usize,
+    scroll: UniformListScrollHandle,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// The cell whose whole value is on screen.
+///
+/// A lane is capped, so a value longer than about forty characters truncates
+/// in the grid — and the question that raises is "what is in this cell",
+/// which is not the same question as "how wide should this column be". So
+/// the answer is a card over one cell rather than a wider lane: widening a
+/// lane to two thousand pixels only turns reading into panning.
+///
+/// It holds **where** the value is, never the value itself. A run or a page
+/// turn replaces the rows under it, and a string copied when the card opened
+/// would go on saying what used to be there.
+struct Peek {
+    tab: u64,
+    cell: Cell,
+    /// The card holds the focus while it is up, so its key context is the
+    /// deepest one and ⏎ closes rather than opening another.
+    focus: FocusHandle,
 }
 
 /// One "stop this run" request on its way to the server.
@@ -589,6 +710,8 @@ impl Shell {
             scope,
             env,
             palette: None,
+            column_find: None,
+            peek: None,
             confirm: None,
             sweeping: false,
             timing: false,
@@ -1591,8 +1714,13 @@ impl Shell {
     /// the runs is a local SQLite call, so it stays on this thread — the
     /// tokio bridge is for the database, not for the file beside it.
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // One overlay at a time: the palette takes the focus, so a
+        // column-find popover or a value peek left open would sit under it
+        // holding keys nobody can see them taking.
+        self.column_find = None;
+        self.peek = None;
         let query = cx.new(|cx| {
-            TextField::new("Search tables, columns and history…", cx)
+            TextField::new("Search tables and history…", cx)
                 .bare(palette::INPUT_FONT_SIZE)
         });
         let subscriptions = vec![cx.subscribe_in(&query, window, Self::on_palette_event)];
@@ -1763,6 +1891,219 @@ impl Shell {
         }
     }
 
+    // --- finding a column -------------------------------------------------
+
+    /// ⌘J. A result wider than the pane is the ordinary case for a real
+    /// table, and the name of the column is usually all the user knows about
+    /// the one they are looking for — so the way to it is a search over the
+    /// names, not a scroll along the header.
+    fn toggle_column_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The palette and the close dialog are each already the thing taking
+        // keys while they are up.
+        if self.palette.is_some() || self.confirm.is_some() {
+            return;
+        }
+        if self.column_find.is_some() {
+            self.close_column_find(window, cx);
+        } else {
+            self.open_column_find(window, cx);
+        }
+    }
+
+    fn open_column_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active).map(Tab::id) else { return };
+        // A tab with no result has no column to jump to. Nothing is said
+        // about it: the button is not there either.
+        if self.result_columns().is_empty() {
+            return;
+        }
+        let query = cx.new(|cx| TextField::new("find column", cx).bare(COLUMN_FIND_FONT_SIZE));
+        let subscriptions = vec![cx.subscribe_in(&query, window, Self::on_column_find_event)];
+        window.focus(&query.focus_handle(cx), cx);
+        self.column_find = Some(ColumnFind {
+            tab,
+            query,
+            selected: 0,
+            scroll: UniformListScrollHandle::new(),
+            _subscriptions: subscriptions,
+        });
+        cx.notify();
+    }
+
+    /// Close it and give the keys back to the tab, so ⎋ leaves the user
+    /// where they were rather than nowhere.
+    fn close_column_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.column_find = None;
+        self.focus_active_tab(window, cx);
+        cx.notify();
+    }
+
+    /// The column names of the result on screen. Both kinds of tab that show
+    /// one answer here; a history tab shows a list of runs, so it has none.
+    fn result_columns(&self) -> &[String] {
+        match self.tabs.get(self.active) {
+            Some(Tab::Table(tab)) => &tab.data.columns,
+            Some(Tab::Query(tab)) => &tab.data.columns,
+            Some(Tab::History(_)) | None => &[],
+        }
+    }
+
+    /// Which lanes the typed line names, as indices into the result. Worked
+    /// out rather than remembered — see [`ColumnFind`].
+    fn column_matches(&self, cx: &App) -> Vec<usize> {
+        let Some(find) = &self.column_find else { return Vec::new() };
+        find_columns(self.result_columns(), find.query.read(cx).text())
+    }
+
+    /// ↑↓ walk what the search found. They stop at the ends rather than
+    /// wrapping, as the palette's list does: a list that jumps back to the
+    /// top loses the reader's place.
+    fn step_column_find(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let count = self.column_matches(cx).len();
+        let Some(find) = &mut self.column_find else { return };
+        if count == 0 {
+            return;
+        }
+        let here = find.selected.min(count - 1);
+        let next = if forward { (here + 1).min(count - 1) } else { here.saturating_sub(1) };
+        find.selected = next;
+        find.scroll.scroll_to_item(next, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    /// ⏎: jump to the row the list has selected.
+    fn jump_to_selected_column(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let matches = self.column_matches(cx);
+        let Some(find) = &self.column_find else { return };
+        let Some(column) = matches.get(find.selected.min(matches.len().saturating_sub(1))).copied()
+        else {
+            return;
+        };
+        self.jump_to_column(column, window, cx);
+    }
+
+    /// Put the cursor in one column of the result and bring it into view,
+    /// **keeping the row it is already on**: the user asked for a column,
+    /// not for a cell somewhere else in the result.
+    fn jump_to_column(&mut self, column: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.column_find = None;
+        let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else { return };
+        let extent = Extent::of(marked.data);
+        // The result can have been replaced since the list was painted, so
+        // the lane is checked against the result in hand rather than trusted.
+        if column >= extent.columns || extent.rows == 0 {
+            return;
+        }
+        let row = marked.selection.cursor().map_or(0, |cursor| cursor.row);
+        let cell = Cell::new(row.min(extent.rows - 1), column);
+        marked.selection.focus(cell);
+        marked.scroll.reveal(cell, marked.data);
+        // A jump hands the keys to the result it jumped in, so ↑↓ walk the
+        // grid from the cell it landed on.
+        window.focus(&self.grid_focus, cx);
+        cx.notify();
+    }
+
+    fn on_column_find_event(
+        &mut self,
+        _field: &Entity<TextField>,
+        event: &TextFieldEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            // The list is read straight off the line, so a keystroke only
+            // has to put the selection back on the first match — the rows
+            // change under it with every character.
+            TextFieldEvent::Changed => {
+                if let Some(find) = &mut self.column_find {
+                    find.selected = 0;
+                    find.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                }
+                cx.notify();
+            }
+            TextFieldEvent::Submit => self.jump_to_selected_column(window, cx),
+            TextFieldEvent::Cancel => self.close_column_find(window, cx),
+            // ⇥ has nothing to finish here. The palette completes a path one
+            // part at a time because a name is deep; a column name is one
+            // part, and the whole list of them is already on screen.
+            TextFieldEvent::NextField => {}
+        }
+    }
+
+    // --- reading a whole value ---------------------------------------------
+
+    /// ⏎ over the cursor's cell, and a double click on any cell: show the
+    /// value whole.
+    fn open_peek(&mut self, cell: Cell, window: &mut Window, cx: &mut Context<Self>) {
+        // Each of those is already the thing taking keys while it is up.
+        if self.palette.is_some() || self.confirm.is_some() {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active).map(Tab::id) else { return };
+        self.column_find = None;
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        self.peek = Some(Peek { tab, cell, focus });
+        // Nothing worth showing means nothing shown: an out-of-range cell
+        // is a cell the result no longer has.
+        if self.peek_value().is_none() {
+            self.peek = None;
+            window.focus(&self.grid_focus, cx);
+            return;
+        }
+        cx.notify();
+    }
+
+    /// ⏎ from the grid: the cursor's own cell.
+    fn peek_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cell) = self.tabs.get(self.active).and_then(Tab::selection).and_then(Selection::cursor)
+        else {
+            return;
+        };
+        self.open_peek(cell, window, cx);
+    }
+
+    /// What the card is showing: the column's name, the row's number as the
+    /// gutter counts it, and the value.
+    ///
+    /// Read from the result in hand every time, never remembered — see
+    /// [`Peek`]. `None` says there is nothing there to show, which is what a
+    /// page turn under an open card leaves behind.
+    fn peek_value(&self) -> Option<(SharedString, usize, String)> {
+        let peek = self.peek.as_ref()?;
+        let tab = self.tabs.get(self.active).filter(|tab| tab.id() == peek.tab)?;
+        let (data, first_row) = match tab {
+            // A table tab is a window on the table, so the row wears the
+            // number its gutter gives it rather than its index in the page.
+            Tab::Table(tab) => (&tab.data, tab.page * PAGE_SIZE + 1),
+            Tab::Query(tab) => (&tab.data, 1),
+            Tab::History(_) => return None,
+        };
+        let value = data.rows.get(peek.cell.row)?.get(peek.cell.column)?;
+        let name = data.columns.get(peek.cell.column)?;
+        Some((name.clone().into(), first_row + peek.cell.row, value.display()))
+    }
+
+    fn close_peek(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.peek = None;
+        // Back to the result the card was opened over, not to the tab's
+        // usual focus: the user was walking the grid a keystroke ago.
+        window.focus(&self.grid_focus, cx);
+        cx.notify();
+    }
+
+    /// ⌘C in the card copies **this value**, whole — not the slice the card
+    /// painted, and not the selection the grid's own ⌘C would take.
+    ///
+    /// It is written bare, with none of CSV's quoting: a value read on its
+    /// own is not a row, so a URL with a comma in it must not come back
+    /// wrapped in quotes it never had.
+    fn copy_peek(&mut self, cx: &mut Context<Self>) {
+        let Some((_, _, value)) = self.peek_value() else { return };
+        cx.write_to_clipboard(ClipboardItem::new_string(value));
+    }
+
     // --- walking the tabs -------------------------------------------------
 
     /// ⌃⇥ moves to the next tab, ⌃⇧⇥ to the one before it, in the order
@@ -1808,10 +2149,13 @@ impl Shell {
             return true;
         }
         // The palette must not be left underneath: two overlays both taking
-        // keys, and only one of them the one being answered.
+        // keys, and only one of them the one being answered. The column-find
+        // popover and the value peek go for the same reason.
         if self.palette.is_some() {
             self.close_palette(window, cx);
         }
+        self.column_find = None;
+        self.peek = None;
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         self.confirm = Some(Confirm { what, running, open, focus });
@@ -1955,6 +2299,12 @@ impl Shell {
         if self.tabs.get(ix).is_none() {
             return;
         }
+        // The column-find popover and the value peek are both controls on
+        // one result. Every caller here hands the focus on to the tab it
+        // activated, so they go rather than being carried to a result they
+        // were never opened on.
+        self.column_find = None;
+        self.peek = None;
         self.active = ix;
         self.remember_tabs(cx);
     }
@@ -2158,8 +2508,36 @@ impl Shell {
         self.step_page(true, cx);
     }
 
-    fn on_show_history(&mut self, _: &ShowHistory, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_show_history(&mut self, _: &ShowHistory, window: &mut Window, cx: &mut Context<Self>) {
         self.open_history(cx);
+        // The history tab leaves the focus on the shell, where the shell's
+        // own keys are bound. Saying so here matters because the tab this
+        // one replaces may have been holding the focus in a popover.
+        self.focus_active_tab(window, cx);
+    }
+
+    fn on_find_column(&mut self, _: &FindColumn, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_column_find(window, cx);
+    }
+
+    fn on_column_prev(&mut self, _: &ColumnPrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_column_find(false, cx);
+    }
+
+    fn on_column_next(&mut self, _: &ColumnNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_column_find(true, cx);
+    }
+
+    fn on_peek_value(&mut self, _: &PeekValue, window: &mut Window, cx: &mut Context<Self>) {
+        self.peek_cursor(window, cx);
+    }
+
+    fn on_close_peek(&mut self, _: &ClosePeek, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_peek(window, cx);
+    }
+
+    fn on_copy_peek(&mut self, _: &CopyPeek, _: &mut Window, cx: &mut Context<Self>) {
+        self.copy_peek(cx);
     }
 
     fn on_toggle_palette(
@@ -2582,6 +2960,8 @@ impl Render for Shell {
             .on_action(cx.listener(Self::on_prev_page))
             .on_action(cx.listener(Self::on_next_page))
             .on_action(cx.listener(Self::on_show_history))
+            .on_action(cx.listener(Self::on_find_column))
+            .on_action(cx.listener(Self::on_peek_value))
             .on_action(cx.listener(Self::on_toggle_palette))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
@@ -2613,6 +2993,10 @@ impl Render for Shell {
         }
         root.child(framed)
             .children(self.env.map(|env| frame_overlay(env, radius, &colors)))
+            // Under the palette and the dialog, both of which clear it on
+            // the way up, so the order only settles the one frame where two
+            // could be painted.
+            .children(self.peek_overlay(&colors, cx))
             .children(self.palette_overlay(&colors, cx))
             // Last, so it paints over the palette on the one frame where
             // both could be up.
@@ -3082,9 +3466,12 @@ impl Shell {
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _event, window, cx| {
                     this.activate(ix, cx);
-                    if let Some(Tab::Query(tab)) = this.tabs.get(ix) {
-                        window.focus(&tab.editor.focus_handle(cx), cx);
-                    }
+                    // The tab that was clicked takes the focus, each kind the
+                    // way it takes it when it opens: a query tab into its
+                    // editor, a table tab into its grid. Leaving the focus
+                    // where it was would leave it on a control the click has
+                    // just taken off the screen.
+                    this.focus_active_tab(window, cx);
                     cx.notify();
                 }))
                 .child(match tab {
@@ -3215,15 +3602,27 @@ impl Shell {
         let this = cx.entity().downgrade();
         Rc::new(move |hit, window, cx| {
             this.update(cx, |this: &mut Shell, cx| {
+                // A click in the result is a click outside the column-find
+                // popover, and a popover a click has landed behind is one
+                // the user is done with.
+                this.column_find = None;
                 let Some(tab) = this.tab_mut(tab_id) else { return };
                 let Some(marked) = tab.marked() else { return };
                 let extent = Extent::of(marked.data);
+                let mut asked_to_peek = None;
                 match hit {
-                    Hit::Cell { cell, extend } => {
+                    Hit::Cell { cell, extend, peek } => {
                         if extend {
                             marked.selection.extend_to(cell);
                         } else {
                             marked.selection.focus(cell);
+                        }
+                        // The second click of a double click asks for the
+                        // whole value. The first one has already moved the
+                        // cursor there, so the card opens on the cell the
+                        // user is looking at either way.
+                        if peek {
+                            asked_to_peek = Some(cell);
                         }
                     }
                     Hit::Pick { row, through } => {
@@ -3243,6 +3642,11 @@ impl Shell {
                 // makes a bare `space` mean "tick this row" here and a
                 // space in the SQL there.
                 window.focus(&this.grid_focus, cx);
+                if let Some(cell) = asked_to_peek {
+                    // After the focus, not before: the card takes the focus
+                    // for itself, and ⎋ hands it back to the grid.
+                    this.open_peek(cell, window, cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -3285,6 +3689,7 @@ impl Shell {
                 div().text_size(px(11.)).text_color(colors.accent).child("loading…")
             }))
             .child(div().flex_1())
+            .children(self.column_find_control(colors, cx))
             .child(
                 div()
                     .id("refresh")
@@ -3301,6 +3706,209 @@ impl Shell {
                     .on_click(cx.listener(|this, _event, _window, cx| this.refresh_active(cx)))
                     .child("refresh"),
             )
+    }
+
+    /// The comp's "column ⌘J" button, and the popover it opens under itself.
+    /// Both kinds of tab that show a result carry it: a result is as wide
+    /// wherever it came from.
+    ///
+    /// Nothing is drawn while the result has no columns. A button that opened
+    /// an empty list would be a control that says it can do something it
+    /// cannot.
+    ///
+    /// The popover is `deferred`, which paints it after everything around it
+    /// rather than under: GPUI paints siblings in order, and the toolbar is
+    /// painted before the grid it hangs over.
+    fn column_find_control(&self, colors: &ThemeColors, cx: &Context<Self>) -> Option<Div> {
+        let tab = self.tabs.get(self.active).map(Tab::id)?;
+        if self.result_columns().is_empty() {
+            return None;
+        }
+        // Only ever over the result it was opened on, and never under one of
+        // the two dialogs — both of them are already the thing taking keys.
+        let open = self
+            .column_find
+            .as_ref()
+            .filter(|find| find.tab == tab && self.palette.is_none() && self.confirm.is_none());
+        // Open, the button wears the run timer's warm pill: the same "this is
+        // live" reading, in the accent's family rather than a warning's.
+        let (border, fill) = match open {
+            Some(_) => (colors.running_border, colors.running_surface),
+            None => (colors.border_strong, colors.elevated),
+        };
+
+        Some(
+            div()
+                .relative()
+                .flex_none()
+                .child(
+                    div()
+                        .id("find-column")
+                        .flex()
+                        .items_center()
+                        .gap(px(7.))
+                        .pl(px(9.))
+                        .pr(px(5.))
+                        .py(px(4.))
+                        .border_1()
+                        .border_color(border)
+                        .rounded(px(6.))
+                        .bg(fill)
+                        .text_size(px(11.))
+                        .text_color(colors.text_secondary)
+                        .cursor_pointer()
+                        .hover(|s| s.border_color(colors.text_faint))
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.toggle_column_find(window, cx)
+                        }))
+                        .child(search_glyph(colors.accent))
+                        .child("column")
+                        .child(key_badge("⌘J", colors)),
+                )
+                .children(open.map(|find| {
+                    deferred(self.column_find_popover(find, colors, cx)).with_priority(1)
+                })),
+        )
+    }
+
+    /// The popover: the search line, what it found, and what the keys do.
+    fn column_find_popover(
+        &self,
+        find: &ColumnFind,
+        colors: &ThemeColors,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let matches = self.column_matches(cx);
+        let columns = self.result_columns();
+        let count = format!("{}/{}", matches.len(), columns.len());
+
+        div()
+            .id("column-find")
+            .key_context(COLUMN_FIND_KEY_CONTEXT)
+            .on_action(cx.listener(Self::on_column_prev))
+            .on_action(cx.listener(Self::on_column_next))
+            // A click in the popover is not a click in the grid under it.
+            .occlude()
+            .absolute()
+            .top(px(COLUMN_FIND_TOP))
+            // Hung from the button's right edge, not its left as the comp
+            // draws it: the button sits at the right end of the toolbar
+            // here, and 290px to the right of it is off the window.
+            .right(px(0.))
+            .w(px(COLUMN_FIND_WIDTH))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .border_1()
+            .border_color(colors.border_strong)
+            .rounded(px(9.))
+            .bg(colors.elevated)
+            .shadow(vec![
+                BoxShadow::new(px(0.), px(18.), colors.shadow)
+                    .blur_radius(px(40.))
+                    .spread_radius(px(-14.)),
+            ])
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(11.))
+                    .py(px(9.))
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(search_glyph(colors.text_faint))
+                    .child(div().flex_1().min_w(px(0.)).child(find.query.clone()))
+                    // How much of the result is left, so a search that has
+                    // narrowed to one column says so without counting rows.
+                    .child(div().text_size(px(10.)).text_color(colors.text_faint).child(count)),
+            )
+            .child(self.column_find_list(find, &matches, colors, cx))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(11.))
+                    .py(px(7.))
+                    .border_t_1()
+                    .border_color(colors.border)
+                    .bg(colors.panel)
+                    .text_size(px(9.))
+                    .text_color(colors.text_muted)
+                    .child("↑↓ browse")
+                    .child("⏎ jump")
+                    .child("esc close"),
+            )
+    }
+
+    /// What the search found, one column per row. The list grows to the
+    /// matches and stops at nine rows: a popover is a way to one column, not
+    /// a second view of the header.
+    fn column_find_list(
+        &self,
+        find: &ColumnFind,
+        matches: &[usize],
+        colors: &ThemeColors,
+        cx: &Context<Self>,
+    ) -> Div {
+        if matches.is_empty() {
+            return div()
+                .flex_none()
+                .px(px(13.))
+                .py(px(10.))
+                .text_size(px(11.))
+                .text_color(colors.text_faint)
+                .child("no column matches");
+        }
+
+        let columns = self.result_columns();
+        let rows: Rc<Vec<(usize, SharedString)>> = Rc::new(
+            matches.iter().map(|&ix| (ix, columns[ix].clone().into())).collect(),
+        );
+        // Which lane the cursor is in, so the list can say so: the user is
+        // being shown where they are as well as where they could go.
+        let cursor = self
+            .tabs
+            .get(self.active)
+            .and_then(Tab::selection)
+            .and_then(Selection::cursor)
+            .map(|cursor| cursor.column);
+        let selected = find.selected.min(rows.len() - 1);
+        let jump: Rc<dyn Fn(usize, &mut Window, &mut App)> = {
+            let shell = cx.entity().downgrade();
+            Rc::new(move |column, window, cx| {
+                shell
+                    .update(cx, |shell: &mut Shell, cx| {
+                        shell.jump_to_column(column, window, cx)
+                    })
+                    .ok();
+            })
+        };
+
+        // The 5px of padding the list sits in counts towards the height the
+        // comp gives the box, so it comes off the rows rather than being
+        // added to them: a scrolling list must not be a half-row tall.
+        let padding = 5.;
+        let height =
+            (rows.len() as f32 * COLUMN_ROW_HEIGHT).min(COLUMN_LIST_MAX_HEIGHT - 2. * padding);
+        let mut list = uniform_list("column-matches", rows.len(), move |range, _window, cx| {
+            let colors = theme(cx).colors.clone();
+            range
+                .map(|ix| column_row(ix, &rows[ix], ix == selected, cursor, &jump, &colors))
+                .collect::<Vec<_>>()
+        });
+        list.style().restrict_scroll_to_axis = Some(true);
+
+        div()
+            .h(px(height + 2. * padding))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .p(px(padding))
+            .child(list.track_scroll(&find.scroll).flex_1().min_h(px(0.)))
     }
 
     /// The timer beside the run button. It is the only thing on screen that
@@ -3550,7 +4158,12 @@ impl Shell {
                 .text_color(ink)
                 .child(div().font_weight(FontWeight::SEMIBOLD).text_color(ink).child(label))
                 .child(summary)
-                .children(cap_note(tab, colors)),
+                .children(cap_note(tab, colors))
+                .child(div().flex_1())
+                // The way to a column of the result, on the line that
+                // describes the result — not on the toolbar above the
+                // editor, which is about the statement.
+                .children(self.column_find_control(colors, cx)),
         )
         .child(self.result_body(tab.id, cx))
     }
@@ -3737,6 +4350,10 @@ impl Shell {
             .get(self.active)
             .and_then(|tab| tab.selection())
             .and_then(|selection| selection.summary());
+        // Only over a result there is something to do to. A tab still
+        // waiting on its first run has no columns and no keys worth listing.
+        let keys = (!self.result_columns().is_empty())
+            .then_some("↑↓←→ move · ⌘J column · ⏎ value · space picks · ⌘C copies");
 
         div()
             .h(px(30.))
@@ -3759,11 +4376,12 @@ impl Shell {
                 self.page_link("next", true, colors, cx)
             }))
             .children(marks.as_ref().map(|_| divider()))
-            .children(marks.map(|marks| {
-                div()
-                    .text_color(colors.accent_deep)
-                    .child(format!("{marks} · ⌘C copies"))
-            }))
+            .children(marks.map(|marks| div().text_color(colors.accent_deep).child(marks)))
+            // The keys the result answers to, as the comp's own footer lists
+            // them. It is the only place ⏎ and ⌘J are written down, and a
+            // gesture nothing on screen names is a gesture nobody finds.
+            .children(keys.map(|_| divider()))
+            .children(keys.map(|keys| div().text_color(colors.text_faint).truncate().child(keys)))
             .child(div().flex_1())
             .children(
                 elapsed.map(|ms| div().child(format!("queried in {}", format_millis(ms)))),
@@ -3918,6 +4536,150 @@ impl Shell {
                                             this.proceed_close(confirm.what, window, cx);
                                         }))
                                         .child(act),
+                                ),
+                        ),
+                ),
+        )
+    }
+
+    /// The value peek: one cell's whole value, over the grid it came from.
+    ///
+    /// The scrim carries **no wash**. The palette's dims the workspace
+    /// because the palette is a place the user has gone to; this card is a
+    /// second look at something already on screen, and dimming the result
+    /// behind it would hide what is being looked at. It still occludes, so a
+    /// click cannot reach the grid underneath — and a click on it closes the
+    /// card, which is what a click outside a peek means.
+    fn peek_overlay(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let peek = self.peek.as_ref()?;
+        let (column, row, value) = self.peek_value()?;
+        let characters = value.chars().count();
+        // What is painted is bounded; what ⌘C copies is not.
+        let shown: String = value.chars().take(PEEK_CHARS).collect();
+        let cut = characters > PEEK_CHARS;
+        let meta = match (characters, cut) {
+            (1, _) => "1 character".to_string(),
+            (n, false) => format!("{} characters", format_count(n as u64)),
+            (n, true) => format!(
+                "first {} of {} characters",
+                format_count(PEEK_CHARS as u64),
+                format_count(n as u64)
+            ),
+        };
+
+        Some(
+            div()
+                .id("peek-scrim")
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .size_full()
+                .flex()
+                .justify_center()
+                .items_start()
+                .pt(px(PEEK_TOP_MARGIN))
+                .occlude()
+                .on_click(cx.listener(|this, _event, window, cx| this.close_peek(window, cx)))
+                .child(
+                    div()
+                        .id("peek")
+                        .key_context(PEEK_KEY_CONTEXT)
+                        .track_focus(&peek.focus)
+                        .on_action(cx.listener(Self::on_close_peek))
+                        .on_action(cx.listener(Self::on_copy_peek))
+                        // A click in the card is not a click on the scrim,
+                        // so it must not close it.
+                        .occlude()
+                        .w(px(PEEK_WIDTH))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(colors.border_strong)
+                        .rounded(px(10.))
+                        .bg(colors.elevated)
+                        .shadow(vec![
+                            BoxShadow::new(px(0.), px(24.), colors.shadow)
+                                .blur_radius(px(60.))
+                                .spread_radius(px(-20.)),
+                        ])
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(10.))
+                                .px(px(15.))
+                                .py(px(11.))
+                                .border_b_1()
+                                .border_color(colors.border)
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(colors.text)
+                                        .truncate()
+                                        .child(column),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(11.))
+                                        .text_color(colors.text_muted)
+                                        .child(format!("row {row} · {meta}")),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    key_badge("esc", colors)
+                                        .id("close-peek")
+                                        .cursor_pointer()
+                                        .hover(|s| s.text_color(colors.accent))
+                                        .on_click(cx.listener(|this, _event, window, cx| {
+                                            this.close_peek(window, cx)
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("peek-value")
+                                .max_h(px(PEEK_MAX_HEIGHT))
+                                .overflow_y_scroll()
+                                .px(px(15.))
+                                .py(px(13.))
+                                .text_size(px(12.))
+                                .text_color(if value == "NULL" {
+                                    // The word is what the grid paints for an
+                                    // absence, and it reads as an absence
+                                    // there; it has to read the same here.
+                                    colors.text_faint
+                                } else {
+                                    colors.text_body
+                                })
+                                .child(shown),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(14.))
+                                .px(px(15.))
+                                .py(px(9.))
+                                .border_t_1()
+                                .border_color(colors.border)
+                                .bg(colors.panel)
+                                .text_size(px(10.))
+                                .text_color(colors.text_muted)
+                                .child(if cut {
+                                    "⌘C copies the whole value"
+                                } else {
+                                    "⌘C copies this value"
+                                })
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .text_color(colors.text_faint)
+                                        .child("⏎ or ⎋ closes"),
                                 ),
                         ),
                 ),
@@ -4086,7 +4848,7 @@ impl Shell {
         // What the search found, in the comp's own words. With nothing
         // typed there is no count worth saying, only what to do next.
         let found = match (needle.is_empty(), palette.matches) {
-            (true, _) => "type to search tables, columns and history".to_string(),
+            (true, _) => "type to search tables and history".to_string(),
             (false, 0) => format!("meerkat found nothing for “{needle}”"),
             (false, 1) => format!("meerkat found 1 match for “{needle}”"),
             (false, n) => format!("meerkat found {n} matches for “{needle}”"),
@@ -4424,6 +5186,70 @@ fn catalog_row(
 }
 
 /// A keystroke, in the bordered pill the comp puts one in.
+/// One row of the column-find list: where the column sits in the result,
+/// its name, and the one thing worth saying about it.
+///
+/// The trailing mark says **`cursor`** for the column the cursor is already
+/// in and **⏎** for the one the key would jump to. They are never both:
+/// "you are here" outranks "you could go here", and a row that claimed both
+/// would be saying the jump goes nowhere.
+fn column_row(
+    ix: usize,
+    (column, name): &(usize, SharedString),
+    selected: bool,
+    cursor: Option<usize>,
+    jump: &Rc<dyn Fn(usize, &mut Window, &mut App)>,
+    colors: &ThemeColors,
+) -> Stateful<Div> {
+    let (mark, mark_ink) = if cursor == Some(*column) {
+        ("cursor", colors.accent_deep)
+    } else if selected {
+        ("⏎", colors.accent)
+    } else {
+        ("", colors.accent)
+    };
+    let column = *column;
+    let jump = jump.clone();
+
+    let mut row = div()
+        .id(ix)
+        .h(px(COLUMN_ROW_HEIGHT))
+        .flex()
+        .items_center()
+        .gap(px(9.))
+        .px(px(8.))
+        .rounded(px(5.))
+        .cursor_pointer()
+        .on_click(move |_event, window, cx| jump(column, window, cx))
+        .child(
+            // The lane's own number, counted from one as the header reads,
+            // so the popover and the result agree about where a column is.
+            div()
+                .w(px(15.))
+                .flex_none()
+                .text_size(px(9.))
+                .text_color(colors.line_number)
+                .child(format!("{}", column + 1)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_size(px(11.))
+                .text_color(if selected { colors.text } else { colors.text_secondary })
+                .truncate()
+                .child(name.clone()),
+        )
+        .child(div().flex_none().text_size(px(10.)).text_color(mark_ink).child(mark));
+    row = if selected {
+        row.bg(colors.selection)
+    } else {
+        let hover = colors.panel;
+        row.hover(move |s| s.bg(hover))
+    };
+    row
+}
+
 fn key_badge(keys: &'static str, colors: &ThemeColors) -> Div {
     div()
         .flex_none()

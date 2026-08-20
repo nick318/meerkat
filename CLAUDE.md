@@ -215,9 +215,10 @@ decides nothing.
 
 **One callback, not five.** The grid reports where the mouse landed as
 one `Hit` — a cell (with ⇧ held, and with the second click of a double
-click), the gutter beside a row, the gutter's head, or a column header —
-and `Shell::hit_handler` turns it into a call on `Selection`. So the
-mouse and the keys move the same selection through the same code.
+click, which asks to read the value whole), the gutter beside a row, the
+gutter's head, or a column header — and `Shell::hit_handler` turns it
+into a call on `Selection`. So the mouse and the keys move the same
+selection through the same code.
 
 Three marks in the same warm family, and they have to stay apart at a
 glance: the cursor's own cell wears `match_strong`, the range around it
@@ -254,6 +255,94 @@ extends, ⌘ with them goes as far as it goes, ⌘A takes everything, space
 ticks the cursor's row — ↓ then space walks a result and picks out of it
 without the mouse — and ⎋ drops what is marked.
 
+### Finding a column of a result
+
+A result wider than the pane is the ordinary case for a real table, and
+the column's **name** is usually all the user knows about the one they
+want. So ⌘J opens a search line over the names the result came back
+with, and ⏎ jumps to the column: `Shell::jump_to_column` puts the cursor
+there and `GridState::reveal` scrolls it in, the same call the arrow keys
+already go through.
+
+The jump **keeps the row the cursor is on**. The user asked for a
+column, not for a cell somewhere else in the result.
+
+The **column header marks the cursor's lane** — an accent rule under the
+name, and the name in `accent_deep`. That is the mark which survives
+scrolling: the cursor's own cell can be a hundred rows down the page, so
+after a jump it is the only thing on screen that says the jump landed.
+It is a child of the header cell rather than a bottom border, because a
+border carries one colour for all four sides and the left hairline has
+already claimed it.
+
+`results_grid::find_columns` is the whole of the matching: the palette's
+rule — a case-insensitive substring, not a fuzzy score — over the column
+names, answering with indices into the result's own lanes. It lowercases
+the whole of Unicode where the palette lowercases ASCII alone, because
+nothing underlines the hit here, so no byte range has to stay valid in
+the original name. A column's **type** is not searched: a result carries
+names and values, the driver reports no type per column, and a search
+that answered differently on a tab opened from the catalog would be
+worse than one that does not offer it.
+
+**What the search found is never kept.** A run or a page turn replaces
+the result under the popover, and remembered lane indices would point at
+lanes that are not there any more — so `Shell::column_matches` works
+them out from the line and the result in hand every time, and
+`jump_to_column` checks the lane against the result before it moves
+anything. `ColumnFind` holds only where the user has walked to.
+
+The popover is `deferred`, which paints it after the elements around it:
+GPUI paints siblings in order, and the toolbar it hangs from is painted
+before the grid it hangs over. Its keys live in
+`COLUMN_FIND_KEY_CONTEXT` — ↑↓ only, or they would be taken from the
+grid while nothing is open — and ⏎ and ⎋ arrive as the `TextField`'s own
+`Submit` and `Cancel`, the way the palette answers them. ⇥ finishes
+nothing: a column name is one part, and the whole list is on screen.
+
+It is a control on **one** result, so `Shell::activate` drops it — which
+is why every path that changes the active tab now hands the focus on
+through `focus_active_tab`, or the focus would be left on a control the
+switch took off the screen. `guard_close` and `open_palette` drop it for
+the reason they close the palette: one thing takes keys at a time.
+
+### Reading a whole value
+
+A lane is capped at `MAX_COLUMN_WIDTH`, so a long value truncates on
+screen. **The question that raises is "what is in this cell", which is
+not the question "how wide should this column be"** — widening a lane to
+two thousand pixels only turns reading into panning. So ⏎ over the
+cursor's cell, or a double click on any cell, opens a card holding the
+value whole: wrapped, scrolling if it is long, ⌘C to copy it, ⏎ or ⎋ to
+close. The lane cap stays where it is; it was only ever wrong as the
+*one* way to read a value.
+
+The card is the overlay pattern the palette and the close dialog already
+use — an absolutely positioned child of the shell, its own focus and its
+own `PEEK_KEY_CONTEXT` — with two differences. Its scrim carries **no
+wash**: the palette is a place the user went to, while this is a second
+look at something already on screen, and dimming the result would hide
+what is being looked at. And a click on the scrim **does** close it,
+unlike the confirmation's, because nothing here is lost by dismissing.
+
+`Peek` holds **where** the value is, never the value: a run or a page
+turn replaces the rows under the card, and a string copied when it opened
+would go on saying what used to be there. `Shell::peek_value` reads the
+cell out of the result in hand and answers `None` when the result no
+longer has it.
+
+**What is painted is bounded; what ⌘C copies is not.** `MAX_CELL_BYTES`
+lets a megabyte of text into one cell, and laying a megabyte of wrapped
+text out on the GPUI thread would freeze the window, so the card paints
+the first `PEEK_CHARS` and says how much there is. ⌘C is bound in the
+card's own context and means something narrower than the grid's: **this
+value**, whole, written bare — a value read on its own is not a row, so
+none of CSV's quoting applies to it.
+
+The status strip lists the keys a result answers to, as the comp's footer
+does. It is the only place ⏎ and ⌘J are written down, and a gesture
+nothing on screen names is a gesture nobody finds.
+
 ### Query history
 
 Every run — a table page the app built as well as a statement the user
@@ -289,13 +378,20 @@ height. `Shell::palette` owns the state; the palette is an absolutely
 positioned child of the shell, never a window of its own, so closing it
 hands the focus straight back to the workspace.
 
-A **dot in the query names a path**. Each result carries its name in parts
-— schema, relation, and a column's own name — and the typed parts line up
-with the *end* of that path first, sliding one part further out when
-nothing hit there. So `task` finds every `task`, `dev.ta` finds
+A **dot in the query names a path**. Each result carries its name in
+parts — the schema and the relation — and the typed parts line up with the
+*end* of that path first, sliding one part further out when nothing hit
+there. So `task` finds every `task`, `dev.ta` finds
 `sample_dev_sample.task`, and a bare schema name answers with the tables
-it holds. Sliding is off for columns: a bare `task` there would return
-every column of every task table.
+it holds.
+
+**It does not search columns**, and the `c:` scope is gone with them.
+Every row of the palette ends in "open this", and a column has nothing of
+its own to open — a column row could only offer its table, which the
+table row already offers. It also made a bare word answer with a page of
+near-identical names. The way to a column is ⌘J over the result that
+holds it, which is a search over the columns actually on screen rather
+than over every column in the database.
 
 ⇥ finishes the line from the selected row (`completion()`), one part at a
 time, so ⇥⇥ walks schema then relation. It **replaces** what was typed
