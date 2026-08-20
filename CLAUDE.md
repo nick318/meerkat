@@ -709,10 +709,111 @@ than in a running window.
 **Every taking-back is visible.** `QueryTab::session_ended` puts
 `session ended · a run opens a new one` in the toolbar until the next run,
 because a `search_path` that reset an hour later must be explainable rather
-than a mystery. Beside it, `IN TRANSACTION` in the accent's family marks
-the state where everything the tab does is inside something a close would
-roll back. Neither mark says "a session is open": that is the ordinary case
-and needs no badge.
+than a mystery. It does not say "a session is open": that is the ordinary
+case and needs no badge. An open transaction is marked by the transaction
+bar below, which is a strip and not a badge — see the next section.
+
+### Who ends a transaction
+
+A statement on a Postgres connection commits as it succeeds, and for a
+viewer that is the whole story. It stops being the whole story the moment
+the connection is the user's to write on: a set of statements that has to
+land together, or a `DELETE` worth looking at before anyone else can see
+it, needs a transaction the user ends rather than one the server ends for
+them. So `db_client::TxMode` is a property of a **tab** — `Auto` or
+`Manual` — because a transaction lives on one connection and a tab is one
+connection.
+
+`Profile::tx_mode` is the mode a new tab opens on, set in the connection
+form beside the read-only switch. It is **not** a connect parameter —
+nothing in the startup packet says it, and the app is what holds the
+transaction open — but it belongs to the connection rather than to a
+window: "manual on prod, auto on the laptop copy" is a decision about the
+database. A command-line URL carries no setting and opens on `Auto`, and a
+profiles row an older build wrote reads as `Auto` — the mirror image of
+`read_only`, whose missing answer is the *careful* one. Here the careful
+answer is to hold nothing open. A tab remembers its own mode in
+`open_tabs`, so a tab switched to manual comes back manual; the
+transaction is not remembered, because a restored tab has no session and
+so has nothing open.
+
+**In manual mode a run opens the transaction and nothing closes it but the
+user.** `needs_begin` is the whole of the decision, and it answers no
+three ways: auto mode holds nothing open; one is open already, so a second
+`BEGIN` would be a warning from the server and a lie in the bar; and the
+buffer opens its own, which is the user saying where the transaction
+starts. The `BEGIN` goes out through `Session::begin` rather than
+`Session::execute`, because **a transaction boundary is not a run**: it has
+no result to cap, no timing worth reporting and no columns to describe, and
+`execute` would pay a round trip on the app pool asking the server what
+columns `COMMIT` returns. It is not counted in the run's statements either
+— but the clock does start before it, because the round trip is part of
+what the user waited.
+
+**A typed `BEGIN` is handled in either mode, and that is the point of
+`query::transaction_verb`.** In auto mode a `BEGIN` the user wrote opens a
+transaction exactly as manual mode does, and before this the only way out
+of it was to close the tab — which rolled it back. Now the bar appears
+either way. The verb reader takes the first word or two past any leading
+comments and does not attempt to parse SQL: `ROLLBACK TO SAVEPOINT` is not
+an end, `START` is only a verb with `TRANSACTION` after it, and a `begin`
+inside a dollar-quoted body never reaches it because `statements()` hands
+such a body over whole. **Being wrong is cheap on purpose** — the server's
+own answer, `Session::in_transaction`, is what the app believes about the
+state afterwards, so a misread costs at most one spare `BEGIN` or a bar
+that says nothing rather than something wrong. The buffer's **last** verb
+is what the bar reports, because `BEGIN; …; COMMIT` leaves nothing open.
+
+The bar sits directly over the result, because it is about what the runs
+have done rather than about the statement above them. `tx_copy` is pure, so
+the wording is testable without a window, and `None` means no strip at all:
+a strip that said "no transaction" would be one that is always there saying
+nothing. Open warms to the accent's family, a commit rests in the dev
+family's green that the read-only mark already wears, and a rollback goes
+back to paper — nothing was written, so nothing is worth a colour. It stays
+up for a moment after the transaction ends, saying which way it went,
+because "committed" is the answer to the question the user just asked; the
+next run clears it, since news about a transaction that was over before the
+run is not news.
+
+The second line counts **statements, not rows**. The comp says "N rows
+touched", and the driver reports no affected count today — `rows_affected`
+is filled in nowhere — so a row figure would be invented. A statement count
+is a number the app has. What it counts is the statements that are *not*
+boundaries, so a bare `BEGIN` opens a transaction with nothing in it, which
+is what it did.
+
+⌘S commits and ⇧⌘R rolls back, and the bar's two buttons say so on their
+faces: this is the only place those keys are written down. **⇧⌘R is not the
+comp's ⇧⌘Z**, which is Redo in the SQL editor — the editor's context sits
+*inside* the shell's, so a binding here would never fire while the user is
+typing, and taking redo off a text editor would be the wrong trade even if
+it did.
+
+Both go down the tab's **own** session, because that is where the
+transaction is: a `COMMIT` on a pooled connection would commit nothing and
+report success. So a boundary waits for that connection the way a run does
+— and a run in flight is holding it, which is why a boundary is **refused
+rather than queued** behind one, naming ⌘. as the way out. The buttons go
+faint rather than away: the transaction is still there, and so is the
+answer to it once the run has stopped. `tx_ending` is what stops a second
+press from sending a second boundary, and it blocks ⌘⏎ for the same reason
+a run in flight does.
+
+A boundary is kept in `query_history`, unlike the `BEGIN`: "why did my work
+disappear" is answered by a `ROLLBACK` in the list.
+
+**Switching to auto is refused while a transaction is open.** It would
+leave the transaction standing with nothing on screen offering to end it,
+and the statements after it would land inside a transaction the tab says it
+is not in. The auto chip paints faint and does nothing; the bar's two
+buttons are the way out. Switching the other way is allowed at any time —
+a user who typed `BEGIN` may well want the app to stop committing behind it.
+
+Everything else about an open transaction is unchanged and still holds: the
+sweep never takes a session that has one (`spare`), the cap gives way
+rather than evicting one, closing a tab rolls it back for the *pool's* sake,
+and every way out of the shell asks about it first.
 
 ### Closing something that is still running
 

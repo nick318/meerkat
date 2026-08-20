@@ -3,7 +3,7 @@
 use anyhow::Context as _;
 use async_trait::async_trait;
 use db_client::{
-    Connection, Limits, QueryResult, Result, RowChange, RowSink, RunId, Session, Value,
+    Connection, Limits, QueryResult, Result, RowChange, RowSink, RunId, Session, TxEnd, Value,
 };
 use futures::TryStreamExt as _;
 use introspect::{Catalog, Column, Schema, Table, TableKind};
@@ -77,6 +77,21 @@ impl Session for SqliteSession {
         Ok(sink.finish())
     }
 
+    /// The same two statements the Postgres session sends, and the same
+    /// reason they do not go through `execute`: a boundary is not a run.
+    ///
+    /// SQLite leaves [`Session::in_transaction`] unanswered, so the app has
+    /// only what it sent to go on here — see that method. It is why a
+    /// second `BEGIN`, which SQLite refuses outright, must never be asked
+    /// for.
+    async fn begin(&self) -> Result<()> {
+        self.boundary("BEGIN").await
+    }
+
+    async fn end_transaction(&self, how: TxEnd) -> Result<()> {
+        self.boundary(how.sql()).await
+    }
+
     async fn close(&self) {
         let Some(mut conn) = self.conn.lock().await.take() else { return };
         match sqlx::query("ROLLBACK").execute(&mut *conn).await {
@@ -88,6 +103,20 @@ impl Session for SqliteSession {
             Err(sqlx::Error::Database(_)) => drop(conn),
             Err(_) => drop(conn.detach()),
         }
+    }
+}
+
+impl SqliteSession {
+    /// A transaction boundary, on this session's own connection: the
+    /// transaction belongs to the connection that opened it.
+    async fn boundary(&self, sql: &str) -> Result<()> {
+        let mut held = self.conn.lock().await;
+        let conn = held.as_mut().context("this tab's session is closed")?;
+        sqlx::query(sql)
+            .execute(&mut **conn)
+            .await
+            .with_context(|| format!("SQLite refused {sql}"))?;
+        Ok(())
     }
 }
 

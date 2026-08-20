@@ -29,10 +29,79 @@ pub struct Profile {
     /// reading of a missing answer is the careful one.
     #[serde(default = "read_only_default")]
     pub read_only: bool,
+    /// Which way a new query tab on this connection commits. It is not a
+    /// connect parameter — nothing in the startup packet says it, and the
+    /// app is what holds a transaction open — but it belongs to the
+    /// *connection* rather than to a window: "manual on prod, auto on my
+    /// laptop copy" is a decision about the database, so it travels with
+    /// the profile the way `read_only` does. A tab may still be switched
+    /// on its own from the query toolbar.
+    #[serde(default)]
+    pub tx_mode: TxMode,
 }
 
 fn read_only_default() -> bool {
     true
+}
+
+/// Who ends a transaction: the server after every statement, or the user.
+///
+/// `Auto` is what a connection does with nothing asked of it — every
+/// statement commits as it succeeds, which is Postgres's own default and
+/// the only thing a viewer needs. `Manual` holds one transaction open
+/// across the runs of a tab, so a set of statements lands together or not
+/// at all, and the user says which.
+///
+/// It is a property of a **tab**, because a transaction belongs to one
+/// connection and a tab is one connection. The profile carries the default
+/// a new tab opens with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TxMode {
+    /// Every statement commits on its own, as soon as it succeeds.
+    #[default]
+    Auto,
+    /// The app opens a transaction on the tab's next run and holds it until
+    /// the user commits or rolls it back.
+    Manual,
+}
+
+impl TxMode {
+    /// The word the toolbar, the store and the settings note all use, so
+    /// the mode cannot be called one thing on screen and another on disk.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TxMode::Auto => "auto",
+            TxMode::Manual => "manual",
+        }
+    }
+
+    /// Read a stored mode. Anything unrecognised — and a row an older build
+    /// wrote, which has nothing here at all — is `Auto`: the mode a
+    /// connection has when nobody asked for the other one.
+    pub fn parse(text: Option<&str>) -> Self {
+        match text {
+            Some("manual") => TxMode::Manual,
+            _ => TxMode::Auto,
+        }
+    }
+}
+
+/// How a transaction ends. The two are one statement apart and opposite in
+/// every other way, so the app names which one happened rather than saying
+/// "the transaction closed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxEnd {
+    Commit,
+    Rollback,
+}
+
+impl TxEnd {
+    pub fn sql(self) -> &'static str {
+        match self {
+            TxEnd::Commit => "COMMIT",
+            TxEnd::Rollback => "ROLLBACK",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,16 +441,44 @@ pub trait Session: Send + Sync {
     /// Run one statement on this session's own connection.
     async fn execute(&self, sql: &str) -> Result<QueryResult>;
 
-    /// Whether this connection is sitting inside a transaction the user
-    /// began — the one thing a close cannot take back for them.
+    /// Whether this connection is sitting inside a transaction — one the
+    /// user typed a `BEGIN` for, or one the app opened because the tab is
+    /// in [`TxMode::Manual`]. It is the one thing a close cannot take back
+    /// for them.
     ///
     /// The answer is worth **caching against the last run**, and the cache
     /// is exact rather than approximate: the connection is pinned to one
     /// tab, so nothing but that tab's own statements can change what it is
     /// in. Ask once after each run and the answer holds until the next.
+    ///
+    /// An engine that cannot answer says `false` for ever, and the app then
+    /// has only what it sent to go on: no transaction bar, and no close
+    /// warning. Every engine that lets a tab hold a transaction open owes
+    /// this an answer.
     async fn in_transaction(&self) -> Result<bool> {
         Ok(false)
     }
+
+    /// Open a transaction on this session.
+    ///
+    /// It is **not** `execute`. A transaction boundary is not a run: it has
+    /// no result to cap, no timing worth reporting to the user and no
+    /// columns to describe — and `execute` would pay a round trip on the
+    /// app pool asking the server what columns `COMMIT` returns.
+    ///
+    /// The caller must not send this on a session already inside a
+    /// transaction. Postgres answers a second `BEGIN` with a warning and
+    /// SQLite with an error, and neither is worth finding out: the app
+    /// knows what it opened, and [`Session::in_transaction`] is what
+    /// corrects it.
+    async fn begin(&self) -> Result<()>;
+
+    /// End the transaction this session is in, either way.
+    ///
+    /// Sent whether or not one is open, for the reason [`Session::close`]
+    /// sends its `ROLLBACK` that way: outside a transaction the server says
+    /// so and carries on, which is cheaper than asking first.
+    async fn end_transaction(&self, how: TxEnd) -> Result<()>;
 
     /// What the server says the statement this session ran **last** cost.
     ///

@@ -9,7 +9,9 @@
 //! and a reply that does not carry the tab's current generation is thrown
 //! away. Without that, a slow first page would overwrite a fast second one.
 
-use db_client::{Connection, Profile, QueryResult, RunId, ServerTiming, Session, Stop, Wire};
+use db_client::{
+    Connection, Profile, QueryResult, RunId, ServerTiming, Session, Stop, TxEnd, TxMode, Wire,
+};
 use db_postgres::{Label, PostgresConnection};
 use gpui::{
     Animation, AnimationExt, AnyElement, App, BoxShadow, ClipboardItem, Context, Div, ElementId,
@@ -18,6 +20,7 @@ use gpui::{
     prelude::*, px, uniform_list,
 };
 use introspect::{Catalog, Table, TableKind};
+use query::TxVerb;
 use results_grid::{
     Cell, Extent, Grid, GridData, GridState, Hit, Selection, Step, clipboard_text, find_columns,
 };
@@ -77,7 +80,9 @@ actions!(
         ColumnNext,
         PeekValue,
         ClosePeek,
-        CopyPeek
+        CopyPeek,
+        CommitTransaction,
+        RollbackTransaction
     ]
 );
 
@@ -227,7 +232,14 @@ const RUN_PRESS_DEPTH: f32 = 0.08;
 /// not resize under the pointer when a run turns out to be slow. "run" and
 /// "stop" share one width; "terminate" is three times the word and gets its
 /// own.
-const RUN_LABEL_WIDTH: f32 = 26.;
+///
+/// **Each one is sized by the longest word it serves, not by the first.**
+/// The font is monospaced at 0.6 em an advance, so an 11px label costs
+/// 6.6px a character: "stop" needs 26.4px and "terminate" 59.4px. A width
+/// that fits "run" clips the "p" off "stop" — the button's own label is the
+/// one thing on it that must never be cut, because the word *is* what the
+/// button is offering to do. The couple of pixels over are the rounding.
+const RUN_LABEL_WIDTH: f32 = 28.;
 const TERMINATE_LABEL_WIDTH: f32 = 62.;
 /// How long a tab's session may sit unused before it is handed back, and
 /// how often the sweep looks. Ten minutes is long enough that a session is
@@ -330,6 +342,11 @@ pub struct Shell {
     /// and the two lines that name the mode read it. A command-line URL
     /// carries no setting and is read-only.
     read_only: bool,
+    /// The transaction mode a new query tab on this connection opens on,
+    /// from the profile. A tab may then be switched on its own; nothing a
+    /// tab does writes back here. A command-line URL carries no setting,
+    /// and auto is what a connection does with nothing asked of it.
+    tx_default: TxMode,
     tabs: Vec<Tab>,
     active: usize,
     next_id: u64,
@@ -558,8 +575,9 @@ struct QueryTab {
     /// the answer there, and a warm confirming tone would be the wrong
     /// word.
     landed: u64,
-    /// Whether this tab's session is sitting inside a transaction the user
-    /// began, as of its last run.
+    /// Whether this tab's session is sitting inside a transaction, as of
+    /// its last run — one the user typed a `BEGIN` for, or one the app
+    /// opened because the tab is in [`TxMode::Manual`].
     ///
     /// Read after every run rather than at the moment it is wanted,
     /// because the moment it is wanted is a close — and a close cannot
@@ -567,6 +585,25 @@ struct QueryTab {
     /// not a guess: the connection is pinned to this tab, so nothing but
     /// this tab's own statements can change what it is in.
     in_transaction: bool,
+    /// Who ends this tab's transactions. It is a property of the **tab**,
+    /// because a transaction lives on one connection and a tab is one
+    /// connection; the profile carries the mode a new tab opens on.
+    tx_mode: TxMode,
+    /// How many statements have run inside the transaction that is open.
+    ///
+    /// It is what the bar has to say instead of "rows touched": the driver
+    /// reports no affected count today, so a row figure would be invented.
+    /// A statement count is a number the app actually has.
+    tx_statements: usize,
+    /// How the last transaction ended, until the next run or the next
+    /// change of mode. The bar goes on saying so for a moment, because
+    /// "committed" is the answer to the question the user just asked and a
+    /// bar that vanished would leave it unanswered.
+    tx_done: Option<TxEnd>,
+    /// True while a commit or a rollback is out. One at a time: the
+    /// session is one connection, and a second press must not send a
+    /// second boundary down it.
+    tx_ending: bool,
     /// When this tab last used its session. Only a run counts: reading a
     /// result on screen costs the server nothing, and a connection held
     /// open for a tab nobody is asking anything is the thing the sweep
@@ -888,6 +925,10 @@ impl Shell {
                 Target::Profile(profile) => profile.read_only,
                 Target::Url(_) => true,
             },
+            tx_default: match &target {
+                Target::Profile(profile) => profile.tx_mode,
+                Target::Url(_) => TxMode::Auto,
+            },
             tabs: Vec::new(),
             active: 0,
             next_id: 1,
@@ -934,13 +975,17 @@ impl Shell {
         self.restoring = true;
         for tab in saved.tabs {
             match tab {
-                SavedTab::Query { title, statement, relation } => {
+                SavedTab::Query { title, statement, relation, tx_mode } => {
                     self.new_query_with(&statement, window, cx);
                     if let Some(Tab::Query(tab)) = self.tabs.last_mut() {
                         if !title.is_empty() {
                             tab.title = title.into();
                         }
                         tab.relation = relation;
+                        // The mode the tab was left in, not the
+                        // connection's default: a tab switched to manual
+                        // was switched for a reason.
+                        tab.tx_mode = tx_mode;
                     }
                 }
                 SavedTab::Table { schema, table, page } => {
@@ -1013,6 +1058,7 @@ impl Shell {
                     title: tab.title.to_string(),
                     statement: tab.editor.read(cx).text().to_string(),
                     relation: tab.relation.clone(),
+                    tx_mode: tab.tx_mode,
                 },
                 Tab::History(_) => SavedTab::History,
             })
@@ -1439,6 +1485,10 @@ impl Shell {
             run: Run::Idle,
             landed: 0,
             in_transaction: false,
+            tx_mode: self.tx_default,
+            tx_statements: 0,
+            tx_done: None,
+            tx_ending: false,
             last_used: Instant::now(),
             session_ended: false,
             // Opened on the tab's first run, never here: a strip of a
@@ -1459,7 +1509,9 @@ impl Shell {
         // ⌘⏎ while the last run is still out does nothing: the key that
         // starts a run is not the key that stops one, and a second run
         // over the top of the first would leave the first unstoppable.
-        if tab.run.in_flight() {
+        // A commit on its way out holds the same connection, so it counts
+        // as a run in flight here.
+        if tab.run.in_flight() || tab.tx_ending {
             return;
         }
         // The tab opens before the connection does, so ⌘⏎ can arrive
@@ -1481,6 +1533,25 @@ impl Shell {
         }
         let tab_id = tab.id;
         let session = tab.session.clone();
+        // **Manual mode holds one transaction across the runs of a tab**,
+        // so a run opens one when none is open — and never when the buffer
+        // opens its own, because a second `BEGIN` is a warning from the
+        // server and a lie in the bar.
+        let begin = needs_begin(
+            tab.tx_mode,
+            tab.in_transaction,
+            query::transaction_verb(&statements[0]),
+        );
+        // What the buffer itself does to the transaction, which the bar has
+        // to report whichever mode the tab is in: a `COMMIT` typed by hand
+        // is the same event as the button. The **last** verb wins, because
+        // `BEGIN; …; COMMIT` in one buffer leaves nothing open.
+        let buffer_verb = statements.iter().rev().find_map(|sql| query::transaction_verb(sql));
+        // What the bar counts as having landed *inside* the transaction:
+        // the statements that are not boundaries. A bare `BEGIN` therefore
+        // opens a transaction with nothing in it, which is what it did.
+        let plain_statements =
+            statements.iter().filter(|sql| query::transaction_verb(sql).is_none()).count();
         // A tab about to open its first session may be the one too many.
         // Give back the session that has gone longest without a question;
         // with nothing spare to give, say so here rather than let the pool
@@ -1500,6 +1571,10 @@ impl Shell {
         let backend = session.as_ref().and_then(|session| session.backend());
         tab.run = Run::Running(Live { started: Instant::now(), backend });
         tab.error = None;
+        // "committed" was the answer to the last question. This is a new
+        // one, so the bar stops saying it: news about a transaction that
+        // has been over since before this run is not news.
+        tab.tx_done = None;
         tab.last_used = Instant::now();
         tab.session_ended = false;
         tab.generation += 1;
@@ -1509,7 +1584,7 @@ impl Shell {
         // The buffer has been edited since the tab was opened, and this is
         // the moment the user says it is worth something.
         self.remember_tabs(cx);
-        let task = run_statements(connection, session, statements, tab_id, generation, cx);
+        let task = run_statements(connection, session, begin, statements, tab_id, generation, cx);
         self.start_timer(cx);
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
@@ -1524,7 +1599,14 @@ impl Shell {
                 // but the history still keeps what the server said.
                 let stopped = matches!(tab.run, Run::Cancelling(_));
                 let waited = tab.run.live().map(|live| live.started.elapsed().as_millis());
-                let RunOutcome { session, result } = outcome;
+                let RunOutcome { session, result, began } = outcome;
+                // The `BEGIN` went out, so a transaction is open whether or
+                // not the statements after it worked: a statement that fails
+                // inside a transaction leaves it open and aborted, which is
+                // the state most worth having a bar for.
+                if began {
+                    tab.in_transaction = true;
+                }
                 // Kept whether the run worked or not. A failed statement
                 // does not end a transaction, and throwing the session away
                 // here would lose whatever the tab had set — and hand the
@@ -1559,6 +1641,27 @@ impl Shell {
                         // selection points at rows by index. Marks from the
                         // last answer can only point at these ones wrongly.
                         tab.selection.clear();
+                        // What the buffer did to the transaction itself. The
+                        // server's own answer follows in `refresh_transaction`
+                        // a moment later; this is what the bar says at once,
+                        // so a commit the user typed reads as a commit.
+                        match buffer_verb {
+                            Some(TxVerb::Begin) => tab.in_transaction = true,
+                            Some(TxVerb::Commit) => {
+                                tab.in_transaction = false;
+                                tab.tx_done = Some(TxEnd::Commit);
+                            }
+                            Some(TxVerb::Rollback) => {
+                                tab.in_transaction = false;
+                                tab.tx_done = Some(TxEnd::Rollback);
+                            }
+                            None => {}
+                        }
+                        if tab.in_transaction {
+                            tab.tx_statements += plain_statements;
+                        } else {
+                            tab.tx_statements = 0;
+                        }
                         Outcome { elapsed: Some(elapsed), rows: Some(rows), error: None }
                     }
                     Err(error) => {
@@ -1756,8 +1859,117 @@ impl Shell {
                 let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return };
                 if tab.in_transaction != open {
                     tab.in_transaction = open;
+                    // Nothing is open, so there is nothing for the count to
+                    // be a count of. It is reset here as well as on the
+                    // buttons, because the server is what has the last word:
+                    // a statement the app did not recognise may have ended
+                    // the transaction, and a stale count would outlive it.
+                    if !open {
+                        tab.tx_statements = 0;
+                    }
                     cx.notify();
                 }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // --- transactions -----------------------------------------------------
+
+    /// Switch which way this tab commits.
+    ///
+    /// **Auto is refused while a transaction is open.** The switch would
+    /// otherwise leave the transaction standing with nothing on screen
+    /// offering to end it, and the statements after it would land inside a
+    /// transaction the tab says it is not in. Commit or roll back first;
+    /// the bar is right there.
+    fn set_tx_mode(&mut self, mode: TxMode, cx: &mut Context<Self>) {
+        let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else { return };
+        if tab.tx_mode == mode {
+            return;
+        }
+        if mode == TxMode::Auto && tab.in_transaction {
+            return;
+        }
+        tab.tx_mode = mode;
+        // The mode is not news about the last transaction, and the bar's
+        // "committed" line is: switching clears it rather than leaving an
+        // answer to an older question under a control that just moved.
+        tab.tx_done = None;
+        // A tab remembers its mode across sessions, so a switch is worth
+        // writing back at once.
+        self.remember_tabs(cx);
+        cx.notify();
+    }
+
+    /// Commit or roll back the transaction the active tab is in.
+    ///
+    /// It goes down the tab's **own** session, because that is where the
+    /// transaction is: a `COMMIT` on a pooled connection would commit
+    /// nothing and report success. So it waits for the connection the same
+    /// way a run does — and a run in flight is holding it, which is why a
+    /// boundary is refused rather than queued behind one. The user has ⌘.
+    /// for that, and the bar says so.
+    fn end_transaction(&mut self, how: TxEnd, cx: &mut Context<Self>) {
+        let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else { return };
+        if !tab.in_transaction || tab.tx_ending {
+            return;
+        }
+        if tab.run.in_flight() {
+            tab.error = Some(RUN_HOLDS_THE_SESSION.to_string());
+            cx.notify();
+            return;
+        }
+        let Some(session) = tab.session.clone() else {
+            // No session and yet in a transaction is a state that cannot
+            // happen: the flag is only ever set from a session's answer.
+            return;
+        };
+        let (tab_id, statement) = (tab.id, how.sql());
+        tab.tx_ending = true;
+        tab.error = None;
+        tab.last_used = Instant::now();
+        cx.notify();
+
+        let started = Instant::now();
+        cx.spawn(async move |this, cx| {
+            let Ok(task) = this.update(cx, |_, cx| {
+                gpui_tokio::Tokio::spawn(cx, async move { session.end_transaction(how).await })
+            }) else {
+                return;
+            };
+            let outcome = flatten(task.await);
+            this.update(cx, |this, cx| {
+                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return };
+                tab.tx_ending = false;
+                tab.last_used = Instant::now();
+                match &outcome {
+                    Ok(()) => {
+                        tab.in_transaction = false;
+                        tab.tx_statements = 0;
+                        tab.tx_done = Some(how);
+                    }
+                    // The transaction is still whatever the server says it
+                    // is, so the bar stays up and `refresh_transaction`
+                    // below is what corrects it.
+                    Err(error) => tab.error = Some(error.clone()),
+                }
+                // A boundary is a statement the user ran on this
+                // connection, so the history keeps it: "why did my work
+                // disappear" is answered by a `ROLLBACK` in the list.
+                this.record_run(
+                    statement,
+                    RunSource::User,
+                    &Outcome {
+                        elapsed: Some(started.elapsed().as_millis()),
+                        rows: outcome.is_ok().then_some(0),
+                        error: outcome.err(),
+                    },
+                );
+                this.reload_open_history(cx);
+                this.refresh_transaction(tab_id, cx);
+                cx.notify();
             })
             .ok();
         })
@@ -2722,6 +2934,24 @@ impl Shell {
         self.stop_active_query(cx);
     }
 
+    fn on_commit_transaction(
+        &mut self,
+        _: &CommitTransaction,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.end_transaction(TxEnd::Commit, cx);
+    }
+
+    fn on_rollback_transaction(
+        &mut self,
+        _: &RollbackTransaction,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.end_transaction(TxEnd::Rollback, cx);
+    }
+
     fn on_new_query(&mut self, _: &NewQuery, window: &mut Window, cx: &mut Context<Self>) {
         self.new_query(window, cx);
     }
@@ -2917,13 +3147,18 @@ fn run_sql(
 struct RunOutcome {
     session: Option<Arc<dyn Session>>,
     result: Result<(QueryResult, u128, usize), String>,
+    /// Whether the run opened a transaction of its own, for a tab in
+    /// [`TxMode::Manual`]. It is reported apart from the result because it
+    /// is true on both paths: a statement that fails inside a transaction
+    /// leaves it open, and that is the state most worth reporting.
+    began: bool,
 }
 
 impl RunOutcome {
     /// The shell went away mid-run. Nothing will read this, and the pool
     /// it belonged to is going with it.
     fn abandoned() -> Self {
-        Self { session: None, result: Err("the workspace closed".to_string()) }
+        Self { session: None, result: Err("the workspace closed".to_string()), began: false }
     }
 }
 
@@ -2938,6 +3173,13 @@ const CALLED_OFF: &str = "the run was called off before it started";
 const NO_SESSION_LEFT: &str =
     "every connection is in use — close a tab, or end a transaction, and run again";
 
+/// Said when a commit or a rollback is asked for while a run is still out.
+/// A session is one connection and the run has it, so the boundary would
+/// have to queue behind the very statement the user may want to give up.
+/// It names the way out rather than waiting.
+const RUN_HOLDS_THE_SESSION: &str =
+    "this tab is still running a statement — ⌘. stops it, then commit or roll back";
+
 /// Run a buffer's statements in order and keep the last result that has
 /// columns, so a trailing `create table` does not blank a grid the SELECT
 /// before it filled. The first statement to fail stops the run and its
@@ -2950,6 +3192,7 @@ const NO_SESSION_LEFT: &str =
 fn run_statements(
     connection: Arc<dyn Connection>,
     session: Option<Arc<dyn Session>>,
+    begin: bool,
     statements: Vec<String>,
     tab_id: u64,
     generation: u64,
@@ -2968,7 +3211,9 @@ fn run_statements(
                 let Ok(opening) = opening else { return RunOutcome::abandoned() };
                 match flatten(opening.await) {
                     Ok(session) => session,
-                    Err(error) => return RunOutcome { session: None, result: Err(error) },
+                    Err(error) => {
+                        return RunOutcome { session: None, result: Err(error), began: false };
+                    }
                 }
             }
         };
@@ -2992,21 +3237,31 @@ fn run_statements(
             !matches!(tab.run, Run::Cancelling(_))
         });
         if !matches!(go, Ok(true)) {
-            return RunOutcome { session: Some(session), result: Err(CALLED_OFF.to_string()) };
+            // Nothing was sent, so nothing was begun: a run called off in
+            // this window costs the server nothing at all.
+            return RunOutcome {
+                session: Some(session),
+                result: Err(CALLED_OFF.to_string()),
+                began: false,
+            };
         }
 
         let running = this.update(cx, |_, cx| {
             gpui_tokio::Tokio::spawn(cx, async move {
-                let outcome = execute_all(&session, &statements).await;
-                (session, outcome)
+                let (began, outcome) = execute_all(&session, begin, &statements).await;
+                (session, began, outcome)
             })
         });
         let Ok(running) = running else { return RunOutcome::abandoned() };
         match running.await {
-            Ok((session, result)) => RunOutcome { session: Some(session), result },
+            Ok((session, began, result)) => RunOutcome { session: Some(session), result, began },
+            // The task itself died, so what reached the server is unknown.
+            // `refresh_transaction` asks rather than guessing, and it is the
+            // one thing here that can answer.
             Err(join) => RunOutcome {
                 session: None,
                 result: Err(format!("the query was interrupted: {join}")),
+                began: false,
             },
         }
     })
@@ -3014,11 +3269,34 @@ fn run_statements(
 
 /// Send a buffer's statements in turn, keeping the last result that has
 /// columns. The first failure ends the run.
+///
+/// `begin` opens a transaction in front of them, for a tab in
+/// [`TxMode::Manual`]. It is **not one of the statements**: it does not
+/// count towards what the result line reports, and it is not what the
+/// server is asked to time. The clock does start before it, because the
+/// round trip is part of what the user waited.
+///
+/// The `bool` that comes back says the transaction was opened, which the
+/// caller needs on the failure path too.
 async fn execute_all(
     session: &Arc<dyn Session>,
+    begin: bool,
     statements: &[String],
-) -> Result<(QueryResult, u128, usize), String> {
+) -> (bool, Result<(QueryResult, u128, usize), String>) {
     let started = Instant::now();
+    if begin {
+        if let Err(error) = session.begin().await {
+            return (false, Err(error.to_string()));
+        }
+    }
+    (begin, run_each(session, statements, started).await)
+}
+
+async fn run_each(
+    session: &Arc<dyn Session>,
+    statements: &[String],
+    started: Instant,
+) -> Result<(QueryResult, u128, usize), String> {
     let mut last = QueryResult::default();
     let mut ran = 0;
     for statement in statements {
@@ -3202,6 +3480,8 @@ impl Render for Shell {
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::on_run_query))
             .on_action(cx.listener(Self::on_stop_query))
+            .on_action(cx.listener(Self::on_commit_transaction))
+            .on_action(cx.listener(Self::on_rollback_transaction))
             .on_action(cx.listener(Self::on_new_query))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_refresh))
@@ -4200,6 +4480,240 @@ impl Shell {
         )
     }
 
+    /// The comp's `tx auto | manual` switch, in the query toolbar.
+    ///
+    /// Two chips and one of them is always lit: the mode is a choice
+    /// between two states rather than a switch with an off position. The
+    /// dot on `manual` is the quiet mark that a transaction is open — the
+    /// bar under the editor is the loud one.
+    ///
+    /// **Auto does nothing while a transaction is open**, and paints faint
+    /// to say so. Switching would leave the transaction standing with
+    /// nothing offering to end it; the bar's two buttons are the way out.
+    fn tx_switch(&self, tab: &QueryTab, colors: &ThemeColors, cx: &Context<Self>) -> Div {
+        let manual = tab.tx_mode == TxMode::Manual;
+        let locked = tab.in_transaction;
+        let chip = |mode: TxMode, lit: bool, faint: bool, cx: &Context<Self>| {
+            let mut chip = div()
+                .id(SharedString::from(format!("tx-{}", mode.as_str())))
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .px(px(7.))
+                .py(px(4.))
+                .rounded(px(4.))
+                .text_size(px(10.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(if lit {
+                    colors.accent_deep
+                } else if faint {
+                    colors.text_faint
+                } else {
+                    colors.text_muted
+                })
+                .child(mode.as_str());
+            if lit {
+                chip = chip.bg(colors.selection);
+            }
+            if !faint {
+                chip = chip.cursor_pointer().on_click(
+                    cx.listener(move |this, _event, _window, cx| this.set_tx_mode(mode, cx)),
+                );
+            }
+            chip
+        };
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(3.))
+            .p(px(3.))
+            .border_1()
+            .border_color(if manual { colors.running_border } else { colors.border_strong })
+            .rounded(px(6.))
+            .bg(if manual { colors.running_surface } else { colors.panel })
+            .child(
+                div()
+                    .px(px(4.))
+                    .text_size(px(9.))
+                    .text_color(colors.mode_off_text)
+                    .child("tx"),
+            )
+            .child(chip(TxMode::Auto, !manual, locked, cx))
+            .child(
+                chip(TxMode::Manual, manual, false, cx).when(manual, |chip| {
+                    chip.child(status_dot(if tab.in_transaction {
+                        colors.running_mark
+                    } else {
+                        colors.running_border
+                    }))
+                }),
+            )
+    }
+
+    /// The strip over the result: what the open transaction holds, and the
+    /// two ways to end it.
+    ///
+    /// It is painted **whichever mode the tab is in**. A `BEGIN` the user
+    /// typed into an auto-mode buffer opens a transaction exactly as manual
+    /// mode does, and leaving that unmarked was the old behaviour's real
+    /// gap: the transaction was on screen only as a badge, and the only way
+    /// out of it was to close the tab, which rolled it back.
+    ///
+    /// It also stays up for a moment after the transaction ends, saying
+    /// which way it went. "committed" is the answer to the question the
+    /// user just asked, and a strip that vanished would leave it
+    /// unanswered.
+    fn tx_bar(&self, tab: &QueryTab, colors: &ThemeColors, cx: &Context<Self>) -> Option<Div> {
+        let state = TxState {
+            mode: tab.tx_mode,
+            open: tab.in_transaction,
+            done: tab.tx_done,
+            statements: tab.tx_statements,
+            running: tab.run.in_flight(),
+            ending: tab.tx_ending,
+        };
+        let (title, sub) = tx_copy(state)?;
+        // Open warms to the accent's family, a commit rests in the dev
+        // green the read-only mark already uses, and a rollback goes back
+        // to paper: nothing was written, so nothing is worth a colour.
+        let (surface, border, ink, sub_ink, dot) = match (state.open, state.done) {
+            (true, _) => (
+                colors.running_surface,
+                colors.running_border,
+                colors.accent_deep,
+                colors.accent_muted,
+                colors.running_mark,
+            ),
+            (false, Some(TxEnd::Commit)) => (
+                colors.env_dev_surface,
+                colors.env_dev_inner,
+                colors.env_dev_text,
+                colors.text_muted,
+                colors.env_dev,
+            ),
+            (false, _) => (
+                colors.panel,
+                colors.border_strong,
+                colors.text_secondary,
+                colors.text_muted,
+                colors.text_faint,
+            ),
+        };
+        // A boundary needs the session, and a run is holding it. The
+        // buttons go faint rather than away: the transaction is still
+        // there, and so is the answer to it once ⌘. has landed.
+        let ready = state.open && !state.running && !state.ending;
+
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(14.))
+                .py(px(9.))
+                .border_b_1()
+                .border_color(border)
+                .bg(surface)
+                .child(status_dot(dot))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ink)
+                        .child(title),
+                )
+                .child(div().text_size(px(10.)).text_color(sub_ink).child(sub))
+                .child(div().flex_1())
+                .when(state.open, |bar| {
+                    bar.child(self.tx_button(TxEnd::Rollback, ready, colors, cx))
+                        .child(self.tx_button(TxEnd::Commit, ready, colors, cx))
+                }),
+        )
+    }
+
+    /// One of the bar's two buttons. Commit is filled in the accent, as the
+    /// deliberate answer; rollback is outlined over paper, because
+    /// discarding work the user has not seen the point of yet must not be
+    /// the button the eye lands on first.
+    ///
+    /// The key sits in a **keycap**, the same one the run button carries.
+    /// These three are the app's only buttons with a key written on them,
+    /// and a key that reads as a key in one of them and as trailing text in
+    /// the others would say the three were different kinds of thing. The
+    /// tones follow the fill, as they do there: paper over the outlined
+    /// button, and the white-on-fill pair over the filled one.
+    fn tx_button(
+        &self,
+        how: TxEnd,
+        ready: bool,
+        colors: &ThemeColors,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let (label, keys) = match how {
+            TxEnd::Commit => ("commit", "⌘S"),
+            TxEnd::Rollback => ("rollback", "⇧⌘R"),
+        };
+        let (border, fill, ink, cap_surface, cap_border) = match how {
+            TxEnd::Commit => (
+                colors.accent,
+                colors.accent,
+                colors.window,
+                colors.key_on_fill_surface,
+                colors.key_on_fill_border,
+            ),
+            TxEnd::Rollback => (
+                colors.border_strong,
+                colors.elevated,
+                colors.text_secondary,
+                colors.window,
+                colors.mode_off_border,
+            ),
+        };
+        let button = div()
+            .id(SharedString::from(format!("tx-{label}")))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            // Less room on the right than on the left: the keycap carries a
+            // box of its own, and even padding either side of it reads as
+            // too much. The run button is spaced the same way.
+            //
+            // **Everything here is a size under the run button's**, and the
+            // difference is the point: that one is the verb of the whole
+            // pane and these two are controls on a strip inside it. A
+            // rollback drawn as large as a run would read as the bigger
+            // decision, which it is not.
+            .pl(px(8.))
+            .pr(px(4.))
+            .py(px(3.))
+            .border_1()
+            .border_color(border)
+            .rounded(px(5.))
+            .bg(fill)
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .when(how == TxEnd::Commit, |label| {
+                        label.font_weight(FontWeight::MEDIUM)
+                    })
+                    .text_color(ink)
+                    .child(label),
+            )
+            .child(keycap(keys, 9., cap_surface, cap_border, ink));
+        if !ready {
+            return button.opacity(0.5);
+        }
+        match how {
+            TxEnd::Commit => button.hover(|s| s.bg(colors.accent_deep)),
+            TxEnd::Rollback => button.hover(|s| s.border_color(colors.text_faint)),
+        }
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _event, _window, cx| this.end_transaction(how, cx)))
+    }
+
     /// One button for all three verbs, as the comp draws it: **run** filled
     /// in the accent, **stop** outlined in clay over paper, **terminate**
     /// filled in clay. The escalation is the point — the button that ends a
@@ -4323,6 +4837,10 @@ impl Shell {
                 // out to be slow does not resize the button under the
                 // pointer that is reaching for it.
                 div()
+                    // Fixed *and* `flex_none`: a width alone still leaves a
+                    // flex item shrinkable, so a toolbar tight for room
+                    // would take the pixels back out of the word.
+                    .flex_none()
                     .w(px(if phase == RunPhase::Terminate {
                         TERMINATE_LABEL_WIDTH
                     } else {
@@ -4333,25 +4851,10 @@ impl Shell {
                     .text_color(ink)
                     .child(verb),
             )
-            .child(
-                // The keycap the comp puts inside the button, with the 2px
-                // bottom edge that makes it read as a key. It does not move
-                // on a press: the tone says that, and a keycap sinking a
-                // pixel is the one thing on this button that would still
-                // read as a mechanism.
-                div()
-                    .px(px(6.))
-                    .py(px(4.))
-                    .border_1()
-                    .border_b_2()
-                    .border_color(cap_border)
-                    .rounded(px(5.))
-                    .bg(cap_surface)
-                    .text_size(px(11.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(ink)
-                    .child(keys),
-            );
+            // The keycap does not move on a press: the tone says the press
+            // landed, and a keycap sinking a pixel is the one thing on this
+            // button that would still read as a mechanism.
+            .child(keycap(keys, 11., cap_surface, cap_border, ink));
 
         // A press holds the button still at its pressed tone: what is under
         // the pointer must not also be breathing.
@@ -4492,25 +4995,64 @@ impl Shell {
                 .border_b_1()
                 .border_color(colors.hairline)
                 .child(
+                    // **Everything on the left gives up room before any
+                    // control on the right does.** The run button must not
+                    // move because a tab has a long name, and it must not
+                    // be the thing that falls off the edge: it is
+                    // `flex_none`, so a row that overflows pushes it past
+                    // the pane and clips it.
+                    //
+                    // `min_w(0)` on each child is what makes that possible.
+                    // A text element's automatic minimum is its own text,
+                    // so without it these four cannot shrink at all,
+                    // whatever the flex factors say — and the row overflows
+                    // rather than truncating. It is the same pairing every
+                    // cell in the grid needs.
+                    //
+                    // This group also *is* the spacer: it takes the slack
+                    // when there is any, so the controls sit right however
+                    // little there is to say on the left.
                     div()
-                        .text_size(px(12.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(colors.text)
-                        .child(tab.title.clone()),
+                        .flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .items_center()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(colors.text)
+                                .truncate()
+                                .child(tab.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .text_size(px(11.))
+                                .text_color(colors.text_muted)
+                                .truncate()
+                                .child(format!(
+                                    "{} · {}",
+                                    self.session_name(),
+                                    self.mode_word()
+                                )),
+                        )
+                        .children(session_mark(tab, colors))
+                        // With several statements in the buffer, say which
+                        // one a run would send, so ⌘⏎ never comes as a
+                        // surprise.
+                        .children(run_scope(tab, cx).map(|scope| {
+                            div()
+                                .min_w(px(0.))
+                                .text_size(px(11.))
+                                .text_color(colors.text_faint)
+                                .truncate()
+                                .child(scope)
+                        })),
                 )
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(colors.text_muted)
-                        .child(format!("{} · {}", self.session_name(), self.mode_word())),
-                )
-                .children(session_mark(tab, colors))
-                // With several statements in the buffer, say which one a
-                // run would send, so ⌘⏎ never comes as a surprise.
-                .children(run_scope(tab, cx).map(|scope| {
-                    div().text_size(px(11.)).text_color(colors.text_faint).child(scope)
-                }))
-                .child(div().flex_1())
+                .child(self.tx_switch(tab, colors, cx))
                 .children(self.run_timer(tab, colors))
                 .child(self.run_button(tab, colors, cx)),
         )
@@ -4523,6 +5065,9 @@ impl Shell {
                 .child(tab.editor.clone()),
         )
         .children(tab.error.clone().map(|error| error_strip(error, colors)))
+        // Directly over the result, because it is about what the runs have
+        // done rather than about the statement above them.
+        .children(self.tx_bar(tab, colors, cx))
         .child(
             // Result header
             div()
@@ -5629,6 +6174,46 @@ fn column_row(
     row
 }
 
+/// The comp's keycap, as it appears **inside a button**: a small box with a
+/// 2px bottom edge, which is the whole of what makes it read as a key
+/// rather than as a chip.
+///
+/// Every button in the app that carries a key uses this one — the run
+/// button's three verbs, and the transaction bar's commit and rollback.
+/// They are the only buttons that name a key, and a key drawn as a key on
+/// one and as trailing text on another would say they were different kinds
+/// of thing.
+///
+/// The tones are the caller's, because they follow the **fill** rather than
+/// the key: `key_on_fill_*` over a filled button, paper over an outlined
+/// one. Both of the alpha pair carry alpha for exactly this reason — one
+/// cap has to work over ochre and over clay without a tone per state.
+///
+/// **The padding is in proportion to the type**, the comp's 6 and 4 at its
+/// own 11px. A smaller cap has to be smaller in every direction: a 9px key
+/// in a box built for an 11px one is a small word in a big box, which reads
+/// as a mistake rather than as a smaller key. The bottom edge stays at 2px
+/// through all of it — it is what says "key", and 1.6px of it would only
+/// blur.
+///
+/// [`key_badge`] is the flat cousin, for a key named in a hint or a footer
+/// rather than written on a button.
+fn keycap(keys: &'static str, size: f32, surface: Hsla, border: Hsla, ink: Hsla) -> Div {
+    div()
+        .flex_none()
+        .px(px(size * 6. / 11.))
+        .py(px(size * 4. / 11.))
+        .border_1()
+        .border_b_2()
+        .border_color(border)
+        .rounded(px(5.))
+        .bg(surface)
+        .text_size(px(size))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(ink)
+        .child(keys)
+}
+
 fn key_badge(keys: &'static str, colors: &ThemeColors) -> Div {
     div()
         .flex_none()
@@ -5742,6 +6327,82 @@ fn evictable(states: &[SessionState]) -> Option<u64> {
     states.iter().filter(|state| spare(state)).max_by_key(|state| state.idle).map(|s| s.tab_id)
 }
 
+/// Whether a run has to open a transaction before it sends anything.
+///
+/// Three ways to answer no, and each of them matters: auto mode holds no
+/// transaction at all; one is open already, so a second `BEGIN` would be a
+/// warning from the server and a lie in the bar; and the buffer opens its
+/// own, which is the user saying where the transaction starts.
+fn needs_begin(mode: TxMode, in_transaction: bool, first: Option<TxVerb>) -> bool {
+    mode == TxMode::Manual && !in_transaction && first != Some(TxVerb::Begin)
+}
+
+/// Everything the transaction bar reads, as plain values.
+///
+/// Kept apart from the tab so the wording below is a function of numbers
+/// and flags, and can be argued with in a test rather than in a running
+/// window — the reason `confirm_copy` and the session policy are written
+/// the same way.
+#[derive(Clone, Copy, Debug)]
+struct TxState {
+    mode: TxMode,
+    /// Whether a transaction is open, as the server last said.
+    open: bool,
+    /// How the last one ended, when nothing is open.
+    done: Option<TxEnd>,
+    /// Statements that have landed inside the open transaction.
+    statements: usize,
+    /// A run is out on this tab's session.
+    running: bool,
+    /// A commit or a rollback is out.
+    ending: bool,
+}
+
+/// What the transaction bar says: the state, and the line under it.
+///
+/// `None` is the ordinary case — no transaction, and none just ended — and
+/// it means the bar is not painted at all. A strip that said "no
+/// transaction" would be a strip that is always there saying nothing.
+fn tx_copy(state: TxState) -> Option<(&'static str, String)> {
+    if state.open {
+        let title = "transaction open";
+        if state.ending {
+            return Some((title, "ending it · waiting for the server".to_string()));
+        }
+        if state.running {
+            // The session is one connection and the run has it, so the
+            // buttons cannot be answered yet. Say which key clears the way.
+            return Some((title, "a run is out · ⌘. stops it first".to_string()));
+        }
+        let held = match state.statements {
+            // The transaction is open and nothing has landed in it: a run
+            // that failed on its first statement leaves exactly this.
+            0 => "nothing has landed in it yet".to_string(),
+            1 => "1 statement".to_string(),
+            n => format!("{n} statements"),
+        };
+        return Some((title, format!("{held} · nothing visible to anyone else yet")));
+    }
+    match state.done? {
+        // What happens *next* differs by mode, and the line has to be
+        // right about it: in auto mode nothing opens another transaction.
+        TxEnd::Commit => Some((
+            "committed",
+            match state.mode {
+                TxMode::Manual => {
+                    "changes are live · a new transaction opens on your next run".to_string()
+                }
+                TxMode::Auto => {
+                    "changes are live · statements commit on their own again".to_string()
+                }
+            },
+        )),
+        TxEnd::Rollback => {
+            Some(("rolled back", "all changes discarded · nothing was written".to_string()))
+        }
+    }
+}
+
 /// What the toolbar says about the tab's own connection, when there is
 /// anything to say.
 ///
@@ -5753,23 +6414,30 @@ fn evictable(states: &[SessionState]) -> Option<u64> {
 /// a `search_path` set an hour ago is gone, and a mark is the difference
 /// between that and a mystery.
 ///
-/// In transaction wins when both are true — but they cannot be: a session
-/// holding a transaction is the one thing the sweep never takes.
+/// One state earns a mark, and it is not "a session is open" — that is the
+/// ordinary case and needs no badge. **session ended** explains a reset the
+/// user did not ask for: the sweep took the connection back, so a
+/// `search_path` set an hour ago is gone, and a mark is the difference
+/// between that and a mystery.
+///
+/// An open transaction used to be a badge here as well. It is not any more,
+/// because the transaction bar says it in a whole strip and offers the two
+/// ways out — and the toolbar's mode switch carries the same dot. Three
+/// marks for one state is two too many.
 fn session_mark(tab: &QueryTab, colors: &ThemeColors) -> Option<Div> {
-    let (text, ink) = if tab.in_transaction {
-        ("IN TRANSACTION", colors.accent_deep)
-    } else if tab.session_ended {
-        ("session ended · a run opens a new one", colors.text_faint)
-    } else {
+    if !tab.session_ended {
         return None;
-    };
+    }
     Some(
+        // Shrinkable, not `flex_none`: it is the longest thing on the
+        // toolbar's left side, and a note about a connection that reset
+        // must not be what pushes the run button off the edge.
         div()
-            .flex_none()
+            .min_w(px(0.))
             .text_size(px(11.))
-            .font_weight(if tab.in_transaction { FontWeight::MEDIUM } else { FontWeight::NORMAL })
-            .text_color(ink)
-            .child(text),
+            .text_color(colors.text_faint)
+            .truncate()
+            .child("session ended · a run opens a new one"),
     )
 }
 
@@ -5848,6 +6516,97 @@ mod tests {
         assert!(!cancelling.arming());
         // Nothing is out, so a click runs a query.
         assert!(!Run::Idle.arming());
+    }
+
+    /// Manual mode's whole mechanism: one `BEGIN`, and never a second.
+    #[test]
+    fn a_run_opens_a_transaction_only_when_manual_mode_has_none() {
+        // Auto mode holds nothing open, whatever the buffer says.
+        assert!(!needs_begin(TxMode::Auto, false, None));
+        assert!(!needs_begin(TxMode::Auto, false, Some(TxVerb::Begin)));
+        // Manual mode with nothing open opens one.
+        assert!(needs_begin(TxMode::Manual, false, None));
+        // ...and never a second: the transaction spans the runs of the tab.
+        assert!(!needs_begin(TxMode::Manual, true, None));
+        // The buffer's own `BEGIN` is the user saying where it starts.
+        assert!(!needs_begin(TxMode::Manual, false, Some(TxVerb::Begin)));
+        // A buffer that ends a transaction still needs one to end.
+        assert!(needs_begin(TxMode::Manual, false, Some(TxVerb::Commit)));
+    }
+
+    /// The bar is painted for a transaction the *user* opened as well, in
+    /// either mode — which is the whole of what "handle a typed BEGIN"
+    /// means on screen.
+    #[test]
+    fn the_transaction_bar_speaks_for_both_modes() {
+        let state = |mode, open, done, statements| TxState {
+            mode,
+            open,
+            done,
+            statements,
+            running: false,
+            ending: false,
+        };
+        // Nothing open and nothing just ended: no bar at all.
+        assert!(tx_copy(state(TxMode::Auto, false, None, 0)).is_none());
+        assert!(tx_copy(state(TxMode::Manual, false, None, 0)).is_none());
+
+        // A `BEGIN` typed into an auto-mode buffer gets the same bar as a
+        // transaction manual mode opened.
+        let (title, sub) = tx_copy(state(TxMode::Auto, true, None, 2)).unwrap();
+        assert_eq!(title, "transaction open");
+        assert!(sub.starts_with("2 statements · "), "{sub}");
+        let (manual_title, _) = tx_copy(state(TxMode::Manual, true, None, 1)).unwrap();
+        assert_eq!(manual_title, title);
+        // One statement is not "1 statements".
+        let (_, sub) = tx_copy(state(TxMode::Manual, true, None, 1)).unwrap();
+        assert!(sub.starts_with("1 statement · "), "{sub}");
+        // A run that failed on its first statement leaves a transaction
+        // with nothing in it, and the line says so rather than "0".
+        let (_, sub) = tx_copy(state(TxMode::Manual, true, None, 0)).unwrap();
+        assert!(sub.starts_with("nothing has landed in it yet"), "{sub}");
+    }
+
+    /// What happens *next* differs by mode, so the line after a commit
+    /// cannot be one sentence for both: in auto mode nothing opens another
+    /// transaction.
+    #[test]
+    fn the_line_after_a_commit_says_what_the_mode_does_next() {
+        let ended = |mode, done| TxState {
+            mode,
+            open: false,
+            done: Some(done),
+            statements: 0,
+            running: false,
+            ending: false,
+        };
+        let (title, sub) = tx_copy(ended(TxMode::Manual, TxEnd::Commit)).unwrap();
+        assert_eq!(title, "committed");
+        assert!(sub.ends_with("a new transaction opens on your next run"), "{sub}");
+        let (_, sub) = tx_copy(ended(TxMode::Auto, TxEnd::Commit)).unwrap();
+        assert!(sub.ends_with("statements commit on their own again"), "{sub}");
+        let (title, sub) = tx_copy(ended(TxMode::Auto, TxEnd::Rollback)).unwrap();
+        assert_eq!(title, "rolled back");
+        assert!(sub.contains("nothing was written"), "{sub}");
+    }
+
+    /// A run holds the one connection the transaction is on, so the bar
+    /// says which key clears the way rather than offering a button that
+    /// would have to queue behind the run.
+    #[test]
+    fn a_run_in_flight_is_named_in_the_bar() {
+        let state = TxState {
+            mode: TxMode::Manual,
+            open: true,
+            done: None,
+            statements: 3,
+            running: true,
+            ending: false,
+        };
+        let (_, sub) = tx_copy(state).unwrap();
+        assert!(sub.contains("⌘."), "{sub}");
+        let (_, sub) = tx_copy(TxState { running: false, ending: true, ..state }).unwrap();
+        assert!(sub.contains("waiting for the server"), "{sub}");
     }
 
     /// The shape a VPN puts the app in, and the reason the split exists: a

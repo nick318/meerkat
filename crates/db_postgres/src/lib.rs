@@ -14,7 +14,7 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use db_client::{
     Connection, Limits, Profile, QueryResult, Result, RowChange, RowSink, RunId, ServerTiming,
-    Session, Stop, Value, Wire,
+    Session, Stop, TxEnd, Value, Wire,
 };
 use futures::TryStreamExt as _;
 use introspect::{Catalog, Column, Schema, Table, TableKind};
@@ -242,6 +242,9 @@ pub fn profile_from_url(id: &str, name: &str, url: &str) -> Result<(Profile, Opt
         // the flag from the form. Read-only is the value a new connection
         // starts on.
         read_only: true,
+        // Nor does a URL say who commits. Auto is what a connection does
+        // with nothing asked of it, and the form sets the other one.
+        tx_mode: db_client::TxMode::Auto,
     };
     Ok((profile, password_in(url)))
 }
@@ -415,6 +418,23 @@ struct PostgresSession {
     limits: Limits,
 }
 
+impl PostgresSession {
+    /// Send a transaction boundary down this session's own connection.
+    ///
+    /// It has to be this connection and no other: a transaction belongs to
+    /// the connection that opened it, so a `COMMIT` on a pooled one would
+    /// commit nothing and say it worked.
+    async fn boundary(&self, sql: &str) -> Result<()> {
+        let mut held = self.conn.lock().await;
+        let conn = held.as_mut().context("this tab's session is closed")?;
+        sqlx::query(sql)
+            .execute(&mut **conn)
+            .await
+            .with_context(|| format!("the server refused {sql}"))?;
+        Ok(())
+    }
+}
+
 /// One reading of a statement's running totals.
 #[derive(Clone, Copy)]
 struct Counted {
@@ -502,6 +522,17 @@ impl Session for PostgresSession {
                 .context("failed to read what the session is doing")?
                 .flatten();
         Ok(state.is_some_and(|state| state.starts_with("idle in transaction")))
+    }
+
+    /// One statement, one round trip, and nothing else: no cap, no timing,
+    /// no `describe` to ask what columns `BEGIN` returns. See
+    /// [`Session::begin`] for why a boundary is not a run.
+    async fn begin(&self) -> Result<()> {
+        self.boundary("BEGIN").await
+    }
+
+    async fn end_transaction(&self, how: TxEnd) -> Result<()> {
+        self.boundary(how.sql()).await
     }
 
     async fn close(&self) {
@@ -1504,6 +1535,53 @@ mod tests {
 
         session.execute("ROLLBACK").await.unwrap();
         assert!(!session.in_transaction().await.unwrap());
+    }
+
+    /// What manual mode is made of. The app opens the transaction, the
+    /// statements of several runs land inside it, and the user's word ends
+    /// it — so the boundaries have to work without going through `execute`,
+    /// which is the path with the cap and the timing on it.
+    #[tokio::test]
+    async fn a_session_opens_and_ends_a_transaction_on_request() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect_url(&url, false).await.unwrap();
+        let session = conn.open_session().await.unwrap();
+
+        session.begin().await.unwrap();
+        assert!(session.in_transaction().await.unwrap());
+        session.execute("CREATE TEMP TABLE meerkat_manual_probe (id int)").await.unwrap();
+        session.execute("INSERT INTO meerkat_manual_probe VALUES (1)").await.unwrap();
+        // Still open across the runs, which is the whole of manual mode.
+        assert!(session.in_transaction().await.unwrap());
+
+        session.end_transaction(TxEnd::Rollback).await.unwrap();
+        assert!(!session.in_transaction().await.unwrap());
+        let error =
+            session.execute("SELECT * FROM meerkat_manual_probe").await.unwrap_err().to_string();
+        assert!(error.contains("meerkat_manual_probe"), "{error}");
+
+        // And a commit keeps what the transaction did. A temp table lives
+        // as long as the session, so it is proof enough without writing to
+        // anything the server keeps.
+        session.begin().await.unwrap();
+        session.execute("CREATE TEMP TABLE meerkat_manual_kept (id int)").await.unwrap();
+        session.end_transaction(TxEnd::Commit).await.unwrap();
+        assert!(!session.in_transaction().await.unwrap());
+        session.execute("SELECT * FROM meerkat_manual_kept").await.unwrap();
+    }
+
+    /// Ending a transaction nobody opened is not an error. The app sends it
+    /// rather than asking first, and Postgres answers "there is no
+    /// transaction in progress" and carries on.
+    #[tokio::test]
+    async fn ending_a_transaction_that_is_not_open_is_not_an_error() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+        let session = conn.open_session().await.unwrap();
+        session.end_transaction(TxEnd::Commit).await.unwrap();
+        session.end_transaction(TxEnd::Rollback).await.unwrap();
+        // The session is unharmed and still answers questions.
+        session.execute("SELECT 1").await.unwrap();
     }
 
     /// A session may reach its last `Arc` **anywhere**, and for this app

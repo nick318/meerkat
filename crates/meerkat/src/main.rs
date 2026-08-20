@@ -59,6 +59,17 @@ fn main() {
             // ⌘. stops the run the way it does in psql's siblings: once to
             // ask the statement to give up, again to close the backend.
             KeyBinding::new("cmd-.", shell::StopQuery, Some("Shell")),
+            // The two ends of a transaction. ⌘S is the comp's own key and
+            // means here what it means everywhere: make this permanent.
+            //
+            // **The rollback key is not the comp's ⇧⌘Z.** That is Redo in
+            // the SQL editor, whose context sits *inside* the shell's, so a
+            // binding here would never fire while the user is typing — and
+            // taking redo off a text editor would be the wrong trade even
+            // if it did. ⇧⌘R is free, and it is the letter the word starts
+            // with.
+            KeyBinding::new("cmd-s", shell::CommitTransaction, Some("Shell")),
+            KeyBinding::new("cmd-shift-r", shell::RollbackTransaction, Some("Shell")),
             KeyBinding::new("cmd-t", shell::NewQuery, Some("Shell")),
             KeyBinding::new("cmd-w", shell::CloseTab, Some("Shell")),
             KeyBinding::new("cmd-r", shell::Refresh, Some("Shell")),

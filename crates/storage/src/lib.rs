@@ -3,7 +3,7 @@
 //! Stored in a SQLite file under the user data directory (Zed `db` pattern).
 
 use anyhow::{Context as _, Result};
-use db_client::{Engine, Profile};
+use db_client::{Engine, Profile, TxMode};
 use introspect::Catalog;
 use rusqlite::{Connection, OptionalExtension as _};
 use std::path::PathBuf;
@@ -103,9 +103,16 @@ pub struct HistoryFilter {
 pub enum SavedTab {
     /// The paged table view, on the page it was left on.
     Table { schema: String, table: String, page: usize },
-    /// A query tab: its statement, the name on the strip, and the
-    /// relation it was opened on, when it came from the sidebar.
-    Query { title: String, statement: String, relation: Option<(String, String)> },
+    /// A query tab: its statement, the name on the strip, the relation it
+    /// was opened on when it came from the sidebar, and which way it
+    /// commits. The mode is kept and the transaction is not: a restored tab
+    /// has no session, so there is nothing open to come back to.
+    Query {
+        title: String,
+        statement: String,
+        relation: Option<(String, String)>,
+        tx_mode: TxMode,
+    },
     /// The query-history tab. It is a view of this file, so it carries
     /// no state worth keeping.
     History,
@@ -186,29 +193,43 @@ impl Store {
     }
 
     /// Columns added after the first release. Each one is added on its own,
-    /// so an older profiles file keeps its rows.
+    /// so an older file keeps its rows.
     fn migrate(&self) -> Result<()> {
-        let existing: Vec<String> = {
-            let mut stmt = self.conn.prepare("PRAGMA table_info(profiles)")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            rows.collect::<std::result::Result<_, _>>()?
-        };
         // `tables` and `views` were dropped from the screen; an older file
         // keeps those columns, and nothing reads them.
         //
         // `read_only` arrives NULL on every row an older build saved, and
         // `list_connections` reads NULL as on: a connection saved before
         // the app could be told to be careful is one nobody said could
-        // write.
-        for (column, kind) in [
-            ("last_opened", "INTEGER"),
-            ("server", "TEXT"),
-            ("env", "TEXT"),
-            ("read_only", "INTEGER"),
-        ] {
+        // write. `tx_mode` reads NULL as auto for the mirror-image reason —
+        // nobody asked to hold transactions open, so nothing does.
+        self.add_columns(
+            "profiles",
+            &[
+                ("last_opened", "INTEGER"),
+                ("server", "TEXT"),
+                ("env", "TEXT"),
+                ("read_only", "INTEGER"),
+                ("tx_mode", "TEXT"),
+            ],
+        )?;
+        // A query tab remembers which way it commits, so a strip restored
+        // on a manual connection comes back manual. NULL is auto.
+        self.add_columns("open_tabs", &[("tx_mode", "TEXT")])?;
+        Ok(())
+    }
+
+    fn add_columns(&self, table: &str, columns: &[(&str, &str)]) -> Result<()> {
+        let existing: Vec<String> = {
+            let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for (column, kind) in columns {
             if !existing.iter().any(|name| name == column) {
-                self.conn
-                    .execute_batch(&format!("ALTER TABLE profiles ADD COLUMN {column} {kind}"))?;
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} {kind}"
+                ))?;
             }
         }
         Ok(())
@@ -219,8 +240,9 @@ impl Store {
     /// counts and the last-opened time away on every edit.
     pub fn save_profile(&self, p: &Profile) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO profiles (id, name, engine, host, port, database, user, read_only)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO profiles
+                (id, name, engine, host, port, database, user, read_only, tx_mode)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 engine = excluded.engine,
@@ -228,7 +250,8 @@ impl Store {
                 port = excluded.port,
                 database = excluded.database,
                 user = excluded.user,
-                read_only = excluded.read_only",
+                read_only = excluded.read_only,
+                tx_mode = excluded.tx_mode",
             rusqlite::params![
                 p.id,
                 p.name,
@@ -237,7 +260,8 @@ impl Store {
                 p.port,
                 p.database,
                 p.user,
-                p.read_only
+                p.read_only,
+                p.tx_mode.as_str()
             ],
         )?;
         Ok(())
@@ -252,7 +276,7 @@ impl Store {
     pub fn list_connections(&self) -> Result<Vec<SavedConnection>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, engine, host, port, database, user,
-                    last_opened, server, env, read_only
+                    last_opened, server, env, read_only, tx_mode
              FROM profiles
              ORDER BY last_opened IS NULL, last_opened DESC, name",
         )?;
@@ -269,6 +293,7 @@ impl Store {
                     // A row an older build wrote has no answer here, and
                     // the careful reading of no answer is "do not write".
                     read_only: row.get::<_, Option<bool>>(10)?.unwrap_or(true),
+                    tx_mode: TxMode::parse(row.get::<_, Option<String>>(11)?.as_deref()),
                 },
                 last_opened: row.get(7)?,
                 server: row.get(8)?,
@@ -399,7 +424,7 @@ impl Store {
     /// must open even when the file holds something older.
     pub fn saved_tabs(&self, scope: &str) -> Result<SavedTabs> {
         let mut stmt = self.conn.prepare(
-            "SELECT kind, title, schema, relation, page, statement, active
+            "SELECT kind, title, schema, relation, page, statement, active, tx_mode
                FROM open_tabs
               WHERE scope = ?1
               ORDER BY position",
@@ -413,12 +438,13 @@ impl Store {
                 row.get::<_, Option<i64>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
 
         let mut tabs = SavedTabs::default();
         for row in rows {
-            let (kind, title, schema, relation, page, statement, active) = row?;
+            let (kind, title, schema, relation, page, statement, active, tx_mode) = row?;
             let tab = match kind.as_str() {
                 "table" => match (schema, relation) {
                     (Some(schema), Some(table)) => SavedTab::Table {
@@ -432,6 +458,7 @@ impl Store {
                     title: title.unwrap_or_default(),
                     statement: statement.unwrap_or_default(),
                     relation: schema.zip(relation),
+                    tx_mode: TxMode::parse(tx_mode.as_deref()),
                 },
                 "history" => SavedTab::History,
                 _ => continue,
@@ -458,7 +485,7 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM open_tabs WHERE scope = ?1", [scope])?;
         for (position, tab) in kept.iter().enumerate() {
-            let (kind, title, schema, relation, page, statement) = match tab {
+            let (kind, title, schema, relation, page, statement, tx_mode) = match tab {
                 SavedTab::Table { schema, table, page } => (
                     "table",
                     None,
@@ -466,21 +493,24 @@ impl Store {
                     Some(table.as_str()),
                     Some(*page as i64),
                     None,
+                    None,
                 ),
-                SavedTab::Query { title, statement, relation } => (
+                SavedTab::Query { title, statement, relation, tx_mode } => (
                     "query",
                     Some(title.as_str()),
                     relation.as_ref().map(|(schema, _)| schema.as_str()),
                     relation.as_ref().map(|(_, table)| table.as_str()),
                     None,
                     Some(statement.as_str()),
+                    Some(tx_mode.as_str()),
                 ),
-                SavedTab::History => ("history", None, None, None, None, None),
+                SavedTab::History => ("history", None, None, None, None, None, None),
             };
             tx.execute(
                 "INSERT INTO open_tabs
-                    (scope, position, kind, title, schema, relation, page, statement, active)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    (scope, position, kind, title, schema, relation, page, statement, active,
+                     tx_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     scope,
                     position as i64,
@@ -491,6 +521,7 @@ impl Store {
                     page,
                     statement,
                     (position == active) as i64,
+                    tx_mode,
                 ],
             )?;
         }
@@ -633,6 +664,7 @@ mod tests {
                 database: "app".into(),
                 user: Some("nick".into()),
                 read_only: true,
+                tx_mode: TxMode::Auto,
             })
             .unwrap();
 
@@ -659,6 +691,7 @@ mod tests {
             database: "app".into(),
             user: Some("nick".into()),
             read_only: true,
+            tx_mode: TxMode::Auto,
         };
         store.save_profile(&profile).unwrap();
         store.record_probe("p1", "PG 16.2").unwrap();
@@ -686,6 +719,7 @@ mod tests {
             database: "app".into(),
             user: Some("nick".into()),
             read_only: true,
+            tx_mode: TxMode::Auto,
         };
         store.save_profile(&profile).unwrap();
         store.set_env("p1", Some("prod")).unwrap();
@@ -710,6 +744,7 @@ mod tests {
             database: "app".into(),
             user: Some("nick".into()),
             read_only: false,
+            tx_mode: TxMode::Auto,
         };
         store.save_profile(&profile).unwrap();
         assert!(!store.list_connections().unwrap()[0].profile.read_only);
@@ -723,6 +758,34 @@ mod tests {
         // careful reading is the one that wins.
         store.conn.execute("UPDATE profiles SET read_only = NULL", []).unwrap();
         assert!(store.list_connections().unwrap()[0].profile.read_only);
+    }
+
+    /// The mirror image of the read-only flag, and the default goes the
+    /// other way for a reason: nobody asked for a transaction to be held
+    /// open, so none is.
+    #[test]
+    fn the_transaction_mode_round_trips_and_an_older_row_reads_as_auto() {
+        let store = store_at("tx_mode.sqlite");
+        let mut profile = Profile {
+            id: "p1".into(),
+            name: "Local PG".into(),
+            engine: Engine::Postgres,
+            host: Some("localhost".into()),
+            port: Some(5432),
+            database: "app".into(),
+            user: None,
+            read_only: false,
+            tx_mode: TxMode::Manual,
+        };
+        store.save_profile(&profile).unwrap();
+        assert_eq!(store.list_connections().unwrap()[0].profile.tx_mode, TxMode::Manual);
+
+        profile.tx_mode = TxMode::Auto;
+        store.save_profile(&profile).unwrap();
+        assert_eq!(store.list_connections().unwrap()[0].profile.tx_mode, TxMode::Auto);
+
+        store.conn.execute("UPDATE profiles SET tx_mode = NULL", []).unwrap();
+        assert_eq!(store.list_connections().unwrap()[0].profile.tx_mode, TxMode::Auto);
     }
 
     fn store_at(name: &str) -> Store {
@@ -861,11 +924,15 @@ mod tests {
                 title: "query 1".into(),
                 statement: "select 1".into(),
                 relation: None,
+                tx_mode: TxMode::Auto,
             },
             SavedTab::Query {
                 title: "public.users".into(),
                 statement: "select * from \"public\".\"users\" limit 500;".into(),
                 relation: Some(("public".into(), "users".into())),
+                // A tab that holds its own transactions comes back holding
+                // them, so the mode rides in the row beside the statement.
+                tx_mode: TxMode::Manual,
             },
             SavedTab::Table { schema: "public".into(), table: "orders".into(), page: 3 },
             SavedTab::History,
@@ -887,6 +954,7 @@ mod tests {
             title: "query".into(),
             statement: sql.into(),
             relation: None,
+            tx_mode: TxMode::Auto,
         };
         store.save_tabs("prod", &[query("select 1"), query("select 2")], 1).unwrap();
         store.save_tabs("prod", &[query("select 3")], 0).unwrap();
@@ -904,6 +972,7 @@ mod tests {
                 title: format!("query {ix}"),
                 statement: format!("select {ix}"),
                 relation: None,
+                tx_mode: TxMode::Auto,
             })
             .collect();
         store.save_tabs("prod", &tabs, tabs.len() - 1).unwrap();
@@ -957,6 +1026,7 @@ mod tests {
                     database: "app".into(),
                     user: None,
                     read_only: true,
+                    tx_mode: TxMode::Auto,
                 })
                 .unwrap();
         }

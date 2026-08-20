@@ -40,7 +40,7 @@
 
 use crate::env::Env;
 use chrono::Local;
-use db_client::{Connection, Engine, Profile};
+use db_client::{Connection, Engine, Profile, TxMode};
 use db_postgres::PostgresConnection;
 use gpui::{
     App, Context, Div, ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
@@ -149,6 +149,10 @@ struct Form {
     /// connection starts on: the careful setting is the one nobody has to
     /// remember to choose.
     read_only: bool,
+    /// Which way a new query tab on this connection commits. It is the
+    /// tab's starting mode, not a lock: the query toolbar can switch one
+    /// tab without touching what the connection saved.
+    tx_mode: TxMode,
     /// The profile this form edits; `None` saves a new one.
     editing: Option<String>,
     error: Option<String>,
@@ -496,6 +500,7 @@ impl Connections {
             password,
             env: Env::parse(prefill.and_then(|saved| saved.env.as_deref())),
             read_only: prefill.map(|saved| saved.profile.read_only).unwrap_or(true),
+            tx_mode: prefill.map(|saved| saved.profile.tx_mode).unwrap_or_default(),
             editing: prefill.map(|saved| saved.profile.id.clone()),
             error: None,
             _subscriptions: subscriptions,
@@ -514,6 +519,13 @@ impl Connections {
     fn toggle_form_read_only(&mut self, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.form {
             form.read_only = !form.read_only;
+            cx.notify();
+        }
+    }
+
+    fn set_form_tx_mode(&mut self, mode: TxMode, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.form {
+            form.tx_mode = mode;
             cx.notify();
         }
     }
@@ -571,6 +583,7 @@ impl Connections {
         );
         let env = form.env;
         let read_only = form.read_only;
+        let tx_mode = form.tx_mode;
         let id = form.editing.clone().unwrap_or_else(new_id);
         if url.is_empty() {
             self.set_form_error("a connection needs a URL", cx);
@@ -590,6 +603,8 @@ impl Connections {
         };
         // The URL says nothing about how careful to be; the switch does.
         profile.read_only = read_only;
+        // Nor who commits. The two buttons do.
+        profile.tx_mode = tx_mode;
         let password = merge_credentials(&mut profile, &user, &typed_password, url_password);
         if let Err(error) = store
             .save_profile(&profile)
@@ -1242,19 +1257,27 @@ impl Connections {
         }
     }
 
-    /// The comp's "safety & limits" block, with the one switch this build
-    /// has: a read-only session. The switch is not a label on the row — it
-    /// is a connection parameter, and the driver asks the server for a
-    /// read-only session, so `DROP TABLE` comes back as an error from
-    /// Postgres rather than from a guess about what the SQL meant.
+    /// The comp's "safety & limits" block: the read-only switch, and which
+    /// way a new query tab on this connection commits.
+    ///
+    /// The switch is not a label on the row — it is a connection parameter,
+    /// and the driver asks the server for a read-only session, so
+    /// `DROP TABLE` comes back as an error from Postgres rather than from a
+    /// guess about what the SQL meant.
     ///
     /// The note under it says what the flag does *not* cover, because a
     /// guardrail that is trusted further than it reaches is worse than
     /// none: the setting is the session's default, and a statement is free
     /// to turn it off for itself. Only a role without write rights closes
     /// that door.
+    ///
+    /// The transaction mode is the **default a tab opens on**, not a lock:
+    /// the query toolbar switches one tab without writing anything back
+    /// here. It sits in this block because it belongs to the same question —
+    /// how much a statement can do before anyone else sees it.
     fn safety_section(&self, form: &Form, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
         let on = form.read_only;
+        let manual = form.tx_mode == TxMode::Manual;
         div()
             .flex()
             .flex_col()
@@ -1297,6 +1320,33 @@ impl Connections {
                                         "Every statement you type can change the database. Nothing asks twice."
                                     }),
                             ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(colors.text_muted)
+                            .child("transactions"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(tx_mode_button(TxMode::Auto, !manual, colors, cx))
+                            .child(tx_mode_button(TxMode::Manual, manual, colors, cx)),
+                    )
+                    .child(
+                        div().text_size(px(9.)).text_color(colors.text_faint).child(if manual {
+                            "Manual: a tab opens a transaction on its first run and holds it — \
+                             you commit or roll back from the query bar."
+                        } else {
+                            "Auto: every statement commits on its own, as soon as it succeeds."
+                        }),
                     ),
             )
     }
@@ -1485,6 +1535,43 @@ fn mode_word(profile: &Profile) -> &'static str {
     if profile.read_only { "read-only" } else { "read-write" }
 }
 
+/// One of the form's two transaction buttons. Both are always on screen
+/// and one of them is always lit: the mode is a choice between two states,
+/// not a switch with an off position, and a toggle would leave the user
+/// guessing which way "off" fell.
+fn tx_mode_button(
+    mode: TxMode,
+    picked: bool,
+    colors: &ThemeColors,
+    cx: &mut Context<Connections>,
+) -> Stateful<Div> {
+    let button = div()
+        .id(SharedString::from(format!("tx-mode-{}", mode.as_str())))
+        .flex_1()
+        .min_w(px(0.))
+        .py(px(8.))
+        .border_1()
+        .rounded(px(6.))
+        .text_size(px(10.))
+        .cursor_pointer()
+        .flex()
+        .justify_center()
+        .child(mode.as_str())
+        .on_click(cx.listener(move |this, _event, _window, cx| this.set_form_tx_mode(mode, cx)));
+    if picked {
+        button
+            .border_color(colors.running_border)
+            .bg(colors.selection)
+            .text_color(colors.accent_deep)
+    } else {
+        button
+            .border_color(colors.border)
+            .bg(colors.elevated)
+            .text_color(colors.text_muted)
+            .hover(|s| s.border_color(colors.text_faint))
+    }
+}
+
 /// `postgres://host:port/database`, with no credentials in it.
 fn profile_url(profile: &Profile) -> SharedString {
     let scheme = match profile.engine {
@@ -1632,6 +1719,7 @@ mod tests {
             database: "meerkat".into(),
             user: Some("ada".into()),
             read_only: true,
+            tx_mode: TxMode::Auto,
         };
         assert_eq!(profile_url(&profile), "postgres://db.internal:5432/meerkat");
     }
@@ -1677,6 +1765,7 @@ mod tests {
                 database: database.into(),
                 user: Some(user.into()),
                 read_only: true,
+                tx_mode: TxMode::Auto,
             },
             last_opened: None,
             server: None,
@@ -1739,6 +1828,7 @@ mod tests {
             database: "meerkat".into(),
             user: Some("from_url".into()),
             read_only: true,
+            tx_mode: TxMode::Auto,
         };
 
         // Both fields filled: the URL's credentials are replaced.

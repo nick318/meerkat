@@ -111,6 +111,11 @@ pub struct ThemeColors {
     pub running_surface: Hsla,
     pub running_border: Hsla,
     pub running_mark: Hsla,
+    /// A caption on `running_surface`: the transaction bar's second line,
+    /// which says what an open transaction holds. `text_muted` is grey and
+    /// goes muddy over that warm wash, so the accent family needs a muted
+    /// tone of its own — the only one in the app.
+    pub accent_muted: Hsla,
     /// A keycap sitting *inside* a filled button (the run button's ⌘⏎).
     /// Both carry alpha, because the cap has to work over the ochre fill
     /// and over the clay one without a tone of its own for each.
@@ -187,6 +192,7 @@ impl Theme {
                 running_surface: rgb(0xFDF8EE).into(),
                 running_border: rgb(0xDCCFB4).into(),
                 running_mark: rgb(0xC98B3E).into(),
+                accent_muted: rgb(0xA08544).into(),
                 key_on_fill_surface: rgba(0xFFFFFF29).into(),
                 key_on_fill_border: rgba(0xFFFFFF57).into(),
                 ok: rgb(0x5C8A4E).into(),

@@ -5,12 +5,91 @@
 //! them in turn. A semicolon separates statements only when it is plain
 //! text — inside a string, a quoted identifier, a comment or a
 //! dollar-quoted body it is just a character.
+//!
+//! Reading a statement's transaction verb: the app has to know whether the
+//! buffer it is about to send opens or ends a transaction itself, because
+//! that decides whether the app adds a `BEGIN` of its own and what the
+//! transaction bar says afterwards.
 
 use std::ops::Range;
 
 /// Every non-empty statement in `sql`, in order, ready to send.
 pub fn statements(sql: &str) -> Vec<String> {
     ranges(sql).into_iter().map(|range| sql[range].to_string()).collect()
+}
+
+/// What a statement does to the transaction around it, when that is all it
+/// does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxVerb {
+    /// `BEGIN`, `BEGIN TRANSACTION`, `START TRANSACTION`.
+    Begin,
+    /// `COMMIT`, `END`.
+    Commit,
+    /// `ROLLBACK`, `ABORT` — but never `ROLLBACK TO SAVEPOINT`, which
+    /// leaves the transaction open and is therefore not an end.
+    Rollback,
+}
+
+/// The transaction verb `statement` is, or `None` for everything else.
+///
+/// **What it is for**: in manual mode the app adds a `BEGIN` before a run,
+/// and it must not add one in front of a buffer that opens its own; and
+/// after a run the transaction bar says "committed" or "rolled back", which
+/// it can only know from the buffer when the user typed the word.
+///
+/// Being wrong is cheap on purpose. The server's own answer —
+/// `Session::in_transaction` — is what the app believes about the state
+/// afterwards, so a verb misread here costs at most one spare `BEGIN` or a
+/// bar that says nothing rather than something wrong. That is why this
+/// reads the first word or two and does not attempt to parse SQL.
+///
+/// Leading comments and whitespace are skipped: `-- go\nCOMMIT` is a
+/// commit. A `begin` inside a dollar-quoted function body is not seen at
+/// all, because [`statements`] hands such a body over whole.
+pub fn transaction_verb(statement: &str) -> Option<TxVerb> {
+    let body = skip_leading_comments(statement);
+    let mut words = body.split(|c: char| c.is_whitespace() || c == ';').filter(|w| !w.is_empty());
+    let first = words.next()?.to_ascii_lowercase();
+    let second = words.next().unwrap_or_default().to_ascii_lowercase();
+    match first.as_str() {
+        "begin" => Some(TxVerb::Begin),
+        // `START` is only a transaction verb with `TRANSACTION` after it.
+        "start" if second == "transaction" => Some(TxVerb::Begin),
+        // `END` closes a transaction; `END` inside a PL/pgSQL body never
+        // reaches here, because a dollar-quoted body is one statement.
+        "commit" | "end" => Some(TxVerb::Commit),
+        // `ROLLBACK TO [SAVEPOINT] name` unwinds *within* the transaction
+        // and leaves it open, so it is not an end.
+        "rollback" if second == "to" => None,
+        "rollback" | "abort" => Some(TxVerb::Rollback),
+        _ => None,
+    }
+}
+
+/// The statement past whatever comments open it. A buffer's statements are
+/// trimmed already, but `-- what this does` on the line above a `COMMIT` is
+/// part of the statement that follows it.
+fn skip_leading_comments(statement: &str) -> &str {
+    let mut rest = statement.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = match after.find('\n') {
+                Some(end) => after[end + 1..].trim_start(),
+                // A line comment with nothing after it is the whole
+                // statement, and the whole statement is then no verb.
+                None => return "",
+            };
+            continue;
+        }
+        if rest.starts_with("/*") {
+            let bytes = rest.as_bytes();
+            let end = end_of_block_comment(bytes, 0);
+            rest = rest[end..].trim_start();
+            continue;
+        }
+        return rest;
+    }
 }
 
 /// Byte ranges of the statements in `text`, whitespace trimmed and the
@@ -176,6 +255,53 @@ mod tests {
         );
         // A lone `$` is not a quote opener.
         assert_eq!(texts("select 1 $ 2; select 3"), vec!["select 1 $ 2", "select 3"]);
+    }
+
+    #[test]
+    fn the_transaction_verbs_are_read_off_the_first_word() {
+        let verb = |sql| transaction_verb(sql);
+        assert_eq!(verb("BEGIN"), Some(TxVerb::Begin));
+        assert_eq!(verb("begin transaction"), Some(TxVerb::Begin));
+        assert_eq!(verb("BEGIN ISOLATION LEVEL SERIALIZABLE"), Some(TxVerb::Begin));
+        assert_eq!(verb("start transaction"), Some(TxVerb::Begin));
+        assert_eq!(verb("COMMIT"), Some(TxVerb::Commit));
+        assert_eq!(verb("end"), Some(TxVerb::Commit));
+        assert_eq!(verb("rollback"), Some(TxVerb::Rollback));
+        assert_eq!(verb("ABORT"), Some(TxVerb::Rollback));
+        assert_eq!(verb("select 1"), None);
+        assert_eq!(verb(""), None);
+    }
+
+    /// The two shapes that read like a verb and are not one. Getting either
+    /// wrong would have the app add a `BEGIN` in front of a transaction
+    /// that is already open, or drop the bar while one still is.
+    #[test]
+    fn a_verb_that_only_looks_like_one_is_not_read_as_one() {
+        // `ROLLBACK TO SAVEPOINT` unwinds inside the transaction and leaves
+        // it open, so it does not end anything.
+        assert_eq!(transaction_verb("rollback to savepoint s1"), None);
+        assert_eq!(transaction_verb("ROLLBACK TO s1"), None);
+        // `START` on its own is not a transaction verb.
+        assert_eq!(transaction_verb("start replication"), None);
+    }
+
+    /// A comment above the word is part of the statement the splitter hands
+    /// over, so the verb has to be found past it.
+    #[test]
+    fn a_comment_in_front_of_the_verb_is_skipped() {
+        assert_eq!(transaction_verb("-- land it\nCOMMIT"), Some(TxVerb::Commit));
+        assert_eq!(transaction_verb("/* land it */ commit"), Some(TxVerb::Commit));
+        assert_eq!(transaction_verb("-- nothing but a note"), None);
+    }
+
+    /// A `begin` inside a function body is not a statement of the buffer's,
+    /// so it never reaches the verb reader at all.
+    #[test]
+    fn a_begin_inside_a_function_body_is_not_a_transaction() {
+        let text = "create function f() returns int as $$ begin return 1; end $$";
+        let statements = texts(text);
+        assert_eq!(statements.len(), 1);
+        assert_eq!(transaction_verb(&statements[0]), None);
     }
 
     #[test]
