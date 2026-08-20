@@ -137,12 +137,23 @@ catalog.
 
 The filter line over the list narrows the names the session already
 holds — no query goes out — by the palette's own rule, through
-`palette::path_matches`: the `fuzzy` crate's word-start rule, and **a dot
+`palette::path_rank`: the `fuzzy` crate's word-start rule, and **a dot
 names a path**. So `address` finds every `address`, `addr_ln` finds
 `address_line`, `dev.addr` finds the one in `sample_dev_sample`, and a
 bare schema name answers with everything under it. Whatever is left with nothing under it is dropped, header and all,
 and what survives is drawn open whatever the two sets say — a search that
 needs a second click to show its hits is not a search. ⎋ empties the line.
+
+**A filtered section is ranked, not alphabetical.** `path_rank` answers
+with the palette's own key — the alignment furthest out, then the score,
+then the length of the name — so a query offers the same name first in
+the sidebar and in ⌘K. The catalog's order is alphabetical, which puts
+`master` sixth among the thirteen names that hold the word, and ↑↓ then
+walk past five near-misses to reach the one the user typed. The sort is
+stable, so names the query cannot tell apart keep the catalog's order.
+**Nothing is ranked with the line empty**: there is nothing to be closest
+to, and a schema whose tables reshuffled as the line emptied would be
+worse than alphabetical.
 
 **↑↓ walk the names the filter left, and ⏎ opens the one they are on.** A
 filter that answers with five tables is a list the user would otherwise

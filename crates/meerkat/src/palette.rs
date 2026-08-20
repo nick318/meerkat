@@ -576,10 +576,18 @@ struct Aligned {
     score: i32,
 }
 
-/// Does a path answer this query? The sidebar's filter asks the palette,
-/// so `schema.table` finds the same thing in both places.
-pub fn path_matches(parts: &[String], needle: &str) -> bool {
-    find_path(parts, needle).is_some()
+/// Does a path answer this query, and how well? The sidebar's filter asks
+/// the palette, so `schema.table` finds the same thing in both places —
+/// and, since the answer is the palette's own [`rank`], puts its hits in
+/// the same order too. `None` says the path does not answer at all.
+///
+/// The key sorts ascending, and it is the palette's row order: an
+/// alignment further out first, then the score, then the length of the
+/// name.
+pub fn path_rank(parts: &[String], needle: &str) -> Option<(usize, i32, usize)> {
+    let aligned = find_path(parts, needle)?;
+    let name = parts.last().map(String::as_str).unwrap_or_default();
+    Some(rank(&aligned, parts.len(), name))
 }
 
 /// How a result sorts: an alignment further out first, because a name the

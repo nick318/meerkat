@@ -6005,13 +6005,23 @@ fn catalog_groups(catalog: &Catalog) -> Rc<Vec<Group>> {
 /// opened to see what is in it.
 ///
 /// A `needle` narrows the list to the relations it matches, by the same
-/// rule the palette uses: a case-insensitive substring, and **a dot names
-/// a path**. So `address` finds every `address`, `dev.addr` finds the one
-/// in `sample_dev_sample`, and a bare schema name answers with everything
+/// rule the palette uses: the word-start rule, and **a dot names a path**.
+/// So `address` finds every `address`, `dev.addr` finds the one in
+/// `sample_dev_sample`, and a bare schema name answers with everything
 /// under it. Whatever is left with nothing under it is dropped, header and
 /// all. While the filter is on, everything that survived is drawn open
 /// whatever the two sets say — a search that needs a second click to show
 /// its hits is not a search.
+///
+/// **The hits are ranked, and only while the filter is on.** The catalog's
+/// own order is alphabetical, which puts `master` in the middle of the
+/// thirteen names that hold the word, and a list whose best answer is
+/// eighth is one the user reads before they can use it. So a filtered
+/// section is sorted by `palette::path_rank` — the palette's own order, so
+/// the same query offers the same name first in both places — and ↑↓ walk
+/// it best-first. Unfiltered, nothing is ranked: with no query there is
+/// nothing to be closest to, and shuffling a schema's tables on every
+/// keystroke of an emptying line would be worse than alphabetical.
 fn catalog_rows(
     groups: &[Group],
     open_schemas: &HashSet<SharedString>,
@@ -6028,14 +6038,18 @@ fn catalog_rows(
                 let matches: Vec<&SharedString> = if !filtering {
                     section.relations.iter().collect()
                 } else {
-                    section
+                    let mut ranked: Vec<((usize, i32, usize), &SharedString)> = section
                         .relations
                         .iter()
-                        .filter(|name| {
+                        .filter_map(|name| {
                             let path = [group.schema.to_string(), name.to_string()];
-                            palette::path_matches(&path, needle)
+                            Some((palette::path_rank(&path, needle)?, name))
                         })
-                        .collect()
+                        .collect();
+                    // A stable sort, so two names the query cannot tell
+                    // apart stay in the catalog's own order.
+                    ranked.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    ranked.into_iter().map(|(_, name)| name).collect()
                 };
                 (!matches.is_empty()).then_some((section, matches))
             })
@@ -7044,6 +7058,43 @@ mod tests {
         );
         // No hit anywhere is an empty list, not a list of empty headers.
         assert!(rows(&groups, "nothing").is_empty());
+    }
+
+    #[test]
+    fn the_filter_puts_its_closest_hit_first() {
+        let catalog = Catalog {
+            schemas: vec![Schema {
+                name: "app".to_string(),
+                tables: vec![
+                    relation("correspondence_master", TableKind::Table),
+                    relation("master_assignment", TableKind::Table),
+                    relation("master", TableKind::Table),
+                    relation("master_rate", TableKind::Table),
+                ],
+            }],
+        };
+        let groups = catalog_groups(&catalog);
+        // Alphabetical order buries the name the query says outright, so
+        // the filtered section is ranked instead: the whole word first,
+        // then the names it starts, shortest first, then the name that
+        // only holds it further in.
+        assert_eq!(
+            read(&rows(&groups, "master")),
+            [
+                "[APP 4 open]",
+                "(TABLES 4 open)",
+                "master",
+                "master_rate",
+                "master_assignment",
+                "correspondence_master",
+            ]
+        );
+        // With no filter the catalog's own order stands.
+        let open = HashSet::from([groups[0].key.clone()]);
+        assert_eq!(
+            read(&catalog_rows(&groups, &open, &HashSet::new(), ""))[2..],
+            ["correspondence_master", "master_assignment", "master", "master_rate"]
+        );
     }
 
     #[test]
