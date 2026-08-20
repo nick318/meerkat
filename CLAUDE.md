@@ -142,10 +142,32 @@ names a path**. So `address` finds every `address`, `addr_ln` finds
 `address_line`, `dev.addr` finds the one in `sample_dev_sample`, and a
 bare schema name answers with everything under it. Whatever is left with nothing under it is dropped, header and all,
 and what survives is drawn open whatever the two sets say — a search that
-needs a second click to show its hits is not a search. ⏎ opens the first
-relation left, ⎋ empties the line.
+needs a second click to show its hits is not a search. ⎋ empties the line.
 
-⇥ completes the line from the first match, through
+**↑↓ walk the names the filter left, and ⏎ opens the one they are on.** A
+filter that answers with five tables is a list the user would otherwise
+have to reach for the mouse to use, and the name they want is rarely the
+first. The cursor is `Shell::catalog_selected`, an index into
+`catalog_rows`, and it only ever names a relation: a header opens and
+closes, and ⏎ on this line means "open this relation". `None` says the
+cursor is still on the **line itself**, and the line is a position in the
+ring — ↑ off the first name goes back to it and ↓ off the last comes round
+to it, so the key that walked into the list is the key that walks out.
+`step_stop` is that ring, a plain function over indices, so it is argued
+with in a test. A keystroke in the filter puts other names at those
+indices, so `rebuild_catalog_rows` drops the cursor rather than leave it
+pointing at a row the user never walked to; with the cursor on the line, ⏎
+and ⇥ read the **first** match, as they did before there was a cursor.
+
+The cursor's row wears `match_strong`, not `selection`: the row the active
+tab came from already wears `selection`, the cursor is often on that same
+row, and one mark cannot say both. It is the mark the grid's own cursor
+wears, for the same reason — it sits over `selection` and stays visible.
+The keys live in `CATALOG_FILTER_KEY_CONTEXT`, scoped to the filter line
+like the palette's and the column find's, or ↑↓ would be taken from the
+results grid whenever nothing is typed.
+
+⇥ completes the line from the row the cursor is on, through
 `palette::complete_path`, so a name is walked in the same steps here and
 in the palette: one part at a time, **replacing** what was typed rather
 than appending to it, and the faint hint is shaped by `palette::ghost`,

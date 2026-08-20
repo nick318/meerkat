@@ -78,6 +78,8 @@ actions!(
         FindColumn,
         ColumnPrev,
         ColumnNext,
+        CatalogPrev,
+        CatalogNext,
         PeekValue,
         ClosePeek,
         CopyPeek,
@@ -117,6 +119,29 @@ pub fn column_find_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("cmd-j", FindColumn, Some("Shell")),
         gpui::KeyBinding::new("up", ColumnPrev, Some(COLUMN_FIND_KEY_CONTEXT)),
         gpui::KeyBinding::new("down", ColumnNext, Some(COLUMN_FIND_KEY_CONTEXT)),
+    ]
+}
+
+/// The sidebar filter's own key context. Scoped to that line, like the
+/// palette's and the column find's: ↑↓ walk the names the filter left
+/// while the line has the focus, and mean what they mean everywhere else
+/// as soon as it does not.
+pub const CATALOG_FILTER_KEY_CONTEXT: &str = "CatalogFilter";
+
+/// Key bindings for walking the names the sidebar's filter left.
+///
+/// A filter that answers with five tables is a list the user has to reach
+/// for the mouse to use, and the name they want is rarely the first one.
+/// ↓ steps into that list, ↑ steps back out of it, and ⏎ opens whichever
+/// name the cursor is on.
+///
+/// ⏎ and ⎋ are bound nowhere here. The filter is a `TextField`, which
+/// reports both as events of its own, so the sidebar answers them the way
+/// the palette and the column find do.
+pub fn catalog_filter_key_bindings() -> Vec<gpui::KeyBinding> {
+    vec![
+        gpui::KeyBinding::new("up", CatalogPrev, Some(CATALOG_FILTER_KEY_CONTEXT)),
+        gpui::KeyBinding::new("down", CatalogNext, Some(CATALOG_FILTER_KEY_CONTEXT)),
     ]
 }
 
@@ -322,6 +347,11 @@ pub struct Shell {
     /// The sidebar's filter line. It narrows the rows already in hand — no
     /// query goes out for it.
     catalog_filter: Entity<TextField>,
+    /// Which row of the list the arrow keys are on, as an index into
+    /// `catalog_rows`. It only ever names a relation, and `None` says the
+    /// cursor is still on the line itself — where ⏎ and ⇥ read the *first*
+    /// match instead, as they did before there was a cursor at all.
+    catalog_selected: Option<usize>,
     /// Where the sidebar is scrolled, kept across re-renders.
     catalog_scroll: UniformListScrollHandle,
     /// Which of the sidebar's scrollbars is being dragged, if any.
@@ -915,6 +945,7 @@ impl Shell {
             open_schemas: HashSet::new(),
             closed_sections: HashSet::new(),
             catalog_filter,
+            catalog_selected: None,
             catalog_scroll: UniformListScrollHandle::new(),
             catalog_drag: DragState::default(),
             relation_total: 0,
@@ -1084,23 +1115,69 @@ impl Shell {
             &self.closed_sections,
             &needle,
         );
+        // The cursor is an index into the rows that have just been
+        // replaced, so it cannot survive them: a keystroke in the filter
+        // puts other names at those indices, and a cursor left where it
+        // was would point at one the user never walked to.
+        self.catalog_selected = None;
         // What ⇥ would take is read off the rows, so the hint is set here
         // rather than by each caller.
         self.update_filter_ghost(cx);
         cx.notify();
     }
 
+    /// The relation the keys are aimed at: the one the cursor is on, or
+    /// the first the filter left while the cursor is still on the line. ⏎
+    /// opens it and ⇥ finishes the line from it, so the hint and the key
+    /// cannot say two different things.
+    fn filter_target(&self) -> Option<(SharedString, SharedString)> {
+        let row = match self.catalog_selected {
+            Some(ix) => self.catalog_rows.get(ix)?,
+            None => self
+                .catalog_rows
+                .iter()
+                .find(|row| matches!(row, CatalogRow::Relation { .. }))?,
+        };
+        match row {
+            CatalogRow::Relation { schema, name, .. } => Some((schema.clone(), name.clone())),
+            CatalogRow::Schema { .. } | CatalogRow::Section { .. } => None,
+        }
+    }
+
+    /// The rows ↑↓ walk: the relations the filter left, by their index
+    /// into the flattened list. A header is not among them — it opens and
+    /// closes, and ⏎ on this line means "open this relation".
+    fn catalog_stops(&self) -> Vec<usize> {
+        self.catalog_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| matches!(row, CatalogRow::Relation { .. }))
+            .map(|(ix, _)| ix)
+            .collect()
+    }
+
+    /// Move the cursor one relation on, and scroll it into view.
+    fn step_catalog(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let stops = self.catalog_stops();
+        self.catalog_selected = step_stop(&stops, self.catalog_selected, forward);
+        if let Some(ix) = self.catalog_selected {
+            // `Nearest` and not `Center`: the cursor walks one row at a
+            // time, and a list that re-centred on every press would move
+            // further than the cursor did.
+            self.catalog_scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
+        }
+        // ⇥ finishes the line from the cursor, so moving it changes what
+        // the hint offers.
+        self.update_filter_ghost(cx);
+        cx.notify();
+    }
+
     /// What ⇥ would finish the filter line with: the next part of the
-    /// first relation the filter left, as the palette finishes a name.
+    /// relation the keys are aimed at, as the palette finishes a name.
     fn filter_completion(&self, cx: &App) -> Option<String> {
         let needle = self.catalog_filter.read(cx).trimmed();
-        let first = self.catalog_rows.iter().find_map(|row| match row {
-            CatalogRow::Relation { schema, name, .. } => {
-                Some(vec![schema.to_string(), name.to_string()])
-            }
-            CatalogRow::Schema { .. } | CatalogRow::Section { .. } => None,
-        })?;
-        palette::complete_path(&first, needle)
+        let (schema, name) = self.filter_target()?;
+        palette::complete_path(&[schema.to_string(), name.to_string()], needle)
     }
 
     /// Show what ⇥ would take, faint and after the value, in the shape
@@ -1158,18 +1235,13 @@ impl Shell {
                 self.catalog_scroll.scroll_to_item(0, ScrollStrategy::Top);
                 self.rebuild_catalog_rows(cx);
             }
-            // Enter opens the first relation the filter left, which is what
-            // a one-hit filter is for. Escape empties the line and hands the
-            // keys back to the workspace.
+            // Enter opens the relation the cursor is on, and the first the
+            // filter left while the cursor is still on the line — which is
+            // what a one-hit filter is for. Escape empties the line and
+            // hands the keys back to the workspace.
             TextFieldEvent::Submit => {
-                let first = self.catalog_rows.iter().find_map(|row| match row {
-                    CatalogRow::Relation { schema, name, .. } => {
-                        Some((schema.to_string(), name.to_string()))
-                    }
-                    CatalogRow::Schema { .. } | CatalogRow::Section { .. } => None,
-                });
-                if let Some((schema, table)) = first {
-                    self.browse_table(&schema, &table, window, cx);
+                if let Some((schema, table)) = self.filter_target() {
+                    self.browse_table(&schema.to_string(), &table.to_string(), window, cx);
                 }
             }
             TextFieldEvent::Cancel => {
@@ -3046,12 +3118,44 @@ impl Shell {
         self.open_palette_selection(true, window, cx);
     }
 
+    fn on_catalog_prev(&mut self, _: &CatalogPrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_catalog(false, cx);
+    }
+
+    fn on_catalog_next(&mut self, _: &CatalogNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_catalog(true, cx);
+    }
+
     fn on_next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
         self.step_tab(true, window, cx);
     }
 
     fn on_prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
         self.step_tab(false, window, cx);
+    }
+}
+
+/// Where one press of ↑ or ↓ lands in the sidebar's filtered list.
+/// `stops` are the rows a cursor may sit on, and `from` is where it sits
+/// now.
+///
+/// **The line the user is typing on is a position in this ring**, and it
+/// is `None`. ↑ off the first name goes back to it and ↓ off the last name
+/// comes round to it, so the way out of the list is the key that walked
+/// into it. A cursor that could only be escaped by deleting the line would
+/// be a trap, and the line is where the next keystroke has to land: the
+/// user is still typing a name.
+fn step_stop(stops: &[usize], from: Option<usize>, forward: bool) -> Option<usize> {
+    if stops.is_empty() {
+        return None;
+    }
+    let here = from.and_then(|ix| stops.iter().position(|stop| *stop == ix));
+    match (here, forward) {
+        (None, true) => stops.first().copied(),
+        (None, false) => stops.last().copied(),
+        (Some(ix), true) => stops.get(ix + 1).copied(),
+        (Some(0), false) => None,
+        (Some(ix), false) => stops.get(ix - 1).copied(),
     }
 }
 
@@ -3821,6 +3925,12 @@ impl Shell {
     fn catalog_filter_row(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
         let filtering = !self.catalog_filter.read(cx).is_empty();
         div()
+            // ↑↓ walk the list below while this line has the focus. The
+            // context sits here rather than on the shell, or the two keys
+            // would be taken from the grid whenever nothing is typed.
+            .key_context(CATALOG_FILTER_KEY_CONTEXT)
+            .on_action(cx.listener(Self::on_catalog_prev))
+            .on_action(cx.listener(Self::on_catalog_next))
             .flex_none()
             .px(px(12.))
             .py(px(8.))
@@ -3901,6 +4011,7 @@ impl Shell {
             _ => None,
         };
         let rows = self.catalog_rows.clone();
+        let cursor = self.catalog_selected;
         let shell = cx.entity().downgrade();
 
         let mut list = uniform_list(
@@ -3910,7 +4021,15 @@ impl Shell {
                 let colors = theme(cx).colors.clone();
                 range
                     .map(|ix| {
-                        catalog_row(ix, &rows[ix], active.as_ref(), &shell, &colors, cx)
+                        catalog_row(
+                            ix,
+                            &rows[ix],
+                            active.as_ref(),
+                            cursor == Some(ix),
+                            &shell,
+                            &colors,
+                            cx,
+                        )
                     })
                     .collect::<Vec<_>>()
             },
@@ -6005,6 +6124,7 @@ fn catalog_row(
     ix: usize,
     row: &CatalogRow,
     active: Option<&(SharedString, SharedString)>,
+    cursor: bool,
     shell: &gpui::WeakEntity<Shell>,
     colors: &ThemeColors,
     cx: &App,
@@ -6043,6 +6163,10 @@ fn catalog_row(
         }
         CatalogRow::Relation { schema, name, kind } => {
             let is_active = active.is_some_and(|(s, t)| s == schema && t == name);
+            // Two rows read loud, and for the same reason: this is the one
+            // being pointed at. The tab's row says where the result on
+            // screen came from, the cursor's says what ⏎ would open.
+            let lit = is_active || cursor;
             let shell = shell.clone();
             let (schema_name, table_name) = (schema.to_string(), name.to_string());
 
@@ -6066,33 +6190,36 @@ fn catalog_row(
                         .ok();
                 })
                 .child(match kind {
-                    TableKind::Table => table_glyph(is_active, cx),
+                    TableKind::Table => table_glyph(lit, cx),
                     TableKind::View => div()
                         .size(px(5.))
                         .rounded_full()
                         .border_1()
-                        .border_color(if is_active { colors.accent } else { colors.text_faint }),
+                        .border_color(if lit { colors.accent } else { colors.text_faint }),
                 })
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.))
                         .text_size(px(12.))
-                        .font_weight(if is_active {
-                            FontWeight::MEDIUM
-                        } else {
-                            FontWeight::NORMAL
-                        })
-                        .text_color(if is_active { colors.text } else { colors.text_secondary })
+                        .font_weight(if lit { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                        .text_color(if lit { colors.text } else { colors.text_secondary })
                         .truncate()
                         .child(name.clone()),
                 );
 
-            if is_active {
-                item.bg(colors.selection).into_any_element()
-            } else {
-                let hover = colors.hairline;
-                item.hover(move |s| s.bg(hover)).into_any_element()
+            match (cursor, is_active) {
+                // The cursor's mark is the deeper of the two, and it has
+                // to be: the row it is on is often the row the active tab
+                // came from as well, and one mark cannot say both. It is
+                // the mark the grid's own cursor wears, for the same
+                // reason — it sits over `selection` and stays visible.
+                (true, _) => item.bg(colors.match_strong).into_any_element(),
+                (false, true) => item.bg(colors.selection).into_any_element(),
+                (false, false) => {
+                    let hover = colors.hairline;
+                    item.hover(move |s| s.bg(hover)).into_any_element()
+                }
             }
         }
     }
@@ -6505,6 +6632,30 @@ mod tests {
         assert!(!cancelling.arming());
         // Nothing is out, so a click runs a query.
         assert!(!Run::Idle.arming());
+    }
+
+    /// The sidebar cursor's ring, with the filter line itself in it: ↓
+    /// walks into the names and ↑ walks back out to the line.
+    #[test]
+    fn the_sidebar_cursor_walks_out_of_the_list_it_walked_into() {
+        // Indices into the flattened rows, so the headers between them are
+        // the gaps: a schema heading, two tables, a section heading, one
+        // more table.
+        let stops = [1_usize, 2, 4];
+        // The line is where a fresh filter leaves the cursor, and each key
+        // enters the list from its own end.
+        assert_eq!(step_stop(&stops, None, true), Some(1));
+        assert_eq!(step_stop(&stops, None, false), Some(4));
+        // One name at a time, over the headings.
+        assert_eq!(step_stop(&stops, Some(1), true), Some(2));
+        assert_eq!(step_stop(&stops, Some(2), true), Some(4));
+        assert_eq!(step_stop(&stops, Some(4), false), Some(2));
+        // Both ends come back to the line, which is where the user is
+        // still typing.
+        assert_eq!(step_stop(&stops, Some(4), true), None);
+        assert_eq!(step_stop(&stops, Some(1), false), None);
+        // Nothing matched: there is nowhere to walk to.
+        assert_eq!(step_stop(&[], None, true), None);
     }
 
     /// Manual mode's whole mechanism: one `BEGIN`, and never a second.
