@@ -19,9 +19,9 @@ use db_client::{
 use futures::TryStreamExt as _;
 use introspect::{Catalog, Column, Schema, Table, TableKind};
 use sqlx::postgres::{
-    PgConnectOptions, PgPool, PgPoolOptions, PgRow, PgValueFormat, PgValueRef,
+    PgConnectOptions, PgPool, PgPoolOptions, PgQueryResult, PgRow, PgValueFormat, PgValueRef,
 };
-use sqlx::{Column as _, Executor as _, Row as _, TypeInfo as _, ValueRef as _};
+use sqlx::{Column as _, Either, Executor as _, Row as _, TypeInfo as _, ValueRef as _};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -667,6 +667,14 @@ fn between(before: Option<Counted>, now: Counted) -> Option<ServerTiming> {
 /// `fetch_all` held both the raw rows and the decoded ones at once, which
 /// is how `SELECT *` over a large table took the app down.
 ///
+/// It streams with `fetch_many` rather than `fetch`, because `fetch` yields
+/// the rows and **throws the completion tag away** — and the tag is the
+/// only place the number of rows an `UPDATE` changed is ever stated. A
+/// statement that changes rows sends no row at all, so `fetch` answered one
+/// with nothing whatever: no rows, no columns and no count. `fetch_many`
+/// hands the tag over as `Either::Left`, which is where `rows_affected`
+/// comes from.
+///
 /// `app` is the pool used to cancel and to describe: both must reach the
 /// server while `conn` is busy with the statement, so neither may be `conn`.
 async fn collect_capped(
@@ -683,9 +691,28 @@ async fn collect_capped(
     // not separate.
     let sent = Instant::now();
     let mut first_row = None;
+    // The server's own count, off the completion tag. Summed rather than
+    // assigned, because one call may answer with more than one tag.
+    let mut affected = 0;
     {
-        let mut rows = sqlx::query(sql).fetch(&mut *conn);
-        while let Some(row) = rows.try_next().await? {
+        // `Executor::fetch_many` rather than `Query::fetch_many`, which is
+        // deprecated for taking several statements in one string. This
+        // sends one, through the extended protocol exactly as `fetch` did —
+        // so the values still come back in binary and `off_the_wire` still
+        // reads what it expects.
+        let mut stream = (&mut *conn).fetch_many(sqlx::query(sql));
+        while let Some(step) = stream.try_next().await? {
+            let row = match step {
+                // The statement finished. For an `UPDATE` this is the whole
+                // of the answer; for a `SELECT` it repeats the row count,
+                // which is why the caller reads it only where there are no
+                // columns.
+                Either::Left(done) => {
+                    affected += done.rows_affected();
+                    continue;
+                }
+                Either::Right(row) => row,
+            };
             // Taken before the row is decoded, or this process's own
             // decoding would be counted as the server's time.
             first_row.get_or_insert_with(Instant::now);
@@ -704,13 +731,21 @@ async fn collect_capped(
                 // sending the whole result. Ask it to stop instead — the
                 // same `pg_cancel_backend` the stop button sends.
                 let stopped = cancel(app, backend, Stop::Cancel).await.unwrap_or(false);
-                drain(&mut rows, stopped).await?;
+                drain(&mut stream, stopped).await?;
                 break;
             }
         }
     }
 
-    if !sink.has_columns() {
+    // A statement that changed rows has none to name columns with and no
+    // columns to describe — the describe would answer `NoData`. So the
+    // count is what says not to ask: a round trip on the app pool for
+    // headers that cannot exist is a round trip on every `UPDATE`.
+    //
+    // A count of zero is the case that still has to ask, because a
+    // `SELECT` matching nothing reads exactly the same way here, and an
+    // empty result set has headers worth painting.
+    if !sink.has_columns() && affected == 0 {
         // No rows came back, so the row metadata cannot name the columns.
         // Ask the server to describe the statement instead, so an empty
         // result still renders its headers. DDL and other statements
@@ -719,7 +754,7 @@ async fn collect_capped(
             sink.columns(described.columns().iter().map(|c| c.name().to_string()).collect());
         }
     }
-    let mut result = sink.finish();
+    let mut result = sink.finish(affected);
     result.wire = wire_of(sent, first_row);
     Ok(result)
 }
@@ -764,7 +799,7 @@ async fn cancel(pool: &PgPool, run: RunId, how: Stop) -> Result<bool> {
 /// answer we asked for rather than news. Any other error is the server's own
 /// and is reported.
 async fn drain(
-    rows: &mut futures::stream::BoxStream<'_, sqlx::Result<PgRow>>,
+    rows: &mut futures::stream::BoxStream<'_, sqlx::Result<Either<PgQueryResult, PgRow>>>,
     stopped: bool,
 ) -> Result<()> {
     loop {
@@ -1208,6 +1243,58 @@ mod tests {
         let result = conn.execute("SELECT 1 AS x WHERE false").await.unwrap();
         assert!(result.rows.is_empty());
         assert_eq!(result.columns, vec!["x".to_string()]);
+    }
+
+    /// A statement that changes rows comes back as a count and no result
+    /// set, and the count is the only thing it ever says. `fetch` threw the
+    /// completion tag away, so such a statement answered with nothing at
+    /// all — no rows, no columns and no number.
+    #[tokio::test]
+    async fn a_statement_that_changes_rows_reports_how_many() {
+        let Some(url) = test_url() else { return };
+        // Writable, because this writes.
+        let conn = PostgresConnection::connect_url(&url, false).await.unwrap();
+        let session = conn.open_session().await.unwrap();
+
+        session.execute("CREATE TEMP TABLE meerkat_affected (id int)").await.unwrap();
+        let inserted =
+            session.execute("INSERT INTO meerkat_affected VALUES (1), (2), (3)").await.unwrap();
+        assert_eq!(inserted.rows_affected, 3);
+        // No result set: the columns are what the app reads to know there
+        // is no grid to paint.
+        assert!(inserted.columns.is_empty(), "{:?}", inserted.columns);
+
+        let updated =
+            session.execute("UPDATE meerkat_affected SET id = id + 1 WHERE id > 1").await.unwrap();
+        assert_eq!(updated.rows_affected, 2);
+
+        // The reading that matters: the statement worked and matched
+        // nothing, which is a different answer from an empty table.
+        let matched_nothing =
+            session.execute("DELETE FROM meerkat_affected WHERE id = 999").await.unwrap();
+        assert_eq!(matched_nothing.rows_affected, 0);
+        assert!(matched_nothing.columns.is_empty());
+
+        // A statement with a `RETURNING` clause is a result set as well as
+        // a count, and it keeps both.
+        let returning = session.execute("DELETE FROM meerkat_affected RETURNING id").await.unwrap();
+        assert_eq!(returning.rows_affected, 3);
+        assert_eq!(returning.columns, vec!["id".to_string()]);
+        assert_eq!(returning.rows.len(), 3);
+    }
+
+    /// A `SELECT` is counted by the server too — its tag is `SELECT 5` — so
+    /// the count cannot be what says a statement changed anything. The
+    /// columns are, which is why the app reads `rows_affected` only where
+    /// there are none.
+    #[tokio::test]
+    async fn a_query_is_counted_as_well_and_keeps_its_columns() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+
+        let result = conn.execute("SELECT * FROM generate_series(1, 5)").await.unwrap();
+        assert_eq!(result.rows_affected, 5);
+        assert_eq!(result.columns.len(), 1);
     }
 
     /// The client's own split, against a real server. Every part of it has

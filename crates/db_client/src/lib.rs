@@ -184,11 +184,25 @@ fn hex_prefix(bytes: &[u8], max: usize) -> String {
     out
 }
 
+/// One statement's answer.
+///
+/// **`columns` is what says whether there was a result set at all.** A
+/// statement that changes rows describes no columns — Postgres answers the
+/// describe with `NoData` — so an empty `columns` means the statement came
+/// back as a count, and `rows_affected` is the whole of what it said. A
+/// `SELECT` that matched nothing still names its columns, so an empty
+/// result set and a command are never confused: the one paints a grid with
+/// headers and no rows, the other paints no grid.
+///
+/// The count cannot stand in for that test on its own, because Postgres
+/// counts a `SELECT` too — the tag for one is `SELECT 5`. So
+/// `rows_affected` is only ever read where `columns` is empty.
 #[derive(Debug, Clone, Default)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
-    /// Rows affected, for statements that return no rows.
+    /// What the server's own completion tag counted. Meaningful only where
+    /// `columns` is empty — see the note above.
     pub rows_affected: u64,
     /// Set when the memory cap stopped the read before the server ran out
     /// of rows. `false` means the result is the whole result.
@@ -366,11 +380,15 @@ impl RowSink {
         self.truncated
     }
 
-    pub fn finish(self) -> QueryResult {
+    /// `rows_affected` is the server's own count, off the statement's
+    /// completion tag. The sink counts rows it kept, which is a different
+    /// number and not the one to report: a statement that changed a
+    /// thousand rows streams none of them back.
+    pub fn finish(self, rows_affected: u64) -> QueryResult {
         QueryResult {
             columns: self.columns,
             rows: self.rows,
-            rows_affected: 0,
+            rows_affected,
             truncated: self.truncated,
             // The sink counts bytes, not seconds. The driver is what holds
             // the clock, because only the driver knows when the statement
@@ -600,7 +618,7 @@ mod tests {
         for n in 0..3 {
             assert!(sink.push(row(n)), "row {n} was refused");
         }
-        let result = sink.finish();
+        let result = sink.finish(0);
         assert_eq!(result.rows.len(), 3);
         assert!(!result.truncated);
     }
@@ -613,7 +631,7 @@ mod tests {
             assert!(sink.push(row(n)));
         }
         assert!(!sink.push(row(3)), "the fourth row was kept");
-        let result = sink.finish();
+        let result = sink.finish(0);
         assert_eq!(result.rows.len(), 3);
         assert!(result.truncated);
     }
@@ -625,7 +643,7 @@ mod tests {
         let mut sink = RowSink::new(Limits { max_bytes: 16, max_cell_bytes: 1024 });
         assert!(sink.push(vec![Value::Text("x".repeat(500))]));
         assert!(!sink.push(vec![Value::Text("x".repeat(500))]));
-        let result = sink.finish();
+        let result = sink.finish(0);
         assert_eq!(result.rows.len(), 1);
         assert!(result.truncated);
     }
@@ -634,7 +652,7 @@ mod tests {
     fn a_cut_cell_says_it_was_cut() {
         let mut sink = RowSink::new(small());
         sink.push(vec![Value::Text("abcdefghijkl".to_string())]);
-        let result = sink.finish();
+        let result = sink.finish(0);
         assert_eq!(result.rows[0][0], Value::Text("abcdefgh…".to_string()));
     }
 
@@ -645,7 +663,7 @@ mod tests {
         let mut sink = RowSink::new(small());
         // Three-byte characters, so byte 8 sits inside one.
         sink.push(vec![Value::Text("日本語です".to_string())]);
-        let result = sink.finish();
+        let result = sink.finish(0);
         assert_eq!(result.rows[0][0], Value::Text("日本…".to_string()));
     }
 
@@ -655,7 +673,7 @@ mod tests {
         let limits = Limits { max_cell_bytes: 32, ..small() };
         let mut sink = RowSink::new(limits);
         sink.push(vec![Value::Bytes(vec![0xAB; 400])]);
-        let result = sink.finish();
+        let result = sink.finish(0);
         assert_eq!(result.rows[0][0], Value::Bytes(vec![0xAB; 32]));
         // `display` is what marks it, as it does for any long byte string.
         assert!(result.rows[0][0].display().ends_with('…'));

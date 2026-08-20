@@ -63,6 +63,13 @@ pub struct QueryRun {
     pub source: RunSource,
     pub elapsed_ms: Option<u64>,
     pub row_count: Option<u64>,
+    /// Rows the run changed, as the server counted them. Its own column
+    /// rather than a value in `row_count`, because rows returned and rows
+    /// changed are different answers and a row that meant one of them where
+    /// the reader expected the other would be worse than no column at all.
+    /// `None` for everything that returned rows, and for every run an older
+    /// build wrote.
+    pub affected: Option<u64>,
     pub error: Option<String>,
 }
 
@@ -79,6 +86,7 @@ pub struct NewRun<'a> {
     pub source: RunSource,
     pub elapsed_ms: Option<u64>,
     pub row_count: Option<u64>,
+    pub affected: Option<u64>,
     pub error: Option<&'a str>,
 }
 
@@ -161,6 +169,7 @@ impl Store {
                 source TEXT NOT NULL,
                 elapsed_ms INTEGER,
                 row_count INTEGER,
+                affected INTEGER,
                 error TEXT
             );
             CREATE INDEX IF NOT EXISTS query_history_scope_time
@@ -216,6 +225,10 @@ impl Store {
         // A query tab remembers which way it commits, so a strip restored
         // on a manual connection comes back manual. NULL is auto.
         self.add_columns("open_tabs", &[("tx_mode", "TEXT")])?;
+        // Rows changed, for the runs that answer with a count instead of a
+        // result set. NULL on every row an older build wrote, which is the
+        // same thing it means on a new one: this run reported no count.
+        self.add_columns("query_history", &[("affected", "INTEGER")])?;
         Ok(())
     }
 
@@ -537,8 +550,8 @@ impl Store {
     pub fn record_query(&self, run: NewRun<'_>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO query_history
-                (scope, statement, ran_at, source, elapsed_ms, row_count, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (scope, statement, ran_at, source, elapsed_ms, row_count, affected, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 run.scope,
                 run.statement,
@@ -546,6 +559,7 @@ impl Store {
                 source_str(run.source),
                 run.elapsed_ms,
                 run.row_count,
+                run.affected,
                 run.error,
             ],
         )?;
@@ -572,7 +586,7 @@ impl Store {
     /// combination.
     pub fn list_history(&self, scope: &str, filter: HistoryFilter) -> Result<Vec<QueryRun>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, statement, ran_at, source, elapsed_ms, row_count, error
+            "SELECT id, statement, ran_at, source, elapsed_ms, row_count, affected, error
                FROM query_history
               WHERE scope = ?1
                 AND (?2 = 0 OR source = 'user')
@@ -598,7 +612,8 @@ impl Store {
                     source: parse_source(&row.get::<_, String>(3)?),
                     elapsed_ms: row.get(4)?,
                     row_count: row.get(5)?,
-                    error: row.get(6)?,
+                    affected: row.get(6)?,
+                    error: row.get(7)?,
                 })
             },
         )?;
@@ -804,6 +819,7 @@ mod tests {
             source,
             elapsed_ms: Some(12),
             row_count: Some(3),
+            affected: None,
             error: None,
         }
     }
@@ -823,6 +839,28 @@ mod tests {
             .collect();
         // A staging query never shows up under production.
         assert_eq!(seen, ["select 2", "select 1"]);
+    }
+
+    /// Rows changed ride their own column, so a run that returned nothing
+    /// and changed three rows reads back as exactly that — and a run that
+    /// returned rows reads back with no count at all, rather than a zero
+    /// that would say it changed nothing when it was never asked to.
+    #[test]
+    fn the_history_keeps_rows_changed_apart_from_rows_returned() {
+        let store = store_at("history-affected.sqlite");
+        store
+            .record_query(NewRun {
+                row_count: Some(0),
+                affected: Some(3),
+                ..run("prod", "update t set a = 1", 100, RunSource::User)
+            })
+            .unwrap();
+        store.record_query(run("prod", "select 1", 90, RunSource::User)).unwrap();
+
+        let seen = store.list_history("prod", HistoryFilter::default()).unwrap();
+        assert_eq!(seen[0].affected, Some(3));
+        assert_eq!(seen[0].row_count, Some(0));
+        assert_eq!(seen[1].affected, None);
     }
 
     #[test]

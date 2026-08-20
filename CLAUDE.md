@@ -901,12 +901,13 @@ because "committed" is the answer to the question the user just asked; the
 next run clears it, since news about a transaction that was over before the
 run is not news.
 
-The second line counts **statements, not rows**. The comp says "N rows
-touched", and the driver reports no affected count today — `rows_affected`
-is filled in nowhere — so a row figure would be invented. A statement count
-is a number the app has. What it counts is the statements that are *not*
-boundaries, so a bare `BEGIN` opens a transaction with nothing in it, which
-is what it did.
+The second line counts **statements, and the rows they changed**. The
+statement count is the statements that are *not* boundaries, so a bare
+`BEGIN` opens a transaction with nothing in it, which is what it did. The
+row count is the server's own, off each statement's completion tag — see
+"A statement that changes rows" — and it is said only when there is
+something to say: a transaction of nothing but `SELECT`s has touched
+nothing, and a `0` there would be a warning about nothing.
 
 ⌘S commits and ⇧⌘R rolls back, and the bar's two buttons say so on their
 faces: this is the only place those keys are written down. **⇧⌘R is not the
@@ -1046,6 +1047,63 @@ a local file, so dropping the stream ends the work.
 `Limits` is a field on the connection, and `with_limits` is for the tests: a
 cap of a few kilobytes is reached in a query that takes no time, where the
 real one would want gigabytes of fixture.
+
+### A statement that changes rows
+
+An `UPDATE` answers with **a count and no result set**, and for a while the
+app heard neither half of that. sqlx's `fetch` yields the rows and throws
+the statement's completion tag away — and the tag is the only place the
+number is ever stated — so a working `UPDATE` came back as no rows, no
+columns and no number, and the pane painted a grid of nothing under
+`0 rows · 0 columns`: a table where there had never been a table. Both
+drivers stream with `fetch_many` instead, whose `Either::Left` carries
+`PgQueryResult`, and `RowSink::finish` takes the count.
+
+**`columns` is what says there was no result set — never the count.**
+Postgres counts a query too, its tag being `SELECT 5`, so a count above
+zero says nothing about whether anything was written. A statement that
+changes rows describes no columns, while a `SELECT` that matched nothing
+still names its own, so the two are never confused: one paints headers over
+no rows, the other paints no grid. `rows_affected` is only ever read where
+`columns` is empty. A `RETURNING` clause is both, and keeps both.
+
+That test is also what saves a round trip. The driver describes a
+column-less result to recover its headers, and a statement that changed
+rows has none to recover — so `collect_capped` asks only where the count is
+**zero**, which is the one case that may still be an empty query.
+
+**Zero is the reading the user is waiting for**, and the count alone cannot
+be worded: it means "your `WHERE` matched nothing" after an `UPDATE` and
+"there was nothing to count" after a `CREATE INDEX`. `query::command_verb`
+is what tells those apart — the first word past any comments, in
+`transaction_verb`'s spirit and for lower stakes still: **it decides one
+sentence and nothing else**. Nothing about what runs, what is painted or
+what the count is depends on it, so a data-modifying CTE reads as no verb
+and takes the generic `1 row affected` rather than being parsed for a verb
+buried in it. `changed_copy` is pure, so the wording is testable without a
+window, as `tx_copy` and `confirm_copy` are.
+
+A buffer is several statements and one line, so `Ran` answers for all of
+them: the last result **that had columns** — the one the grid paints — and
+the counts summed over the statements that had none. A query's own tag
+count is never added, or the rows already on screen would be reported a
+second time as though they had been written. `UPDATE …; SELECT …;` in one
+buffer therefore says both things, and the verb goes generic where the
+counted statements disagree.
+
+The result line reads **DONE** rather than RESULT when there is no result
+set, because "result" is the wrong word over a pane with none in it. And
+**no columns means no grid**: `result_body` paints the empty pane instead,
+with `nothing run yet · ⌘⏎ runs the statement` on a tab that has run
+nothing — the count is already on the line above, so a tab that has run
+something is told nothing twice.
+
+`query_history` keeps the count in a column of its own, `affected`, added
+by `Store::migrate`. Overloading `row_count` was the alternative and it
+would have been a lie in the column's own documentation: `row_count` is
+`None` exactly when a run failed, and rows returned is not rows changed.
+The history row says `1 row changed`, in that word, because the column
+otherwise reads as rows returned.
 
 ### How long a run may take
 

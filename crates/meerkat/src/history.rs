@@ -69,10 +69,15 @@ pub fn flatten(runs: &[QueryRun], today: NaiveDate) -> Vec<HistoryRow> {
         }
         rows.push(HistoryRow::Run(RunRow {
             statement: run.statement.clone(),
-            detail: match (&run.error, run.row_count) {
-                (Some(error), _) => first_line(error).into(),
-                (None, Some(count)) => rows_label(count).into(),
-                (None, None) => SharedString::default(),
+            detail: match (&run.error, run.affected, run.row_count) {
+                (Some(error), _, _) => first_line(error).into(),
+                // Rows changed win the line over rows returned. A statement
+                // that changed rows returned none, so the count is the only
+                // thing about it worth a column — and `0 rows` said nothing
+                // at all about what it did.
+                (None, Some(count), _) => changed_label(count).into(),
+                (None, None, Some(count)) => rows_label(count).into(),
+                (None, None, None) => SharedString::default(),
             },
             timing: match (&run.error, run.elapsed_ms) {
                 (Some(_), _) => "error".into(),
@@ -108,6 +113,17 @@ fn rows_label(count: u64) -> String {
     match count {
         1 => "1 row".to_string(),
         n => format!("{} rows", format_count(n)),
+    }
+}
+
+/// Rows changed, said so: `1 row changed`, `6 rows changed`. The word is
+/// there because the column otherwise reads as rows returned, and this run
+/// returned none.
+fn changed_label(count: u64) -> String {
+    match count {
+        0 => "no rows changed".to_string(),
+        1 => "1 row changed".to_string(),
+        n => format!("{} rows changed", format_count(n)),
     }
 }
 
@@ -251,6 +267,7 @@ mod tests {
             source: RunSource::User,
             elapsed_ms: Some(128),
             row_count: Some(6),
+            affected: None,
             error: None,
         }
     }
@@ -309,6 +326,27 @@ mod tests {
         assert_eq!(row.detail, "relation \"user_setings\" does not exist");
         assert_eq!(row.timing, "error");
         assert!(row.failed);
+    }
+
+    /// A run that changed rows says so, and says it in a word the column
+    /// cannot be read the other way round: the column otherwise means rows
+    /// returned, and this run returned none.
+    #[test]
+    fn a_run_that_changed_rows_says_so_rather_than_counting_none() {
+        let mut updated = run("update t set a = 1", noon(0));
+        updated.row_count = Some(0);
+        updated.affected = Some(1);
+        let rows = flatten(&[updated], Local::now().date_naive());
+        let HistoryRow::Run(row) = &rows[1] else { panic!("expected a run") };
+        assert_eq!(row.detail, "1 row changed");
+
+        assert_eq!(changed_label(0), "no rows changed");
+        assert_eq!(changed_label(18_412), "18.4k rows changed");
+
+        // A run that returned rows keeps the count it always had.
+        let rows = flatten(&[run("select 1", noon(0))], Local::now().date_naive());
+        let HistoryRow::Run(row) = &rows[1] else { panic!("expected a run") };
+        assert_eq!(row.detail, "6 rows");
     }
 
     #[test]

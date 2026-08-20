@@ -10,6 +10,12 @@
 //! buffer it is about to send opens or ends a transaction itself, because
 //! that decides whether the app adds a `BEGIN` of its own and what the
 //! transaction bar says afterwards.
+//!
+//! Reading a statement's command verb: a statement that changes rows comes
+//! back as a count and no result set, and the count alone cannot say
+//! whether zero means "your `WHERE` matched nothing" or "there was never
+//! anything to count". The verb is what tells those apart, and it is used
+//! for the wording only — see [`command_verb`].
 
 use std::ops::Range;
 
@@ -63,6 +69,61 @@ pub fn transaction_verb(statement: &str) -> Option<TxVerb> {
         // and leaves it open, so it is not an end.
         "rollback" if second == "to" => None,
         "rollback" | "abort" => Some(TxVerb::Rollback),
+        _ => None,
+    }
+}
+
+/// What a statement did to the rows, for a statement that answers with a
+/// count instead of a result set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandVerb {
+    Insert,
+    Update,
+    Delete,
+    /// `MERGE`, which inserts, updates and deletes in one statement — so
+    /// "merged" is the only word that is true of all of it.
+    Merge,
+}
+
+impl CommandVerb {
+    /// The past participle, for `1 row updated`.
+    pub fn past(self) -> &'static str {
+        match self {
+            CommandVerb::Insert => "inserted",
+            CommandVerb::Update => "updated",
+            CommandVerb::Delete => "deleted",
+            CommandVerb::Merge => "merged",
+        }
+    }
+}
+
+/// The row-changing verb `statement` opens with, or `None` for everything
+/// else.
+///
+/// **What it is for is the wording of a count, and nothing else.** The
+/// server's tag carries the number of rows but the wire hands the app no
+/// verb — sqlx reports `rows_affected` and drops the tag itself — so a
+/// count of `0` reads either as "the `WHERE` matched nothing", which is the
+/// answer the user is waiting for, or as "a `CREATE INDEX` has nothing to
+/// count", which is not news. This says which sentence to write.
+///
+/// Being wrong is cheap, as it is in [`transaction_verb`], and cheaper: a
+/// misread costs a generic `1 row affected` in place of `1 row updated`.
+/// Nothing here decides what runs, what is painted, or what the count is.
+/// So a data-modifying CTE — `WITH moved AS (DELETE …) INSERT …` — reads as
+/// no verb and takes the generic wording, rather than being parsed for a
+/// verb buried in it.
+pub fn command_verb(statement: &str) -> Option<CommandVerb> {
+    let body = skip_leading_comments(statement);
+    let first = body
+        .split(|c: char| c.is_whitespace() || c == ';' || c == '(')
+        .find(|word| !word.is_empty())?
+        .to_ascii_lowercase();
+    match first.as_str() {
+        "insert" => Some(CommandVerb::Insert),
+        "update" => Some(CommandVerb::Update),
+        "delete" => Some(CommandVerb::Delete),
+        "merge" => Some(CommandVerb::Merge),
         _ => None,
     }
 }
@@ -302,6 +363,35 @@ mod tests {
         let statements = texts(text);
         assert_eq!(statements.len(), 1);
         assert_eq!(transaction_verb(&statements[0]), None);
+    }
+
+    /// The verb decides one sentence in the result line. A `SELECT` must
+    /// not read as one, or a query returning no rows would be reported as
+    /// having matched nothing.
+    #[test]
+    fn the_command_verbs_are_read_off_the_first_word() {
+        assert_eq!(command_verb("update t set a = 1"), Some(CommandVerb::Update));
+        assert_eq!(command_verb("INSERT INTO t VALUES (1)"), Some(CommandVerb::Insert));
+        assert_eq!(command_verb("delete from t"), Some(CommandVerb::Delete));
+        assert_eq!(command_verb("Merge into t using s on true"), Some(CommandVerb::Merge));
+        assert_eq!(command_verb("select 1"), None);
+        assert_eq!(command_verb("create index on t (a)"), None);
+        assert_eq!(command_verb(""), None);
+        assert_eq!(command_verb("-- update t set a = 1"), None);
+        assert_eq!(command_verb("/* note */ delete from t"), Some(CommandVerb::Delete));
+    }
+
+    /// A statement that changes rows from inside a CTE takes the generic
+    /// wording rather than a verb read out of the middle of it. Reading one
+    /// there would mean parsing SQL, and the count is right either way.
+    #[test]
+    fn a_data_modifying_cte_reads_as_no_verb() {
+        assert_eq!(
+            command_verb(
+                "with moved as (delete from t returning *) insert into u select * from moved"
+            ),
+            None
+        );
     }
 
     #[test]

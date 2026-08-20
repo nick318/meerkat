@@ -20,7 +20,7 @@ use gpui::{
     prelude::*, px, uniform_list,
 };
 use introspect::{Catalog, Table, TableKind};
-use query::TxVerb;
+use query::{CommandVerb, TxVerb};
 use results_grid::{
     Cell, Extent, Grid, GridData, GridState, Hit, Selection, Step, clipboard_text, find_columns,
 };
@@ -592,7 +592,22 @@ struct QueryTab {
     relation: Option<(String, String)>,
     editor: Entity<SqlEditor>,
     data: Rc<GridData>,
+    /// Whether the last run answered with a **result set** — columns to
+    /// paint a grid from, however few rows came back with them.
+    ///
+    /// It is not "the run worked". A statement that changes rows works and
+    /// answers with no result set at all, and painting a grid of no columns
+    /// for it drew a bare gutter and a row of nothing: a table where there
+    /// was never a table. So this is what decides whether there is a grid,
+    /// and [`QueryTab::changed`] is what the line says instead.
     has_result: bool,
+    /// What the run's counted statements changed, when any of them did.
+    ///
+    /// `None` says no statement of the buffer answered with a count, so
+    /// there is nothing to report — which is different from a count of
+    /// zero, and the difference is the whole point: zero means the `WHERE`
+    /// matched nothing, and that is news.
+    changed: Option<Changed>,
     /// Whether the memory cap ended the read before the server ran out of
     /// rows. The result line says so, because a grid that stops at an
     /// arbitrary row must not read as the whole answer.
@@ -630,11 +645,14 @@ struct QueryTab {
     /// connection; the profile carries the mode a new tab opens on.
     tx_mode: TxMode,
     /// How many statements have run inside the transaction that is open.
-    ///
-    /// It is what the bar has to say instead of "rows touched": the driver
-    /// reports no affected count today, so a row figure would be invented.
-    /// A statement count is a number the app actually has.
     tx_statements: usize,
+    /// How many rows those statements changed, as the server counted them.
+    ///
+    /// The bar says this beside the statement count, because "what have I
+    /// touched that nobody else can see yet" is the question an open
+    /// transaction raises. It counts only the statements that answered with
+    /// a count: a `SELECT` inside the transaction changed nothing.
+    tx_affected: u64,
     /// How the last transaction ended, until the next run or the next
     /// change of mode. The bar goes on saying so for a moment, because
     /// "committed" is the answer to the question the user just asked and a
@@ -1533,12 +1551,19 @@ impl Shell {
                         // `LIMIT 500`, not a statement anyone is tuning.
                         tab.timing = Some(Timing::new(elapsed, result.wire));
                         tab.data = Rc::new(GridData::new(result.columns, result.rows));
-                        Outcome { elapsed: Some(elapsed), rows: Some(rows), error: None }
+                        // A page is the app's own `SELECT`: it returns rows
+                        // and changes none, so there is no count to keep.
+                        Outcome {
+                            elapsed: Some(elapsed),
+                            rows: Some(rows),
+                            affected: None,
+                            error: None,
+                        }
                     }
                     Err(error) => {
                         tab.error = Some(error.clone());
                         tab.data = empty_grid();
-                        Outcome { elapsed: None, rows: None, error: Some(error) }
+                        Outcome { elapsed: None, rows: None, affected: None, error: Some(error) }
                     }
                 };
                 this.record_run(&recorded, RunSource::App, &run);
@@ -1570,6 +1595,7 @@ impl Shell {
             editor,
             data: empty_grid(),
             has_result: false,
+            changed: None,
             truncated: false,
             statements_run: 0,
             timing: None,
@@ -1579,6 +1605,7 @@ impl Shell {
             in_transaction: false,
             tx_mode: self.tx_default,
             tx_statements: 0,
+            tx_affected: 0,
             tx_done: None,
             tx_ending: false,
             last_used: Instant::now(),
@@ -1715,17 +1742,24 @@ impl Shell {
                 // therefore unanswerable — reporting the last statement's
                 // time as the run's would be a wrong number, not a partial
                 // one — so the ask goes out only for a buffer of one.
-                let one_statement = matches!(result, Ok((_, _, 1)));
+                let one_statement = matches!(&result, Ok(ran) if ran.ran == 1);
                 let run = match result {
-                    Ok((result, elapsed, ran)) => {
+                    Ok(ran) => {
+                        let Ran { result, affected, counted, verb, elapsed_ms, ran } = ran;
                         tab.run = Run::Idle;
                         // The run button settles on this, so it counts a
                         // result rather than a reply: a failure is not
                         // something to congratulate the user on.
                         tab.landed += 1;
                         let rows = result.rows.len() as u64;
-                        tab.timing = Some(Timing::new(elapsed, result.wire));
-                        tab.has_result = true;
+                        tab.timing = Some(Timing::new(elapsed_ms, result.wire));
+                        // Columns, not success: a statement that changed
+                        // rows succeeded and has no result set to show.
+                        tab.has_result = !result.columns.is_empty();
+                        // A count of zero is still a count, so this turns on
+                        // the *number of counted statements* rather than on
+                        // the number itself.
+                        tab.changed = (counted > 0).then_some(Changed { rows: affected, verb });
                         tab.truncated = result.truncated;
                         tab.statements_run = ran;
                         tab.data = Rc::new(GridData::new(result.columns, result.rows));
@@ -1751,10 +1785,21 @@ impl Shell {
                         }
                         if tab.in_transaction {
                             tab.tx_statements += plain_statements;
+                            tab.tx_affected += affected;
                         } else {
                             tab.tx_statements = 0;
+                            tab.tx_affected = 0;
                         }
-                        Outcome { elapsed: Some(elapsed), rows: Some(rows), error: None }
+                        Outcome {
+                            elapsed: Some(elapsed_ms),
+                            rows: Some(rows),
+                            // The history's own column, kept apart from the
+                            // row count for the same reason the result line
+                            // keeps them apart: rows returned and rows
+                            // changed are different answers.
+                            affected: (counted > 0).then_some(affected),
+                            error: None,
+                        }
                     }
                     Err(error) => {
                         if stopped {
@@ -1764,10 +1809,13 @@ impl Shell {
                             tab.error = Some(error.clone());
                         }
                         tab.has_result = false;
+                        // Whatever the last run changed is not what this one
+                        // did, and this one says nothing about rows at all.
+                        tab.changed = None;
                         tab.truncated = false;
                         tab.data = empty_grid();
                         tab.selection.clear();
-                        Outcome { elapsed: None, rows: None, error: Some(error) }
+                        Outcome { elapsed: None, rows: None, affected: None, error: Some(error) }
                     }
                 };
                 this.record_run(&recorded, RunSource::User, &run);
@@ -2056,6 +2104,11 @@ impl Shell {
                     &Outcome {
                         elapsed: Some(started.elapsed().as_millis()),
                         rows: outcome.is_ok().then_some(0),
+                        // A boundary changes no rows of its own. What it did
+                        // to the rows before it is not a number the server
+                        // reports, and inventing one here would say a commit
+                        // wrote nothing.
+                        affected: None,
                         error: outcome.err(),
                     },
                 );
@@ -2161,6 +2214,7 @@ impl Shell {
                 source,
                 elapsed_ms: outcome.elapsed.map(|millis| millis as u64),
                 row_count: outcome.rows,
+                affected: outcome.affected,
                 error: outcome.error.as_deref(),
             })
             .ok();
@@ -3215,6 +3269,11 @@ fn step_wrapping(len: usize, from: usize, forward: bool) -> usize {
 struct Outcome {
     elapsed: Option<u128>,
     rows: Option<u64>,
+    /// Rows changed, for a statement that answered with a count instead of
+    /// a result set. `None` where nothing counted — which is every `SELECT`,
+    /// every table page and every failed run — so the history says nothing
+    /// there rather than `0 rows changed`.
+    affected: Option<u64>,
     error: Option<String>,
 }
 
@@ -3285,6 +3344,51 @@ fn run_sql(
     })
 }
 
+/// What a run changed, for a run that answered with a count.
+///
+/// The verb rides along because the count alone cannot be worded: `0` is
+/// "your `WHERE` matched nothing" for an `UPDATE` and "there was nothing to
+/// count" for a `CREATE INDEX`, and those are not the same news.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Changed {
+    rows: u64,
+    verb: Option<CommandVerb>,
+}
+
+/// What a buffer's statements came back with, taken together.
+///
+/// A buffer is several statements and one result line, so the run has to
+/// answer for all of them at once. **The two halves are separate because
+/// they are different answers**: a result set is rows to look at, and a
+/// count is rows that changed and are not on screen. One buffer can do
+/// both — `UPDATE …; SELECT …;` — and the line says both.
+struct Ran {
+    /// The last result that had columns: the one the grid paints. With no
+    /// columns there is no result set in the buffer at all, and nothing to
+    /// paint a grid for.
+    result: QueryResult,
+    /// Rows changed, summed over the statements that answered with a count
+    /// rather than a result set.
+    ///
+    /// A `SELECT`'s own tag count is never added: the server counts one for
+    /// a query too, and adding it would report the rows already on screen a
+    /// second time as though they had been written.
+    affected: u64,
+    /// How many statements answered with a count rather than a result set.
+    /// It is what says whether `affected == 0` is worth a sentence: no
+    /// counted statement means nothing changed nothing, while one that
+    /// counted zero means a `WHERE` matched nothing.
+    counted: usize,
+    /// The verb those statements share, for the wording alone. `None` where
+    /// they disagree, or where the verb could not be read — a mixed buffer
+    /// takes the generic word rather than the last statement's.
+    verb: Option<CommandVerb>,
+    /// The whole wait, the app's own clock around the run.
+    elapsed_ms: u128,
+    /// How many statements were sent.
+    ran: usize,
+}
+
 /// What a run hands back: the tab's session, and how the statements went.
 ///
 /// The two are separate because they fail separately. A statement that
@@ -3293,7 +3397,7 @@ fn run_sql(
 /// `None` only when opening it is what failed.
 struct RunOutcome {
     session: Option<Arc<dyn Session>>,
-    result: Result<(QueryResult, u128, usize), String>,
+    result: Result<Ran, String>,
     /// Whether the run opened a transaction of its own, for a tab in
     /// [`TxMode::Manual`]. It is reported apart from the result because it
     /// is true on both paths: a statement that fails inside a transaction
@@ -3429,7 +3533,7 @@ async fn execute_all(
     session: &Arc<dyn Session>,
     begin: bool,
     statements: &[String],
-) -> (bool, Result<(QueryResult, u128, usize), String>) {
+) -> (bool, Result<Ran, String>) {
     let started = Instant::now();
     if begin {
         if let Err(error) = session.begin().await {
@@ -3443,21 +3547,49 @@ async fn run_each(
     session: &Arc<dyn Session>,
     statements: &[String],
     started: Instant,
-) -> Result<(QueryResult, u128, usize), String> {
+) -> Result<Ran, String> {
     let mut last = QueryResult::default();
     let mut ran = 0;
+    let mut affected = 0;
+    let mut counted = 0;
+    // The verb the counted statements agree on. `Some(None)` is one that
+    // could not be read; the outer `None` is "nothing counted yet", which
+    // is why this is not simply an `Option<CommandVerb>`.
+    let mut verb: Option<Option<CommandVerb>> = None;
     for statement in statements {
         match session.execute(statement).await {
             Ok(result) => {
                 ran += 1;
-                if !result.columns.is_empty() {
+                if result.columns.is_empty() {
+                    // No result set, so the count is the whole of what this
+                    // statement said — including a zero, which is the answer
+                    // to "did my `WHERE` match anything".
+                    affected += result.rows_affected;
+                    counted += 1;
+                    let read = query::command_verb(statement);
+                    verb = Some(match verb {
+                        None => read,
+                        // Two statements that changed rows in different ways
+                        // have no shared word, so the line takes the generic
+                        // one rather than the last statement's.
+                        Some(seen) if seen == read => read,
+                        Some(_) => None,
+                    });
+                } else {
                     last = result;
                 }
             }
             Err(error) => return Err(error.to_string()),
         }
     }
-    Ok((last, started.elapsed().as_millis(), ran))
+    Ok(Ran {
+        result: last,
+        affected,
+        counted,
+        verb: verb.flatten(),
+        elapsed_ms: started.elapsed().as_millis(),
+        ran,
+    })
 }
 
 /// Collapse "the tokio task died" and "the query failed" into one message.
@@ -4241,7 +4373,7 @@ impl Shell {
             Some(Tab::Table(tab)) => pane
                 .child(self.table_toolbar(tab, colors, cx))
                 .children(tab.error.clone().map(|error| error_strip(error, colors)))
-                .child(self.result_body(tab.id, cx)),
+                .child(self.result_body(tab.id, colors, cx)),
             Some(Tab::Query(tab)) => self.query_pane(pane, tab, colors, cx),
             Some(Tab::History(tab)) => self.history_pane(pane, tab, colors, cx),
             None => pane.child(self.placeholder(colors, window)),
@@ -4251,8 +4383,24 @@ impl Shell {
     /// The grid, in a focus and a key context of its own. Both kinds of tab
     /// that show a result render through here, so the keys reach the grid the
     /// same way in each.
-    fn result_body(&self, tab_id: u64, cx: &Context<Self>) -> Div {
+    /// The grid under the result line — or, where there is no result set,
+    /// what to say instead of one.
+    ///
+    /// **No columns, no grid.** A statement that changes rows describes no
+    /// columns, and a `Grid` over none of them painted a bare gutter and an
+    /// empty header rule: a table where there had never been a table, which
+    /// is what made a working `UPDATE` look like a failure. The same shape
+    /// showed on a tab that had run nothing at all.
+    fn result_body(&self, tab_id: u64, colors: &ThemeColors, cx: &Context<Self>) -> Div {
         let Some(tab) = self.tabs.iter().find(|tab| tab.id() == tab_id) else { return div() };
+        let columns = match tab {
+            Tab::Table(tab) => tab.data.columns.len(),
+            Tab::Query(tab) => tab.data.columns.len(),
+            Tab::History(_) => 0,
+        };
+        if columns == 0 {
+            return div().flex_1().min_h(px(0.)).children(no_result_note(tab, colors));
+        }
         let (data, selection, scroll, first_row) = match tab {
             Tab::Table(tab) => (
                 &tab.data,
@@ -4731,6 +4879,7 @@ impl Shell {
             open: tab.in_transaction,
             done: tab.tx_done,
             statements: tab.tx_statements,
+            affected: tab.tx_affected,
             running: tab.run.in_flight(),
             ending: tab.tx_ending,
         };
@@ -5126,16 +5275,41 @@ impl Shell {
                     0 | 1 => String::new(),
                     n => format!("{n} statements · last result · "),
                 };
+                // One buffer can do both — `UPDATE …; SELECT …;` — and the
+                // line has to say both: the grid below shows the query's
+                // rows and says nothing whatever about the rows the update
+                // wrote.
+                let changed =
+                    tab.changed.map(|c| format!("{} · ", changed_copy(c))).unwrap_or_default();
                 (
                     "RESULT",
                     format!(
-                        "{statements}{} rows · {} columns · {}",
+                        "{statements}{} rows · {} columns · {changed}{}",
                         tab.data.rows.len(),
                         tab.data.columns.len(),
                         // The whole wait, and only that. The split into
                         // server and lag lives on the status strip, which
                         // is already the line about what is on screen —
                         // saying it twice would crowd both.
+                        tab.timing.map(|t| format_millis(t.total_ms)).unwrap_or_default()
+                    ),
+                    colors.text_muted,
+                )
+            }
+            // The run worked and there is no result set: every statement in
+            // the buffer answered with a count. "RESULT" would be the wrong
+            // word over a pane with no result in it — the statement is done,
+            // and what it did is the count.
+            Run::Idle if tab.changed.is_some() => {
+                let statements = match tab.statements_run {
+                    0 | 1 => String::new(),
+                    n => format!("{n} statements · "),
+                };
+                let changed = tab.changed.map(changed_copy).unwrap_or_default();
+                (
+                    "DONE",
+                    format!(
+                        "{statements}{changed} · {}",
                         tab.timing.map(|t| format_millis(t.total_ms)).unwrap_or_default()
                     ),
                     colors.text_muted,
@@ -5252,7 +5426,7 @@ impl Shell {
                 // editor, which is about the statement.
                 .children(self.column_find_control(colors, cx)),
         )
-        .child(self.result_body(tab.id, cx))
+        .child(self.result_body(tab.id, colors, cx))
     }
 
     /// The history screen: a heading, the comp's two chips, and the list
@@ -5410,10 +5584,14 @@ impl Shell {
                 (range, tab.timing)
             }
             Some(Tab::Query(tab)) => (
-                if tab.has_result {
-                    format!("{} rows", tab.data.rows.len())
-                } else {
-                    String::new()
+                // The strip says how much is on screen. With no result set
+                // there is nothing on screen to count, so it says what the
+                // run did instead — and never `0 rows`, which reported a
+                // working `UPDATE` as an empty table.
+                match (tab.has_result, tab.changed) {
+                    (true, _) => format!("{} rows", tab.data.rows.len()),
+                    (false, Some(changed)) => changed_copy(changed),
+                    (false, None) => String::new(),
                 },
                 tab.timing,
             ),
@@ -6535,10 +6713,63 @@ struct TxState {
     done: Option<TxEnd>,
     /// Statements that have landed inside the open transaction.
     statements: usize,
+    /// Rows those statements changed, as the server counted them.
+    affected: u64,
     /// A run is out on this tab's session.
     running: bool,
     /// A commit or a rollback is out.
     ending: bool,
+}
+
+/// What a pane with no result set says, when it is worth saying anything.
+///
+/// A tab that has run nothing is told which key runs it: the pane is the
+/// largest empty thing on screen, and a gesture nothing names is a gesture
+/// nobody finds. A tab whose statement changed rows is told nothing here —
+/// the count is already on the line above, and repeating it in the middle
+/// of the pane would say the same thing twice in one glance.
+fn no_result_note(tab: &Tab, colors: &ThemeColors) -> Option<Div> {
+    let Tab::Query(tab) = tab else { return None };
+    if tab.landed > 0 || tab.error.is_some() || !matches!(tab.run, Run::Idle) {
+        return None;
+    }
+    Some(
+        div()
+            .px(px(16.))
+            .pt(px(14.))
+            .text_size(px(11.))
+            .text_color(colors.text_faint)
+            .child("nothing run yet · ⌘⏎ runs the statement"),
+    )
+}
+
+/// What the result line says about a run that answered with a count.
+///
+/// **The count alone is not the answer.** `0` is the reading the user is
+/// most often waiting for — the `WHERE` matched nothing, so nothing
+/// happened — and `0 rows · 0 columns`, which is what the line said before,
+/// reported that as an empty table instead: a shape, not an outcome.
+///
+/// The verb is what makes zero readable. With one, the line names what did
+/// not happen (`no rows updated`); without one the statement was something
+/// else altogether — a `CREATE INDEX`, a `COMMIT`, a data-modifying CTE —
+/// and there is nothing to have matched, so it says only that there is
+/// nothing to look at.
+///
+/// It is pure so the wording can be argued with in a test rather than in a
+/// running window, as [`tx_copy`] and [`confirm_copy`] are.
+fn changed_copy(changed: Changed) -> String {
+    let Changed { rows, verb } = changed;
+    match (rows, verb) {
+        (0, Some(verb)) => format!("no rows {}", verb.past()),
+        (1, Some(verb)) => format!("1 row {}", verb.past()),
+        (n, Some(verb)) => format!("{} rows {}", format_count(n), verb.past()),
+        // No verb to name, so the neutral word: the server counted rows and
+        // the app will not guess what it did to them.
+        (0, None) => "no rows to show".to_string(),
+        (1, None) => "1 row affected".to_string(),
+        (n, None) => format!("{} rows affected", format_count(n)),
+    }
 }
 
 /// What the transaction bar says: the state, and the line under it.
@@ -6564,7 +6795,17 @@ fn tx_copy(state: TxState) -> Option<(&'static str, String)> {
             1 => "1 statement".to_string(),
             n => format!("{n} statements"),
         };
-        return Some((title, format!("{held} · nothing visible to anyone else yet")));
+        // Rows, now that the server's count is read off the completion tag
+        // — the comp asked for this line and the driver could not answer it
+        // before. It is said only where there is something to say: a
+        // transaction of nothing but `SELECT`s has touched no rows, and a
+        // zero there would read as a warning about nothing.
+        let touched = match state.affected {
+            0 => String::new(),
+            1 => " · 1 row touched".to_string(),
+            n => format!(" · {} rows touched", format_count(n)),
+        };
+        return Some((title, format!("{held}{touched} · nothing visible to anyone else yet")));
     }
     match state.done? {
         // What happens *next* differs by mode, and the line has to be
@@ -6741,6 +6982,55 @@ mod tests {
         assert!(needs_begin(TxMode::Manual, false, Some(TxVerb::Commit)));
     }
 
+    /// The line for a statement that answered with a count. **Zero is the
+    /// reading that matters**: it is the answer to "did my `WHERE` match
+    /// anything", and the line it replaced — `0 rows · 0 columns` — reported
+    /// it as an empty table instead.
+    #[test]
+    fn a_count_is_worded_by_its_verb() {
+        let said = |rows, verb| changed_copy(Changed { rows, verb });
+        assert_eq!(said(1, Some(CommandVerb::Update)), "1 row updated");
+        assert_eq!(said(42, Some(CommandVerb::Delete)), "42 rows deleted");
+        assert_eq!(said(0, Some(CommandVerb::Update)), "no rows updated");
+        assert_eq!(said(0, Some(CommandVerb::Insert)), "no rows inserted");
+    }
+
+    /// With no verb read there is nothing to say happened, so the line says
+    /// only what the server counted. A `CREATE INDEX` has no rows to have
+    /// matched, and telling the user none were updated would be a claim
+    /// about a statement that never updates anything.
+    #[test]
+    fn a_count_with_no_verb_takes_the_neutral_word() {
+        let said = |rows| changed_copy(Changed { rows, verb: None });
+        assert_eq!(said(0), "no rows to show");
+        assert_eq!(said(1), "1 row affected");
+        assert_eq!(said(9), "9 rows affected");
+    }
+
+    /// The bar counts rows now that the server's own count is read off the
+    /// completion tag. It is said only where there is something to say: a
+    /// transaction of nothing but `SELECT`s has touched nothing, and a `0`
+    /// there would be a warning about nothing.
+    #[test]
+    fn the_transaction_bar_counts_the_rows_it_is_holding() {
+        let state = |statements, affected| TxState {
+            mode: TxMode::Manual,
+            open: true,
+            done: None,
+            statements,
+            affected,
+            running: false,
+            ending: false,
+        };
+        let (_, sub) = tx_copy(state(1, 1)).unwrap();
+        assert!(sub.starts_with("1 statement · 1 row touched · "), "{sub}");
+        let (_, sub) = tx_copy(state(2, 30)).unwrap();
+        assert!(sub.starts_with("2 statements · 30 rows touched · "), "{sub}");
+        // Nothing touched, nothing said about rows.
+        let (_, sub) = tx_copy(state(2, 0)).unwrap();
+        assert!(sub.starts_with("2 statements · nothing visible"), "{sub}");
+    }
+
     /// The bar is painted for a transaction the *user* opened as well, in
     /// either mode — which is the whole of what "handle a typed BEGIN"
     /// means on screen.
@@ -6751,6 +7041,7 @@ mod tests {
             open,
             done,
             statements,
+            affected: 0,
             running: false,
             ending: false,
         };
@@ -6784,6 +7075,7 @@ mod tests {
             open: false,
             done: Some(done),
             statements: 0,
+            affected: 0,
             running: false,
             ending: false,
         };
@@ -6807,6 +7099,7 @@ mod tests {
             open: true,
             done: None,
             statements: 3,
+            affected: 0,
             running: true,
             ending: false,
         };

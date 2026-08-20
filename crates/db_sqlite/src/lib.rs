@@ -8,7 +8,7 @@ use db_client::{
 use futures::TryStreamExt as _;
 use introspect::{Catalog, Column, Schema, Table, TableKind};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqliteRow};
-use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
+use sqlx::{Column as _, Either, Executor as _, Row as _, TypeInfo as _, ValueRef as _};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -60,8 +60,20 @@ impl Session for SqliteSession {
         let mut held = self.conn.lock().await;
         let conn = held.as_mut().context("this tab's session is closed")?;
         let mut sink = RowSink::new(self.limits);
-        let mut rows = sqlx::query(sql).fetch(&mut **conn);
-        while let Some(row) = rows.try_next().await? {
+        // `fetch_many` rather than `fetch`, because `fetch` drops the
+        // completion tag — and the tag is the only place SQLite ever states
+        // how many rows an `UPDATE` changed. See `collect_capped` in
+        // `db_postgres` for the whole of that reasoning; it holds here too.
+        let mut affected = 0;
+        let mut stream = (&mut **conn).fetch_many(sqlx::query(sql));
+        while let Some(step) = stream.try_next().await? {
+            let row = match step {
+                Either::Left(done) => {
+                    affected += done.rows_affected();
+                    continue;
+                }
+                Either::Right(row) => row,
+            };
             if !sink.has_columns() {
                 sink.columns(row.columns().iter().map(|c| c.name().to_string()).collect());
             }
@@ -73,8 +85,8 @@ impl Session for SqliteSession {
                 break;
             }
         }
-        drop(rows);
-        Ok(sink.finish())
+        drop(stream);
+        Ok(sink.finish(affected))
     }
 
     /// The same two statements the Postgres session sends, and the same
@@ -212,8 +224,17 @@ impl Connection for SqliteConnection {
     /// whole story and splitting it would invent two numbers out of one.
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
         let mut sink = RowSink::new(self.limits);
-        let mut rows = sqlx::query(sql).fetch(&self.pool);
-        while let Some(row) = rows.try_next().await? {
+        // The tag carries the count, and only `fetch_many` hands it over.
+        let mut affected = 0;
+        let mut stream = self.pool.fetch_many(sqlx::query(sql));
+        while let Some(step) = stream.try_next().await? {
+            let row = match step {
+                Either::Left(done) => {
+                    affected += done.rows_affected();
+                    continue;
+                }
+                Either::Right(row) => row,
+            };
             if !sink.has_columns() {
                 sink.columns(row.columns().iter().map(|c| c.name().to_string()).collect());
             }
@@ -225,7 +246,8 @@ impl Connection for SqliteConnection {
                 break;
             }
         }
-        Ok(sink.finish())
+        drop(stream);
+        Ok(sink.finish(affected))
     }
 
     async fn apply(&self, _changes: &[RowChange]) -> Result<u64> {
@@ -273,6 +295,29 @@ mod tests {
         assert_eq!(result.columns, vec!["id", "name"]);
         assert_eq!(result.rows[0][1], Value::Text("ada".to_string()));
         assert_eq!(result.rows[1][0], Value::Int(2));
+    }
+
+    /// The count off the completion tag, on the engine that needs no
+    /// server. `fetch` dropped that tag, so an `UPDATE` used to answer with
+    /// nothing whatever.
+    #[tokio::test]
+    async fn a_statement_that_changes_rows_reports_how_many() {
+        let conn = SqliteConnection::open_in_memory().await.unwrap();
+        let session = conn.open_session().await.unwrap();
+
+        session.execute("CREATE TABLE t (id INTEGER)").await.unwrap();
+        let inserted = session.execute("INSERT INTO t VALUES (1), (2), (3)").await.unwrap();
+        assert_eq!(inserted.rows_affected, 3);
+        assert!(inserted.columns.is_empty());
+
+        let updated = session.execute("UPDATE t SET id = id + 1 WHERE id > 1").await.unwrap();
+        assert_eq!(updated.rows_affected, 2);
+
+        // Matched nothing, and says so with a count rather than an empty
+        // table: the statement worked.
+        let nothing = session.execute("DELETE FROM t WHERE id = 999").await.unwrap();
+        assert_eq!(nothing.rows_affected, 0);
+        assert!(nothing.columns.is_empty());
     }
 
     /// A session is one connection, so a temp table made by one statement

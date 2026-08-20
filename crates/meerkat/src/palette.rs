@@ -922,6 +922,7 @@ mod tests {
             source: RunSource::User,
             elapsed_ms: Some(34),
             row_count: Some(6),
+            affected: None,
             error: None,
         }
     }
