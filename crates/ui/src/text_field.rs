@@ -486,6 +486,13 @@ impl TextField {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_everything(cx);
+    }
+
+    /// Mark the whole value, as ⌘A does. A key that puts the focus on a
+    /// field the user may have typed into before wants this: the next
+    /// character replaces what is there rather than being appended to it.
+    pub fn select_everything(&mut self, cx: &mut Context<Self>) {
         self.move_to(0, cx);
         self.select_to(self.content.len(), cx);
     }

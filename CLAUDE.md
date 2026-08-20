@@ -144,6 +144,16 @@ bare schema name answers with everything under it. Whatever is left with nothing
 and what survives is drawn open whatever the two sets say — a search that
 needs a second click to show its hits is not a search. ⎋ empties the line.
 
+**⌘E puts the keys on it, from wherever they are.** The line is the only
+way into the sidebar without the mouse, and the focus is usually in the
+SQL editor or the grid. So the key is bound to the `Shell` context, like
+⌘J and for the same reason, and the cap is painted in the line while it
+is empty — a gesture nothing on screen names is a gesture nobody finds.
+It is not a toggle: the line is on screen either way, and a second press
+would have to guess where to hand the focus back. What is typed is
+**marked, not emptied**, so a line narrowed to `dev.` can be carried on
+from and the next character still replaces it; ⎋ is the way out.
+
 **A filtered section is ranked, not alphabetical.** `path_rank` answers
 with the palette's own key — the alignment furthest out, then the score,
 then the length of the name — so a query offers the same name first in

@@ -78,6 +78,7 @@ actions!(
         FindColumn,
         ColumnPrev,
         ColumnNext,
+        FilterCatalog,
         CatalogPrev,
         CatalogNext,
         PeekValue,
@@ -128,18 +129,27 @@ pub fn column_find_key_bindings() -> Vec<gpui::KeyBinding> {
 /// as soon as it does not.
 pub const CATALOG_FILTER_KEY_CONTEXT: &str = "CatalogFilter";
 
-/// Key bindings for walking the names the sidebar's filter left.
+/// Key bindings for the sidebar's filter.
+///
+/// ⌘E is the **shell's**, like ⌘J and for the same reason: it has to reach
+/// the line from wherever the focus is — the SQL editor, the grid — which is
+/// the whole of what it is for. It only puts the focus there and marks what
+/// is already typed; it is not a toggle, because the line is on screen
+/// either way and a second press would have to guess where to hand the
+/// focus back to. ⎋ is the way out, as it was.
 ///
 /// A filter that answers with five tables is a list the user has to reach
 /// for the mouse to use, and the name they want is rarely the first one.
 /// ↓ steps into that list, ↑ steps back out of it, and ⏎ opens whichever
-/// name the cursor is on.
+/// name the cursor is on. Those two are the line's own, or they would be
+/// taken from the results grid whenever nothing is typed.
 ///
 /// ⏎ and ⎋ are bound nowhere here. The filter is a `TextField`, which
 /// reports both as events of its own, so the sidebar answers them the way
 /// the palette and the column find do.
 pub fn catalog_filter_key_bindings() -> Vec<gpui::KeyBinding> {
     vec![
+        gpui::KeyBinding::new("cmd-e", FilterCatalog, Some("Shell")),
         gpui::KeyBinding::new("up", CatalogPrev, Some(CATALOG_FILTER_KEY_CONTEXT)),
         gpui::KeyBinding::new("down", CatalogNext, Some(CATALOG_FILTER_KEY_CONTEXT)),
     ]
@@ -1201,6 +1211,28 @@ impl Shell {
         // Setting the text emits `Changed`, which filters again, so the
         // list already follows the completed line when this returns.
         self.catalog_filter.update(cx, |field, cx| field.set_text(completed, cx));
+    }
+
+    /// Put the keys on the filter line, wherever they were, and mark what
+    /// is on it. ⌘E is how the sidebar is reached without the mouse.
+    ///
+    /// The value is **marked rather than emptied**: a line the user
+    /// narrowed to `dev.` is worth carrying on from, and ⎋ already empties
+    /// it. Marking it means the next character replaces it either way, so
+    /// nothing is lost by keeping it.
+    ///
+    /// The column find is closed for the reason the palette closes it: one
+    /// search line takes the keys at a time. The palette and the close
+    /// dialog are not reached past, because each is already the thing
+    /// being answered.
+    fn focus_catalog_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() || self.confirm.is_some() {
+            return;
+        }
+        self.close_column_find(window, cx);
+        self.catalog_filter.update(cx, |field, cx| field.select_everything(cx));
+        window.focus(&self.catalog_filter.focus_handle(cx), cx);
+        cx.notify();
     }
 
     /// Open a closed schema, or close an open one.
@@ -3072,6 +3104,15 @@ impl Shell {
         self.toggle_column_find(window, cx);
     }
 
+    fn on_filter_catalog(
+        &mut self,
+        _: &FilterCatalog,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_catalog_filter(window, cx);
+    }
+
     fn on_column_prev(&mut self, _: &ColumnPrev, _: &mut Window, cx: &mut Context<Self>) {
         self.step_column_find(false, cx);
     }
@@ -3595,6 +3636,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::on_next_page))
             .on_action(cx.listener(Self::on_show_history))
             .on_action(cx.listener(Self::on_find_column))
+            .on_action(cx.listener(Self::on_filter_catalog))
             .on_action(cx.listener(Self::on_peek_value))
             .on_action(cx.listener(Self::on_toggle_palette))
             .on_action(cx.listener(Self::on_next_tab))
@@ -3951,6 +3993,17 @@ impl Shell {
                             .child("⌕"),
                     )
                     .child(div().flex_1().min_w(px(0.)).child(self.catalog_filter.clone()))
+                    // ⌘E reaches this line from anywhere, and a gesture
+                    // nothing on screen names is a gesture nobody finds.
+                    // It gives way to the clear mark, which is about the
+                    // line the user is already on.
+                    .children((!filtering).then(|| {
+                        div()
+                            .flex_none()
+                            .text_size(px(10.))
+                            .text_color(colors.text_faint)
+                            .child("⌘E")
+                    }))
                     // The way out of a filter for the mouse. It appears only
                     // when there is something to clear.
                     .children(filtering.then(|| {
