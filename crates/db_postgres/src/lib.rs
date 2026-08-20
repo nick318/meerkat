@@ -18,7 +18,9 @@ use db_client::{
 };
 use futures::TryStreamExt as _;
 use introspect::{Catalog, Column, Schema, Table, TableKind};
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
+use sqlx::postgres::{
+    PgConnectOptions, PgPool, PgPoolOptions, PgRow, PgValueFormat, PgValueRef,
+};
 use sqlx::{Column as _, Executor as _, Row as _, TypeInfo as _, ValueRef as _};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -821,10 +823,111 @@ fn decode(row: &PgRow, i: usize) -> Result<Value> {
         "TIME" => Value::Text(format_time(row.try_get::<sqlx::types::time::Time, _>(i)?)),
         "JSON" | "JSONB" => Value::Text(row.try_get::<serde_json::Value, _>(i)?.to_string()),
         "BYTEA" => Value::Bytes(row.try_get::<Vec<u8>, _>(i)?),
-        // A viewer must never fall over on an exotic column: show the type
-        // name instead of failing the whole result.
+        // Everything sqlx has no decoder for: read the wire bytes.
+        _ => off_the_wire(row.try_get_raw(i)?, &type_name)?,
+    })
+}
+
+/// Render a value sqlx cannot decode, from the bytes the server sent.
+///
+/// sqlx knows the built-in types by OID and calls everything else by the
+/// name it reads back from the catalog — `xid8`, `tsvector`. There is no
+/// `Decode` for those, so `try_get` on any Rust type fails, and the old
+/// fallback painted `<xid8>` in every cell of the column: the type name
+/// is the one thing about the value the user already knew.
+///
+/// The wire carries enough to do better. A statement sent unprepared
+/// comes back in **text** format, which is Postgres's own rendering of
+/// the value and is right for every type there will ever be. A prepared
+/// statement — which is the path a run takes — comes back in **binary**,
+/// where each type is its own layout and nothing generic can be said, so
+/// the ones worth reading are decoded by hand and the rest keep the type
+/// name they had.
+fn off_the_wire(raw: PgValueRef<'_>, type_name: &str) -> Result<Value> {
+    let format = raw.format();
+    let bytes = raw.as_bytes().map_err(|error| anyhow::anyhow!("{error}"))?;
+    if let PgValueFormat::Text = format {
+        return Ok(Value::Text(String::from_utf8_lossy(bytes).into_owned()));
+    }
+    // The name comes from the catalog, so it arrives as the server spells
+    // it; the built-in names sqlx uses are upper case.
+    Ok(match type_name.to_ascii_lowercase().as_str() {
+        "xid" => transaction_id(u32::from_be_bytes(fixed(bytes)?) as u64),
+        "xid8" => transaction_id(u64::from_be_bytes(fixed(bytes)?)),
+        "tsvector" => Value::Text(tsvector(bytes)?),
         _ => Value::Text(format!("<{type_name}>")),
     })
+}
+
+fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("expected {N} bytes on the wire, got {}", bytes.len()))
+}
+
+/// A transaction id is 64 bits *unsigned*, so a value past `i64::MAX` has
+/// no `Value::Int` to go in. No cluster has ever counted that far, but
+/// rendering it as a negative number would be a lie rather than a limit,
+/// so those digits go through as text.
+fn transaction_id(id: u64) -> Value {
+    i64::try_from(id).map(Value::Int).unwrap_or_else(|_| Value::Text(id.to_string()))
+}
+
+/// `tsvector`'s binary form, rendered the way `tsvector_out` renders it:
+/// `'fox':3 'quick':2A`.
+///
+/// The wire form is a count of lexemes, then for each one the lexeme as a
+/// NUL-terminated string, a count of positions, and that many `u16`s
+/// holding the position in the low 14 bits and the weight in the top two.
+/// Weight 3 prints as `A` down to 1 as `C`; 0 is the default and prints as
+/// nothing. A quote or a backslash inside a lexeme is doubled, as
+/// Postgres doubles it, or the rendering could not be read back.
+fn tsvector(mut bytes: &[u8]) -> Result<String> {
+    fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+        if bytes.len() < n {
+            anyhow::bail!("tsvector ended early");
+        }
+        let (head, rest) = bytes.split_at(n);
+        *bytes = rest;
+        Ok(head)
+    }
+
+    let lexemes = u32::from_be_bytes(fixed(take(&mut bytes, 4)?)?);
+    let mut out = String::new();
+    for _ in 0..lexemes {
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| anyhow::anyhow!("tsvector lexeme is not terminated"))?;
+        let lexeme = String::from_utf8_lossy(take(&mut bytes, end)?).into_owned();
+        take(&mut bytes, 1)?;
+
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push('\'');
+        for character in lexeme.chars() {
+            if character == '\'' || character == '\\' {
+                out.push(character);
+            }
+            out.push(character);
+        }
+        out.push('\'');
+
+        let positions = u16::from_be_bytes(fixed(take(&mut bytes, 2)?)?);
+        for n in 0..positions {
+            let entry = u16::from_be_bytes(fixed(take(&mut bytes, 2)?)?);
+            out.push(if n == 0 { ':' } else { ',' });
+            out.push_str(&(entry & 0x3fff).to_string());
+            match entry >> 14 {
+                3 => out.push('A'),
+                2 => out.push('B'),
+                1 => out.push('C'),
+                _ => {}
+            }
+        }
+    }
+    Ok(out)
 }
 
 // The `time` crate's `Display` output is not ISO-8601, and pulling in a
@@ -1037,6 +1140,33 @@ mod tests {
         let result = conn.execute("SELECT point(1, 2) AS p, 1 AS n").await.unwrap();
         assert_eq!(result.rows[0][0], Value::Text("<POINT>".to_string()));
         assert_eq!(result.rows[0][1], Value::Int(1));
+    }
+
+    /// The wire readers, against the server that writes those bytes: the
+    /// layouts are documented rather than versioned, so a test over a
+    /// fixture alone would go on passing if the reading were wrong.
+    #[tokio::test]
+    async fn transaction_ids_and_tsvectors_read_as_values() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+
+        let result = conn
+            .execute(
+                "SELECT '42'::xid AS x,
+                        '4294967300'::xid8 AS x8,
+                        to_tsvector('english', 'The quick brown fox') AS v,
+                        setweight(to_tsvector('english', 'quick fox'), 'A') AS w,
+                        'a''b'::tsvector AS q",
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows[0][0], Value::Int(42));
+        assert_eq!(result.rows[0][1], Value::Int(4294967300));
+        assert_eq!(result.rows[0][2], Value::Text("'brown':3 'fox':4 'quick':2".to_string()));
+        // The weight is the top two bits of the position, so a wrong
+        // reading would put the letter on the wrong lexeme or lose it.
+        assert_eq!(result.rows[0][3], Value::Text("'fox':2A 'quick':1A".to_string()));
+        assert_eq!(result.rows[0][4], Value::Text("'a''b'".to_string()));
     }
 
     #[tokio::test]
@@ -1470,6 +1600,62 @@ mod tests {
         assert!(error.to_string().contains("not a valid PostgreSQL URL"), "{error}");
     }
 
+
+    /// The bytes `tsvectorsend` writes, so the reader can be argued with
+    /// without a server: a lexeme count, then each lexeme NUL-terminated
+    /// with its positions.
+    fn tsvector_bytes(lexemes: &[(&str, &[(u16, u16)])]) -> Vec<u8> {
+        let mut bytes = (lexemes.len() as u32).to_be_bytes().to_vec();
+        for (lexeme, positions) in lexemes {
+            bytes.extend(lexeme.as_bytes());
+            bytes.push(0);
+            bytes.extend((positions.len() as u16).to_be_bytes());
+            for (position, weight) in *positions {
+                bytes.extend((position | (weight << 14)).to_be_bytes());
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_tsvector_reads_as_postgres_prints_it() {
+        let bytes = tsvector_bytes(&[("fox", &[(3, 0)]), ("quick", &[(2, 3), (7, 0)])]);
+        assert_eq!(tsvector(&bytes).unwrap(), "'fox':3 'quick':2A,7");
+
+        // No positions at all — `to_tsvector` always gives them, but
+        // `'a'::tsvector` does not.
+        assert_eq!(tsvector(&tsvector_bytes(&[("a", &[])])).unwrap(), "'a'");
+        assert_eq!(tsvector(&tsvector_bytes(&[])).unwrap(), "");
+
+        // Every weight has its letter, and D — weight 0 — has none.
+        let bytes = tsvector_bytes(&[("w", &[(1, 3), (2, 2), (3, 1), (4, 0)])]);
+        assert_eq!(tsvector(&bytes).unwrap(), "'w':1A,2B,3C,4");
+
+        // A quote and a backslash are doubled, or the rendering could not
+        // be read back as a tsvector.
+        let bytes = tsvector_bytes(&[("it's", &[]), ("a\\b", &[])]);
+        assert_eq!(tsvector(&bytes).unwrap(), "'it''s' 'a\\\\b'");
+    }
+
+    #[test]
+    fn a_short_tsvector_is_an_error_not_a_panic() {
+        // A count that promises more than the bytes hold must not index
+        // past the end: a viewer reports the cell, it does not abort.
+        assert!(tsvector(&[0, 0, 0, 1]).is_err());
+        assert!(tsvector(&[0, 0]).is_err());
+        // A lexeme with no terminator.
+        assert!(tsvector(&[0, 0, 0, 1, b'a']).is_err());
+        // A position count with no positions behind it.
+        assert!(tsvector(&[0, 0, 0, 1, b'a', 0, 0, 1]).is_err());
+    }
+
+    #[test]
+    fn a_transaction_id_stays_unsigned() {
+        assert_eq!(transaction_id(7), Value::Int(7));
+        assert_eq!(transaction_id(u32::MAX as u64), Value::Int(4294967295));
+        // Past `i64::MAX` there is no `Int` that says the truth.
+        assert_eq!(transaction_id(u64::MAX), Value::Text(u64::MAX.to_string()));
+    }
 
     #[test]
     fn the_server_version_reads_short() {

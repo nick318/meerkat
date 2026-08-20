@@ -947,9 +947,24 @@ renders type names the way `psql` does. Primary keys come from
 `information_schema`, which reports key column order.
 
 Decode result columns by matching on `type_info().name()` — `try_get::<String>`
-fails on non-text Postgres types. An unknown type must return
-`Value::Text(format!("<{type_name}>"))` rather than erroring: a viewer must
-not fall over on exotic columns.
+fails on non-text Postgres types. An unknown type must never error: a viewer
+must not fall over on exotic columns.
+
+**What sqlx cannot decode is read off the wire.** sqlx knows the built-in
+types by OID, under upper-case names, and calls everything else by the name
+it reads back from the catalog — `xid8`, `tsvector` — with no `Decode` for
+it, so `try_get` fails on every Rust type. `off_the_wire` takes the bytes
+instead. A statement sent **unprepared** answers in text format, which is
+Postgres's own rendering and is right for every type there will ever be. A
+run is **prepared**, so it answers in binary, where each type is its own
+layout and nothing generic can be said: `xid` and `xid8` are big-endian
+unsigned integers, `tsvector` is read by `tsvector` — a lexeme count, then
+each lexeme NUL-terminated with its positions, the weight in the top two
+bits of each — and everything else keeps the `<type_name>` placeholder it
+had. A short or malformed value is an error on that cell, never a panic.
+
+A transaction id is unsigned 64 bits, so one past `i64::MAX` goes through
+as its digits rather than as a negative `Value::Int`.
 
 `Table::approx_rows` is an estimate for the sidebar only. Never use it for
 paging arithmetic that must be exact.
