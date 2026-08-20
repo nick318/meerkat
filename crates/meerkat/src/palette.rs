@@ -18,10 +18,20 @@
 //! one row and lays out only what is on screen. Arrow keys then move the
 //! selection by index, and the list scrolls to it.
 //!
-//! Matching is a case-insensitive substring, not a fuzzy score. A database
-//! viewer's names are typed, not guessed: someone looking for `user_id`
-//! types part of `user_id`, and a contiguous hit is the one the palette can
-//! underline honestly.
+//! Matching a **name** is [`fuzzy`]'s rule, shared with the ⌘J column find
+//! and the SQL editor's completion panel: a query names the starts of a
+//! name's words, so `mast_cl` finds `master_client_reference` and `mcr`
+//! finds it by its initials. It is not an open fuzzy score — nothing
+//! matches loose in the middle of a word — so the hit is still a few runs
+//! of characters the row can underline honestly.
+//!
+//! Matching a **statement** is a plain case-insensitive substring, and that
+//! difference is on purpose. A name is a path of words, which is what the
+//! word-start rule reads; a run's statement is prose, long and full of
+//! word starts, so the same rule over it would answer a short query with
+//! everything the connection has ever run. IntelliJ draws the line in the
+//! same place: its hump matcher is for symbols, and find-in-text is a
+//! substring.
 //!
 //! A **dot in the query names a path**. Every result carries its name in
 //! parts — the schema and the relation — and the typed parts are lined up
@@ -187,8 +197,9 @@ pub struct Item {
 struct Candidate {
     /// The name in parts, outermost first: the schema, then the relation.
     parts: Vec<String>,
-    /// Where the query hit inside each part, if it hit that part at all.
-    hits: Vec<Option<Range<usize>>>,
+    /// Where the query hit inside each part: one list of runs per part, and
+    /// an empty list for a part the query never addressed.
+    hits: Vec<Vec<Range<usize>>>,
     /// The outermost part the query itself named. Everything before it the
     /// user did not ask about.
     named: usize,
@@ -198,10 +209,11 @@ struct Candidate {
     /// Whether the search line may be completed from this path. A run
     /// carries a statement, not a path, so it may not.
     completes: bool,
-    /// How far out the query aligned, where the hit sat, and how long the
-    /// name is. A table the query named directly comes before one its
-    /// schema matched, and `users` before `active_users_7d`.
-    rank: (usize, usize, usize),
+    /// How far out the query aligned, what the match cost — a negated
+    /// score, so lower is still better — and how long the name is. A table
+    /// the query named directly comes before one its schema matched, and
+    /// `users` before `active_users_7d`.
+    rank: (usize, i32, usize),
     glyph: Glyph,
     meta: SharedString,
     trailing: SharedString,
@@ -329,13 +341,15 @@ fn dress(found: Vec<Candidate>) -> (Vec<Item>, bool) {
 
             let mut label = String::new();
             let mut hits = Vec::new();
-            for (part, hit) in candidate.parts[from..].iter().zip(&candidate.hits[from..]) {
+            for (part, runs) in candidate.parts[from..].iter().zip(&candidate.hits[from..]) {
                 if !label.is_empty() {
                     label.push('.');
                 }
-                if let Some(hit) = hit.clone().filter(|hit| !hit.is_empty()) {
-                    hits.push((label.len() + hit.start)..(label.len() + hit.end));
-                }
+                hits.extend(
+                    runs.iter()
+                        .filter(|run| !run.is_empty())
+                        .map(|run| (label.len() + run.start)..(label.len() + run.end)),
+                );
                 label.push_str(part);
             }
 
@@ -365,11 +379,12 @@ fn tables(catalog: Option<&Catalog>, needle: &str) -> Vec<Candidate> {
         for table in &schema.tables {
             let parts = vec![schema.name.clone(), table.name.clone()];
             // A bare schema name answers with the tables it holds.
-            let Some((hits, named)) = find_path(&parts, needle) else { continue };
+            let Some(aligned) = find_path(&parts, needle) else { continue };
+            let named = aligned.named;
             found.push(Candidate {
-                rank: rank(&hits, &table.name),
+                rank: rank(&aligned, parts.len(), &table.name),
                 parts,
-                hits,
+                hits: aligned.hits,
                 named,
                 // A relation hides its schema: the heading has it.
                 from: 1,
@@ -409,10 +424,13 @@ fn history(runs: &[QueryRun], needle: &str, today: NaiveDate) -> Vec<Candidate> 
         .filter_map(|run| {
             let statement = one_line(&run.statement);
             let hit = find(&statement, needle)?;
+            // The earlier the query sits in the statement, the better: a
+            // cost, the way a table's negated score is.
+            let cost = hit.start.min(i32::MAX as usize) as i32;
             Some(Candidate {
-                rank: (0, hit.start, statement.len()),
+                rank: (0, cost, statement.len()),
                 parts: vec![statement],
-                hits: vec![Some(hit)],
+                hits: vec![vec![hit]],
                 named: 0,
                 from: 0,
                 completes: false,
@@ -462,8 +480,8 @@ pub fn complete_path(parts: &[String], needle: &str) -> Option<String> {
     if needle.is_empty() {
         return None;
     }
-    let (_, named) = find_path(parts, needle)?;
-    finish(parts, named, needle)
+    let aligned = find_path(parts, needle)?;
+    finish(parts, aligned.named, needle)
 }
 
 /// The line the query becomes when it takes the next part of `path`.
@@ -501,7 +519,7 @@ fn finish(path: &[String], named: usize, needle: &str) -> Option<String> {
 /// "dev.ta"      ^hit         ^hit
 /// "dev_sample"  ^hit  (slid out one part, so the whole schema answers)
 /// ```
-fn find_path(parts: &[String], needle: &str) -> Option<(Vec<Option<Range<usize>>>, usize)> {
+fn find_path(parts: &[String], needle: &str) -> Option<Aligned> {
     let typed: Vec<&str> = needle.split('.').collect();
     if typed.len() > parts.len() {
         return None;
@@ -510,12 +528,29 @@ fn find_path(parts: &[String], needle: &str) -> Option<(Vec<Option<Range<usize>>
 
     // Innermost alignment first: `task` is a table before it is a schema.
     (0..=flush).rev().find_map(|named| {
-        let mut hits = vec![None; parts.len()];
+        let mut hits = vec![Vec::new(); parts.len()];
+        let mut score = 0;
         for (ix, part) in typed.iter().enumerate() {
-            hits[named + ix] = Some(find(&parts[named + ix], part)?);
+            let hit = fuzzy::score(&parts[named + ix], part)?;
+            score += hit.score;
+            hits[named + ix] = hit.ranges;
         }
-        Some((hits, named))
+        Some(Aligned { hits, named, typed: typed.len(), score })
     })
+}
+
+/// Where a query landed on one path.
+struct Aligned {
+    /// The matched runs inside each part, and nothing for a part the query
+    /// did not address.
+    hits: Vec<Vec<Range<usize>>>,
+    /// The outermost part the query itself named.
+    named: usize,
+    /// How many parts the query was written in. This says which parts were
+    /// addressed, which the hits cannot: a query ending in a dot addresses
+    /// a part it has matched nothing inside.
+    typed: usize,
+    score: i32,
 }
 
 /// Does a path answer this query? The sidebar's filter asks the palette,
@@ -525,12 +560,11 @@ pub fn path_matches(parts: &[String], needle: &str) -> bool {
 }
 
 /// How a result sorts: an alignment further out first, because a name the
-/// query hit directly beats a name its container matched; then where the
-/// hit sat, then how long the name is.
-fn rank(hits: &[Option<Range<usize>>], name: &str) -> (usize, usize, usize) {
-    let innermost = hits.iter().rposition(|hit| hit.is_some()).unwrap_or(0);
-    let start = hits[innermost].as_ref().map_or(0, |hit| hit.start);
-    (hits.len() - 1 - innermost, start, name.len())
+/// query hit directly beats a name its container matched; then how well the
+/// query matched, then how long the name is.
+fn rank(aligned: &Aligned, parts: usize, name: &str) -> (usize, i32, usize) {
+    let innermost = aligned.named + aligned.typed - 1;
+    (parts - 1 - innermost, -aligned.score, name.len())
 }
 
 /// A multi-line statement is one row here, so the newlines become spaces
@@ -553,9 +587,12 @@ fn clock(ran_at: i64, today: NaiveDate) -> SharedString {
     }
 }
 
-/// Where the query sits inside a name, as a byte range, or `None` when it
-/// is not there at all. An empty query matches everything at offset zero
-/// but underlines nothing.
+/// Where the query sits inside a **statement**, as a byte range, or `None`
+/// when it is not there at all. An empty query matches everything at offset
+/// zero but underlines nothing.
+///
+/// A statement is prose, so this is a substring and not [`fuzzy`]'s
+/// word-start rule — see the module docs for why the two differ.
 ///
 /// The comparison lowercases ASCII only, which is what keeps the range
 /// usable: `to_ascii_lowercase` never changes a character's byte length,
@@ -891,13 +928,14 @@ mod tests {
             labels(&results),
             [
                 "[TABLES · PUBLIC 4]",
-                // `users` and `user_settings` hit at 0, shortest first;
-                // then the two whose hit sits further in, the nearer one
-                // first.
+                // `users` and `user_settings` are hit at the start of the
+                // name, shortest first. Then `active_users_7d`, where the
+                // hit starts the word `users`, and last the one where it
+                // sits inside a word and starts nothing.
                 "users",
                 "user_settings",
-                "accoustics_test",
                 "active_users_7d",
+                "accoustics_test",
             ]
         );
         assert_eq!(results.matches, 4);
@@ -906,7 +944,7 @@ mod tests {
     #[test]
     fn the_matched_part_is_reported_as_a_range_of_the_label() {
         let results = build(Some(&catalog()), &[], Scope::Tables, "US", today());
-        let Row::Item(item) = &results.rows[4] else { panic!("expected a result") };
+        let Row::Item(item) = &results.rows[3] else { panic!("expected a result") };
         assert_eq!(item.label, "active_users_7d");
         // Case-insensitive, and the range points at the original casing.
         assert_eq!(underlined(item), ["us"]);
@@ -993,10 +1031,15 @@ mod tests {
         // One schema matched, so nothing forces the full path — but the
         // user typed the schema, so the rows read it back and the heading
         // stops saying it.
+        //
+        // `user_settings` answers too — four characters and then the `s`
+        // that starts `settings` — and it ranks below both names that hold
+        // `users` whole, because a name matched in one piece beats a name
+        // matched in two.
         let results = build(Some(&catalog()), &[], Scope::Tables, "public.users", today());
         assert_eq!(
             labels(&results),
-            ["[TABLES 2]", "public.users", "public.active_users_7d"]
+            ["[TABLES 3]", "public.users", "public.user_settings", "public.active_users_7d"]
         );
 
         // Without the dot, the heading carries the schema instead.

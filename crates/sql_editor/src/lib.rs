@@ -1278,11 +1278,6 @@ impl SqlEditor {
     /// it never resizes the query pane.
     fn completions_menu(&self, cx: &mut Context<Self>) -> Div {
         let colors = theme(cx).colors.clone();
-        // How much of each label the user has already typed, so the
-        // matched head can be marked and the rest left plain.
-        let typed = self.content[clamp_range(&self.content, self.completion_range.clone())]
-            .chars()
-            .count();
 
         div()
             .flex()
@@ -1298,7 +1293,8 @@ impl SqlEditor {
             .text_size(px(12.))
             .children(self.completions.iter().enumerate().map(|(ix, completion)| {
                 let selected = ix == self.completion_ix;
-                let (head, tail) = split_at_chars(&completion.label, typed);
+                let spans = matched_spans(&completion.label, &completion.matched);
+                let last = spans.len().saturating_sub(1);
                 let row = div()
                     .id(ElementId::Name(format!("completion-{ix}").into()))
                     .mx(px(4.))
@@ -1318,14 +1314,23 @@ impl SqlEditor {
                             .min_w(px(0.))
                             .flex()
                             .overflow_hidden()
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(colors.accent_deep)
-                                    .child(head),
-                            )
-                            .child(div().truncate().text_color(colors.text).child(tail)),
+                            .children(spans.into_iter().enumerate().map(|(at, (text, hit))| {
+                                let span = if at == last {
+                                    // Only the last span may give way: a
+                                    // long name has to end in an ellipsis
+                                    // rather than run out of the panel.
+                                    div().truncate()
+                                } else {
+                                    div().flex_none()
+                                };
+                                if hit {
+                                    span.font_weight(FontWeight::MEDIUM)
+                                        .text_color(colors.accent_deep)
+                                        .child(text)
+                                } else {
+                                    span.text_color(colors.text).child(text)
+                                }
+                            })),
                     )
                     .child(
                         div()
@@ -1356,14 +1361,26 @@ impl SqlEditor {
     }
 }
 
-/// Split a label after `count` characters, never mid-character.
-fn split_at_chars(label: &str, count: usize) -> (String, String) {
-    let split = label
-        .char_indices()
-        .nth(count)
-        .map(|(ix, _)| ix)
-        .unwrap_or(label.len());
-    (label[..split].to_string(), label[split..].to_string())
+/// A label cut into the pieces the panel paints: each piece with whether
+/// the typed word matched it. The ranges come from the matcher, in order and
+/// never overlapping, so this is one walk with no sorting.
+fn matched_spans(label: &str, matched: &[Range<usize>]) -> Vec<(String, bool)> {
+    let mut spans = Vec::with_capacity(matched.len() * 2 + 1);
+    let mut at = 0;
+    for hit in matched {
+        if hit.start < at || hit.end > label.len() {
+            continue;
+        }
+        if hit.start > at {
+            spans.push((label[at..hit.start].to_string(), false));
+        }
+        spans.push((label[hit.clone()].to_string(), true));
+        at = hit.end;
+    }
+    if at < label.len() {
+        spans.push((label[at..].to_string(), false));
+    }
+    spans
 }
 
 /// Byte offset for a UTF-16 offset *within* `text`, clamped to its end.
@@ -1834,6 +1851,25 @@ mod tests {
         assert_eq!(clamp_range(text, 2..50), 2..8);
         // Out of order comes back ordered rather than panicking on slice.
         assert_eq!(clamp_range(text, 6..2), 6..6);
+    }
+
+    /// The panel marks what the word actually matched, wherever in the name
+    /// that landed — not the label's first characters, which is what a
+    /// prefix match used to make the same thing.
+    #[test]
+    fn a_label_is_cut_into_matched_and_plain() {
+        let hit = fuzzy::score("master_client_reference", "mast_cl").expect("matches");
+        assert_eq!(
+            matched_spans("master_client_reference", &hit.ranges),
+            [
+                ("mast".to_string(), true),
+                ("er_".to_string(), false),
+                ("cl".to_string(), true),
+                ("ient_reference".to_string(), false),
+            ]
+        );
+        // Nothing typed marks nothing, and the whole label stays one piece.
+        assert_eq!(matched_spans("users", &[]), [("users".to_string(), false)]);
     }
 
     #[test]

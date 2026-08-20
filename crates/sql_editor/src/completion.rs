@@ -37,6 +37,11 @@ pub struct Completion {
     pub label: String,
     pub detail: String,
     pub kind: Kind,
+    /// The parts of `label` the typed word matched, as byte ranges in order
+    /// and never overlapping. The panel marks these rather than the label's
+    /// first characters: a match sits anywhere inside a name, so marking
+    /// the head would say the user typed something they did not.
+    pub matched: Vec<Range<usize>>,
 }
 
 /// The names in the connected database, folded to lower case for lookup
@@ -84,8 +89,16 @@ impl Vocabulary {
         self.entries.is_empty()
     }
 
-    /// Candidates for `prefix`, restricted to `qualifier`'s children when
-    /// the caret sits after `something.`.
+    /// Candidates for `prefix` — the word under the caret — restricted to
+    /// `qualifier`'s children when the caret sits after `something.`, and
+    /// ranked best first.
+    ///
+    /// It is called a prefix because that is where the caret is, not
+    /// because a name has to start with it: matching is [`fuzzy`]'s, the
+    /// same rule the ⌘J column find and the ⌘K palette answer to, so
+    /// `mast_cl` offers `master_client_reference`. A viewer's columns are
+    /// long compound names, and typing one from the front is exactly the
+    /// work completion is meant to save.
     ///
     /// An empty prefix is allowed: that is what `users.` should offer.
     pub fn candidates(&self, prefix: &str, qualifier: Option<&str>) -> Vec<Completion> {
@@ -98,47 +111,78 @@ impl Vocabulary {
             .as_ref()
             .is_some_and(|owner| self.entries.iter().any(|e| e.owner.as_ref() == Some(owner)));
 
-        let mut candidates: Vec<Completion> = self
+        let pattern = fuzzy::Pattern::new(&prefix);
+        let mut candidates: Vec<Ranked> = self
             .entries
             .iter()
             .filter(|entry| !qualified || entry.owner == owner)
-            .filter(|entry| entry.lowered.starts_with(&prefix))
-            .map(|entry| Completion {
-                label: entry.name.clone(),
-                detail: entry.detail.clone(),
-                kind: entry.kind,
+            .filter_map(|entry| {
+                let hit = pattern.score(&entry.name)?;
+                Some(Ranked {
+                    score: hit.score,
+                    completion: Completion {
+                        label: entry.name.clone(),
+                        detail: entry.detail.clone(),
+                        kind: entry.kind,
+                        matched: hit.ranges,
+                    },
+                })
             })
             .collect();
 
         // Keywords are not owned by anything, so a qualified caret never
         // wants them, and neither does a caret with nothing typed yet.
+        //
+        // They are matched on the **prefix**, not the way a name is. A
+        // keyword is one word with no parts to walk, so there is nothing
+        // for the word-start rule to find, and matching one anywhere inside
+        // would answer `em` with `temp` — a word the user was not typing.
+        // The score itself is the same one the names are given, or a
+        // keyword and a name matched the same way would not sort against
+        // each other.
         if !qualified && !prefix.is_empty() {
             candidates.extend(
                 KEYWORDS
                     .iter()
                     .filter(|keyword| keyword.starts_with(&prefix))
-                    .map(|keyword| Completion {
-                        label: keyword.to_string(),
-                        detail: "keyword".to_string(),
-                        kind: Kind::Keyword,
+                    .filter_map(|keyword| {
+                        let hit = pattern.score(keyword)?;
+                        Some(Ranked {
+                            score: hit.score,
+                            completion: Completion {
+                                label: keyword.to_string(),
+                                detail: "keyword".to_string(),
+                                kind: Kind::Keyword,
+                                matched: hit.ranges,
+                            },
+                        })
                     }),
             );
         }
 
-        // Shortest first: the closest match to what was typed. Ties go to
-        // database names before keywords, then alphabetically, so the
-        // order never depends on how the catalog happened to be walked.
+        // Best match first, then the shortest label: the closest thing to
+        // what was typed. Ties go to database names before keywords, then
+        // alphabetically, so the order never depends on how the catalog
+        // happened to be walked.
         candidates.sort_by(|a, b| {
-            a.label
-                .len()
-                .cmp(&b.label.len())
-                .then(a.kind.cmp(&b.kind))
-                .then(a.label.cmp(&b.label))
+            b.score
+                .cmp(&a.score)
+                .then(a.completion.label.len().cmp(&b.completion.label.len()))
+                .then(a.completion.kind.cmp(&b.completion.kind))
+                .then(a.completion.label.cmp(&b.completion.label))
         });
+        let mut candidates: Vec<Completion> =
+            candidates.into_iter().map(|ranked| ranked.completion).collect();
         candidates.dedup_by(|a, b| a.label == b.label && a.kind == b.kind);
         candidates.truncate(MAX_CANDIDATES);
         candidates
     }
+}
+
+/// A candidate with the score that decides where it sits in the panel.
+struct Ranked {
+    score: i32,
+    completion: Completion,
 }
 
 /// The word being typed at `offset`: the run of identifier characters
@@ -283,5 +327,34 @@ mod tests {
     #[test]
     fn nothing_matches_a_word_the_database_does_not_have() {
         assert!(vocabulary().candidates("zzz", None).is_empty());
+    }
+
+    /// The word under the caret names the parts of a name, so a long column
+    /// is offered without typing it from the front. Before this the panel
+    /// matched on the prefix alone and offered nothing at all here.
+    #[test]
+    fn a_word_may_name_the_parts_of_a_name() {
+        let vocabulary = Vocabulary::new(["master_client_reference", "master_state_type_code"].map(
+            |name| Name {
+                name: name.into(),
+                detail: "text".into(),
+                kind: Kind::Column,
+                owner: Some("masters".into()),
+            },
+        ));
+        assert_eq!(
+            labels(&vocabulary.candidates("mast_cl", Some("masters"))),
+            vec!["master_client_reference"]
+        );
+        assert_eq!(
+            labels(&vocabulary.candidates("client", Some("masters"))),
+            vec!["master_client_reference"]
+        );
+        // The closest match leads: `mast` starts one name and sits inside
+        // the middle of neither.
+        assert_eq!(
+            labels(&vocabulary.candidates("mast", Some("masters"))),
+            vec!["master_state_type_code", "master_client_reference"]
+        );
     }
 }

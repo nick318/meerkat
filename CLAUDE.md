@@ -60,8 +60,8 @@ with Metal.
 ### Dependency direction
 
 UI crates may depend on data crates; the reverse is forbidden. `db_postgres`,
-`db_sqlite`, `db_client`, `introspect`, `storage`, `secrets`, `query` and
-`settings` must not know about `gpui`.
+`db_sqlite`, `db_client`, `introspect`, `storage`, `secrets`, `query`,
+`fuzzy` and `settings` must not know about `gpui`.
 
 | Crate | Role |
 |---|---|
@@ -70,6 +70,7 @@ UI crates may depend on data crates; the reverse is forbidden. `db_postgres`,
 | `db_postgres`, `db_sqlite` | sqlx drivers behind that trait |
 | `introspect` | Schema model (`Catalog` → `Schema` → `Table` → `Column`) that drivers fill |
 | `query` | `statements()`: split a buffer into statements, quote- and comment-aware |
+| `fuzzy` | `Pattern::score`: one matcher for every search line over names |
 | `sql_editor` | Multi-line SQL buffer: motion, undo, colouring, completion |
 | `results_grid` | Virtualized grid |
 | `ui`, `theme` | Component kit (incl. `TextField` and the overlay `scrollbar`) and color tokens |
@@ -136,10 +137,10 @@ catalog.
 
 The filter line over the list narrows the names the session already
 holds — no query goes out — by the palette's own rule, through
-`palette::path_matches`: a case-insensitive substring, and **a dot names
-a path**. So `address` finds every `address`, `dev.addr` finds the one in
-`sample_dev_sample`, and a bare schema name answers with everything under
-it. Whatever is left with nothing under it is dropped, header and all,
+`palette::path_matches`: the `fuzzy` crate's word-start rule, and **a dot
+names a path**. So `address` finds every `address`, `addr_ln` finds
+`address_line`, `dev.addr` finds the one in `sample_dev_sample`, and a
+bare schema name answers with everything under it. Whatever is left with nothing under it is dropped, header and all,
 and what survives is drawn open whatever the two sets say — a search that
 needs a second click to show its hits is not a search. ⏎ opens the first
 relation left, ⎋ empties the line.
@@ -309,6 +310,55 @@ extends, ⌘ with them goes as far as it goes, ⌘A takes everything, space
 ticks the cursor's row — ↓ then space walks a result and picks out of it
 without the mouse — and ⎋ drops what is marked.
 
+### Matching a name against what is typed
+
+Four search lines ask the same question — the sidebar's filter, the ⌘K
+palette, the ⌘J column find, and the SQL editor's completion panel — and
+`fuzzy` is the one answer. Before it there were three: a substring, a
+substring per path part, and a prefix, so `mast_cl` found
+`master_client_reference` in none of them and the same name was found three
+different ways depending on which line the user was typing into.
+
+**A query names the starts of a name's words**, which is the idea
+IntelliJ's `MinusculeMatcher` is built on. The query is cut into
+*fragments* at everything that is not a letter or a digit; the first may
+sit anywhere in the name, and every one after it must begin a word — where
+a word starts at the name's front, after a separator, at a case change, or
+at the step between letters and digits. Inside a fragment a character
+either follows the one before it or begins a word, which is what lets
+`mcr` find `master_client_reference` by its initials. So `mast_cl` finds
+`master_client_reference` and `masterClientReference` both, and `client`
+finds it as well.
+
+That last rule is the gate, and it is what keeps this from being a fuzzy
+finder. An unrestricted subsequence — fzf's rule — answers a three-letter
+query with half of a hundred-column result, and a jump list that long is
+not a jump. Nothing lands loose in the middle of a word.
+
+The score is fzf's shape: a match, more for a word start, more again for a
+character straight after the last one, and a gap costs. Two constants are
+rules rather than taste. **`GAP_START` costs more than the word start it
+buys**, so a name matched in one piece always beats a name matched in two
+— or `users` would rank `user_settings` above `users`. And the name's own
+first character is worth a shade more than an inner word start, which is
+what sorts `master_state_type_code` above `invoice_master_name` for
+`mast`. Callers break the remaining ties on the length of the name.
+
+The alignment is a dynamic program, not a greedy walk, because the greedy
+answer is wrong often enough to see: `cl` in `include_client` has to land
+on whichever of the two scores better. A subsequence scan runs first and
+throws out most of a large vocabulary without allocating.
+
+Case is ignored until the query shows it means it: a query written in
+**both** cases reads as strict, so `Cl` then asks for a capital or for a
+word starting with one, while `EMAIL` still finds `email`.
+
+**Two places do not use it.** A run's statement in the palette is matched
+by substring, because it is prose rather than a path of words — see the
+palette section. And SQL keywords in the completion panel are matched by
+prefix: a keyword is one word with nothing to walk, and matching inside
+one would answer `em` with `temp`.
+
 ### Finding a column of a result
 
 A result wider than the pane is the ordinary case for a real table, and
@@ -329,12 +379,13 @@ It is a child of the header cell rather than a bottom border, because a
 border carries one colour for all four sides and the left hairline has
 already claimed it.
 
-`results_grid::find_columns` is the whole of the matching: the palette's
-rule — a case-insensitive substring, not a fuzzy score — over the column
-names, answering with indices into the result's own lanes. It lowercases
-the whole of Unicode where the palette lowercases ASCII alone, because
-nothing underlines the hit here, so no byte range has to stay valid in
-the original name. A column's **type** is not searched: a result carries
+`results_grid::find_columns` is the whole of the matching: the `fuzzy`
+crate's rule over the column names, answering with indices into the
+result's own lanes, **ranked rather than in result order** — a search
+that offers the right column fourth is one the user reads before they can
+use it, and the score is what says which is closest. Ties go to the
+shorter name, then to the earlier lane. A column's **type** is not
+searched: a result carries
 names and values, the driver reports no type per column, and a search
 that answered differently on a tab opened from the catalog would be
 worse than one that does not offer it.
@@ -419,12 +470,20 @@ the palette opened. Nothing there hits the database, so a keystroke costs a
 substring scan, not a query. `build()` is pure — catalog and runs in, flat
 rows out — which is what makes the matching testable without a window.
 
-Matching is a case-insensitive **substring**, not a fuzzy score, and the
-comparison lowercases ASCII only. That is deliberate: `to_ascii_lowercase`
-never changes a character's byte length, so the hit's byte range into the
-lowered copy is still valid in the original, and the row can underline the
-matched characters. Rows are ranked by where the hit sits, then by name
-length.
+Matching a **name** is the `fuzzy` crate's rule, so `mast_cl` finds
+`master_client_reference`; rows are ranked by how far out the query
+aligned, then by the score, then by name length. Matching a **run's
+statement** is still a plain case-insensitive substring, and the
+difference is the point: a name is a path of words, which is what the
+word-start rule reads, while a statement is prose full of word starts, so
+the same rule over it would answer a short query with everything the
+connection has ever run. IntelliJ draws the line in the same place — a
+hump matcher for symbols, a substring for find-in-text.
+
+The statement comparison lowercases ASCII only, which keeps the hit's byte
+range into the lowered copy valid in the original so the row can underline
+it. `fuzzy` needs no such rule: it walks `char_indices` and hands back
+ranges on character boundaries of the string it was given.
 
 Rows are flattened into headings plus results of one height, as the
 sidebar and the history list are, because `uniform_list` needs one row

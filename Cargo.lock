@@ -2066,6 +2066,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuzzy"
+version = "0.1.0"
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3415,6 +3419,7 @@ dependencies = [
  "chrono",
  "db_client",
  "db_postgres",
+ "fuzzy",
  "gpui",
  "gpui_platform",
  "gpui_tokio",
@@ -4835,6 +4840,7 @@ name = "results_grid"
 version = "0.1.0"
 dependencies = [
  "db_client",
+ "fuzzy",
  "gpui",
  "theme",
  "ui",
@@ -5547,6 +5553,7 @@ dependencies = [
 name = "sql_editor"
 version = "0.1.0"
 dependencies = [
+ "fuzzy",
  "gpui",
  "theme",
  "ui",

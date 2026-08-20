@@ -7,11 +7,19 @@
 //! — an index into the same lanes [`crate::Selection`] and the grid count
 //! in, so the caller can put the cursor there and scroll to it.
 //!
-//! The rule is the ⌘K palette's: a case-insensitive **substring**, not a
-//! fuzzy score. A column name is typed, not guessed. Unlike the palette
-//! this lowercases the whole of Unicode rather than ASCII alone, because
-//! nothing here underlines the hit — no byte range has to stay valid in the
-//! original name.
+//! The rule is [`fuzzy`]'s, which is the ⌘K palette's and the SQL editor's
+//! as well: a query names the **starts of a name's words**, so `mast_cl`
+//! finds `master_client_reference` — the case this replaced a plain
+//! substring for. A substring could only be typed by somebody who already
+//! knew where in the name to start reading, which is not what a search line
+//! over a hundred columns is for.
+//!
+//! **The answer is ranked, not in result order.** A search that offers the
+//! right column fourth is one the user reads before they can use it, and
+//! the match itself says which one is closest to what was typed; lane 34
+//! coming before lane 4 is what a ranked answer looks like. Ties go to the
+//! shorter name and then to the earlier lane, so the order is settled by
+//! the result rather than by how the matching happened to run.
 //!
 //! A column's **type** is not part of it. A result carries its column names
 //! and its values; the driver reports no type per column, so a search over
@@ -19,20 +27,31 @@
 //! search that answers differently depending on where the tab came from is
 //! worse than one that does not offer it.
 
-/// The columns whose names hold `needle`, in the order they sit in the
-/// result.
+/// The columns whose names answer `needle`, best first.
 ///
-/// An empty needle matches every column, so a search line that has just
-/// opened lists the result from its first lane rather than showing nothing
-/// until a character is typed.
+/// An empty needle matches every column, in the result's own order, so a
+/// search line that has just opened lists the result from its first lane
+/// rather than showing nothing until a character is typed.
 pub fn find_columns(columns: &[String], needle: &str) -> Vec<usize> {
-    let needle = needle.trim().to_lowercase();
-    columns
+    let pattern = fuzzy::Pattern::new(needle);
+    // Nothing typed, nothing to rank: the result's own order is the only
+    // order there is, and sorting an unranked list by name length would
+    // shuffle the lanes for no reason.
+    if pattern.is_empty() {
+        return (0..columns.len()).collect();
+    }
+    let mut found: Vec<(usize, i32, usize)> = columns
         .iter()
         .enumerate()
-        .filter(|(_, name)| needle.is_empty() || name.to_lowercase().contains(&needle))
-        .map(|(index, _)| index)
-        .collect()
+        .filter_map(|(index, name)| {
+            let hit = pattern.score(name)?;
+            Some((index, hit.score, name.chars().count()))
+        })
+        .collect();
+    // Best score first; then the shorter name, which is more of what was
+    // typed; then the lane the result puts first.
+    found.sort_by_key(|&(index, score, length)| (-score, length, index));
+    found.into_iter().map(|(index, _, _)| index).collect()
 }
 
 #[cfg(test)]
@@ -50,6 +69,18 @@ mod tests {
     fn a_hit_anywhere_in_the_name_counts() {
         assert_eq!(find_columns(&columns(), "at"), vec![2, 4]);
         assert_eq!(find_columns(&columns(), "mail"), vec![1]);
+    }
+
+    /// The case this crate's matcher exists for: two words of a name, each
+    /// named by its start.
+    #[test]
+    fn a_query_may_name_the_words_of_a_name() {
+        let columns: Vec<String> = ["master_state_type_code", "master_client_reference"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(find_columns(&columns, "mast_cl"), vec![1]);
+        assert_eq!(find_columns(&columns, "mcr"), vec![1]);
     }
 
     /// Case is not part of what the user is asking: a column the database
@@ -75,11 +106,23 @@ mod tests {
         assert!(find_columns(&[], "id").is_empty());
     }
 
-    /// The indices are the result's own lane numbers, in result order —
-    /// never the order the matches were found in.
+    /// The closest match comes first, whatever lane it sits in — a search
+    /// that answers with the right column fourth is one the user has to
+    /// read before they can use it.
     #[test]
-    fn matches_come_back_in_result_order() {
-        let columns = vec!["zed".to_string(), "azure".to_string(), "z".to_string()];
-        assert_eq!(find_columns(&columns, "z"), vec![0, 1, 2]);
+    fn matches_come_back_ranked() {
+        let columns: Vec<String> = ["invoice_master_name", "master_state_type_code"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(find_columns(&columns, "mast"), vec![1, 0]);
+    }
+
+    /// Equal matches keep the result's own order, so the list never depends
+    /// on how the matching happened to run.
+    #[test]
+    fn an_equal_match_keeps_the_lane_order() {
+        let columns = vec!["zed".to_string(), "zip".to_string()];
+        assert_eq!(find_columns(&columns, "z"), vec![0, 1]);
     }
 }

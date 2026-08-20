@@ -10,6 +10,7 @@ members = [
     "crates/db_sqlite",
     "crates/db_postgres",
     "crates/introspect",
+    "crates/fuzzy",
     "crates/query",
     "crates/sql_editor",
     "crates/results_grid",
@@ -40,6 +41,7 @@ db_client = { path = "crates/db_client" }
 db_sqlite = { path = "crates/db_sqlite" }
 db_postgres = { path = "crates/db_postgres" }
 introspect = { path = "crates/introspect" }
+fuzzy = { path = "crates/fuzzy" }
 query = { path = "crates/query" }
 sql_editor = { path = "crates/sql_editor" }
 results_grid = { path = "crates/results_grid" }
@@ -64,4 +66,12 @@ dirs = "6"
 [profile.dev]
 # GPUI is slow in unoptimized builds; keep dependencies optimized.
 [profile.dev.package."*"]
+opt-level = 2
+
+# `"*"` above covers dependencies but not workspace members, and `fuzzy` is
+# the one member with a hot inner loop: every keystroke in a search line
+# runs its table over every name the session knows, which for a completion
+# vocabulary is every column of every table. Unoptimized that is hundreds of
+# milliseconds on a large database — the same reason GPUI is on this list.
+[profile.dev.package.fuzzy]
 opt-level = 2
