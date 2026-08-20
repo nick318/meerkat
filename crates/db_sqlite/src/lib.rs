@@ -176,6 +176,11 @@ impl Connection for SqliteConnection {
     /// no cancel to send: the rows come from a file on this machine, so
     /// dropping the stream ends the work rather than leaving a server to
     /// finish a result nobody will read.
+    ///
+    /// [`db_client::Wire`] is left empty on purpose, here and on the
+    /// session. There is no link to measure and no server to blame: the
+    /// rows come off a local file, so the wall clock around the call is the
+    /// whole story and splitting it would invent two numbers out of one.
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
         let mut sink = RowSink::new(self.limits);
         let mut rows = sqlx::query(sql).fetch(&self.pool);

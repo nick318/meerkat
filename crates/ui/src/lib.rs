@@ -99,6 +99,20 @@ pub fn format_millis(millis: u128) -> String {
     }
 }
 
+/// A timing that came back as a fraction of a millisecond, which is what
+/// the server reports its own work as.
+///
+/// Under ten milliseconds the fraction is most of the number — `0.4 ms` and
+/// `4.4 ms` both round to the same useless answer — so one decimal is kept
+/// there and dropped above it, where it says nothing.
+pub fn format_millis_frac(millis: f64) -> String {
+    if millis < 10. {
+        format!("{millis:.1} ms")
+    } else {
+        format_millis(millis.round() as u128)
+    }
+}
+
 /// A clock that is still running: always seconds with one decimal, from
 /// `0.1 s` up. Unlike `format_millis` it never switches units, because a
 /// timer that changed shape as it passed a second would read as a glitch.

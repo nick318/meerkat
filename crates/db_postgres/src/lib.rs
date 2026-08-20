@@ -13,16 +13,18 @@
 use anyhow::Context as _;
 use async_trait::async_trait;
 use db_client::{
-    Connection, Limits, Profile, QueryResult, Result, RowChange, RowSink, RunId, Session, Stop,
-    Value,
+    Connection, Limits, Profile, QueryResult, Result, RowChange, RowSink, RunId, ServerTiming,
+    Session, Stop, Value, Wire,
 };
 use futures::TryStreamExt as _;
 use introspect::{Catalog, Column, Schema, Table, TableKind};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
 use sqlx::{Column as _, Executor as _, Row as _, TypeInfo as _, ValueRef as _};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 /// Two pools, and the split is the point.
 ///
@@ -332,10 +334,13 @@ impl Connection for PostgresConnection {
     /// watching the run.
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
         let mut conn = self.pool.acquire().await.context("no connection to run the statement")?;
-        let backend = prepare_run(&mut *conn, &self.statement_timeout).await?;
-        let result = collect_capped(&mut conn, &self.pool, backend, sql, self.limits).await;
+        let (backend, link) = prepare_run(&mut *conn, &self.statement_timeout).await?;
+        let mut result = collect_capped(&mut conn, &self.pool, backend, sql, self.limits).await;
         // The connection goes back to the pool here.
         drop(conn);
+        if let Ok(result) = &mut result {
+            result.wire.link_ms = Some(link);
+        }
         result
     }
 
@@ -349,11 +354,14 @@ impl Connection for PostgresConnection {
             .acquire()
             .await
             .context("no connection left for another session — close a tab")?;
-        let backend = prepare_run(&mut *conn, &self.statement_timeout).await?;
+        let (backend, link) = prepare_run(&mut *conn, &self.statement_timeout).await?;
         Ok(Arc::new(PostgresSession {
             app: self.pool.clone(),
             conn: futures::lock::Mutex::new(Some(conn)),
             backend,
+            link_ms: link,
+            counted: std::sync::Mutex::new(HashMap::new()),
+            no_statement_stats: AtomicBool::new(false),
             limits: self.limits,
         }))
     }
@@ -383,7 +391,34 @@ struct PostgresSession {
     app: PgPool,
     conn: futures::lock::Mutex<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>>,
     backend: RunId,
+    /// One round trip to this server, measured at open on the trip that
+    /// reads the backend id. A session is one connection to one host, so
+    /// the number holds for every run on it; it is remeasured only by
+    /// opening another session.
+    link_ms: u128,
+    /// The running totals `pg_stat_statements` reported for each statement
+    /// this session has run, as of the last time it was asked.
+    ///
+    /// **This is what makes one execution's own time knowable.** The view
+    /// counts rather than logs — one row of totals per statement, shared by
+    /// every backend in the cluster — so a single reading can only give a
+    /// mean. Two readings with one execution between them give that
+    /// execution, and `calls` is what says how many landed in the window.
+    counted: std::sync::Mutex<HashMap<i64, Counted>>,
+    /// Set once the server has answered that it cannot report these
+    /// numbers: no `pg_stat_statements`, or a server too old to carry
+    /// `pg_stat_activity.query_id`. Asking again every run would be one
+    /// wasted round trip per run, for ever, on every such server.
+    no_statement_stats: AtomicBool,
     limits: Limits,
+}
+
+/// One reading of a statement's running totals.
+#[derive(Clone, Copy)]
+struct Counted {
+    calls: i64,
+    exec_ms: f64,
+    plan_ms: f64,
 }
 
 #[async_trait]
@@ -395,7 +430,56 @@ impl Session for PostgresSession {
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
         let mut held = self.conn.lock().await;
         let conn = held.as_mut().context("this tab's session is closed")?;
-        collect_capped(conn, &self.app, self.backend, sql, self.limits).await
+        let mut result = collect_capped(conn, &self.app, self.backend, sql, self.limits).await;
+        if let Ok(result) = &mut result {
+            result.wire.link_ms = Some(self.link_ms);
+        }
+        result
+    }
+
+    /// Read what the server counted for the statement this session ran
+    /// last, and turn two readings into one execution's time.
+    ///
+    /// One round trip, and it goes out on the **app** pool for the reason
+    /// `in_transaction` does: this session's connection may still be
+    /// finishing with the very statement being asked about, and a
+    /// transaction that has gone wrong refuses every statement until it is
+    /// rolled back. It is also asked *after* the result is on screen, so
+    /// the round trip is never in front of the user.
+    ///
+    /// `pg_stat_activity.query_id` is what names the statement. It needs
+    /// `compute_query_id`, which `pg_stat_statements` turns on by itself,
+    /// and it is retained on an idle backend — the column is that backend's
+    /// *most recent* query, not only a running one. So the two views join
+    /// on it and the driver never has to match SQL text, which would not
+    /// match anyway: the view normalizes constants out.
+    async fn server_timing(&self) -> Result<Option<ServerTiming>> {
+        if self.no_statement_stats.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let row: Option<(i64, i64, f64, f64)> = match sqlx::query_as(STATEMENT_STATS)
+            .bind(self.backend.0)
+            .fetch_optional(&self.app)
+            .await
+        {
+            Ok(row) => row,
+            // The server cannot answer this question and never will on this
+            // connection: the extension is not installed, or the column is
+            // not there to join on. That is not a failure worth reporting —
+            // the timing the client measured itself still stands.
+            Err(_) => {
+                self.no_statement_stats.store(true, Ordering::Relaxed);
+                return Ok(None);
+            }
+        };
+        let Some((queryid, calls, exec_ms, plan_ms)) = row else { return Ok(None) };
+        let now = Counted { calls, exec_ms, plan_ms };
+        let before = self
+            .counted
+            .lock()
+            .map(|mut counted| counted.insert(queryid, now))
+            .unwrap_or(None);
+        Ok(between(before, now))
     }
 
     /// Asked of `pg_stat_activity` from the **app** pool, never of the
@@ -466,7 +550,15 @@ impl Drop for PostgresSession {
 ///
 /// A session pays this once, at open. The pooled path pays it once per
 /// run, because a pooled connection is a different backend each time.
-async fn prepare_run(conn: &mut sqlx::PgConnection, timeout: &str) -> Result<RunId> {
+///
+/// It also **times the link, for free**. This statement reads two catalog
+/// values and sets a string: the server's share of it rounds to nothing, so
+/// what the clock around it measures is one round trip to this host and
+/// back. A viewer over a VPN needs that number to make sense of any other —
+/// and it must not cost a round trip of its own to get, or measuring the
+/// lag would add to it.
+async fn prepare_run(conn: &mut sqlx::PgConnection, timeout: &str) -> Result<(RunId, u128)> {
+    let started = Instant::now();
     let (pid, _applied): (i32, Option<String>) = sqlx::query_as(
         "SELECT pg_backend_pid(), \
          (SELECT set_config('statement_timeout', $1, false) \
@@ -477,7 +569,62 @@ async fn prepare_run(conn: &mut sqlx::PgConnection, timeout: &str) -> Result<Run
     .fetch_one(&mut *conn)
     .await
     .context("failed to read the backend id")?;
-    Ok(RunId(pid))
+    Ok((RunId(pid), started.elapsed().as_millis()))
+}
+
+/// The running totals for the statement a backend ran last.
+///
+/// `userid` and `dbid` are part of the join because `queryid` is not a key
+/// on its own: the same normalized statement run by two roles, or against
+/// two databases, is two rows, and summing them would report a stranger's
+/// work as this session's.
+const STATEMENT_STATS: &str = "\
+SELECT s.queryid, s.calls, s.total_exec_time, s.total_plan_time \
+  FROM pg_stat_activity a \
+  JOIN pg_stat_statements s \
+    ON s.queryid = a.query_id \
+   AND s.userid = a.usesysid \
+   AND s.dbid = (SELECT oid FROM pg_database WHERE datname = a.datname) \
+ WHERE a.pid = $1";
+
+/// Turn two readings of a statement's running totals into what one
+/// execution cost. A plain function over numbers, so the three cases can be
+/// argued with in a test rather than against a server.
+///
+/// - **One execution between the readings** is the answer asked for, and it
+///   is exact.
+/// - **Several** means somebody else ran the same statement in the same
+///   window — the view is cluster-wide — so the honest answer is the mean
+///   over them, marked inexact.
+/// - **No earlier reading** leaves nothing to subtract, so the answer is
+///   the mean over every execution the server has ever counted. That is the
+///   first run of a statement in a tab: worth showing, never worth calling
+///   this run's time. The reading just taken is what makes the *next* run
+///   exact.
+///
+/// A `calls` that went *down* is the view being reset or the entry evicted
+/// under `pg_stat_statements.max`. There is no delta to take across that,
+/// so it answers nothing and lets the reading just taken be the baseline.
+fn between(before: Option<Counted>, now: Counted) -> Option<ServerTiming> {
+    let (exec, plan, calls, exact) = match before {
+        Some(before) if now.calls > before.calls => (
+            now.exec_ms - before.exec_ms,
+            now.plan_ms - before.plan_ms,
+            (now.calls - before.calls) as f64,
+            now.calls - before.calls == 1,
+        ),
+        Some(before) if now.calls == before.calls => return None,
+        // Either the first reading, or one taken across a reset.
+        _ if now.calls > 0 => (now.exec_ms, now.plan_ms, now.calls as f64, false),
+        _ => return None,
+    };
+    Some(ServerTiming {
+        exec_ms: exec / calls,
+        // A zero here says "planning was not tracked" as readily as it says
+        // "planning was free", and the two are not the same claim.
+        plan_ms: (plan > 0.).then(|| plan / calls),
+        exact,
+    })
 }
 
 /// Run one statement and collect it, up to `limits`.
@@ -497,9 +644,18 @@ async fn collect_capped(
     limits: Limits,
 ) -> Result<QueryResult> {
     let mut sink = RowSink::new(limits);
+    // Stamped before the statement goes out and again on the first row off
+    // the wire. Postgres emits no row until it has one, so the gap bounds
+    // the server's work — see `db_client::Wire` for what that does and does
+    // not separate.
+    let sent = Instant::now();
+    let mut first_row = None;
     {
         let mut rows = sqlx::query(sql).fetch(&mut *conn);
         while let Some(row) = rows.try_next().await? {
+            // Taken before the row is decoded, or this process's own
+            // decoding would be counted as the server's time.
+            first_row.get_or_insert_with(Instant::now);
             if !sink.has_columns() {
                 sink.columns(row.columns().iter().map(|c| c.name().to_string()).collect());
             }
@@ -530,7 +686,23 @@ async fn collect_capped(
             sink.columns(described.columns().iter().map(|c| c.name().to_string()).collect());
         }
     }
-    Ok(sink.finish())
+    let mut result = sink.finish();
+    result.wire = wire_of(sent, first_row);
+    Ok(result)
+}
+
+/// The client's own view of where a run's time went. `link_ms` is filled in
+/// by the caller, which is the only side that knows which connection — and
+/// so which measured round trip — the statement went down.
+fn wire_of(sent: Instant, first_row: Option<Instant>) -> Wire {
+    Wire {
+        link_ms: None,
+        first_row_ms: first_row.map(|at| at.duration_since(sent).as_millis()),
+        // A statement that returned no rows has no fetch to measure. `0`
+        // would read as "the rows crossed instantly", which is a different
+        // claim from "there were none".
+        fetch_ms: first_row.map(|at| at.elapsed().as_millis()),
+    }
 }
 
 /// `pg_cancel_backend` asks the backend to give up its statement, which
@@ -694,6 +866,76 @@ mod tests {
     use super::*;
     use db_client::{MAX_BYTES, MAX_CELL_BYTES};
 
+    fn counted(calls: i64, exec_ms: f64) -> Counted {
+        Counted { calls, exec_ms, plan_ms: 0. }
+    }
+
+    /// The case the whole delta exists for: one execution landed between
+    /// the two readings, so its own time is knowable and is reported as a
+    /// measurement rather than as an average.
+    #[test]
+    fn one_execution_between_two_readings_is_exact() {
+        let timing = between(Some(counted(4, 40.)), counted(5, 52.5)).unwrap();
+        assert_eq!(timing.exec_ms, 12.5);
+        assert!(timing.exact);
+    }
+
+    /// `pg_stat_statements` is cluster-wide, so somebody else running the
+    /// same statement lands in the same window. The mean over the window is
+    /// still worth showing; calling it this run's time would not be.
+    #[test]
+    fn several_executions_in_the_window_are_a_mean() {
+        let timing = between(Some(counted(4, 40.)), counted(7, 70.)).unwrap();
+        assert_eq!(timing.exec_ms, 10.);
+        assert!(!timing.exact);
+    }
+
+    /// The first run of a statement in a tab. Nothing to subtract from, so
+    /// the answer is the mean over every execution the server has counted —
+    /// and this reading is what makes the next run exact.
+    #[test]
+    fn the_first_reading_is_the_mean_so_far() {
+        let timing = between(None, counted(10, 250.)).unwrap();
+        assert_eq!(timing.exec_ms, 25.);
+        assert!(!timing.exact);
+    }
+
+    /// Two readings with nothing between them describe no run at all. The
+    /// server did not count the statement — it may not have finished being
+    /// counted yet — and a stale total must not be shown as a fresh one.
+    #[test]
+    fn no_execution_between_the_readings_answers_nothing() {
+        assert!(between(Some(counted(4, 40.)), counted(4, 40.)).is_none());
+    }
+
+    /// The view was reset, or the entry evicted under
+    /// `pg_stat_statements.max`. There is no delta across that, so the
+    /// reading is taken as a fresh baseline rather than subtracted into a
+    /// negative time.
+    #[test]
+    fn a_reset_view_does_not_produce_a_negative_time() {
+        let timing = between(Some(counted(900, 9000.)), counted(2, 30.)).unwrap();
+        assert_eq!(timing.exec_ms, 15.);
+        assert!(!timing.exact);
+        assert!(between(Some(counted(900, 9000.)), counted(0, 0.)).is_none());
+    }
+
+    /// `total_plan_time` is `0` both when planning was free and when
+    /// `pg_stat_statements.track_planning` is off, which is the default. A
+    /// zero is dropped rather than reported as a measurement.
+    #[test]
+    fn planning_that_was_not_tracked_is_not_reported() {
+        let untracked = between(Some(counted(1, 10.)), counted(2, 22.)).unwrap();
+        assert_eq!(untracked.plan_ms, None);
+
+        let tracked = between(
+            Some(Counted { calls: 1, exec_ms: 10., plan_ms: 1. }),
+            Counted { calls: 2, exec_ms: 22., plan_ms: 1.5 },
+        )
+        .unwrap();
+        assert_eq!(tracked.plan_ms, Some(0.5));
+    }
+
     /// These tests need a live server. Set `MEERKAT_TEST_PG_URL` to a
     /// database the test may create and drop a schema in; without it the
     /// test reports that it was skipped and passes.
@@ -805,6 +1047,59 @@ mod tests {
         let result = conn.execute("SELECT 1 AS x WHERE false").await.unwrap();
         assert!(result.rows.is_empty());
         assert_eq!(result.columns, vec!["x".to_string()]);
+    }
+
+    /// The client's own split, against a real server. Every part of it has
+    /// to be there for the app to say anything but a wall clock.
+    #[tokio::test]
+    async fn a_result_carries_where_its_time_went() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+        let session = conn.open_session().await.unwrap();
+
+        let wire = session.execute("SELECT * FROM generate_series(1, 20000)").await.unwrap().wire;
+        assert!(wire.link_ms.is_some(), "the session did not time its round trip");
+        assert!(wire.first_row_ms.is_some(), "no row was timed");
+        assert!(wire.fetch_ms.is_some(), "the fetch was not timed");
+
+        // A statement with no rows has no fetch to measure, and `0` would
+        // be a different claim from "there were none".
+        let none = session.execute("SELECT 1 WHERE false").await.unwrap().wire;
+        assert_eq!(none.first_row_ms, None);
+        assert_eq!(none.fetch_ms, None);
+    }
+
+    /// The server's own figure, end to end: `pg_stat_activity.query_id`
+    /// naming the statement, the join to `pg_stat_statements`, and the
+    /// delta between two readings turning running totals into one run.
+    ///
+    /// It self-skips where the extension is not installed, which is the
+    /// same answer the app gives there: the client's split still stands.
+    #[tokio::test]
+    async fn the_server_reports_what_it_spent() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+        let session = conn.open_session().await.unwrap();
+
+        session.execute("SELECT pg_sleep(0.2)").await.unwrap();
+        let Some(first) = session.server_timing().await.unwrap() else {
+            eprintln!("skipped: this server has no pg_stat_statements");
+            return;
+        };
+        // No earlier reading, so this is the mean over every execution the
+        // server has counted — and it must say so.
+        assert!(!first.exact, "a first reading cannot be one run's own time");
+
+        // With a baseline in hand, the next run of the same statement is
+        // exact, and it is the sleep the statement asked for.
+        session.execute("SELECT pg_sleep(0.2)").await.unwrap();
+        let second = session.server_timing().await.unwrap().expect("no second reading");
+        assert!(second.exact, "one run between two readings is exact");
+        assert!(
+            (150. ..600.).contains(&second.exec_ms),
+            "a 200 ms sleep was reported as {} ms",
+            second.exec_ms
+        );
     }
 
     #[tokio::test]

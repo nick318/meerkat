@@ -811,6 +811,101 @@ is `Running` and not `Cancelling`, and the server's own message says
 so an `introspect` that lands on a connection a run has used inherits the
 timeout, though introspection never asks for one itself.
 
+### Where a run's time went
+
+**A wall clock around the call cannot answer the question the user is
+asking.** "Queried in 340 ms" says nothing about whether the database was
+slow or the link was — and over a VPN to a remote server the link is
+usually the larger half. So a run reports two numbers: what the **server**
+spent on the statement, and the **lag** around it. `Timing` in `shell.rs`
+holds both, and the status strip reads
+`queried in 340 ms · server 12.4 ms · lag 328 ms`.
+
+The two always add up to the total, because the lag is the total *less* the
+server's share rather than a clock of its own. Time the app cannot account
+for has to show up somewhere, and the honest place for it is the half that
+means "not the database".
+
+**There are two ways to know the server's share, and they are not equally
+good.** The strip prefers the exact one and falls back to the estimate.
+
+`db_client::Wire` is the **estimate**, and it is always there:
+
+- `link_ms` — one round trip, timed around `prepare_run`. That statement
+  reads two catalog values and sets a string, so the server's share of it
+  rounds to nothing and what is left is the link. It costs no round trip of
+  its own: the driver makes that trip anyway, for the backend id. Measuring
+  the lag must not add to it.
+- `first_row_ms` — statement sent to the first row off the wire. Postgres
+  emits no row until it has one, so this bounds the server's work. Take the
+  round trip off and what is left is the estimate.
+- `fetch_ms` — first row to last row.
+
+**The estimate is honest about what it cannot separate.** For a plan that
+streams — a plain sequential scan — the server keeps working while the
+rows cross, so server time and fetch time genuinely overlap and no
+client-side clock can tell them apart. For a plan that blocks — a sort, a
+hash aggregate, `count(*)` — the first row comes at the end, and
+`first_row_ms` *is* the whole of the server's work.
+
+`db_client::ServerTiming` is the **exact** answer, from
+`pg_stat_statements`. It is the only place a client can ask: the wire
+protocol carries no timing, `EXPLAIN ANALYZE` would mean rewriting the
+user's statement and running it twice, and `log_min_duration_statement`
+writes somewhere no client can read.
+
+**It is asked for after the result is already on screen.** A round trip in
+front of the grid would add lag to the very measurement the user opened
+this to understand. So the result paints on the client's own reckoning, and
+`Shell::refresh_server_timing` fills the server's figure in a moment later
+— the strip drops its `~` and nothing else moves. It goes out on the **app
+pool**, like `in_transaction` and for the same reasons.
+
+**The view counts, it does not log.** One row holds the running totals for
+every execution of a statement, cluster-wide, so a single reading can only
+give a mean. `between` in `db_postgres` subtracts the totals the session
+saw last time, and `calls` is what says how many executions landed in the
+window:
+
+| Δ`calls` | What is reported | `exact` |
+|---|---|---|
+| 1 | that run's own time | yes |
+| more than 1 | the mean over the window — somebody else ran the same statement | no |
+| no earlier reading | the mean over every execution counted so far | no |
+| 0, or `calls` went down | nothing; the reading becomes the baseline | — |
+
+So the **first** run of a statement in a tab gets a mean and the second
+gets a measurement. `~` in the strip is the whole of what says which is
+which, and an unmarked number claims more than the app knows.
+
+`pg_stat_activity.query_id` is what names the statement — it needs
+`compute_query_id`, which `pg_stat_statements` turns on by itself, and it
+is retained on an idle backend, being that backend's *most recent* query
+rather than only a running one. So the two views join on it and the driver
+never matches SQL text, which would not match anyway: the view normalizes
+constants out. `userid` and `dbid` are part of the join because `queryid`
+is not a key on its own.
+
+Three things are deliberately not asked:
+
+- **A buffer of several statements.** The server names only the one a
+  backend ran last, so reporting it as the run's time would be a wrong
+  number rather than a partial one. `one_statement` gates the ask.
+- **A table page.** It runs on the pool, so the backend that ran it has
+  gone back and may be running somebody else's statement. A page is the
+  app's own `LIMIT 500`, not a statement anyone is tuning.
+- **A second time on a server that cannot answer.** The first error sets
+  `no_statement_stats`, or a server without the extension would pay one
+  wasted round trip per run for ever.
+
+SQLite leaves `Wire` empty on purpose. There is no link to measure and no
+server to blame — the rows come off a local file, so the wall clock is the
+whole story and splitting it would invent two numbers out of one.
+
+`query_history` keeps the **total** alone. The exact figure lands after the
+row is written, and a history row that disagreed with the strip would be
+worse than one that says what the user waited.
+
 ### The read-only session
 
 A typed statement goes to the driver verbatim, so `DROP TABLE` is only

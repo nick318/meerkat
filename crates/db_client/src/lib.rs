@@ -124,6 +124,74 @@ pub struct QueryResult {
     /// Set when the memory cap stopped the read before the server ran out
     /// of rows. `false` means the result is the whole result.
     pub truncated: bool,
+    /// Where the run's time went, as far as the client could see it.
+    pub wire: Wire,
+}
+
+/// What a run cost, timed by the **client**, around the wire.
+///
+/// A wall clock around `execute` answers "how long until I could look at
+/// this", which is the right number to show and the wrong number to reason
+/// about: on a VPN most of it is the link, and the user cannot tell that
+/// from a slow server. These three split it as far as the client can see,
+/// with no help from the engine and no extra round trip.
+///
+/// **The split is honest about what it cannot separate.** Postgres emits no
+/// row until it has one, so `first_row_ms` bounds the server's work — but
+/// for a plan that streams (a plain sequential scan) the server keeps
+/// working while the wire moves, so server time and fetch time genuinely
+/// overlap and no client-side clock can tell them apart. For a plan that
+/// blocks (a sort, a hash aggregate, `count(*)`) the first row comes at the
+/// end, and `first_row_ms` *is* the whole of the server's work.
+///
+/// [`ServerTiming`] is the exact answer, when the server can be asked for
+/// one. This is the answer that is always there.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Wire {
+    /// One round trip to this server and back, measured on a statement
+    /// whose own cost is nothing — the driver's `pg_backend_pid()` trip,
+    /// which it makes anyway. So it is the link's latency alone, and it is
+    /// free: no round trip is added to measure it.
+    pub link_ms: Option<u128>,
+    /// Statement sent → the first row off the wire. Subtract `link_ms` and
+    /// what is left is the server's work, up to the caveat above.
+    pub first_row_ms: Option<u128>,
+    /// First row → last row: the result crossing the wire, and this process
+    /// decoding it. `None` when no row ever came back.
+    pub fetch_ms: Option<u128>,
+}
+
+/// What the **server** says one execution of a statement cost.
+///
+/// The client cannot work this out, and the server will not volunteer it:
+/// the wire protocol carries no timing, `EXPLAIN ANALYZE` would mean
+/// rewriting the user's statement and running it twice, and the log has it
+/// but no client can read the log. `pg_stat_statements` is the one place a
+/// client can ask, so this is `None` wherever that extension is not
+/// installed.
+///
+/// It is read **after the result is already on screen**, on a connection
+/// that is not the one that ran the statement, so asking for it costs the
+/// run nothing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ServerTiming {
+    /// Executor time, in milliseconds.
+    pub exec_ms: f64,
+    /// Planner time, when the server tracks it. `pg_stat_statements`
+    /// reports `0` both for "planning was free" and for "planning was not
+    /// tracked", so a zero is dropped rather than shown as a measurement.
+    pub plan_ms: Option<f64>,
+    /// Whether this is **this** execution's own time.
+    ///
+    /// `pg_stat_statements` counts, it does not log: one row holds the
+    /// running totals for every execution of a statement, cluster-wide. The
+    /// driver subtracts the totals it saw last time, so one run between two
+    /// reads gives that run's own time exactly. It is `false` when there was
+    /// nothing to subtract from (a mean over every execution ever) or when
+    /// somebody else ran the same statement in the same window (a mean over
+    /// the few that landed there). Either way the number is worth showing
+    /// and must not be shown as a measurement of this run.
+    pub exact: bool,
 }
 
 /// How much of a result the app will hold.
@@ -235,6 +303,10 @@ impl RowSink {
             rows: self.rows,
             rows_affected: 0,
             truncated: self.truncated,
+            // The sink counts bytes, not seconds. The driver is what holds
+            // the clock, because only the driver knows when the statement
+            // went out, and it fills this in on the way back.
+            wire: Wire::default(),
         }
     }
 }
@@ -309,6 +381,23 @@ pub trait Session: Send + Sync {
     /// in. Ask once after each run and the answer holds until the next.
     async fn in_transaction(&self) -> Result<bool> {
         Ok(false)
+    }
+
+    /// What the server says the statement this session ran **last** cost.
+    ///
+    /// Asked after the result is on screen, never before it — the whole
+    /// point is that the number is worth having and not worth waiting for.
+    /// Like [`Session::in_transaction`] it goes out on a connection that is
+    /// not this session's, so it cannot queue behind the run it is about.
+    ///
+    /// `Ok(None)` is the ordinary answer, not a failure: the extension that
+    /// keeps these numbers is not installed everywhere, and a statement the
+    /// server has not counted yet has nothing to report.
+    ///
+    /// It describes **one statement**, so a caller that sent a buffer of
+    /// several must not report it as the run's: only the last one is here.
+    async fn server_timing(&self) -> Result<Option<ServerTiming>> {
+        Ok(None)
     }
 
     /// Roll back and hand the connection back. `execute` fails afterwards.

@@ -9,7 +9,7 @@
 //! and a reply that does not carry the tab's current generation is thrown
 //! away. Without that, a slow first page would overwrite a fast second one.
 
-use db_client::{Connection, Profile, QueryResult, RunId, Session, Stop};
+use db_client::{Connection, Profile, QueryResult, RunId, ServerTiming, Session, Stop, Wire};
 use db_postgres::{Label, PostgresConnection};
 use gpui::{
     AnyElement, App, BoxShadow, ClipboardItem, Context, Div, ElementId, Entity, EventEmitter,
@@ -30,8 +30,9 @@ use storage::{HistoryFilter, NewRun, QueryRun, RunSource, SavedTab, SavedTabs, S
 use theme::{FONT_FAMILY, ThemeColors, theme};
 use ui::scrollbar::{self, DragState, Scrollbar};
 use ui::{
-    TextField, TextFieldEvent, card, format_count, format_millis, format_seconds, lock_glyph,
-    meerkat_mark, play_glyph, search_glyph, section_label, status_dot, stop_glyph, table_glyph,
+    TextField, TextFieldEvent, card, format_count, format_millis, format_millis_frac,
+    format_seconds, lock_glyph, meerkat_mark, play_glyph, search_glyph, section_label, status_dot,
+    stop_glyph, table_glyph,
 };
 
 use crate::connections::unix_now;
@@ -451,7 +452,7 @@ struct TableTab {
     data: Rc<GridData>,
     page: usize,
     approx_rows: Option<u64>,
-    elapsed: Option<u128>,
+    timing: Option<Timing>,
     loading: bool,
     error: Option<String>,
     /// What the user has marked in the result: the focused cell and the
@@ -481,7 +482,7 @@ struct QueryTab {
     /// How many statements the last run sent, so the result strip can say
     /// which set is on screen.
     statements_run: usize,
-    elapsed: Option<u128>,
+    timing: Option<Timing>,
     error: Option<String>,
     /// Where the tab's last run got to. It drives the run button, the
     /// timer beside it and the result line, which is why all three agree.
@@ -556,6 +557,83 @@ struct Live {
     /// id arrived one round trip *into* the run, and the difference is the
     /// whole reason a stop used to have to wait for a race.
     backend: Option<RunId>,
+}
+
+/// Where a finished run's time went.
+///
+/// **One number cannot answer the question the user is asking.** A wall
+/// clock around the call says "you waited 340 ms" and says nothing about
+/// whether the database was slow or the link was — and over a VPN to a
+/// remote server the link is usually the larger half. So a run reports two:
+/// what the **server** spent on the statement, and the **lag** around it.
+///
+/// The two always add up to `total_ms`, because the lag is the total less
+/// the server's share rather than a clock of its own. Time the app cannot
+/// account for has to show up somewhere, and the honest place for it is the
+/// half that means "not the database".
+#[derive(Clone, Copy)]
+struct Timing {
+    /// Wall clock around the whole run, which is what the user waited.
+    total_ms: u128,
+    /// What the client could see for itself: the round trip, and how long
+    /// the first row took to appear. See `db_client::Wire`.
+    wire: Wire,
+    /// What the server says it spent, from `pg_stat_statements`.
+    ///
+    /// It is **filled in after the result is already on screen**, so it is
+    /// `None` for a moment on every run — and for ever against a server
+    /// without the extension, or for a buffer of several statements, where
+    /// the server's answer names only the last one.
+    server: Option<ServerTiming>,
+}
+
+impl Timing {
+    fn new(total_ms: u128, wire: Wire) -> Self {
+        Self { total_ms, wire, server: None }
+    }
+
+    /// The server's share, and whether that is a measurement or an
+    /// estimate.
+    ///
+    /// The server's own figure when there is one — planning and execution
+    /// together, because both are the server working on this statement and
+    /// the user is asking what the database cost. Otherwise time-to-first-
+    /// row less the round trip, which is an estimate: for a plan that
+    /// streams, the server is still working while the rows cross.
+    ///
+    /// `None` means the engine offered neither, which is every SQLite
+    /// connection — a local file has no link to separate out.
+    fn server_ms(&self) -> Option<(f64, bool)> {
+        if let Some(server) = self.server {
+            return Some((server.exec_ms + server.plan_ms.unwrap_or(0.), server.exact));
+        }
+        let first_row = self.wire.first_row_ms? as f64;
+        let link = self.wire.link_ms.unwrap_or(0) as f64;
+        Some(((first_row - link).max(0.), false))
+    }
+
+    /// Everything that was not the server: the statement going out, the
+    /// rows coming back, and this process decoding them.
+    fn lag_ms(&self) -> Option<f64> {
+        let (server, _) = self.server_ms()?;
+        Some((self.total_ms as f64 - server).max(0.))
+    }
+
+    /// The strip's line. `~` marks a server figure that is an estimate or a
+    /// mean rather than this run's own measured time — an unmarked number
+    /// claims more than the app knows.
+    fn summary(&self) -> String {
+        let total = format_millis(self.total_ms);
+        let Some(((server, exact), lag)) = self.server_ms().zip(self.lag_ms()) else {
+            return format!("queried in {total}");
+        };
+        let mark = if exact { "" } else { "~" };
+        format!(
+            "queried in {total} · server {mark}{} · lag {}",
+            format_millis_frac(server),
+            format_millis_frac(lag)
+        )
+    }
 }
 
 impl Run {
@@ -791,7 +869,7 @@ impl Shell {
             data: empty_grid(),
             page,
             approx_rows,
-            elapsed: None,
+            timing: None,
             loading: false,
             error: None,
             selection: Selection::default(),
@@ -1128,7 +1206,7 @@ impl Shell {
             data: empty_grid(),
             page: 0,
             approx_rows,
-            elapsed: None,
+            timing: None,
             loading: false,
             error: None,
             selection: Selection::default(),
@@ -1199,7 +1277,14 @@ impl Shell {
                 let run = match flatten(outcome) {
                     Ok((result, elapsed)) => {
                         let rows = result.rows.len() as u64;
-                        tab.elapsed = Some(elapsed);
+                        // A table page runs on the *pool*, so there is no
+                        // session to ask what the server spent: the backend
+                        // that ran it has gone back to the pool and may be
+                        // running somebody else's statement by now. The
+                        // client's own split is all this path reports, and
+                        // it is enough — a page is the app's own
+                        // `LIMIT 500`, not a statement anyone is tuning.
+                        tab.timing = Some(Timing::new(elapsed, result.wire));
                         tab.data = Rc::new(GridData::new(result.columns, result.rows));
                         Outcome { elapsed: Some(elapsed), rows: Some(rows), error: None }
                     }
@@ -1240,7 +1325,7 @@ impl Shell {
             has_result: false,
             truncated: false,
             statements_run: 0,
-            elapsed: None,
+            timing: None,
             error: None,
             run: Run::Idle,
             in_transaction: false,
@@ -1341,11 +1426,17 @@ impl Shell {
                 // a statement that took nine minutes has not left its
                 // session idle for nine minutes.
                 tab.last_used = Instant::now();
+                // The server counts one statement at a time, and names only
+                // the one a backend ran last. A buffer of several is
+                // therefore unanswerable — reporting the last statement's
+                // time as the run's would be a wrong number, not a partial
+                // one — so the ask goes out only for a buffer of one.
+                let one_statement = matches!(result, Ok((_, _, 1)));
                 let run = match result {
                     Ok((result, elapsed, ran)) => {
                         tab.run = Run::Idle;
                         let rows = result.rows.len() as u64;
-                        tab.elapsed = Some(elapsed);
+                        tab.timing = Some(Timing::new(elapsed, result.wire));
                         tab.has_result = true;
                         tab.truncated = result.truncated;
                         tab.statements_run = ran;
@@ -1373,6 +1464,9 @@ impl Shell {
                 this.record_run(&recorded, RunSource::User, &run);
                 this.reload_open_history(cx);
                 this.refresh_transaction(tab_id, cx);
+                if one_statement {
+                    this.refresh_server_timing(tab_id, generation, cx);
+                }
                 // There is a session now, so there is something to sweep.
                 this.start_session_timer(cx);
                 cx.notify();
@@ -1548,6 +1642,46 @@ impl Shell {
                 let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return };
                 if tab.in_transaction != open {
                     tab.in_transaction = open;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Ask the server what it actually spent on the statement this tab just
+    /// ran, and fill it into the timing already on screen.
+    ///
+    /// **It is asked after the result, never before it.** The number is
+    /// worth having and not worth waiting for: a round trip in front of the
+    /// grid would add lag to the very measurement the user opened this to
+    /// understand. So the result paints on the client's own reckoning, and
+    /// the server's figure replaces the estimate a moment later — the strip
+    /// drops its `~` and nothing else moves.
+    ///
+    /// The generation is checked twice over, as every reply to this tab is:
+    /// a slow answer must not land on the run after the one it describes.
+    fn refresh_server_timing(&mut self, tab_id: u64, generation: u64, cx: &mut Context<Self>) {
+        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else { return };
+        let Some(session) = tab.session.clone() else { return };
+        cx.spawn(async move |this, cx| {
+            let Ok(task) = this.update(cx, |_, cx| {
+                gpui_tokio::Tokio::spawn(cx, async move { session.server_timing().await })
+            }) else {
+                return;
+            };
+            // Nothing to say is the ordinary answer here — no extension, or
+            // a statement the server has not counted — and it is not worth
+            // a word on screen. The client's own split stands.
+            let Ok(Some(server)) = flatten(task.await) else { return };
+            this.update(cx, |this, cx| {
+                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return };
+                if tab.generation != generation {
+                    return;
+                }
+                if let Some(timing) = &mut tab.timing {
+                    timing.server = Some(server);
                     cx.notify();
                 }
             })
@@ -4102,7 +4236,11 @@ impl Shell {
                         "{statements}{} rows · {} columns · {}",
                         tab.data.rows.len(),
                         tab.data.columns.len(),
-                        tab.elapsed.map(format_millis).unwrap_or_default()
+                        // The whole wait, and only that. The split into
+                        // server and lag lives on the status strip, which
+                        // is already the line about what is on screen —
+                        // saying it twice would crowd both.
+                        tab.timing.map(|t| format_millis(t.total_ms)).unwrap_or_default()
                     ),
                     colors.text_muted,
                 )
@@ -4317,7 +4455,7 @@ impl Shell {
 
     fn status_strip(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
         let divider = || div().text_color(colors.text_faint).child("|");
-        let (range, elapsed) = match self.tabs.get(self.active) {
+        let (range, timing) = match self.tabs.get(self.active) {
             Some(Tab::Table(tab)) => {
                 let first = tab.page * PAGE_SIZE + 1;
                 let last = tab.page * PAGE_SIZE + tab.data.rows.len();
@@ -4331,7 +4469,7 @@ impl Shell {
                         None => format!("rows {first}–{last}"),
                     }
                 };
-                (range, tab.elapsed)
+                (range, tab.timing)
             }
             Some(Tab::Query(tab)) => (
                 if tab.has_result {
@@ -4339,7 +4477,7 @@ impl Shell {
                 } else {
                     String::new()
                 },
-                tab.elapsed,
+                tab.timing,
             ),
             Some(Tab::History(tab)) => (
                 match tab.runs {
@@ -4394,9 +4532,7 @@ impl Shell {
             .children(keys.map(|_| divider()))
             .children(keys.map(|keys| div().text_color(colors.text_faint).truncate().child(keys)))
             .child(div().flex_1())
-            .children(
-                elapsed.map(|ms| div().child(format!("queried in {}", format_millis(ms)))),
-            )
+            .children(timing.map(|timing| div().child(timing.summary())))
             .child(divider())
             .child(match self.status {
                 Status::Connected => "on lookout",
@@ -5456,6 +5592,60 @@ fn redact(url: &str) -> String {
 mod tests {
     use super::*;
     use introspect::Schema;
+
+    /// The shape a VPN puts the app in, and the reason the split exists: a
+    /// third of a second of waiting, of which the database did twelve
+    /// milliseconds' work. One number could not have said that.
+    #[test]
+    fn the_server_and_the_lag_are_reported_apart() {
+        let mut timing =
+            Timing::new(340, Wire { link_ms: Some(33), first_row_ms: Some(46), fetch_ms: Some(294) });
+        timing.server = Some(ServerTiming { exec_ms: 12.4, plan_ms: Some(0.6), exact: true });
+        assert_eq!(timing.summary(), "queried in 340 ms · server 13 ms · lag 327 ms");
+    }
+
+    /// Until the server answers — and for ever without
+    /// `pg_stat_statements` — the estimate stands, and `~` says it is one.
+    #[test]
+    fn an_estimated_server_time_is_marked() {
+        let timing =
+            Timing::new(340, Wire { link_ms: Some(33), first_row_ms: Some(46), fetch_ms: Some(294) });
+        // The same numbers as the measured run above, and only the `~`
+        // between them: the mark is the whole of what says which is which.
+        assert_eq!(timing.summary(), "queried in 340 ms · server ~13 ms · lag 327 ms");
+    }
+
+    /// The estimate is time-to-first-row **less the round trip**. Leaving
+    /// the round trip in would charge the database for the link, which is
+    /// the mistake the whole split is here to fix.
+    #[test]
+    fn the_estimate_takes_the_round_trip_off() {
+        let far = Timing::new(400, Wire { link_ms: Some(120), first_row_ms: Some(132), fetch_ms: Some(268) });
+        let near = Timing::new(280, Wire { link_ms: Some(1), first_row_ms: Some(13), fetch_ms: Some(267) });
+        // The same server work, seen down two very different links.
+        assert_eq!(far.server_ms().map(|(ms, _)| ms), Some(12.));
+        assert_eq!(near.server_ms().map(|(ms, _)| ms), Some(12.));
+    }
+
+    /// A server figure larger than the wall clock is possible — the two are
+    /// measured by different clocks, and the server's covers work that
+    /// overlapped the fetch. The lag floors at zero rather than going
+    /// negative, which would read as the link giving time back.
+    #[test]
+    fn the_lag_never_goes_negative() {
+        let mut timing = Timing::new(10, Wire::default());
+        timing.server = Some(ServerTiming { exec_ms: 14., plan_ms: None, exact: true });
+        assert_eq!(timing.lag_ms(), Some(0.));
+    }
+
+    /// A local file has no link to separate out, so the engine offers
+    /// neither half and the strip says only what it waited.
+    #[test]
+    fn an_engine_with_no_split_reports_the_total_alone() {
+        let timing = Timing::new(7, Wire::default());
+        assert_eq!(timing.server_ms(), None);
+        assert_eq!(timing.summary(), "queried in 7 ms");
+    }
 
     fn relation(name: &str, kind: TableKind) -> Table {
         Table { name: name.to_string(), kind, columns: Vec::new(), primary_key: Vec::new(), approx_rows: None }
