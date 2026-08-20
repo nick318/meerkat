@@ -12,10 +12,10 @@
 use db_client::{Connection, Profile, QueryResult, RunId, ServerTiming, Session, Stop, Wire};
 use db_postgres::{Label, PostgresConnection};
 use gpui::{
-    AnyElement, App, BoxShadow, ClipboardItem, Context, Div, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, Hsla, Pixels, ScrollStrategy, SharedString,
-    Stateful, Subscription, UniformListScrollHandle, Window, actions, deferred, div, prelude::*,
-    px, uniform_list,
+    Animation, AnimationExt, AnyElement, App, BoxShadow, ClipboardItem, Context, Div, ElementId,
+    Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, Pixels, ScrollStrategy,
+    SharedString, Stateful, Subscription, UniformListScrollHandle, Window, actions, deferred, div,
+    prelude::*, px, uniform_list,
 };
 use introspect::{Catalog, Table, TableKind};
 use results_grid::{
@@ -174,6 +174,61 @@ const TIMER_TICK: Duration = Duration::from_millis(100);
 /// again on every one of them would be noise: the timer is there to say a
 /// query is taking a while, so it says nothing until one is.
 const TIMER_DELAY: Duration = Duration::from_secs(1);
+/// How long a run is given to answer before the button offers to stop it.
+///
+/// **The verb must not flicker.** Most statements come back in tens of
+/// milliseconds, and a button that read "run · stop · run" on every one of
+/// them would be a button nobody could aim at. So the first `RUN_ARM` of a
+/// run keeps the word "run" — the fill is already saying a run is out — and
+/// the escalation to "stop" happens only for a run that has proved slow —
+/// which
+/// is the comp's own arming window, and its own comment: *"stop" only
+/// appears once the query has proven itself slow*.
+///
+/// The comp cheats there, because a simulation knows how long its query
+/// will take and can decide during the window that this one will be quick.
+/// Nothing here can know that, so the honest reading of the same rule is
+/// the elapsed time alone. It paints the same screen: a statement that
+/// answers inside the window never shows a stop button at all.
+const RUN_ARM: Duration = Duration::from_millis(420);
+/// **The run button moves in one way only: its own fill, breathing.**
+///
+/// The comp animates a run with the vocabulary of a progress widget — a
+/// front sweeping the button, then an indeterminate band crossing it on a
+/// loop, then a ring blooming out of the border when the rows land. Those
+/// are Material's marks, and three of them are a lot of movement to put on
+/// a 27-pixel button that sits beside a paper-coloured toolbar all day. They
+/// also each carry a shape, and a shape crossing a button asks to be
+/// watched.
+///
+/// A tone does not. So the whole of the animation here is the fill mixing a
+/// little of the button's own ink into itself and back out again: nothing
+/// travels, nothing has an edge, and the button says "working" the way a
+/// held breath does. `RUN_BREATH` is one full cycle and `RUN_BREATH_DEPTH`
+/// how far it goes — far enough to be seen out of the corner of an eye,
+/// and no further, because a button that pulses hard is a button that
+/// interrupts.
+const RUN_BREATH: Duration = Duration::from_millis(2600);
+const RUN_BREATH_DEPTH: f32 = 0.12;
+/// The last exhale, when the rows land: the same mix, easing out to
+/// nothing. It is deliberately the *same* mark as the breath rather than a
+/// flash of its own, so a run reads as one gesture that starts and stops —
+/// and it is what tells the user a statement too quick to breathe has been
+/// answered at all.
+const RUN_SETTLE: Duration = Duration::from_millis(320);
+const RUN_SETTLE_DEPTH: f32 = 0.1;
+/// The press, which is a tone and **not** a movement: the same mix, the
+/// other way, toward the ink of the app rather than the button's own. A
+/// button that drops a pixel under the pointer is the elevation idiom this
+/// one is deliberately not in — and nothing shifting means nothing to
+/// track.
+const RUN_PRESS_DEPTH: f32 = 0.08;
+/// The label's width, held still across the verbs so that the button does
+/// not resize under the pointer when a run turns out to be slow. "run" and
+/// "stop" share one width; "terminate" is three times the word and gets its
+/// own.
+const RUN_LABEL_WIDTH: f32 = 26.;
+const TERMINATE_LABEL_WIDTH: f32 = 62.;
 /// How long a tab's session may sit unused before it is handed back, and
 /// how often the sweep looks. Ten minutes is long enough that a session is
 /// still there when the user comes back from a meeting having left a tab
@@ -306,6 +361,12 @@ pub struct Shell {
     /// True while a repaint loop is running for the query timers. Runs come
     /// and go in several tabs at once; the loop belongs to the window.
     timing: bool,
+    /// Whether the run button is being held down. It is the mouse's own
+    /// state between one frame and the next rather than anything about the
+    /// run, which is why it lives here beside the palette and not on a tab —
+    /// the same reason the grid keeps its hovered row on `GridState`. One
+    /// button is on screen at a time, so one flag covers it.
+    run_pressed: bool,
     /// True while the idle-session sweep is running. One loop for the
     /// window, and only while there is a session to sweep.
     sweeping: bool,
@@ -487,6 +548,16 @@ struct QueryTab {
     /// Where the tab's last run got to. It drives the run button, the
     /// timer beside it and the result line, which is why all three agree.
     run: Run,
+    /// How many runs have landed with a result in this tab.
+    ///
+    /// It is a **counter, not a time**, because that is all the run
+    /// button's settle needs: GPUI restarts an animation when the element's
+    /// id changes, so the id carries this number and the exhale needs
+    /// neither a timer of its own nor an `Instant` to be checked against. A
+    /// run that failed or was cancelled does not count — the error strip is
+    /// the answer there, and a warm confirming tone would be the wrong
+    /// word.
+    landed: u64,
     /// Whether this tab's session is sitting inside a transaction the user
     /// began, as of its last run.
     ///
@@ -636,7 +707,44 @@ impl Timing {
     }
 }
 
+/// What the run button is at this instant, which is not quite what the run
+/// is.
+///
+/// `Run` is the state of the statement; this is the state of the *button*,
+/// and the two part company for the first `RUN_ARM` of a run: the statement
+/// is out, and the button still says "run". Keeping that difference in a
+/// type of its own is what stops the verb, the fill, the glyph and the
+/// keycap from each working it out slightly differently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RunPhase {
+    /// Nothing is out, or something is out and has not been out long
+    /// enough to be worth offering to stop. The comp's `arm` phase is this
+    /// one with a run breathing under it.
+    Ready,
+    /// A run has proved slow. The button offers to end it.
+    Stop,
+    /// A cancel is with the server. The button offers to close the backend.
+    Terminate,
+}
+
 impl Run {
+    /// The button's state, from the run's state and the clock.
+    fn phase(&self) -> RunPhase {
+        match self {
+            Run::Idle | Run::Cancelled { .. } => RunPhase::Ready,
+            Run::Running(live) if live.started.elapsed() < RUN_ARM => RunPhase::Ready,
+            Run::Running(_) => RunPhase::Stop,
+            Run::Cancelling(_) => RunPhase::Terminate,
+        }
+    }
+
+    /// Is the button in its arming window — a run out, and the button not
+    /// yet offering to stop it? A click does nothing here: the word under
+    /// the pointer says "run", and a run is what this tab already has.
+    fn arming(&self) -> bool {
+        self.in_flight() && self.phase() == RunPhase::Ready
+    }
+
     fn live(&self) -> Option<&Live> {
         match self {
             Run::Running(live) | Run::Cancelling(live) => Some(live),
@@ -793,6 +901,7 @@ impl Shell {
             confirm: None,
             sweeping: false,
             timing: false,
+            run_pressed: false,
             restoring: false,
             _subscriptions: subscriptions,
         };
@@ -1328,6 +1437,7 @@ impl Shell {
             timing: None,
             error: None,
             run: Run::Idle,
+            landed: 0,
             in_transaction: false,
             last_used: Instant::now(),
             session_ended: false,
@@ -1435,6 +1545,10 @@ impl Shell {
                 let run = match result {
                     Ok((result, elapsed, ran)) => {
                         tab.run = Run::Idle;
+                        // The run button settles on this, so it counts a
+                        // result rather than a reply: a failure is not
+                        // something to congratulate the user on.
+                        tab.landed += 1;
                         let rows = result.rows.len() as u64;
                         tab.timing = Some(Timing::new(elapsed, result.wire));
                         tab.has_result = true;
@@ -4090,36 +4204,50 @@ impl Shell {
     /// in the accent, **stop** outlined in clay over paper, **terminate**
     /// filled in clay. The escalation is the point — the button that ends a
     /// backend must not look like the button that starts a query.
-    fn run_button(
-        &self,
-        tab: &QueryTab,
-        colors: &ThemeColors,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
-        let (verb, keys) = match tab.run {
-            Run::Idle | Run::Cancelled { .. } => ("run", "⌘⏎"),
-            Run::Running(_) => ("stop", "⌘."),
-            Run::Cancelling(_) => ("terminate", "⌘."),
+    ///
+    /// **It also moves, and it moves in exactly one way: its own fill.**
+    /// While a run is out the fill breathes — a little of the button's ink
+    /// mixed in and back out again, `RUN_BREATH` for the cycle. When the
+    /// rows land the same mix eases out to nothing, so a run reads as one
+    /// gesture that starts and finishes rather than as an effect that plays.
+    /// And a press mixes the other way, toward the app's ink.
+    ///
+    /// Nothing travels across the button, nothing blooms out of it, and
+    /// nothing moves by a pixel. See `RUN_BREATH` for why the comp's
+    /// sweeping front and looping band are not here.
+    ///
+    /// The breath and the settle are GPUI animations rather than ticks of
+    /// the shell's timer. `with_animation` asks for its own frames, restarts
+    /// when the element's id changes — which is the whole of how a landed
+    /// result gets its exhale — and holds still when the platform says the
+    /// user wants less motion.
+    fn run_button(&self, tab: &QueryTab, colors: &ThemeColors, cx: &Context<Self>) -> AnyElement {
+        let phase = tab.run.phase();
+        let (verb, keys) = match phase {
+            RunPhase::Ready => ("run", "⌘⏎"),
+            RunPhase::Stop => ("stop", "⌘."),
+            RunPhase::Terminate => ("terminate", "⌘."),
         };
+        let pressed = self.run_pressed;
         // Paper under clay for "stop": the one state where the button is
         // outlined rather than filled, so a run in flight reads as a
         // question rather than as a command already given.
-        let (border, fill, ink, cap_surface, cap_border) = match tab.run {
-            Run::Idle | Run::Cancelled { .. } => (
+        let (border, resting, ink, cap_surface, cap_border) = match phase {
+            RunPhase::Ready => (
                 colors.accent,
                 colors.accent,
                 colors.window,
                 colors.key_on_fill_surface,
                 colors.key_on_fill_border,
             ),
-            Run::Running(_) => (
+            RunPhase::Stop => (
                 colors.env_prod,
                 colors.window,
                 colors.env_prod_text,
                 colors.env_prod_surface,
                 colors.env_prod_inner,
             ),
-            Run::Cancelling(_) => (
+            RunPhase::Terminate => (
                 colors.env_prod,
                 colors.env_prod,
                 colors.window,
@@ -4127,8 +4255,22 @@ impl Shell {
                 colors.key_on_fill_border,
             ),
         };
+        // One formula for all three of the fill's moods, so that the
+        // breath, the settle and the press cannot drift into three
+        // unrelated effects: mix something into the resting fill.
+        //
+        // **Which way it mixes is the whole of what it says.** Toward the
+        // button's own ink is lighter on a filled button and warmer on the
+        // outlined one — that is "working", and it reads on every state
+        // without a tone per state. Toward the app's ink is darker
+        // everywhere, and that is "held down".
+        let fill = if pressed {
+            resting.blend(colors.text.opacity(RUN_PRESS_DEPTH))
+        } else {
+            resting
+        };
 
-        let mut button = div()
+        let button = div()
             .id("run-query")
             .flex_none()
             .flex()
@@ -4142,23 +4284,61 @@ impl Shell {
             .rounded(px(6.))
             .bg(fill)
             .cursor_pointer()
-            .on_click(cx.listener(|this, _event, _window, cx| this.toggle_run(cx)));
-        button = if tab.run.in_flight() {
-            button.child(stop_glyph(ink))
-        } else {
-            button.child(play_glyph(ink))
-        };
-        button
+            // **The press is the click here, and `on_click` is not used.**
+            // GPUI keeps a click's half-finished state under the element's
+            // id, and this element's id path carries whichever animation is
+            // running — so a button held down across the moment a result
+            // lands would come up under a different id and lose the click.
+            // `run_pressed` is on the shell, where no animation can move it.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.run_pressed = true;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    if this.run_pressed {
+                        this.release_run_button(cx);
+                        this.toggle_run(cx);
+                    }
+                }),
+            )
+            // A press that comes up somewhere else is not a click, but it
+            // is still the end of the press — and nothing else would say
+            // so, which would leave the button held down for good.
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| this.release_run_button(cx)),
+            )
+            .child(if phase == RunPhase::Ready {
+                play_glyph(ink).into_any_element()
+            } else {
+                stop_glyph(ink).into_any_element()
+            })
             .child(
+                // Held at one width across the verbs, so that a run turning
+                // out to be slow does not resize the button under the
+                // pointer that is reaching for it.
                 div()
+                    .w(px(if phase == RunPhase::Terminate {
+                        TERMINATE_LABEL_WIDTH
+                    } else {
+                        RUN_LABEL_WIDTH
+                    }))
                     .text_size(px(11.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(ink)
                     .child(verb),
             )
             .child(
-                // The keycap the comp puts inside the button, with the
-                // 2px bottom edge that makes it read as a key.
+                // The keycap the comp puts inside the button, with the 2px
+                // bottom edge that makes it read as a key. It does not move
+                // on a press: the tone says that, and a keycap sinking a
+                // pixel is the one thing on this button that would still
+                // read as a mechanism.
                 div()
                     .px(px(6.))
                     .py(px(4.))
@@ -4171,12 +4351,64 @@ impl Shell {
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(ink)
                     .child(keys),
+            );
+
+        // A press holds the button still at its pressed tone: what is under
+        // the pointer must not also be breathing.
+        if pressed {
+            return button.into_any_element();
+        }
+        if tab.run.in_flight() {
+            return button
+                .with_animation(
+                    "run-breath",
+                    // Phase-locked to the app's own clock, so a breath does
+                    // not restart from nothing every time something else on
+                    // screen rebuilds this element.
+                    Animation::new(RUN_BREATH)
+                        .repeat_synced()
+                        .with_easing(gpui::pulsating_between(0., 1.)),
+                    move |button, delta| {
+                        button.bg(resting.blend(ink.opacity(RUN_BREATH_DEPTH * delta)))
+                    },
+                )
+                .into_any_element();
+        }
+        // `landed == 0` is a tab that has never answered, and the first
+        // paint of every window is exactly that: nothing to exhale.
+        if tab.landed == 0 {
+            return button.into_any_element();
+        }
+        button
+            .with_animation(
+                ("run-settle", tab.landed),
+                Animation::new(RUN_SETTLE).with_easing(gpui::ease_out_quint()),
+                move |button, delta| {
+                    button.bg(resting.blend(ink.opacity(RUN_SETTLE_DEPTH * (1. - delta))))
+                },
             )
+            .into_any_element()
     }
 
-    /// The button does whichever of the two things its label says.
+    /// The press ends, and nothing else happens: a release away from the
+    /// button is not a click on it.
+    fn release_run_button(&mut self, cx: &mut Context<Self>) {
+        if self.run_pressed {
+            self.run_pressed = false;
+            cx.notify();
+        }
+    }
+
+    /// The button does whichever of the three things its label says — and
+    /// nothing at all while it says "run" over a run that is already out.
+    /// The word under the pointer is what the click has to mean: a click
+    /// during the arming window would either start a second run over the
+    /// first, which is refused anyway, or stop a run the button never
+    /// offered to stop. ⌘. is unaffected: a key press is aimed at the run,
+    /// not at a word on a button.
     fn toggle_run(&mut self, cx: &mut Context<Self>) {
         match self.tabs.get(self.active) {
+            Some(Tab::Query(tab)) if tab.run.arming() => {}
             Some(Tab::Query(tab)) if tab.run.in_flight() => self.stop_active_query(cx),
             _ => self.run_active_query(cx),
         }
@@ -5592,6 +5824,31 @@ fn redact(url: &str) -> String {
 mod tests {
     use super::*;
     use introspect::Schema;
+
+    /// The arming window, which is the whole of why the button's state is a
+    /// type of its own: for the first `RUN_ARM` the statement is out and the
+    /// button still says "run".
+    #[test]
+    fn the_button_offers_a_stop_only_once_a_run_has_lasted() {
+        let ago = |ago: Duration| Live { started: Instant::now() - ago, backend: None };
+        assert_eq!(Run::Idle.phase(), RunPhase::Ready);
+        assert_eq!(Run::Cancelled { elapsed: 120 }.phase(), RunPhase::Ready);
+        // A statement that answers inside the window never swaps the verb,
+        // which is the point: most of them answer inside it.
+        let quick = Run::Running(ago(Duration::from_millis(80)));
+        assert_eq!(quick.phase(), RunPhase::Ready);
+        assert!(quick.arming());
+        let slow = Run::Running(ago(RUN_ARM));
+        assert_eq!(slow.phase(), RunPhase::Stop);
+        assert!(!slow.arming());
+        // A cancel is with the server, so the second press is the one that
+        // closes the backend — and that state never arms.
+        let cancelling = Run::Cancelling(ago(Duration::from_millis(10)));
+        assert_eq!(cancelling.phase(), RunPhase::Terminate);
+        assert!(!cancelling.arming());
+        // Nothing is out, so a click runs a query.
+        assert!(!Run::Idle.arming());
+    }
 
     /// The shape a VPN puts the app in, and the reason the split exists: a
     /// third of a second of waiting, of which the database did twelve

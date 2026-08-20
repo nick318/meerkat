@@ -520,6 +520,63 @@ in the accent, **stop** outlined in clay over paper, **terminate** filled in
 clay. ⌘⏎ runs, ⌘. stops. The escalation is the point: the button that ends
 a backend must not look like the button that starts a query.
 
+**The button also moves, and `RunPhase` is why the states line up.** `Run`
+is the state of the *statement*; `RunPhase` is the state of the *button*,
+and the two part company for the first `RUN_ARM` — 420 ms — of every run:
+the statement is out, and the button still says **run**. Most statements
+answer inside that window, and a verb that read "run · stop · run" on every
+one of them would be a button nobody could aim at. The comp says the same
+thing in its own comment — *"stop" only appears once the query has proven
+itself slow* — and gets there by knowing how long its simulated query will
+take; the elapsed time alone is the honest reading of the same rule, and it
+paints the same screen. A **click** in that window therefore does nothing:
+the word under the pointer says "run", and this tab already has one out. ⌘.
+is untouched — a key press is aimed at the run, not at a word on a button.
+
+**One thing moves, and it is the fill.** The comp animates a run with the
+vocabulary of a progress widget: a front sweeping the button, an
+indeterminate band crossing it on a loop, a ring blooming out of the border
+when the rows land. Those are Material's marks, and they are a lot of
+movement for a 27-pixel button that sits beside a paper toolbar all day —
+each of them carries a shape, and a shape crossing a button asks to be
+watched. A tone does not. So the animation here is the fill mixing a little
+colour in and back out again:
+
+| Mix | When | What it says |
+|---|---|---|
+| toward the button's **own ink**, `RUN_BREATH_DEPTH`, breathing over `RUN_BREATH` | a run is out | working |
+| the same mix, easing out over `RUN_SETTLE` | a result lands | that came back |
+| toward the **app's ink**, `RUN_PRESS_DEPTH`, at once | held down | the press landed |
+
+`Hsla::blend` is the whole of it, and one formula for all three moods is what
+keeps them from drifting into three unrelated effects. **The direction is the
+message**: the button's own ink is paper on a filled button and clay on the
+outlined one, so mixing that way is lighter or warmer but always "working",
+on every state, with no tone per state; the app's ink is darker everywhere,
+and that is "held down". A press holds the button still at its pressed tone —
+what is under the pointer must not also be breathing. Nothing travels,
+nothing blooms, and nothing moves by a pixel: not the button, and not the
+keycap, which is the one part of it that would still read as a mechanism.
+
+The breath and the settle are GPUI animations, never ticks of the shell's
+timer: `with_animation` asks for its own frames, restarts when the element's
+id changes, and holds still under `reduce_motion`. The breath is
+`repeat_synced`, phase-locked to the app's clock, so it does not start over
+every time something else on screen rebuilds the element. The settle's id
+carries `QueryTab::landed`, a **count of results**, which is the whole of why
+the exhale needs no `Instant` and no timer of its own. It counts results and
+not replies — a failure is not something to congratulate the user on — and
+`landed == 0` is what keeps a freshly opened tab from exhaling at a user who
+has asked it nothing.
+
+The press is also the *click*: `on_click` keeps its half-finished state under
+the element's id, that id path carries whichever animation is running, and a
+button held down across the moment a result lands would come up under a
+different id and lose the press. `Shell::run_pressed` is where the press
+lives instead — mouse state between one frame and the next, beside the
+palette rather than on a tab, for the reason the grid's hovered row lives on
+`GridState`.
+
 **The server does the stopping, not the app.** Dropping the future would
 leave the statement running on the server, so a run has to name the backend
 it is on. A query tab's session knows that from the moment it opens; the
