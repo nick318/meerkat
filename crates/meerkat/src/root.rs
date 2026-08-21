@@ -6,7 +6,7 @@
 //! no sockets open.
 
 use crate::connections::{Connections, ConnectionsEvent};
-use crate::shell::{Close, Shell, ShellEvent, Target};
+use crate::shell::{Close, Shell, ShellEvent, StopTask, Target};
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, Subscription, Window, div, prelude::*,
 };
@@ -55,16 +55,49 @@ impl Root {
         }
     }
 
-    /// Ask the workspace whether the app may go. `false` means it put a
-    /// question on screen instead, and will quit itself if the user says
-    /// so — ⌘Q and the window's close button both end every tab at once,
-    /// so neither may skip the guard the tab strip goes through.
+    /// Ask the workspace whether this **window** may close. `false` means
+    /// it put a question on screen instead, and closes the window itself if
+    /// the user says so — the close button ends every tab of this window at
+    /// once, so it may not skip the guard the tab strip goes through.
+    pub fn guard_close_window(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.guard(Close::Window, window, cx)
+    }
+
+    /// Ask the workspace whether the **app** may go. ⌘Q ends every window,
+    /// so each one is asked in turn; `false` means this one is asking the
+    /// user, and the quit carries on from there.
     pub fn guard_quit(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.guard(Close::Quit, window, cx)
+    }
+
+    fn guard(&self, what: Close, window: &mut Window, cx: &mut Context<Self>) -> bool {
         match &self.screen {
-            Screen::Workspace(workspace) => workspace
-                .update(cx, |shell, cx| shell.guard_close(Close::Window, window, cx)),
+            Screen::Workspace(workspace) => {
+                workspace.update(cx, |shell, cx| shell.guard_close(what, window, cx))
+            }
             // The connections screen holds no runs.
             Screen::Connections(_) => true,
+        }
+    }
+
+    /// Forget that this window agreed to a quit. The quit was refused at
+    /// another window's dialog, so nothing was agreed to after all.
+    pub fn forget_quit(&self, cx: &mut Context<Self>) {
+        if let Screen::Workspace(workspace) = &self.screen {
+            workspace.update(cx, |shell, _cx| shell.forget_quit());
+        }
+    }
+
+    /// Ask the server to give up every run in this window, on the way to a
+    /// quit. The requests are handed back rather than detached, because
+    /// quitting drops the tokio runtime and a request that has not left yet
+    /// never leaves.
+    pub fn stop_runs(&self, cx: &mut Context<Self>) -> Vec<StopTask> {
+        match &self.screen {
+            Screen::Workspace(workspace) => {
+                workspace.update(cx, |shell, cx| shell.cancel_runs(Close::Quit, cx))
+            }
+            Screen::Connections(_) => Vec::new(),
         }
     }
 
@@ -87,9 +120,31 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ShellEvent::Close = event;
-        *self = Self::connections(window, cx);
-        cx.notify();
+        match event {
+            ShellEvent::Close => {
+                *self = Self::connections(window, cx);
+                cx.notify();
+            }
+            // The window the user answered has agreed; the others have not
+            // been asked. So the quit starts again and walks the whole list,
+            // and this window now answers yes without asking twice.
+            //
+            // It runs on the next tick rather than from here: the quit
+            // updates every window, this one included, and this callback is
+            // already inside that update.
+            ShellEvent::Quit => cx
+                .spawn(async move |_, cx| {
+                    cx.update(|cx| crate::quit(cx));
+                })
+                .detach(),
+            // Same reason for the next tick: the walk updates every window,
+            // and this callback is inside one of those updates.
+            ShellEvent::QuitCancelled => cx
+                .spawn(async move |_, cx| {
+                    cx.update(|cx| crate::quit_cancelled(cx));
+                })
+                .detach(),
+        }
     }
 }
 

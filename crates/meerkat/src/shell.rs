@@ -427,6 +427,12 @@ pub struct Shell {
     /// steps would otherwise write a half-built strip back over the saved
     /// one — a restore that stopped halfway would lose the rest.
     restoring: bool,
+    /// True once the user has agreed to a quit this window asked about.
+    /// The quit then walks every window again — this one included — so
+    /// without the flag the same dialog would come back for ever: a run
+    /// asked to stop is still in flight, and a transaction is still open,
+    /// until the cancels land.
+    quitting: bool,
     /// Held for as long as the shell lives, so the filter line keeps
     /// reporting what was typed into it.
     _subscriptions: Vec<Subscription>,
@@ -495,7 +501,7 @@ struct Peek {
 }
 
 /// One "stop this run" request on its way to the server.
-type StopTask = gpui::Task<Result<anyhow::Result<bool>, gpui_tokio::JoinError>>;
+pub(crate) type StopTask = gpui::Task<Result<anyhow::Result<bool>, gpui_tokio::JoinError>>;
 
 /// A close the user has to agree to, because it would end work the server
 /// is still doing.
@@ -518,17 +524,26 @@ struct Confirm {
 
 /// Which way out is being confirmed.
 ///
-/// There are four ways out of a session and only one of them is ⌘W, so a
-/// guard wired to the tab alone would be a lie in the other three: the
-/// two here that drop every tab at once, and the × on the tab strip.
+/// There are five ways out of a session and only one of them is ⌘W, so a
+/// guard wired to the tab alone would be a lie in the other four: the
+/// three here that drop every tab at once, and the × on the tab strip.
+///
+/// **The window's close button and ⌘Q are not the same way out**, now that
+/// there can be more than one window. Closing a window ends that window's
+/// work; quitting ends every window's, and the app goes with it. One
+/// wording could not say both, and one guard could not: ⌘Q has to ask each
+/// window in turn.
 #[derive(Clone, Copy)]
 pub enum Close {
     /// ⌘W, or the × on a tab.
     Tab(u64),
     /// "‹ connections". The shell is dropped, and every tab with it.
     Shell,
-    /// ⌘Q, or the window's close button.
+    /// The window's close button. This window's tabs go; the app stays if
+    /// another window is open.
     Window,
+    /// ⌘Q. Every window's tabs go, and the app with them.
+    Quit,
 }
 
 /// What the workspace was opened on: a URL from the command line, or a
@@ -543,6 +558,13 @@ pub enum Target {
 pub enum ShellEvent {
     /// The user asked for the connections screen back.
     Close,
+    /// The user agreed to a quit this window had asked about. The window
+    /// cannot quit on its own — the other windows have not been asked yet
+    /// — so it says so and the app's own quit walks the list again.
+    Quit,
+    /// The user refused a quit at this window's dialog. Every window that
+    /// agreed to it before this one was asked is asked again next time.
+    QuitCancelled,
 }
 
 enum Status {
@@ -995,6 +1017,7 @@ impl Shell {
             timing: false,
             run_pressed: false,
             restoring: false,
+            quitting: false,
             _subscriptions: subscriptions,
         };
         if let Some(catalog) = cached {
@@ -2797,6 +2820,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.quitting {
+            // Asked and answered. The quit re-reads every window after a
+            // dialog is agreed to, and this one has already said yes.
+            return true;
+        }
         if self.confirm.is_some() {
             // One question at a time. A second ⌘W while the dialog is up is
             // the user repeating themselves, not asking something new.
@@ -2828,7 +2856,7 @@ impl Shell {
         let mut open = Vec::new();
         for tab in self.tabs.iter().filter(|tab| match what {
             Close::Tab(id) => tab.id() == id,
-            Close::Shell | Close::Window => true,
+            Close::Shell | Close::Window | Close::Quit => true,
         }) {
             let Tab::Query(tab) = tab else { continue };
             if tab.run.in_flight() {
@@ -2850,12 +2878,12 @@ impl Shell {
     /// stop button waits out and this cannot — the tab is going away — and
     /// the session work closes it for good, because a session knows its
     /// backend from the moment it opens.
-    fn cancel_runs(&mut self, what: Close, cx: &mut Context<Self>) -> Vec<StopTask> {
+    pub(crate) fn cancel_runs(&mut self, what: Close, cx: &mut Context<Self>) -> Vec<StopTask> {
         let Some(connection) = self.connection.clone() else { return Vec::new() };
         let mut stops = Vec::new();
         for tab in self.tabs.iter_mut().filter(|tab| match what {
             Close::Tab(id) => tab.id() == id,
-            Close::Shell | Close::Window => true,
+            Close::Shell | Close::Window | Close::Quit => true,
         }) {
             let Tab::Query(tab) = tab else { continue };
             let Some(live) = tab.run.live() else { continue };
@@ -2877,8 +2905,24 @@ impl Shell {
         stops
     }
 
+    /// Forget an agreement to quit, because the quit was called off at
+    /// another window's dialog.
+    pub(crate) fn forget_quit(&mut self) {
+        self.quitting = false;
+    }
+
     /// Do the close the user agreed to.
     fn proceed_close(&mut self, what: Close, window: &mut Window, cx: &mut Context<Self>) {
+        if let Close::Quit = what {
+            // The cancels are not sent from here. ⌘Q ends every window, and
+            // only the app knows how many there are: it walks the list, asks
+            // each one, and stops every run at once when they all agree. So
+            // this window records that it has agreed and says so.
+            self.quitting = true;
+            self.remember_tabs(cx);
+            cx.emit(ShellEvent::Quit);
+            return;
+        }
         let stops = self.cancel_runs(what, cx);
         match what {
             Close::Tab(id) => {
@@ -2902,21 +2946,36 @@ impl Shell {
             }
             Close::Window => {
                 self.remember_tabs(cx);
-                // This one *is* waited for. Quitting drops the tokio
-                // runtime, so a cancel that has not left yet never leaves,
-                // and the statement outlives the app that started it.
+                // This one *is* waited for, and the window stays on screen
+                // until the cancels land. Closing the last window quits the
+                // app, which drops the tokio runtime — so a cancel that has
+                // not left yet would never leave, and the statement would
+                // outlive the app that started it.
+                let handle = window.window_handle();
                 cx.spawn(async move |_, cx| {
                     for stop in stops {
                         stop.await.ok();
                     }
-                    cx.update(|cx| cx.quit());
+                    cx.update(|cx| {
+                        handle.update(cx, |_, window, _| window.remove_window()).ok();
+                    });
                 })
                 .detach();
             }
+            // Handled above: it sends no cancels of its own.
+            Close::Quit => {}
         }
     }
 
     fn close_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A quit is asked window by window, so a "stay" here calls the
+        // whole quit off — including the windows that agreed to it before
+        // this one was asked. Their agreement was to *this* quit, and this
+        // quit is not happening; leaving them marked would let the next ⌘Q
+        // end their runs without asking.
+        if let Some(Confirm { what: Close::Quit, .. }) = self.confirm {
+            cx.emit(ShellEvent::QuitCancelled);
+        }
         self.confirm = None;
         // The workspace takes the focus back, or the shell's keys have
         // nowhere to dispatch once the dialog is gone.
@@ -6730,7 +6789,13 @@ fn confirm_copy(what: Close, running: &[SharedString], open: &[SharedString]) ->
         Close::Shell => {
             ("Leave this connection?".to_string(), "Leaving", "Stay", "Leave anyway")
         }
-        Close::Window => ("Quit Meerkat?".to_string(), "Quitting", "Stay", "Quit anyway"),
+        // Two windows, two questions. Closing one window ends what that
+        // window is doing; ⌘Q ends every window's, so it is the one that
+        // says "quit".
+        Close::Window => {
+            ("Close this window?".to_string(), "Closing the window", "Stay", "Close anyway")
+        }
+        Close::Quit => ("Quit Meerkat?".to_string(), "Quitting", "Stay", "Quit anyway"),
     };
 
     // One line per thing at stake, because they are lost in different
@@ -7292,8 +7357,8 @@ mod tests {
         names.iter().map(|name| SharedString::from(name.to_string())).collect()
     }
 
-    /// Each way out names itself and names what it ends. The three must
-    /// not drift into saying three unrelated things, which is the whole
+    /// Each way out names itself and names what it ends. The four must
+    /// not drift into saying four unrelated things, which is the whole
     /// reason the copy is one function.
     #[test]
     fn the_confirmation_names_the_way_out_it_is_guarding() {
@@ -7309,7 +7374,13 @@ mod tests {
         assert_eq!(title, "Leave this connection?");
         assert_eq!((keep, act), ("Stay", "Leave anyway"));
 
+        // Closing one window is not quitting, now that there can be more
+        // than one of them: the window's own question says so.
         let (title, _, _, act) = confirm_copy(Close::Window, &one, &none);
+        assert_eq!(title, "Close this window?");
+        assert_eq!(act, "Close anyway");
+
+        let (title, _, _, act) = confirm_copy(Close::Quit, &one, &none);
         assert_eq!(title, "Quit Meerkat?");
         assert_eq!(act, "Quit anyway");
 
@@ -7326,7 +7397,7 @@ mod tests {
     fn the_confirmation_counts_what_it_would_end() {
         let none: Vec<SharedString> = Vec::new();
 
-        let body = confirm_copy(Close::Window, &names(&["query 3"]), &none).1;
+        let body = confirm_copy(Close::Quit, &names(&["query 3"]), &none).1;
         assert_eq!(
             body,
             vec!["“query 3” is still running a statement. Quitting asks the server to stop it."]

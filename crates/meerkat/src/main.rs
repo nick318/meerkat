@@ -1,9 +1,19 @@
 //! Meerkat entry point: boot GPUI and tokio, load bundled fonts, install
-//! the warm-paper theme, open the main window on a database.
+//! the warm-paper theme, open the first window on a database.
 //!
 //! Usage: `meerkat postgres://user@host/db`, or set `MEERKAT_DATABASE_URL`.
 //! With neither, the window opens on the connections screen, which lists
 //! the saved connections and takes new ones.
+//!
+//! **There can be more than one window, and ⌘N opens one** — on the
+//! connections screen, as a browser's new window opens on nothing. A window
+//! is a `Root` and nothing else: each one holds its own screen, its own
+//! session and its own tabs, so two windows can sit on two databases at
+//! once. Nothing is shared between them but the theme, the key bindings and
+//! the local SQLite file.
+//!
+//! The command line names a database for the **first** window only. A second
+//! window was asked for by hand, so it opens where the user can choose.
 
 mod connections;
 mod env;
@@ -23,7 +33,16 @@ use shell::Target;
 use std::borrow::Cow;
 use theme::Theme;
 
-actions!(meerkat, [Quit]);
+actions!(meerkat, [Quit, NewWindow]);
+
+/// How far a new window is offset from the one before it, so it does not
+/// land exactly on top of it — a window nobody can see the edge of reads as
+/// no new window at all.
+const WINDOW_CASCADE: f32 = 28.;
+
+/// How many steps the cascade takes before it starts over. Without it the
+/// tenth window walks off the screen.
+const WINDOW_CASCADE_STEPS: usize = 6;
 
 fn main() {
     let target = database_url().map(Target::Url);
@@ -110,66 +129,132 @@ fn main() {
             KeyBinding::new("space", shell::TogglePick, Some(shell::GRID_KEY_CONTEXT)),
             KeyBinding::new("escape", shell::ClearSelection, Some(shell::GRID_KEY_CONTEXT)),
             KeyBinding::new("cmd-q", Quit, None),
+            // A window, like a browser's ⌘N. Bound globally on purpose:
+            // it means the same thing on the connections screen and inside
+            // a session, and nothing else in the app takes the key.
+            KeyBinding::new("cmd-n", NewWindow, None),
         ]);
 
-        let bounds = Bounds::centered(None, size(px(1360.), px(880.)), cx);
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Meerkat".into()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                |window, cx| cx.new(|cx| Root::new(target.clone(), window, cx)),
-            )
-            .expect("failed to open the main window");
-        let window_handle = window;
-
-        // A session's tabs are written back as they change, but the last
-        // keystrokes in an editor are not: ⌘Q and the window's close
-        // button both drop the shell, so each one saves on the way out.
-        //
-        // Both also end every run at once, so both ask first. `guard_quit`
-        // answering `false` means the workspace has put the question on
-        // screen and will quit itself if the user agrees — so this returns
-        // and does not.
-        cx.on_action(move |_: &Quit, cx: &mut App| {
-            let go = window
-                .update(cx, |root, window, cx| root.guard_quit(window, cx))
-                .unwrap_or(true);
-            if !go {
-                return;
-            }
-            window.update(cx, |root, _window, cx| root.remember(cx)).ok();
-            cx.quit();
+        cx.on_action(|_: &Quit, cx: &mut App| quit(cx));
+        cx.on_action(|_: &NewWindow, cx: &mut App| {
+            // On the connections screen, whatever this window is on: ⌘N
+            // asks for a window, not for a second view of this database.
+            open_window(None, cx);
         });
 
-        // The screen must hold focus from the first frame, or the key
-        // bindings above have nowhere to dispatch.
-        window
-            .update(cx, |root, window, cx| {
-                window.focus(&root.focus_handle(cx), cx);
-                // The platform wants a yes or no on the spot, and the
-                // question takes a person to answer. So a close with runs
-                // out answers "no" and puts the dialog up; agreeing to it
-                // quits from there.
-                window.on_window_should_close(cx, move |_window, cx| {
-                    let go = window_handle
-                        .update(cx, |root, window, cx| root.guard_quit(window, cx))
-                        .unwrap_or(true);
-                    if !go {
-                        return false;
-                    }
-                    window_handle.update(cx, |root, _window, cx| root.remember(cx)).ok();
-                    true
-                });
-            })
-            .expect("failed to focus the main window");
+        // With no window there is no menu bar and no way back in, so the
+        // app has nothing left to be. The handle is called after the window
+        // has gone, so an empty list means this was the last one.
+        cx.on_window_closed(|cx, _id| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+
+        open_window(target.clone(), cx);
         cx.activate(true);
     });
+}
+
+/// Open one window on a target, or on the connections screen with none.
+///
+/// Every window is built here — the first one and every ⌘N after it — so
+/// the guard on the close button and the cascade cannot be true of one
+/// window and forgotten on the next.
+fn open_window(target: Option<Target>, cx: &mut App) {
+    let step = cx.windows().len() % WINDOW_CASCADE_STEPS;
+    let mut bounds = Bounds::centered(None, size(px(1360.), px(880.)), cx);
+    let offset = px(WINDOW_CASCADE * step as f32);
+    bounds.origin.x += offset;
+    bounds.origin.y += offset;
+
+    let handle = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Meerkat".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            |window, cx| cx.new(|cx| Root::new(target, window, cx)),
+        )
+        .expect("failed to open a window");
+
+    // The screen must hold focus from the first frame, or the key bindings
+    // have nowhere to dispatch.
+    handle
+        .update(cx, |root, window, cx| {
+            window.focus(&root.focus_handle(cx), cx);
+            // The platform wants a yes or no on the spot, and the question
+            // takes a person to answer. So a close with runs out answers
+            // "no" and puts the dialog up; agreeing to it closes the window
+            // from there.
+            //
+            // A session's tabs are written back as they change, but the last
+            // keystrokes in an editor are not, so the way out saves first.
+            window.on_window_should_close(cx, move |_window, cx| {
+                let go = handle
+                    .update(cx, |root, window, cx| root.guard_close_window(window, cx))
+                    .unwrap_or(true);
+                if !go {
+                    return false;
+                }
+                handle.update(cx, |root, _window, cx| root.remember(cx)).ok();
+                true
+            });
+        })
+        .expect("failed to focus a new window");
+}
+
+/// Call a quit off, at every window that had already agreed to it.
+pub fn quit_cancelled(cx: &mut App) {
+    for window in cx.windows() {
+        let Some(window) = window.downcast::<Root>() else { continue };
+        window.update(cx, |root, _window, cx| root.forget_quit(cx)).ok();
+    }
+}
+
+/// Quit, if every window agrees.
+///
+/// ⌘Q ends every window's work at once, so **every** window is asked, and
+/// the first one with something at stake puts the question on screen and
+/// stops the walk. Agreeing to it starts the walk again — that window then
+/// answers yes — so the user is asked once per window and the app goes only
+/// when the last of them has said so.
+///
+/// The cancels are waited for. Quitting drops the tokio runtime, so a
+/// `pg_cancel_backend` that has not left yet never leaves, and the statement
+/// outlives the app that started it.
+pub fn quit(cx: &mut App) {
+    let windows: Vec<_> =
+        cx.windows().into_iter().filter_map(|window| window.downcast::<Root>()).collect();
+    for window in &windows {
+        let go = window
+            .update(cx, |root, window, cx| root.guard_quit(window, cx))
+            .unwrap_or(true);
+        if !go {
+            return;
+        }
+    }
+    let mut stops = Vec::new();
+    for window in &windows {
+        window
+            .update(cx, |root, _window, cx| {
+                root.remember(cx);
+                stops.extend(root.stop_runs(cx));
+            })
+            .ok();
+    }
+    cx.spawn(async move |cx| {
+        for stop in stops {
+            stop.await.ok();
+        }
+        cx.update(|cx| cx.quit());
+    })
+    .detach();
 }
 
 /// The first non-flag argument wins, then the environment.

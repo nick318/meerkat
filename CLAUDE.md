@@ -88,6 +88,36 @@ connection pool, so a closed database keeps no sockets open.
 `Catalog`, the flattened sidebar rows, the completion vocabulary, and the
 open tabs (`Tab::Table`, `Tab::Query` or `Tab::History`).
 
+### More than one window
+
+**⌘N opens a window, on the connections screen**, the way a browser's ⌘N
+opens one on nothing. A window is a `Root` and nothing else, so two windows
+hold two screens, two sessions and two tab strips; nothing is shared but the
+theme, the key bindings and the local SQLite file. ⌘T is still a tab and ⌘N
+is now a window, which is the split the browser taught everybody.
+
+`main::open_window` builds every one of them — the first and every ⌘N after
+it — so the guard on the close button cannot be true of one window and
+forgotten on the next. The command line names a database for the **first**
+window only: a second window was asked for by hand, so it opens where the
+user can choose. New windows **cascade** by `WINDOW_CASCADE`, restarting
+after `WINDOW_CASCADE_STEPS`, because a window landing exactly on the one
+before it reads as no new window at all.
+
+**The window's close button and ⌘Q part company here.** With one window they
+were the same gesture; with two, closing a window ends that window's work
+and quitting ends every window's. So `Close` carries both, `confirm_copy`
+asks two different questions, and `Close::Window` now removes its window
+rather than quitting the app. See "Closing something that is still running".
+
+**With no window the app has nothing left to be** — there is no menu bar to
+open one from — so `cx.on_window_closed` quits once the list is empty.
+
+`Store::open` sets `journal_mode = WAL` and a `busy_timeout`, because every
+window opens its own handle on the one file and two windows write it at the
+same moment: a run lands in one while the other saves its tab strip. The
+default timeout is zero, which fails on the spot rather than waiting.
+
 ### Opening a connection
 
 A session opens on an empty query tab. That needs neither a catalog nor a
@@ -1008,18 +1038,38 @@ for — not tidiness.
 `false` for "the dialog is up, and the close happens when the user says so".
 **Every way out calls it.** There are four, and only one of them is ⌘W:
 
-| Way out | Asks about |
-|---|---|
-| ⌘W, or the × on a tab | that tab |
-| "‹ connections" | every tab |
-| ⌘Q | every tab |
-| the window's close button | every tab |
+| Way out | Asks about | Ends |
+|---|---|---|
+| ⌘W, or the × on a tab | that tab | the tab |
+| "‹ connections" | every tab of this window | the session |
+| the window's close button | every tab of this window | the window |
+| ⌘Q | every tab of every window | the app |
 
-The last two reach the shell through `Root::guard_quit`.
-`on_window_should_close` wants a yes or no on the spot and the question
-takes a person to answer, so it answers **no** and puts the dialog up;
-agreeing to it quits from there. A guard wired only to ⌘W would be a lie in
-the other three.
+The last two reach the shell through `Root::guard_close_window` and
+`Root::guard_quit`. `on_window_should_close` wants a yes or no on the spot
+and the question takes a person to answer, so it answers **no** and puts the
+dialog up; agreeing to it closes the window from there. A guard wired only
+to ⌘W would be a lie in the other three.
+
+**⌘Q asks each window in turn, and one dialog stops the walk.** `main::quit`
+walks the windows, and the first with something at stake puts its question
+up and answers `false`; agreeing to it sets `Shell::quitting`, emits
+`ShellEvent::Quit` and starts the walk again — that window now answers yes
+without asking twice, and the next one is asked. So the user is asked once
+per window, and the app goes only when the last of them has said so. The
+flag is needed rather than tidy: a run asked to stop is still in flight and
+a transaction is still open until the cancels land, so without it the same
+dialog would come back for ever. The restart runs on the next tick, because
+the walk updates every window and the answer arrives inside that update.
+
+**A "stay" calls the whole quit off.** The windows that agreed before this
+one was asked agreed to *this* quit, and this quit is not happening — so
+`ShellEvent::QuitCancelled` clears every flag, or the next ⌘Q would end
+their runs without asking.
+
+The cancels for a quit are sent by `main::quit` over every window at once,
+not by the window that happened to be asked — only the app knows how many
+windows there are.
 
 A close that loses nothing never asks. **Two things count**: a run still in
 flight, and a transaction still open. Each gets its own line, because they

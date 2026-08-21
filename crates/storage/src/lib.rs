@@ -151,6 +151,19 @@ impl Store {
     pub fn open(path: PathBuf) -> Result<Self> {
         let conn = Connection::open(&path)
             .with_context(|| format!("failed to open {}", path.display()))?;
+        // **Every window opens its own handle on this one file**, so two
+        // windows can be writing it at the same moment: a run lands in one
+        // while the other saves its tab strip. WAL lets a reader and a
+        // writer through together, and the busy timeout is what turns the
+        // remaining overlap into a short wait instead of `SQLITE_BUSY` —
+        // the default timeout is zero, which fails on the spot. Neither is
+        // a tuning knob: without them a second window makes the first one
+        // lose writes.
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 2000;",
+        )
+        .context("failed to set the store's pragmas")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS profiles (
                 id TEXT PRIMARY KEY,
