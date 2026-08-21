@@ -24,7 +24,8 @@ pub use completion::{Kind, Name, Vocabulary};
 
 use completion::Completion;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Div, Element, ElementId,
+    Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, Div,
+    Element, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
     GlobalElementId, Hsla, IntoElement, KeyContext, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollHandle, ShapedLine, SharedString,
@@ -34,7 +35,7 @@ use gpui::{
 use highlight::Token;
 use std::ops::Range;
 use std::sync::Arc;
-use theme::theme;
+use theme::{ThemeColors, theme};
 use ui::scrollbar::{self, DragState, Scrollbar};
 
 actions!(
@@ -168,7 +169,27 @@ const INDENT: &str = "  ";
 /// 12px text on the comp's 1.75 line height.
 const FONT_SIZE: f32 = 12.;
 const LINE_HEIGHT: f32 = 21.;
-const GUTTER_WIDTH: f32 = 44.;
+const GUTTER_WIDTH: f32 = 64.;
+/// The lane of the gutter that carries a statement's mark, left of the
+/// line numbers. Wide enough for the widest of them with air either side.
+const MARK_WIDTH: f32 = 20.;
+/// How big a mark is drawn. It is read beside 12px text at a glance, from
+/// the other side of the pane, so it is a shade *larger* than the type
+/// rather than a hint tucked under it — the first version was 8px and
+/// disappeared into the gutter.
+const MARK_SIZE: f32 = 12.;
+/// The rail between the gutter and the text: one column of colour saying
+/// which lines belong to which statement, and how that statement ended.
+/// The mark alone sits on the statement's first line, and a statement is
+/// often several lines long — the rail is what says where it reaches to.
+const RAIL_WIDTH: f32 = 2.;
+/// The running mark breathes rather than spins: the run button already
+/// says "working" by mixing a tone in and back out, and a shape turning in
+/// the gutter of a text editor is a lot of movement for one 8px dot.
+const MARK_BREATH: std::time::Duration = std::time::Duration::from_millis(1400);
+/// How far down the breath takes the dot. It never leaves the screen: a
+/// mark that blinks out is one the eye reads as gone rather than as busy.
+const MARK_BREATH_DEPTH: f32 = 0.55;
 /// One character's advance. The font is monospaced, so a line's width is
 /// its character count times this — JetBrains Mono advances 0.6em, which is
 /// exactly what the text system reports for it. It sizes the scrollable
@@ -180,6 +201,35 @@ const TEXT_PADDING_Y: f32 = 12.;
 /// Deep enough for a long editing session, bounded so a runaway paste
 /// loop cannot grow the history without limit.
 const UNDO_DEPTH: usize = 256;
+
+/// How far one statement of the last run got.
+///
+/// A buffer is several statements and a run sends them in turn, so "did
+/// that work" has one answer per statement rather than one for the run.
+/// The gutter is where that answer belongs: the user is reading the
+/// statements there, and a line of prose under the grid cannot point at
+/// the third of five.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementStatus {
+    /// Sent nowhere yet: the statements ahead of it are still running.
+    Queued,
+    /// The server has this one.
+    Running,
+    /// It came back.
+    Done,
+    /// The server refused it. It is the last statement a run reaches.
+    Failed,
+    /// Never sent, because the statement before it failed or the user
+    /// stopped the run.
+    Skipped,
+}
+
+/// One statement of the last run, and where its text sits in the buffer.
+#[derive(Debug, Clone)]
+pub struct StatementMark {
+    pub range: Range<usize>,
+    pub status: StatementStatus,
+}
 
 pub struct SqlEditor {
     focus_handle: FocusHandle,
@@ -217,6 +267,14 @@ pub struct SqlEditor {
     /// Escape closes the panel until the next edit, so it does not spring
     /// straight back open on the next keystroke.
     completions_dismissed: bool,
+    /// The statements of the last run, in the order they were sent, and
+    /// how far each got. Empty means nothing has been run over this
+    /// buffer — or that the buffer has been edited since, which is the
+    /// same thing to the gutter: the ranges are byte offsets into the
+    /// text that was sent, and an edit moves the text out from under
+    /// them. So **every edit drops them**, rather than paint a tick
+    /// beside a line the user has since rewritten.
+    statements: Vec<StatementMark>,
 }
 
 #[derive(Clone)]
@@ -273,6 +331,7 @@ impl SqlEditor {
             completion_ix: 0,
             completion_range: 0..0,
             completions_dismissed: false,
+            statements: Vec::new(),
         }
     }
 
@@ -286,6 +345,75 @@ impl SqlEditor {
         let range = clamp_range(&self.content, self.selected_range.clone());
         let selected = self.content[range].trim().to_string();
         (!selected.is_empty()).then_some(selected)
+    }
+
+    /// The text a run sends and where it starts in the buffer: the
+    /// selection when there is one, the whole buffer otherwise.
+    ///
+    /// The offset is what the gutter marks are worked out from. ⌘⏎ over a
+    /// selection runs the selection alone, and its statements are still
+    /// statements of *this* buffer — a mark on the first of them belongs
+    /// on the line the selection starts on, not on line one.
+    pub fn run_source(&self) -> (String, usize) {
+        let range = clamp_range(&self.content, self.selected_range.clone());
+        let slice = &self.content[range.clone()];
+        let trimmed = slice.trim();
+        if trimmed.is_empty() {
+            return (self.content.clone(), 0);
+        }
+        let start = range.start + (slice.len() - slice.trim_start().len());
+        (trimmed.to_string(), start)
+    }
+
+    /// Take the statements a run is about to send, all of them queued.
+    /// `offset` is where the run's text starts in the buffer, so the
+    /// ranges are the buffer's own.
+    pub fn set_statements(
+        &mut self,
+        ranges: Vec<Range<usize>>,
+        offset: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.statements = ranges
+            .into_iter()
+            .map(|range| StatementMark {
+                range: offset + range.start..offset + range.end,
+                status: StatementStatus::Queued,
+            })
+            .collect();
+        cx.notify();
+    }
+
+    /// Say how the statement at `ix` ended. A run whose buffer was edited
+    /// under it has no marks left to write on, and this says nothing
+    /// rather than guessing which line the statement moved to.
+    pub fn set_statement_status(
+        &mut self,
+        ix: usize,
+        status: StatementStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mark) = self.statements.get_mut(ix) else { return };
+        mark.status = status;
+        cx.notify();
+    }
+
+    /// Mark every statement from `ix` on as never sent. A run stops at its
+    /// first failure, and the statements behind it were not skipped by
+    /// anyone's choice — they never left.
+    pub fn skip_statements_from(&mut self, ix: usize, cx: &mut Context<Self>) {
+        for mark in self.statements.iter_mut().skip(ix) {
+            mark.status = StatementStatus::Skipped;
+        }
+        cx.notify();
+    }
+
+    pub fn clear_statements(&mut self, cx: &mut Context<Self>) {
+        if self.statements.is_empty() {
+            return;
+        }
+        self.statements.clear();
+        cx.notify();
     }
 
     pub fn line_count(&self) -> usize {
@@ -313,6 +441,7 @@ impl SqlEditor {
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.push_undo(EditKind::None);
+        self.statements.clear();
         self.content = text.into();
         let end = self.content.len();
         self.selected_range = end..end;
@@ -402,6 +531,9 @@ impl SqlEditor {
         self.marked_range = None;
         self.last_edit = EditKind::None;
         self.pending_autoscroll = true;
+        // Undo and redo are edits like any other: they move the text the
+        // marks were worked out from.
+        self.statements.clear();
         current
     }
 
@@ -968,6 +1100,10 @@ impl EntityInputHandler for SqlEditor {
         };
         self.push_undo(kind);
         self.last_edit = kind;
+        // The marks name byte ranges in the text that was run, and this
+        // moves that text. A tick beside a line the user has rewritten
+        // would say the wrong thing about the wrong statement.
+        self.statements.clear();
 
         self.content =
             self.content[..range.start].to_owned() + new_text + &self.content[range.end..];
@@ -1006,6 +1142,7 @@ impl EntityInputHandler for SqlEditor {
             self.push_undo(EditKind::None);
         }
         self.last_edit = EditKind::None;
+        self.statements.clear();
 
         self.content =
             self.content[..range.start].to_owned() + new_text + &self.content[range.end..];
@@ -1073,6 +1210,7 @@ impl Render for SqlEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme(cx).colors.clone();
         let line_count = self.line_count();
+        let line_marks = line_marks(&self.content, &self.statements);
         // How wide the text is, and so how far there is to scroll. The
         // element inside fills this box; the box is what the scroll
         // container measures.
@@ -1177,7 +1315,9 @@ impl Render for SqlEditor {
                     // definite width below.
                     .items_start()
                     .child(
-                        // Line-number gutter, right-aligned against the rule.
+                        // Line-number gutter: a statement's mark on the
+                        // left of it, the number right-aligned against the
+                        // rule.
                         div()
                             .w(px(GUTTER_WIDTH))
                             .flex_none()
@@ -1187,15 +1327,62 @@ impl Render for SqlEditor {
                             // reach the bottom of a short buffer.
                             .min_h(relative(1.))
                             .py(px(TEXT_PADDING_Y))
-                            .pr(px(10.))
+                            .pr(px(8.))
                             .bg(colors.panel)
                             .border_r_1()
                             .border_color(colors.border)
                             .text_color(colors.line_number)
                             .flex()
                             .flex_col()
-                            .items_end()
-                            .children((1..=line_count).map(|n| div().child(n.to_string()))),
+                            .children((1..=line_count).map(|n| {
+                                let mark = line_marks
+                                    .get(n - 1)
+                                    .copied()
+                                    .flatten()
+                                    .filter(|(_, first)| *first)
+                                    .map(|(status, _)| statement_mark(n, status, &colors));
+                                div()
+                                    .h(px(LINE_HEIGHT))
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .w(px(MARK_WIDTH))
+                                            .flex_none()
+                                            .flex()
+                                            .justify_center()
+                                            .children(mark),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(div().flex_none().child(n.to_string()))
+                            })),
+                    )
+                    .child(
+                        // The rail. It is a column of its own rather than a
+                        // border on the gutter, because it says something
+                        // per line: which lines one statement covers, and
+                        // how that statement ended. It carries the whole of
+                        // a multi-line statement, which the mark on its
+                        // first line cannot.
+                        div()
+                            .w(px(RAIL_WIDTH))
+                            .flex_none()
+                            .min_h(relative(1.))
+                            .py(px(TEXT_PADDING_Y))
+                            .flex()
+                            .flex_col()
+                            .children((0..line_count).map(|row| {
+                                let rail = line_marks
+                                    .get(row)
+                                    .copied()
+                                    .flatten()
+                                    .map(|(status, _)| rail_color(status, &colors));
+                                let line = div().h(px(LINE_HEIGHT));
+                                match rail {
+                                    Some(color) => line.bg(color),
+                                    None => line,
+                                }
+                            })),
                     )
                     .child(
                         div()
@@ -1358,6 +1545,106 @@ impl SqlEditor {
                     .text_color(colors.text_faint)
                     .child("↩ or ⇥ to insert · esc to dismiss"),
             )
+    }
+}
+
+/// What each line of `content` wears in the gutter: the statement covering
+/// it, and whether the line is the one that statement starts on — the mark
+/// is drawn once, and the rail carries the rest of it.
+///
+/// A plain function over the text and the ranges, so the mapping can be
+/// argued with in a test rather than in a running window.
+fn line_marks(
+    content: &str,
+    statements: &[StatementMark],
+) -> Vec<Option<(StatementStatus, bool)>> {
+    let mut marks = vec![None; content.split('\n').count()];
+    if statements.is_empty() {
+        return marks;
+    }
+    let mut starts = vec![0usize];
+    starts.extend(content.match_indices('\n').map(|(ix, _)| ix + 1));
+    for statement in statements {
+        let first = row_for_offset(&starts, statement.range.start);
+        // The end offset is one past the statement's last character, so a
+        // statement that ends at a line break belongs to the line before
+        // it rather than opening the next one.
+        let last = row_for_offset(&starts, statement.range.end.saturating_sub(1)).max(first);
+        for row in first..=last.min(marks.len().saturating_sub(1)) {
+            marks[row] = Some((statement.status, row == first));
+        }
+    }
+    marks
+}
+
+/// The mark a statement wears in the gutter, on the line its text starts
+/// on. Five states, and they have to be told apart at 8 pixels: **the
+/// shape says which**, not the colour alone — a ring, a dot, a tick, a
+/// filled square and a dash, in the same warm family as everything else on
+/// this screen.
+fn statement_mark(line: usize, status: StatementStatus, colors: &ThemeColors) -> AnyElement {
+    match status {
+        // A ring: the outline of the dot it is about to become.
+        StatementStatus::Queued => div()
+            .size(px(MARK_SIZE))
+            .rounded_full()
+            .border_2()
+            .border_color(colors.running_border)
+            .into_any_element(),
+        StatementStatus::Running => div()
+            .size(px(MARK_SIZE))
+            .rounded_full()
+            .bg(colors.running_mark)
+            // Phase-locked to the app's clock, as the run button's breath
+            // is, so the dot does not start over every time a keystroke
+            // rebuilds the editor. It holds still under `reduce_motion`,
+            // which `with_animation` answers for us.
+            .with_animation(
+                ("statement-running", line),
+                Animation::new(MARK_BREATH)
+                    .repeat_synced()
+                    .with_easing(gpui::pulsating_between(0., 1.)),
+                |dot, delta| dot.opacity(1. - MARK_BREATH_DEPTH * delta),
+            )
+            .into_any_element(),
+        StatementStatus::Done => div()
+            .text_size(px(14.))
+            .font_weight(FontWeight::BOLD)
+            .text_color(colors.ok)
+            .child("✓")
+            .into_any_element(),
+        // The one mark that is filled and clay: a failure is the only
+        // state here that stops the run, and it is read at a glance from
+        // the other side of the pane.
+        StatementStatus::Failed => div()
+            .size(px(MARK_SIZE + 2.))
+            .rounded(px(3.))
+            .bg(colors.env_prod)
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(10.))
+            .font_weight(FontWeight::BOLD)
+            .text_color(colors.window)
+            .child("!")
+            .into_any_element(),
+        // A dash: nothing happened here, and nothing is what it draws.
+        StatementStatus::Skipped => {
+            div().w(px(MARK_SIZE)).h(px(2.)).bg(colors.idle).into_any_element()
+        }
+    }
+}
+
+/// The rail's colour beside a statement's lines. Queued and skipped take
+/// the plain rule the buffer wears everywhere else: neither is news.
+fn rail_color(status: StatementStatus, colors: &ThemeColors) -> Hsla {
+    match status {
+        StatementStatus::Queued | StatementStatus::Skipped => colors.border,
+        StatementStatus::Running => colors.running_mark,
+        // The dev family's green, which the read-only mark and a commit
+        // already wear: this app says "that worked" in one colour.
+        StatementStatus::Done => colors.env_dev_inner,
+        StatementStatus::Failed => colors.error_mark,
     }
 }
 
@@ -1842,6 +2129,43 @@ fn cursor_quad(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mark(range: Range<usize>, status: StatementStatus) -> StatementMark {
+        StatementMark { range, status }
+    }
+
+    #[test]
+    fn a_statement_marks_every_line_it_covers() {
+        let text = "select 1;\nupdate t\n   set a = 1;\n";
+        let marks = [mark(0..8, StatementStatus::Done), mark(10..31, StatementStatus::Running)];
+        assert_eq!(
+            line_marks(text, &marks),
+            vec![
+                // The mark itself sits on the first line of each.
+                Some((StatementStatus::Done, true)),
+                Some((StatementStatus::Running, true)),
+                Some((StatementStatus::Running, false)),
+                // The line past the last semicolon belongs to no statement.
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_statement_ending_at_a_line_break_does_not_open_the_next_line() {
+        // `select 1` runs to offset 8, and offset 9 opens line two. A range
+        // whose end is one past its last character must not reach there.
+        let marks = [mark(0..8, StatementStatus::Done)];
+        assert_eq!(
+            line_marks("select 1;\nselect 2;", &marks),
+            vec![Some((StatementStatus::Done, true)), None]
+        );
+    }
+
+    #[test]
+    fn nothing_run_marks_nothing() {
+        assert_eq!(line_marks("select 1;\nselect 2;", &[]), vec![None, None]);
+    }
 
     #[test]
     fn a_stale_range_is_pulled_back_into_the_buffer() {

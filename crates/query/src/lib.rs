@@ -21,7 +21,17 @@ use std::ops::Range;
 
 /// Every non-empty statement in `sql`, in order, ready to send.
 pub fn statements(sql: &str) -> Vec<String> {
-    ranges(sql).into_iter().map(|range| sql[range].to_string()).collect()
+    statement_ranges(sql).into_iter().map(|range| sql[range].to_string()).collect()
+}
+
+/// Where each of those statements sits in `sql`, in the same order.
+///
+/// The editor marks a run statement by statement in its gutter, so it has
+/// to know which lines each one covers. The ranges are trimmed and carry
+/// no separating semicolon, so they are exactly the text [`statements`]
+/// hands the server.
+pub fn statement_ranges(sql: &str) -> Vec<Range<usize>> {
+    ranges(sql)
 }
 
 /// What a statement does to the transaction around it, when that is all it
@@ -268,6 +278,17 @@ mod tests {
 
     fn texts(text: &str) -> Vec<String> {
         statements(text)
+    }
+
+    #[test]
+    fn a_range_holds_the_statement_it_names() {
+        // The gutter marks a statement by where it sits in the buffer, so
+        // the range and the text have to be the same statement.
+        let text = "select 1;\n\nupdate t set a = 1;\n";
+        let ranges = statement_ranges(text);
+        assert_eq!(ranges, vec![0..8, 11..29]);
+        let named: Vec<&str> = ranges.iter().map(|range| &text[range.clone()]).collect();
+        assert_eq!(named, statements(text));
     }
 
     #[test]

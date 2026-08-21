@@ -746,6 +746,59 @@ below), but it hands the result over in one piece at the end, so there is
 still no buffered count to report without lying. A count needs the driver to
 report *progress*, not merely to stream; that line is where it shows up.
 
+### Marking a run, statement by statement
+
+**A buffer is several statements, and "did that work" has one answer per
+statement rather than one for the run.** The result line under the grid can
+only report the last of them, and it cannot point at the third of five. The
+gutter can: the user is reading the statements there, so that is where each
+one's own answer belongs — a ring for queued, a dot for running, a tick for
+done, a filled clay square for failed, and a dash for never sent.
+
+**The shape says which, not the colour.** These marks are 8 pixels of a
+warm palette that is already carrying the sidebar, the tabs and the run
+button, and five tones of ochre would be five tones of the same thing. The
+running dot **breathes** rather than spins, for the reason the run button
+breathes: a shape turning in the gutter of a text editor asks to be
+watched, and a tone does not. It is `repeat_synced`, phase-locked to the
+app's clock, so a keystroke rebuilding the editor does not restart it.
+
+The mark is drawn once, on the line the statement's text starts on, and a
+**rail** between the gutter and the text carries the rest of it — a
+statement is often five lines long, and a mark on the first of them cannot
+say how far it reaches. The rail is a column of its own rather than a
+border on the gutter, because it says something *per line*.
+
+`sql_editor::StatementMark` is a byte range into the buffer and a status,
+and `query::statement_ranges` is where the ranges come from — the same walk
+`statements()` makes, so the range and the text are always the same
+statement. **Every edit drops the marks**, undo and redo included: the
+ranges name the text that was sent, and an edit moves that text out from
+under them. A tick beside a line the user has since rewritten would say the
+wrong thing about the wrong statement. `line_marks` is a plain function
+over the text and the ranges, so the mapping is argued with in a test.
+
+A run over a **selection** marks the lines the selection is on, not line
+one: `SqlEditor::run_source` answers with the text *and* where it starts,
+and the offsets are the buffer's own from there.
+
+**The loop that sends the statements moved onto the GPUI thread**, one
+tokio task per statement, because a single task carrying the whole buffer
+could say nothing until the last statement landed. `Tally` holds what the
+run has added up so far — the last result that had columns, the rows
+changed, the verb they agree on — so every rule about what is counted stays
+in one place. It also put the stop **between** two statements: a ⌘. that
+reached the backend while it sat idle between them cancelled nothing, and
+the rest of the buffer went out anyway.
+
+**A statement the user stopped is not a failure.** The server refuses a
+cancelled statement in the same words it refuses a broken one, and the tab
+already paints CANCELLED rather than an error strip — so that line takes
+the dash with the ones behind it. Every path that sends nothing marks the
+statements skipped rather than leaving them queued for ever: a session that
+would not open, a `BEGIN` that failed, a run called off while the session
+was opening.
+
 ### A tab is a session
 
 **The tab is a session in the user's head, so it has to be one on the

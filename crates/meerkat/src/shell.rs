@@ -24,7 +24,7 @@ use query::{CommandVerb, TxVerb};
 use results_grid::{
     Cell, Extent, Grid, GridData, GridState, Hit, Selection, Step, clipboard_text, find_columns,
 };
-use sql_editor::{Kind, Name, SqlEditor, Vocabulary};
+use sql_editor::{Kind, Name, SqlEditor, StatementStatus, Vocabulary};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1576,6 +1576,42 @@ impl Shell {
         cx.notify();
     }
 
+    /// Say in the gutter how far one statement of a tab's run got.
+    ///
+    /// A reply from a run the tab has moved on from writes nothing, for
+    /// the reason every other reply checks the generation: the marks
+    /// belong to the run on screen. A buffer edited mid-run has dropped
+    /// its marks already, and the editor answers that by writing nothing.
+    fn mark_statement(
+        &mut self,
+        tab_id: u64,
+        generation: u64,
+        ix: usize,
+        status: StatementStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else { return };
+        if tab.generation != generation {
+            return;
+        }
+        tab.editor.update(cx, |editor, cx| editor.set_statement_status(ix, status, cx));
+    }
+
+    /// Mark every statement from `from` on as never sent.
+    fn skip_statements(
+        &mut self,
+        tab_id: u64,
+        generation: u64,
+        from: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else { return };
+        if tab.generation != generation {
+            return;
+        }
+        tab.editor.update(cx, |editor, cx| editor.skip_statements_from(from, cx));
+    }
+
     fn new_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.new_query_with("select * from ", window, cx);
     }
@@ -1641,12 +1677,15 @@ impl Shell {
             return;
         };
 
-        // The selection when there is one, the whole buffer otherwise.
+        // The selection when there is one, the whole buffer otherwise —
+        // and where it starts, so the gutter can mark the statements on
+        // the lines they were typed on.
         let editor = tab.editor.read(cx);
-        let sql = editor.selected_text().unwrap_or_else(|| editor.text().to_string());
+        let (sql, offset) = editor.run_source();
         // A driver runs one command at a time, so send the statements in
         // turn rather than handing the server a whole scratchpad.
-        let statements = query::statements(&sql);
+        let ranges = query::statement_ranges(&sql);
+        let statements: Vec<String> = ranges.iter().map(|range| sql[range.clone()].to_string()).collect();
         if statements.is_empty() {
             return;
         }
@@ -1698,6 +1737,11 @@ impl Shell {
         tab.session_ended = false;
         tab.generation += 1;
         let generation = tab.generation;
+
+        // Every statement queued, none of them sent. The gutter says so
+        // from the moment ⌘⏎ lands, so a slow first statement is a run the
+        // user can already see the shape of.
+        tab.editor.update(cx, |editor, cx| editor.set_statements(ranges, offset, cx));
 
         let recorded = sql;
         // The buffer has been edited since the tab was opened, and this is
@@ -3418,6 +3462,13 @@ impl RunOutcome {
 /// it is the same answer to the same question.
 const CALLED_OFF: &str = "the run was called off before it started";
 
+/// What a run says for itself when ⌘. reached it between two statements.
+/// The cancel the button sent found the backend idle, so it stopped
+/// nothing — this is what stops the rest of the buffer instead. The tab
+/// paints CANCELLED for it, as it does for a statement the server gave
+/// up: it is the same answer to the same question.
+const STOPPED_BETWEEN: &str = "the run was stopped between statements";
+
 /// Said when every session is busy or holding a transaction and this tab
 /// wanted one too. It names the two ways out, because the app cannot pick
 /// either of them on the user's behalf: both lose something.
@@ -3463,6 +3514,12 @@ fn run_statements(
                 match flatten(opening.await) {
                     Ok(session) => session,
                     Err(error) => {
+                        // No connection, so no statement left: the gutter
+                        // must not leave a buffer queued for ever.
+                        this.update(cx, |this, cx| {
+                            this.skip_statements(tab_id, generation, 0, cx)
+                        })
+                        .ok();
                         return RunOutcome { session: None, result: Err(error), began: false };
                     }
                 }
@@ -3490,6 +3547,7 @@ fn run_statements(
         if !matches!(go, Ok(true)) {
             // Nothing was sent, so nothing was begun: a run called off in
             // this window costs the server nothing at all.
+            this.update(cx, |this, cx| this.skip_statements(tab_id, generation, 0, cx)).ok();
             return RunOutcome {
                 session: Some(session),
                 result: Err(CALLED_OFF.to_string()),
@@ -3497,99 +3555,168 @@ fn run_statements(
             };
         }
 
-        let running = this.update(cx, |_, cx| {
-            gpui_tokio::Tokio::spawn(cx, async move {
-                let (began, outcome) = execute_all(&session, begin, &statements).await;
-                (session, began, outcome)
-            })
-        });
-        let Ok(running) = running else { return RunOutcome::abandoned() };
-        match running.await {
-            Ok((session, began, result)) => RunOutcome { session: Some(session), result, began },
-            // The task itself died, so what reached the server is unknown.
-            // `refresh_transaction` asks rather than guessing, and it is the
-            // one thing here that can answer.
-            Err(join) => RunOutcome {
-                session: None,
-                result: Err(format!("the query was interrupted: {join}")),
-                began: false,
-            },
+        // The clock starts before the `BEGIN`, because the round trip is
+        // part of what the user waited — but the `BEGIN` is not one of the
+        // statements, so it is neither marked in the gutter nor counted.
+        let started = Instant::now();
+        let mut began = false;
+        if begin {
+            let opening = this.update(cx, |_, cx| {
+                let session = session.clone();
+                gpui_tokio::Tokio::spawn(cx, async move { session.begin().await })
+            });
+            let Ok(opening) = opening else { return RunOutcome::abandoned() };
+            if let Err(error) = flatten(opening.await) {
+                // The transaction never opened, so none of the statements
+                // behind it were sent either.
+                this.update(cx, |this, cx| this.skip_statements(tab_id, generation, 0, cx)).ok();
+                return RunOutcome { session: Some(session), result: Err(error), began: false };
+            }
+            began = true;
         }
-    })
-}
 
-/// Send a buffer's statements in turn, keeping the last result that has
-/// columns. The first failure ends the run.
-///
-/// `begin` opens a transaction in front of them, for a tab in
-/// [`TxMode::Manual`]. It is **not one of the statements**: it does not
-/// count towards what the result line reports, and it is not what the
-/// server is asked to time. The clock does start before it, because the
-/// round trip is part of what the user waited.
-///
-/// The `bool` that comes back says the transaction was opened, which the
-/// caller needs on the failure path too.
-async fn execute_all(
-    session: &Arc<dyn Session>,
-    begin: bool,
-    statements: &[String],
-) -> (bool, Result<Ran, String>) {
-    let started = Instant::now();
-    if begin {
-        if let Err(error) = session.begin().await {
-            return (false, Err(error.to_string()));
-        }
-    }
-    (begin, run_each(session, statements, started).await)
-}
+        // **The loop is here, on the GPUI thread, and one tokio task
+        // carries one statement.** It used to be one task carrying the
+        // whole buffer, which could say nothing until the last statement
+        // landed — and the gutter needs each answer as it arrives. It also
+        // puts the stop *between* two statements: before, a ⌘. that
+        // reached the backend while it sat idle between them cancelled
+        // nothing, and the rest of the buffer went out anyway.
+        let mut tally = Tally::default();
+        for (ix, statement) in statements.iter().enumerate() {
+            let go = this.update(cx, |this, cx| {
+                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return false };
+                if tab.generation != generation {
+                    return false;
+                }
+                let go = !matches!(tab.run, Run::Cancelling(_));
+                tab.editor.update(cx, |editor, cx| {
+                    if go {
+                        editor.set_statement_status(ix, StatementStatus::Running, cx);
+                    } else {
+                        // Never sent, and the gutter says so rather than
+                        // leaving them queued for ever.
+                        editor.skip_statements_from(ix, cx);
+                    }
+                });
+                cx.notify();
+                go
+            });
+            if !matches!(go, Ok(true)) {
+                return RunOutcome {
+                    session: Some(session),
+                    result: Err(STOPPED_BETWEEN.to_string()),
+                    began,
+                };
+            }
 
-async fn run_each(
-    session: &Arc<dyn Session>,
-    statements: &[String],
-    started: Instant,
-) -> Result<Ran, String> {
-    let mut last = QueryResult::default();
-    let mut ran = 0;
-    let mut affected = 0;
-    let mut counted = 0;
-    // The verb the counted statements agree on. `Some(None)` is one that
-    // could not be read; the outer `None` is "nothing counted yet", which
-    // is why this is not simply an `Option<CommandVerb>`.
-    let mut verb: Option<Option<CommandVerb>> = None;
-    for statement in statements {
-        match session.execute(statement).await {
-            Ok(result) => {
-                ran += 1;
-                if result.columns.is_empty() {
-                    // No result set, so the count is the whole of what this
-                    // statement said — including a zero, which is the answer
-                    // to "did my `WHERE` match anything".
-                    affected += result.rows_affected;
-                    counted += 1;
-                    let read = query::command_verb(statement);
-                    verb = Some(match verb {
-                        None => read,
-                        // Two statements that changed rows in different ways
-                        // have no shared word, so the line takes the generic
-                        // one rather than the last statement's.
-                        Some(seen) if seen == read => read,
-                        Some(_) => None,
-                    });
-                } else {
-                    last = result;
+            let running = this.update(cx, |_, cx| {
+                let session = session.clone();
+                let sql = statement.clone();
+                gpui_tokio::Tokio::spawn(cx, async move { session.execute(&sql).await })
+            });
+            let Ok(running) = running else { return RunOutcome::abandoned() };
+            match flatten(running.await) {
+                Ok(result) => {
+                    tally.add(statement, result);
+                    this.update(cx, |this, cx| {
+                        this.mark_statement(tab_id, generation, ix, StatementStatus::Done, cx);
+                    })
+                    .ok();
+                }
+                Err(error) => {
+                    // The first failure ends the run, so everything behind
+                    // it never left: this line takes the failure and the
+                    // lines below it wear the dash.
+                    //
+                    // **A statement the user stopped is not a failure.**
+                    // The server refuses a cancelled statement in the same
+                    // words it refuses a broken one, and the tab already
+                    // paints CANCELLED rather than an error strip for it —
+                    // so the gutter says the same thing, and this line
+                    // takes the dash with the rest.
+                    this.update(cx, |this, cx| {
+                        let stopped = matches!(
+                            this.tab_mut(tab_id),
+                            Some(Tab::Query(tab)) if matches!(tab.run, Run::Cancelling(_))
+                        );
+                        if stopped {
+                            this.skip_statements(tab_id, generation, ix, cx);
+                        } else {
+                            this.mark_statement(
+                                tab_id,
+                                generation,
+                                ix,
+                                StatementStatus::Failed,
+                                cx,
+                            );
+                            this.skip_statements(tab_id, generation, ix + 1, cx);
+                        }
+                    })
+                    .ok();
+                    return RunOutcome { session: Some(session), result: Err(error), began };
                 }
             }
-            Err(error) => return Err(error.to_string()),
+        }
+
+        RunOutcome { session: Some(session), result: Ok(tally.finish(started)), began }
+    })
+}
+
+/// What a run has added up over the statements it has sent so far.
+///
+/// The loop that feeds it is on the GPUI thread now, one statement at a
+/// time, so the running totals cannot live in a `for` loop inside one
+/// tokio task any more. Every rule about what is counted is here, in one
+/// place, rather than spread over that loop.
+#[derive(Default)]
+struct Tally {
+    /// The last result that had columns: the one the grid paints, so a
+    /// trailing `create table` does not blank the grid the `SELECT` before
+    /// it filled.
+    last: QueryResult,
+    ran: usize,
+    affected: u64,
+    counted: usize,
+    /// The verb the counted statements agree on. `Some(None)` is one that
+    /// could not be read; the outer `None` is "nothing counted yet", which
+    /// is why this is not simply an `Option<CommandVerb>`.
+    verb: Option<Option<CommandVerb>>,
+}
+
+impl Tally {
+    fn add(&mut self, statement: &str, result: QueryResult) {
+        self.ran += 1;
+        if result.columns.is_empty() {
+            // No result set, so the count is the whole of what this
+            // statement said — including a zero, which is the answer to
+            // "did my `WHERE` match anything".
+            self.affected += result.rows_affected;
+            self.counted += 1;
+            let read = query::command_verb(statement);
+            self.verb = Some(match self.verb {
+                None => read,
+                // Two statements that changed rows in different ways have
+                // no shared word, so the line takes the generic one rather
+                // than the last statement's.
+                Some(seen) if seen == read => read,
+                Some(_) => None,
+            });
+        } else {
+            self.last = result;
         }
     }
-    Ok(Ran {
-        result: last,
-        affected,
-        counted,
-        verb: verb.flatten(),
-        elapsed_ms: started.elapsed().as_millis(),
-        ran,
-    })
+
+    fn finish(self, started: Instant) -> Ran {
+        Ran {
+            result: self.last,
+            affected: self.affected,
+            counted: self.counted,
+            verb: self.verb.flatten(),
+            elapsed_ms: started.elapsed().as_millis(),
+            ran: self.ran,
+        }
+    }
 }
 
 /// Collapse "the tokio task died" and "the query failed" into one message.
