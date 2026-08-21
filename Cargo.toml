@@ -17,6 +17,7 @@ members = [
     "crates/schema_tree",
     "crates/storage",
     "crates/secrets",
+    "crates/release_channel",
 ]
 
 [workspace.package]
@@ -48,6 +49,7 @@ results_grid = { path = "crates/results_grid" }
 schema_tree = { path = "crates/schema_tree" }
 storage = { path = "crates/storage" }
 secrets = { path = "crates/secrets" }
+release_channel = { path = "crates/release_channel" }
 
 # Third party
 anyhow = "1"

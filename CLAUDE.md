@@ -44,6 +44,32 @@ clone still works — the prompts simply carry on.
 
 The script only signs the app. Test binaries pass through it untouched.
 
+### Bundling the macOS app
+
+```sh
+scripts/bundle-mac.sh dev       # Meerkat Dev.app, com.nick318.meerkat-dev
+scripts/bundle-mac.sh public    # Meerkat.app,     com.nick318.meerkat
+```
+
+Outputs land in `target/dist`: the `.app`, a `.tar.gz` of it (what the
+updater downloads), a `.dmg` (what a person downloads), and a `.sha256`
+beside each archive. The two channels are two apps — different names,
+different bundle ids — so they install side by side and neither ever
+updates onto the other.
+
+The channel is baked in at compile time through `MEERKAT_CHANNEL`, read
+by `crates/release_channel` via `option_env!`. A plain `cargo build`
+sets nothing and is therefore a `local` build, which never polls for
+updates; `local` cannot be asked for by name, so CI cannot ship one by
+accident. `MEERKAT_COMMIT_SHA` rides in the same way and is what tells
+two dev builds of one version apart.
+
+Signing follows `run-signed.sh`'s ladder: `MEERKAT_SIGN_IDENTITY`, else
+the self-signed `Meerkat Dev` certificate, else ad-hoc. A "Developer ID"
+identity additionally gets the hardened runtime and a timestamp, which
+notarization requires; notarization itself runs only when
+`NOTARY_KEY_PATH`, `NOTARY_KEY_ID` and `NOTARY_ISSUER_ID` are all set.
+
 The PostgreSQL driver tests skip themselves when no server is configured, so
 `cargo test` stays green without one. To actually run them:
 
@@ -61,7 +87,7 @@ with Metal.
 
 UI crates may depend on data crates; the reverse is forbidden. `db_postgres`,
 `db_sqlite`, `db_client`, `introspect`, `storage`, `secrets`, `query`,
-`fuzzy` and `settings` must not know about `gpui`.
+`fuzzy`, `settings` and `release_channel` must not know about `gpui`.
 
 | Crate | Role |
 |---|---|
@@ -76,6 +102,7 @@ UI crates may depend on data crates; the reverse is forbidden. `db_postgres`,
 | `ui`, `theme` | Component kit (incl. `TextField` and the overlay `scrollbar`) and color tokens |
 | `storage` | Local SQLite: profiles, cached probe counts, layout, history, cached catalogs |
 | `secrets` | OS keychain wrapper for passwords |
+| `release_channel` | Which channel this build is (`local`/`dev`/`public`), its version and commit — baked in at compile time |
 | `workspace`, `schema_tree` | Empty placeholders |
 
 ### Screens
