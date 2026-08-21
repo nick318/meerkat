@@ -14,9 +14,10 @@ use db_client::{
 };
 use db_postgres::{Label, PostgresConnection};
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, BoxShadow, ClipboardItem, Context, Div, ElementId,
-    Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, Pixels, ScrollStrategy,
-    SharedString, Stateful, Subscription, UniformListScrollHandle, Window, actions, deferred, div,
+    Animation, AnimationExt, AnyElement, App, BoxShadow, ClipboardItem, Context, CursorStyle, Div,
+    ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy, SharedString,
+    Size, Stateful, Subscription, UniformListScrollHandle, Window, actions, canvas, deferred, div,
     prelude::*, px, uniform_list,
 };
 use introspect::{Catalog, Table, TableKind};
@@ -191,8 +192,34 @@ pub fn confirm_key_bindings() -> Vec<gpui::KeyBinding> {
     ]
 }
 
-const SIDEBAR_WIDTH: f32 = 246.;
-const EDITOR_HEIGHT: f32 = 250.;
+/// The two pane sizes a hand can set: the sidebar's width and the SQL
+/// editor's height. Each is a default the comp drew, a rail at either end,
+/// and a key in the store's `ui_state` bag — one value for the whole app,
+/// not per connection, because a pane size is hand ergonomics rather than
+/// a property of any database.
+const SIDEBAR_DEFAULT: f32 = 246.;
+/// Narrow enough to be out of the way, wide enough that the filter line
+/// and a relation name still read.
+const SIDEBAR_MIN: f32 = 180.;
+/// Past this a sidebar is a second window, and it also never takes more
+/// than half the window — see [`Divider::range`].
+const SIDEBAR_MAX: f32 = 520.;
+const EDITOR_DEFAULT: f32 = 250.;
+/// About three lines of SQL: an editor shorter than its own statement is
+/// no editor, and the result below always keeps the rest of the pane.
+const EDITOR_MIN: f32 = 72.;
+/// The editor never takes more than this share of the window, so a result
+/// can always be seen under it — the ceiling is a share rather than a
+/// pixel count because it is the *result's* remainder being protected.
+const EDITOR_MAX_SHARE: f32 = 0.7;
+/// The divider's hitbox straddles the 1px border it lives on: wide enough
+/// to hit without aiming, and taking no layout room — it is an absolute
+/// overlay, so nothing moves by a pixel when it appears.
+const HANDLE_HITBOX: f32 = 7.;
+/// The line painted down its middle on hover and while dragging. The rest
+/// of the time the divider paints nothing: the border under it is the mark,
+/// and the resize cursor is what names the gesture.
+const HANDLE_LINE: f32 = 2.;
 /// Every sidebar row is this tall, headers included: `uniform_list` needs
 /// one height to measure, and the design's rows are already within a
 /// pixel of each other.
@@ -317,6 +344,76 @@ const TAB_MIN_WIDTH: f32 = 116.;
 /// strip. The title truncates at that point.
 const TAB_MAX_WIDTH: f32 = 220.;
 
+/// One of the two dividers a hand can drag. Everything either divider
+/// needs — its rails, its key in the store, its cursor — hangs off this,
+/// so the two cannot drift into two unrelated behaviours.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Divider {
+    /// Sidebar | main: drags the sidebar's width.
+    Sidebar,
+    /// Editor | result, inside a query tab: drags the editor's height.
+    Editor,
+}
+
+impl Divider {
+    fn key(self) -> &'static str {
+        match self {
+            Divider::Sidebar => "sidebar_width",
+            Divider::Editor => "editor_height",
+        }
+    }
+
+    fn default_size(self) -> f32 {
+        match self {
+            Divider::Sidebar => SIDEBAR_DEFAULT,
+            Divider::Editor => EDITOR_DEFAULT,
+        }
+    }
+
+    /// The rails, against the window in hand. A saved size is clamped by
+    /// the same rule as a drag, so a width dragged out on a big monitor
+    /// cannot open a sidebar past half of a small one. The ceiling never
+    /// falls below the floor, whatever the window has shrunk to, or the
+    /// clamp itself would panic.
+    fn range(self, viewport: Size<Pixels>) -> (f32, f32) {
+        let (min, max) = match self {
+            Divider::Sidebar => (SIDEBAR_MIN, SIDEBAR_MAX.min(f32::from(viewport.width) / 2.)),
+            Divider::Editor => (EDITOR_MIN, f32::from(viewport.height) * EDITOR_MAX_SHARE),
+        };
+        (min, max.max(min))
+    }
+
+    /// The window wears this for the whole drag: the pointer leaves the
+    /// 7px handle on the first frame, and a cursor that flickered back to
+    /// an arrow mid-drag would say the drag had ended.
+    fn cursor(self) -> CursorStyle {
+        match self {
+            Divider::Sidebar => CursorStyle::ResizeColumn,
+            Divider::Editor => CursorStyle::ResizeRow,
+        }
+    }
+}
+
+/// A divider drag in flight. It is the mouse's own state between one frame
+/// and the next, which is why it lives on the shell beside `run_pressed`
+/// rather than on any tab. `anchor` is where the pointer went down and
+/// `start` the size at that moment, so the size tracks the pointer's
+/// *travel* — a drag that jumped the pane edge under the pointer on the
+/// first frame would read as the handle slipping out of the hand.
+#[derive(Clone, Copy)]
+struct PaneDrag {
+    divider: Divider,
+    anchor: f32,
+    start: f32,
+}
+
+/// The whole of the drag policy: the size the pointer's travel asks for,
+/// held between the rails. A plain function over numbers, so it is argued
+/// with in a test rather than in a running window.
+fn dragged_size(start: f32, anchor: f32, at: f32, min: f32, max: f32) -> f32 {
+    (start + at - anchor).clamp(min, max.max(min))
+}
+
 pub struct Shell {
     focus_handle: FocusHandle,
     /// The focus the results grid takes when the user clicks into it, and
@@ -419,6 +516,15 @@ pub struct Shell {
     /// the same reason the grid keeps its hovered row on `GridState`. One
     /// button is on screen at a time, so one flag covers it.
     run_pressed: bool,
+    /// The divider drag in flight, if any. Mouse state between frames,
+    /// like `run_pressed`, and one at a time: there is one pointer.
+    pane_drag: Option<PaneDrag>,
+    /// The two sizes a hand can set, read from the store on the way in
+    /// and written back when a drag ends. They live here rather than on a
+    /// tab because every tab shares them: an editor height that jumped on
+    /// every tab switch would read as the strip reshuffling the pane.
+    sidebar_width: f32,
+    editor_height: f32,
     /// True while the idle-session sweep is running. One loop for the
     /// window, and only while there is a session to sweep.
     sweeping: bool,
@@ -984,6 +1090,22 @@ impl Shell {
         let catalog_filter =
             cx.new(|cx| TextField::new("filter schemas and tables…", cx).bare(FILTER_FONT_SIZE));
         let subscriptions = vec![cx.subscribe_in(&catalog_filter, window, Self::on_filter_event)];
+        // The pane sizes the last drag left, read here beside the catalog
+        // and the tabs for the same reason: local SQLite, so the first
+        // frame is already the layout the user set. Clamped against this
+        // window, not the one the drag happened on.
+        let viewport = window.viewport_size();
+        let pane_size = |divider: Divider| {
+            let (min, max) = divider.range(viewport);
+            store
+                .as_ref()
+                .and_then(|store| store.ui_value(divider.key()))
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(divider.default_size())
+                .clamp(min, max)
+        };
+        let sidebar_width = pane_size(Divider::Sidebar);
+        let editor_height = pane_size(Divider::Editor);
         let mut shell = Self {
             focus_handle: cx.focus_handle(),
             grid_focus: cx.focus_handle(),
@@ -1022,6 +1144,9 @@ impl Shell {
             sweeping: false,
             timing: false,
             run_pressed: false,
+            pane_drag: None,
+            sidebar_width,
+            editor_height,
             restoring: false,
             quitting: false,
             _subscriptions: subscriptions,
@@ -3916,6 +4041,11 @@ impl Render for Shell {
                     .flex()
                     .flex_1()
                     .min_h(px(0.))
+                    // For the divider, which is positioned off the
+                    // sidebar's width. It is the row's *last* child, so
+                    // its hitbox paints over both neighbours and wins the
+                    // three pixels it overhangs each of them by.
+                    .relative()
                     .child(self.sidebar(&colors, cx))
                     .child(
                         div()
@@ -3926,7 +4056,8 @@ impl Render for Shell {
                             .child(self.tab_strip(&colors, cx))
                             .child(self.pane(&colors, window, cx))
                             .child(self.status_strip(&colors, cx)),
-                    ),
+                    )
+                    .child(self.pane_handle(Divider::Sidebar, &colors, cx)),
             );
         if let Some(env) = self.env {
             content = content
@@ -3995,6 +4126,9 @@ impl Render for Shell {
             // Last, so it paints over the palette on the one frame where
             // both could be up.
             .children(self.confirm_overlay(&colors, cx))
+            // Paints nothing and takes no room: the listeners a divider
+            // drag hangs on the window, there only while one is out.
+            .children(self.pane_drag_surface(cx))
     }
 }
 
@@ -4172,6 +4306,169 @@ impl Shell {
         }
     }
 
+    // --- resizable panes --------------------------------------------------
+
+    fn pane_size(&self, divider: Divider) -> f32 {
+        match divider {
+            Divider::Sidebar => self.sidebar_width,
+            Divider::Editor => self.editor_height,
+        }
+    }
+
+    fn set_pane_size(&mut self, divider: Divider, size: f32, cx: &mut Context<Self>) {
+        let slot = match divider {
+            Divider::Sidebar => &mut self.sidebar_width,
+            Divider::Editor => &mut self.editor_height,
+        };
+        if *slot != size {
+            *slot = size;
+            cx.notify();
+        }
+    }
+
+    /// The press that starts a drag — or, on a double click, puts the
+    /// divider back where the comp drew it. The reset also ends any drag
+    /// the first click of the pair began, or the pane would chase the
+    /// pointer away from the default it was just given.
+    fn on_divider_down(&mut self, divider: Divider, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        if event.click_count > 1 {
+            self.pane_drag = None;
+            self.set_pane_size(divider, divider.default_size(), cx);
+            self.remember_pane_size(divider);
+            cx.notify();
+            return;
+        }
+        let anchor = match divider {
+            Divider::Sidebar => f32::from(event.position.x),
+            Divider::Editor => f32::from(event.position.y),
+        };
+        self.pane_drag = Some(PaneDrag { divider, anchor, start: self.pane_size(divider) });
+        cx.notify();
+    }
+
+    fn drag_pane_to(
+        &mut self,
+        position: Point<Pixels>,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.pane_drag else { return };
+        let at = match drag.divider {
+            Divider::Sidebar => f32::from(position.x),
+            Divider::Editor => f32::from(position.y),
+        };
+        let (min, max) = drag.divider.range(viewport);
+        self.set_pane_size(drag.divider, dragged_size(drag.start, drag.anchor, at, min, max), cx);
+    }
+
+    /// The button coming up anywhere ends the drag, and only then is the
+    /// size written back: the store is local SQLite, but a write per
+    /// mouse-move frame would still be a write per frame for nothing —
+    /// the size on screen is already the truth for the whole drag.
+    fn end_pane_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.pane_drag.take() else { return };
+        self.remember_pane_size(drag.divider);
+        cx.notify();
+    }
+
+    fn remember_pane_size(&self, divider: Divider) {
+        if let Some(store) = &self.store {
+            let size = self.pane_size(divider).round();
+            store.set_ui_value(divider.key(), &format!("{size}")).ok();
+        }
+    }
+
+    /// The divider itself: a hitbox straddling the border, taking no
+    /// layout room. It paints nothing until it is hovered or dragged —
+    /// the border under it is the mark, and the resize cursor is what
+    /// names the gesture. `occlude` because it overhangs its neighbours
+    /// by three pixels each way, and a press there must be a drag, never
+    /// also a click on whatever is under it.
+    fn pane_handle(&self, divider: Divider, colors: &ThemeColors, cx: &Context<Self>) -> Div {
+        let dragging = self.pane_drag.map(|drag| drag.divider) == Some(divider);
+        let line = div()
+            .group_hover(divider.key(), |style| style.bg(colors.accent))
+            .when(dragging, |style| style.bg(colors.accent_deep));
+        let handle = div()
+            .absolute()
+            .group(divider.key())
+            .occlude()
+            .flex()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    this.on_divider_down(divider, event, cx);
+                }),
+            );
+        match divider {
+            Divider::Sidebar => handle
+                .top_0()
+                .bottom_0()
+                .left(px(self.sidebar_width - HANDLE_HITBOX / 2.))
+                .w(px(HANDLE_HITBOX))
+                .justify_center()
+                .cursor_col_resize()
+                .child(line.w(px(HANDLE_LINE)).h_full()),
+            Divider::Editor => handle
+                .left_0()
+                .right_0()
+                .bottom(px(-HANDLE_HITBOX / 2.))
+                .h(px(HANDLE_HITBOX))
+                .flex_col()
+                .justify_center()
+                .cursor_row_resize()
+                .child(line.h(px(HANDLE_LINE)).w_full()),
+        }
+    }
+
+    /// The listeners a drag hangs on the window, alive only while one is
+    /// out. The handle is 7px and the pointer leaves it on the first
+    /// frame, so handlers bound to its hitbox would go deaf exactly when
+    /// they are needed — the grid's `DragSurface` reasoning, and this is
+    /// its pattern: an element that paints nothing and takes no room.
+    fn pane_drag_surface(&self, cx: &Context<Self>) -> Option<gpui::Canvas<()>> {
+        let drag = self.pane_drag?;
+        let shell = cx.entity();
+        Some(
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, _cx| {
+                    window.set_window_cursor_style(drag.divider.cursor());
+                    window.on_mouse_event({
+                        let shell = shell.clone();
+                        move |event: &MouseMoveEvent, phase, window, cx| {
+                            if !phase.bubble() {
+                                return;
+                            }
+                            // A button that came up somewhere nothing here
+                            // heard about ends the drag, rather than
+                            // leaving the pane glued to the pointer.
+                            if event.pressed_button != Some(MouseButton::Left) {
+                                shell.update(cx, |this, cx| this.end_pane_drag(cx));
+                                return;
+                            }
+                            let viewport = window.viewport_size();
+                            shell.update(cx, |this, cx| {
+                                this.drag_pane_to(event.position, viewport, cx)
+                            });
+                        }
+                    });
+                    window.on_mouse_event({
+                        let shell = shell.clone();
+                        move |event: &MouseUpEvent, phase, _window, cx| {
+                            if phase.bubble() && event.button == MouseButton::Left {
+                                shell.update(cx, |this, cx| this.end_pane_drag(cx));
+                            }
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .w(px(0.))
+            .h(px(0.)),
+        )
+    }
+
     fn sidebar(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
         // The card's second line carries whatever the first one does not.
         // A named profile takes the title, so the database moves down here
@@ -4191,7 +4488,7 @@ impl Shell {
         };
 
         div()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar_width))
             .flex_none()
             .flex()
             .flex_col()
@@ -5580,11 +5877,16 @@ impl Shell {
         )
         .child(
             div()
-                .h(px(EDITOR_HEIGHT))
+                // For the divider, which hangs off this box's bottom edge
+                // and paints after the editor, so the border between the
+                // editor and the result is where the drag begins.
+                .relative()
+                .h(px(self.editor_height))
                 .flex_none()
                 .border_b_1()
                 .border_color(colors.border_strong)
-                .child(tab.editor.clone()),
+                .child(tab.editor.clone())
+                .child(self.pane_handle(Divider::Editor, colors, cx)),
         )
         .children(tab.error.clone().map(|error| error_strip(error, colors)))
         // Directly over the result, because it is about what the runs have
@@ -7133,6 +7435,36 @@ mod tests {
         assert!(!cancelling.arming());
         // Nothing is out, so a click runs a query.
         assert!(!Run::Idle.arming());
+    }
+
+    /// The divider policy: the size tracks the pointer's travel from the
+    /// press, and stops at the rails.
+    #[test]
+    fn a_divider_drag_moves_by_the_pointer_and_stops_at_the_rails() {
+        // Ten pixels right of where the press landed is ten pixels wider,
+        // wherever on the handle the press landed.
+        assert_eq!(dragged_size(246., 100., 110., 180., 520.), 256.);
+        assert_eq!(dragged_size(246., 100., 90., 180., 520.), 236.);
+        // The rails hold at both ends.
+        assert_eq!(dragged_size(246., 100., 900., 180., 520.), 520.);
+        assert_eq!(dragged_size(246., 100., -900., 180., 520.), 180.);
+        // A window shrunk until the ceiling is under the floor answers
+        // with the floor rather than panicking in `clamp`.
+        assert_eq!(dragged_size(246., 100., 110., 180., 90.), 180.);
+    }
+
+    /// The rails against the window in hand: the sidebar never takes more
+    /// than half of it, the editor never more than its share, and neither
+    /// ceiling falls below its floor on a tiny window.
+    #[test]
+    fn the_divider_rails_follow_the_window() {
+        let viewport = |w: f32, h: f32| gpui::Size { width: px(w), height: px(h) };
+        assert_eq!(Divider::Sidebar.range(viewport(1400., 900.)), (SIDEBAR_MIN, SIDEBAR_MAX));
+        // Half of an 800px window is under the 520 cap.
+        assert_eq!(Divider::Sidebar.range(viewport(800., 900.)), (SIDEBAR_MIN, 400.));
+        assert_eq!(Divider::Sidebar.range(viewport(200., 900.)), (SIDEBAR_MIN, SIDEBAR_MIN));
+        assert_eq!(Divider::Editor.range(viewport(1400., 1000.)), (EDITOR_MIN, 700.));
+        assert_eq!(Divider::Editor.range(viewport(1400., 80.)), (EDITOR_MIN, EDITOR_MIN));
     }
 
     /// The sidebar cursor's ring, with the filter line itself in it: ↓

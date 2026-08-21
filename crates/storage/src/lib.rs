@@ -353,6 +353,29 @@ impl Store {
         Ok(())
     }
 
+    /// The same bag, for a value that is not an on/off — a pane size the
+    /// user dragged, remembered across launches. A missing key or an
+    /// unreadable file both answer `None`: the caller has a default, and
+    /// screen state is never worth an error.
+    pub fn ui_value(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row("SELECT value FROM ui_state WHERE key = ?1", [key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn set_ui_value(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO ui_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
     /// The environment tag of one profile, for the shell to read on its
     /// way in: the frame it wears is decided once, when the session
     /// opens. An unknown id reads as untagged.
@@ -699,6 +722,23 @@ mod tests {
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].engine, Engine::Postgres);
         assert_eq!(profiles[0].port, Some(5432));
+    }
+
+    #[test]
+    fn a_ui_value_round_trips_and_a_missing_key_is_none() {
+        let dir = std::env::temp_dir().join("meerkat-store-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui-value.sqlite");
+        let _ = std::fs::remove_file(&path);
+
+        let store = Store::open(path).unwrap();
+        assert_eq!(store.ui_value("sidebar_width"), None);
+        store.set_ui_value("sidebar_width", "312").unwrap();
+        assert_eq!(store.ui_value("sidebar_width"), Some("312".to_string()));
+        // A second write replaces, never duplicates: the bag is one value
+        // per key.
+        store.set_ui_value("sidebar_width", "204").unwrap();
+        assert_eq!(store.ui_value("sidebar_width"), Some("204".to_string()));
     }
 
     #[test]

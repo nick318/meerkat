@@ -277,6 +277,46 @@ results grid uses. It reads the plain `ScrollHandle` that
 `UniformListScrollHandle` keeps inside itself, and is painted outside the
 scrolling list, or it would scroll away with it.
 
+### Resizing the panes
+
+Two dividers, not four: the sidebar's width and the SQL editor's height.
+Everything else sizes itself, and the `flex_1` panes absorb what the
+dividers give. `Divider` in `shell.rs` carries each one's rails, its
+store key and its cursor, so the two cannot drift into two behaviours;
+`dragged_size` is the whole drag policy — the pointer's travel from the
+press, held between the rails — and is a plain function argued with in a
+test. The rails follow the window: the sidebar never takes more than
+half of it, the editor never more than `EDITOR_MAX_SHARE`, and neither
+ceiling falls below its floor on a tiny window.
+
+**The handle takes no layout room.** It is a 7px hitbox straddling the
+1px border, an absolute overlay painted after both neighbours so its
+`occlude` wins the three pixels it overhangs each of them by. It paints
+nothing until hovered or dragged — the border under it is the mark, and
+the resize cursor is what names the gesture. A double click puts the
+divider back where the comp drew it.
+
+**The drag lives on the window, not the handle.** The pointer leaves a
+7px handle on the first frame, so handlers bound to its hitbox would go
+deaf exactly when they are needed — the grid's `DragSurface` reasoning,
+and `pane_drag_surface` is its pattern: a canvas that paints nothing,
+registers the move and up listeners, and holds the window's cursor on
+the resize shape for the whole drag. `PaneDrag` is mouse state between
+frames and lives beside `run_pressed` for the same reason. A move that
+arrives with no button held ends the drag, so a release nothing here
+heard about cannot leave a pane glued to the pointer.
+
+The sizes are one value for the whole app, not per connection — a pane
+size is hand ergonomics, not a property of any database. They live in
+the store's `ui_state` bag (`Store::ui_value`), are read synchronously
+in `Shell::new` beside the cached catalog, and are written back when a
+drag ends — never per move, which would be a write per frame for
+nothing. The editor's height is the shell's, shared by every query tab:
+a height that jumped on every tab switch would read as the strip
+reshuffling the pane. A saved size is clamped by the same rails as a
+drag, so a width dragged out on a big monitor cannot open a sidebar past
+half of a small one.
+
 ### The tabs a connection was left with
 
 A session reopens the tabs it was closed with. `open_tabs` in the local
