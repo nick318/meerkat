@@ -11,15 +11,16 @@ shaped the way it is. The visual language is the "warm paper" comp at
 
 ## Status
 
-Read-only PostgreSQL. In-place editing and MySQL are Phase 2.
+PostgreSQL. A statement you type is sent verbatim, so writing is done in
+SQL rather than in the grid.
 
 Launched with no argument it opens the connections screen: saved
 connections, each probed live for its relation counts and server
 version, plus a form that takes a `postgres://` URL. Passwords go to the
-OS keychain, never to the profiles file. Sessions are read-only by
-default, enforced by the server through
-`default_transaction_read_only=on` in the startup packet rather than by
-reading the user's SQL.
+OS keychain, never to the profiles file. A connection is **read-only by
+default** and the form's switch is what turns that off; the server
+enforces it, through `default_transaction_read_only=on` in the startup
+packet, rather than the app reading the user's SQL.
 
 Open a connection and you get:
 
