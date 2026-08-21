@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "sha": "267010d",
+  "sha": "eda2893",
   "assets": {
     "macos-aarch64": {
       "url": "https://github.com/nick318/meerkat/releases/download/v0.1.0/meerkat-public-aarch64.tar.gz",
