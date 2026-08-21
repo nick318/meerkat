@@ -29,15 +29,6 @@ pub struct Profile {
     /// reading of a missing answer is the careful one.
     #[serde(default = "read_only_default")]
     pub read_only: bool,
-    /// Which way a new query tab on this connection commits. It is not a
-    /// connect parameter — nothing in the startup packet says it, and the
-    /// app is what holds a transaction open — but it belongs to the
-    /// *connection* rather than to a window: "manual on prod, auto on my
-    /// laptop copy" is a decision about the database, so it travels with
-    /// the profile the way `read_only` does. A tab may still be switched
-    /// on its own from the query toolbar.
-    #[serde(default)]
-    pub tx_mode: TxMode,
 }
 
 fn read_only_default() -> bool {
@@ -52,9 +43,13 @@ fn read_only_default() -> bool {
 /// across the runs of a tab, so a set of statements lands together or not
 /// at all, and the user says which.
 ///
-/// It is a property of a **tab**, because a transaction belongs to one
-/// connection and a tab is one connection. The profile carries the default
-/// a new tab opens with.
+/// It is a property of a **tab**, and of nothing else, because a
+/// transaction belongs to one connection and a tab is one connection. A
+/// connection has no say in it: "manual on prod" is a wish about one set of
+/// statements, not about every tab that database will ever open, and a
+/// setting that opened every tab holding a transaction would hold them open
+/// behind a user who wanted one. A tab opens on `Auto`, the query toolbar
+/// switches it, and the tab remembers its own mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TxMode {
     /// Every statement commits on its own, as soon as it succeeds.
@@ -75,9 +70,9 @@ impl TxMode {
         }
     }
 
-    /// Read a stored mode. Anything unrecognised — and a row an older build
-    /// wrote, which has nothing here at all — is `Auto`: the mode a
-    /// connection has when nobody asked for the other one.
+    /// Read a stored mode. Anything unrecognised — and a tab an older build
+    /// saved, which has nothing here at all — is `Auto`: the mode a tab has
+    /// when nobody asked for the other one.
     pub fn parse(text: Option<&str>) -> Self {
         match text {
             Some("manual") => TxMode::Manual,

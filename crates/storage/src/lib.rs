@@ -210,8 +210,12 @@ impl Store {
         // `read_only` arrives NULL on every row an older build saved, and
         // `list_connections` reads NULL as on: a connection saved before
         // the app could be told to be careful is one nobody said could
-        // write. `tx_mode` reads NULL as auto for the mirror-image reason —
-        // nobody asked to hold transactions open, so nothing does.
+        // write.
+        //
+        // A `tx_mode` column here is what a build that asked the *profile*
+        // who commits left behind. The mode belongs to a tab, so nothing
+        // reads it any more; an older file keeps the column, as it keeps
+        // `tables` and `views`.
         self.add_columns(
             "profiles",
             &[
@@ -219,11 +223,10 @@ impl Store {
                 ("server", "TEXT"),
                 ("env", "TEXT"),
                 ("read_only", "INTEGER"),
-                ("tx_mode", "TEXT"),
             ],
         )?;
-        // A query tab remembers which way it commits, so a strip restored
-        // on a manual connection comes back manual. NULL is auto.
+        // A query tab remembers which way it commits, so a tab switched to
+        // manual comes back manual. NULL is auto.
         self.add_columns("open_tabs", &[("tx_mode", "TEXT")])?;
         // Rows changed, for the runs that answer with a count instead of a
         // result set. NULL on every row an older build wrote, which is the
@@ -254,8 +257,8 @@ impl Store {
     pub fn save_profile(&self, p: &Profile) -> Result<()> {
         self.conn.execute(
             "INSERT INTO profiles
-                (id, name, engine, host, port, database, user, read_only, tx_mode)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                (id, name, engine, host, port, database, user, read_only)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 engine = excluded.engine,
@@ -263,8 +266,7 @@ impl Store {
                 port = excluded.port,
                 database = excluded.database,
                 user = excluded.user,
-                read_only = excluded.read_only,
-                tx_mode = excluded.tx_mode",
+                read_only = excluded.read_only",
             rusqlite::params![
                 p.id,
                 p.name,
@@ -273,8 +275,7 @@ impl Store {
                 p.port,
                 p.database,
                 p.user,
-                p.read_only,
-                p.tx_mode.as_str()
+                p.read_only
             ],
         )?;
         Ok(())
@@ -289,7 +290,7 @@ impl Store {
     pub fn list_connections(&self) -> Result<Vec<SavedConnection>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, engine, host, port, database, user,
-                    last_opened, server, env, read_only, tx_mode
+                    last_opened, server, env, read_only
              FROM profiles
              ORDER BY last_opened IS NULL, last_opened DESC, name",
         )?;
@@ -306,7 +307,6 @@ impl Store {
                     // A row an older build wrote has no answer here, and
                     // the careful reading of no answer is "do not write".
                     read_only: row.get::<_, Option<bool>>(10)?.unwrap_or(true),
-                    tx_mode: TxMode::parse(row.get::<_, Option<String>>(11)?.as_deref()),
                 },
                 last_opened: row.get(7)?,
                 server: row.get(8)?,
@@ -679,7 +679,6 @@ mod tests {
                 database: "app".into(),
                 user: Some("nick".into()),
                 read_only: true,
-                tx_mode: TxMode::Auto,
             })
             .unwrap();
 
@@ -706,7 +705,6 @@ mod tests {
             database: "app".into(),
             user: Some("nick".into()),
             read_only: true,
-            tx_mode: TxMode::Auto,
         };
         store.save_profile(&profile).unwrap();
         store.record_probe("p1", "PG 16.2").unwrap();
@@ -734,7 +732,6 @@ mod tests {
             database: "app".into(),
             user: Some("nick".into()),
             read_only: true,
-            tx_mode: TxMode::Auto,
         };
         store.save_profile(&profile).unwrap();
         store.set_env("p1", Some("prod")).unwrap();
@@ -759,7 +756,6 @@ mod tests {
             database: "app".into(),
             user: Some("nick".into()),
             read_only: false,
-            tx_mode: TxMode::Auto,
         };
         store.save_profile(&profile).unwrap();
         assert!(!store.list_connections().unwrap()[0].profile.read_only);
@@ -773,34 +769,6 @@ mod tests {
         // careful reading is the one that wins.
         store.conn.execute("UPDATE profiles SET read_only = NULL", []).unwrap();
         assert!(store.list_connections().unwrap()[0].profile.read_only);
-    }
-
-    /// The mirror image of the read-only flag, and the default goes the
-    /// other way for a reason: nobody asked for a transaction to be held
-    /// open, so none is.
-    #[test]
-    fn the_transaction_mode_round_trips_and_an_older_row_reads_as_auto() {
-        let store = store_at("tx_mode.sqlite");
-        let mut profile = Profile {
-            id: "p1".into(),
-            name: "Local PG".into(),
-            engine: Engine::Postgres,
-            host: Some("localhost".into()),
-            port: Some(5432),
-            database: "app".into(),
-            user: None,
-            read_only: false,
-            tx_mode: TxMode::Manual,
-        };
-        store.save_profile(&profile).unwrap();
-        assert_eq!(store.list_connections().unwrap()[0].profile.tx_mode, TxMode::Manual);
-
-        profile.tx_mode = TxMode::Auto;
-        store.save_profile(&profile).unwrap();
-        assert_eq!(store.list_connections().unwrap()[0].profile.tx_mode, TxMode::Auto);
-
-        store.conn.execute("UPDATE profiles SET tx_mode = NULL", []).unwrap();
-        assert_eq!(store.list_connections().unwrap()[0].profile.tx_mode, TxMode::Auto);
     }
 
     fn store_at(name: &str) -> Store {
@@ -1064,7 +1032,6 @@ mod tests {
                     database: "app".into(),
                     user: None,
                     read_only: true,
-                    tx_mode: TxMode::Auto,
                 })
                 .unwrap();
         }

@@ -14,9 +14,16 @@
 //! sleeping server, spend a connection slot, or ask the keychain for a
 //! password nobody asked it to use. A probe — connect, read the server
 //! version, disconnect on the tokio runtime — runs only when the user
-//! asks for it: saving a connection, or the "test" and "retry" actions.
-//! The version it read is cached in the store, so the next launch paints
-//! "read-only · PG 17.2" without a socket.
+//! asks for it: saving a connection, the form's "test" button, or the
+//! "retry" action. The version it read is cached in the store, so the
+//! next launch paints "read-only · PG 17.2" without a socket.
+//!
+//! **"test" lives in the form, at the end of the URL it tests.** The
+//! question it answers is "does what I have typed reach a database", and a
+//! saved row has answered that already: the row paints what the last probe
+//! found, and ⏎ retries the ones that are down. So the button belongs where
+//! the answer is still unknown, and it tests the fields *as typed*, saving
+//! nothing — a URL that does not work must not have to be saved first.
 //!
 //! The rows come grouped by an environment tag the user gives a
 //! connection in the form. The set of tags is closed — prod, staging,
@@ -30,7 +37,7 @@
 //!
 //! The list selects before it acts, after the "select, then act" comp.
 //! A click selects a row and the bar over the list serves the selection:
-//! connect, edit, test, forget. ⏎ or a double click connects, ↑↓ move
+//! connect, edit, forget. ⏎ or a double click connects, ↑↓ move
 //! the selection, ⌘I edits. One bar for the actions keeps the rows
 //! dense, and the keyboard never needs the mouse.
 //!
@@ -40,18 +47,19 @@
 
 use crate::env::Env;
 use chrono::Local;
-use db_client::{Connection, Engine, Profile, TxMode};
-use db_postgres::PostgresConnection;
+use db_client::{Connection, Engine, Profile};
+use db_postgres::{Password, PostgresConnection};
 use gpui::{
-    App, Context, Div, ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    KeyBinding, SharedString, Stateful, Subscription, Window, actions, div, prelude::*, px,
+    Animation, AnimationExt, AnyElement, App, Context, Div, ElementId, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, KeyBinding, SharedString, Stateful, Subscription, Window,
+    actions, div, prelude::*, px,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage::{SavedConnection, Store};
 use theme::{FONT_FAMILY, ThemeColors, theme};
 use ui::{
     TextField, TextFieldEvent, accent_button, meerkat_mark, section_label, status_dot, switch,
-    toolbar_button,
+    toolbar_button, toolbar_button_bare,
 };
 
 /// The comp's reading column: the list never stretches over a wide window.
@@ -65,6 +73,51 @@ const LAST_WIDTH: f32 = 80.;
 /// The search line sits beside the section label, so it takes a fixed
 /// share of that row rather than all of it.
 const SEARCH_WIDTH: f32 = 300.;
+/// The width the form's "test" button holds whatever it says. The label
+/// changes while a test is out — "test" is 4 characters and "testing…" is
+/// 8 — and a button that resized around its own word would move the URL
+/// field beside it on every press, which is a shift the eye reads as a
+/// flicker on the very element the pointer is on. The room is taken for
+/// the longest word once, and the label is centred in it.
+const TEST_WIDTH: f32 = 74.;
+/// The room the form's message line holds whether or not it has anything
+/// to say, so an answer never moves the blocks under it. Two lines of the
+/// 10px face: a test result is one short line, and a driver's refusal —
+/// `error returned from database: password authentication failed for user
+/// "postgres"` — is the message worth reading whole, so the room is taken
+/// for the longer of the two.
+const MESSAGE_HEIGHT: f32 = 28.;
+/// One cycle of the test button's breath while a test is out, and how much
+/// of the button's own ink each breath mixes into the fill. It is the run
+/// button's gesture at a slower pace: this button sits in a form the user
+/// is reading rather than in the toolbar over a result they are waiting
+/// for, and a slow breath asks to be noticed once rather than watched.
+/// `pulsating_between` is a sine, so the turn at either end of the cycle is
+/// already smooth. Nothing travels across the button and nothing moves by a
+/// pixel — see the run button for why.
+const TEST_BREATH: Duration = Duration::from_millis(3600);
+const TEST_BREATH_DEPTH: f32 = 0.12;
+/// How long a word coming up on the button, or a message coming up under
+/// it, takes to reach full ink.
+///
+/// It is a fade and **only** a fade. The width the word sits in and the
+/// room the message sits in are both already taken — `TEST_WIDTH` and
+/// `MESSAGE_HEIGHT` — so a slide or a grow would be the very shift those
+/// two constants exist to prevent. Text that swapped in one frame reads as
+/// a flicker even when nothing has moved; over `FADE_IN` it reads as an
+/// answer arriving.
+///
+/// The easing is `ease_in_out`, which leaves and arrives slowly. A quint
+/// ease-out — what the run button's settle uses, where the point is to be
+/// over quickly — spends most of a long duration almost finished, so the
+/// longer it is set the more it reads as a snap followed by a crawl.
+const FADE_IN: Duration = Duration::from_millis(480);
+/// How much ink the word keeps at the start of its fade. The two words are
+/// a **crossfade**, not an arrival: `test` is already on the button when
+/// `testing…` replaces it, so a fade from nothing would blink the slot
+/// empty for a moment. A message under the URL does start from nothing, and
+/// fades from nothing.
+const WORD_FADE_FLOOR: f32 = 0.3;
 
 /// The screen's own key context. ⌘F belongs to this screen, not to the
 /// app, so it cannot take the key from a workspace that is open.
@@ -149,10 +202,19 @@ struct Form {
     /// connection starts on: the careful setting is the one nobody has to
     /// remember to choose.
     read_only: bool,
-    /// Which way a new query tab on this connection commits. It is the
-    /// tab's starting mode, not a lock: the query toolbar can switch one
-    /// tab without touching what the connection saved.
-    tx_mode: TxMode,
+    /// What the "test" button beside the URL last found. It is state of the
+    /// form rather than of a row: nothing tested here is saved, so there is
+    /// no row to paint it in.
+    test: FormTest,
+    /// Counts the tests this form has sent. A reply that does not carry the
+    /// current count is dropped: a keystroke has changed the fields under
+    /// it, so it answers about a URL that is not on screen any more.
+    test_generation: u64,
+    /// Counts the messages the form has shown. It is what the message's
+    /// fade is keyed by — a GPUI animation replays when its element's id
+    /// changes — and `0` is a form that has said nothing yet, which must
+    /// not fade an empty line in at a user who has asked nothing.
+    messages: u64,
     /// The profile this form edits; `None` saves a new one.
     editing: Option<String>,
     error: Option<String>,
@@ -164,6 +226,17 @@ impl Form {
     fn fields(&self) -> [&Entity<TextField>; 4] {
         [&self.name, &self.url, &self.user, &self.password]
     }
+}
+
+/// What the form's own probe found. `Idle` is where every keystroke puts it
+/// back: the answer was about the URL as it was typed then.
+enum FormTest {
+    Idle,
+    Testing,
+    /// The server version, as `server_version` shortens it. It is empty
+    /// when the server would not say.
+    Ok(String),
+    Failed(String),
 }
 
 impl EventEmitter<ConnectionsEvent> for Connections {}
@@ -500,7 +573,9 @@ impl Connections {
             password,
             env: Env::parse(prefill.and_then(|saved| saved.env.as_deref())),
             read_only: prefill.map(|saved| saved.profile.read_only).unwrap_or(true),
-            tx_mode: prefill.map(|saved| saved.profile.tx_mode).unwrap_or_default(),
+            test: FormTest::Idle,
+            test_generation: 0,
+            messages: 0,
             editing: prefill.map(|saved| saved.profile.id.clone()),
             error: None,
             _subscriptions: subscriptions,
@@ -519,13 +594,6 @@ impl Connections {
     fn toggle_form_read_only(&mut self, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.form {
             form.read_only = !form.read_only;
-            cx.notify();
-        }
-    }
-
-    fn set_form_tx_mode(&mut self, mode: TxMode, cx: &mut Context<Self>) {
-        if let Some(form) = &mut self.form {
-            form.tx_mode = mode;
             cx.notify();
         }
     }
@@ -556,8 +624,12 @@ impl Connections {
             }
             TextFieldEvent::Changed => {
                 if let Some(form) = &mut self.form {
-                    // The message was about the URL as it was typed then.
+                    // The message was about the URL as it was typed then,
+                    // and so was whatever "test" found. The count going up
+                    // drops the reply of a test still in flight.
                     form.error = None;
+                    form.test = FormTest::Idle;
+                    form.test_generation += 1;
                     cx.notify();
                 }
             }
@@ -583,7 +655,6 @@ impl Connections {
         );
         let env = form.env;
         let read_only = form.read_only;
-        let tx_mode = form.tx_mode;
         let id = form.editing.clone().unwrap_or_else(new_id);
         if url.is_empty() {
             self.set_form_error("a connection needs a URL", cx);
@@ -603,8 +674,6 @@ impl Connections {
         };
         // The URL says nothing about how careful to be; the switch does.
         profile.read_only = read_only;
-        // Nor who commits. The two buttons do.
-        profile.tx_mode = tx_mode;
         let password = merge_credentials(&mut profile, &user, &typed_password, url_password);
         if let Err(error) = store
             .save_profile(&profile)
@@ -629,9 +698,95 @@ impl Connections {
         self.probe(&id, cx);
     }
 
+    /// Test the fields as they are typed, and save nothing.
+    ///
+    /// The URL goes through the same parse a save makes, so what is tried
+    /// is what a save would store. The password is handed to the driver
+    /// rather than looked up, because a connection that has not been saved
+    /// has nothing in the keychain under its id. An **edit** that left the
+    /// field empty is the one case that does look it up — the same reading
+    /// of an empty field the save takes.
+    ///
+    /// It reads the server version and gives the connection straight back,
+    /// as `probe` does: a test is a look, not a session.
+    fn test_form(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = &self.form else { return };
+        if matches!(form.test, FormTest::Testing) {
+            return;
+        }
+        let url = form.url.read(cx).trimmed().to_string();
+        let user = form.user.read(cx).trimmed().to_string();
+        // A password may hold spaces at either end, as it may on save.
+        let typed_password = form.password.read(cx).text().to_string();
+        let read_only = form.read_only;
+        let editing = form.editing.clone();
+        if url.is_empty() {
+            self.set_form_error("a connection needs a URL", cx);
+            return;
+        }
+        // The id is only what the keychain is keyed by, and a connection
+        // that has never been saved asks the keychain nothing.
+        let id = editing.clone().unwrap_or_default();
+        let (mut profile, url_password) = match db_postgres::profile_from_url(&id, "", &url) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.set_form_error(error.to_string(), cx);
+                return;
+            }
+        };
+        // Test the session the switch asks for, so a pooler that refuses a
+        // read-only session says so here rather than on the first open.
+        profile.read_only = read_only;
+        let password = merge_credentials(&mut profile, &user, &typed_password, url_password);
+        let from_keychain = password.is_none() && editing.is_some();
+
+        let generation = {
+            let Some(form) = &mut self.form else { return };
+            form.test_generation += 1;
+            form.test = FormTest::Testing;
+            form.error = None;
+            form.test_generation
+        };
+
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            let credential = if from_keychain {
+                Password::Keychain
+            } else {
+                Password::Given(password.as_deref())
+            };
+            let connection = PostgresConnection::connect_probe(&profile, credential).await?;
+            // A server that will not say its version is still usable.
+            let server = connection.server_version().await.unwrap_or_default();
+            connection.close().await;
+            anyhow::Ok(server)
+        });
+
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            this.update(cx, |this, cx| {
+                let Some(form) = &mut this.form else { return };
+                // A keystroke since the request left makes this an answer
+                // about a URL that is not on screen any more.
+                if form.test_generation != generation {
+                    return;
+                }
+                form.test = match flatten(outcome) {
+                    Ok(server) => FormTest::Ok(server),
+                    Err(error) => FormTest::Failed(error),
+                };
+                form.messages += 1;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn set_form_error(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.form {
             form.error = Some(message.into());
+            form.messages += 1;
         }
         cx.notify();
     }
@@ -836,8 +991,7 @@ impl Connections {
             _ => "connect ⏎",
         };
 
-        let (connect_id, edit_id, test_id, forget_id) =
-            (id.clone(), id.clone(), id.clone(), id);
+        let (connect_id, edit_id, forget_id) = (id.clone(), id.clone(), id);
         Some(
             div()
                 .flex()
@@ -898,14 +1052,6 @@ impl Connections {
                         .text_size(px(10.))
                         .on_click(cx.listener(move |this, _event, window, cx| {
                             this.open_edit(&edit_id, window, cx);
-                        })),
-                )
-                .child(
-                    toolbar_button("test", cx)
-                        .id("test-selected")
-                        .text_size(px(10.))
-                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                            this.probe(&test_id, cx);
                         })),
                 )
                 .child(
@@ -1257,8 +1403,7 @@ impl Connections {
         }
     }
 
-    /// The comp's "safety & limits" block: the read-only switch, and which
-    /// way a new query tab on this connection commits.
+    /// The comp's "safety & limits" block: the read-only switch.
     ///
     /// The switch is not a label on the row — it is a connection parameter,
     /// and the driver asks the server for a read-only session, so
@@ -1271,13 +1416,13 @@ impl Connections {
     /// to turn it off for itself. Only a role without write rights closes
     /// that door.
     ///
-    /// The transaction mode is the **default a tab opens on**, not a lock:
-    /// the query toolbar switches one tab without writing anything back
-    /// here. It sits in this block because it belongs to the same question —
-    /// how much a statement can do before anyone else sees it.
+    /// Who ends a transaction is **not** asked here. A transaction lives on
+    /// one connection and a tab is one connection, so the mode is the tab's
+    /// and the query toolbar is where it is switched: a connection-wide
+    /// setting would open every tab of that database holding a transaction,
+    /// for a user who wanted one.
     fn safety_section(&self, form: &Form, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
         let on = form.read_only;
-        let manual = form.tx_mode == TxMode::Manual;
         div()
             .flex()
             .flex_col()
@@ -1322,33 +1467,116 @@ impl Connections {
                             ),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(colors.text_muted)
-                            .child("transactions"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(8.))
-                            .child(tx_mode_button(TxMode::Auto, !manual, colors, cx))
-                            .child(tx_mode_button(TxMode::Manual, manual, colors, cx)),
-                    )
-                    .child(
-                        div().text_size(px(9.)).text_color(colors.text_faint).child(if manual {
-                            "Manual: a tab opens a transaction on its first run and holds it — \
-                             you commit or roll back from the query bar."
-                        } else {
-                            "Auto: every statement commits on its own, as soon as it succeeds."
-                        }),
-                    ),
+    }
+
+    /// The form's own probe button, at the end of the URL field. It says
+    /// what it is doing on its own face: a button whose only answer is
+    /// three lines down is a button nobody watches.
+    ///
+    /// **Two things move, and neither of them is a pixel.** The word fades
+    /// in when it changes, because a label that swaps in one frame reads as
+    /// a flicker on the very element the pointer is on — the width is
+    /// already held, so the fade is all that is left to say the word
+    /// changed. And while the test is out the fill breathes, which is the
+    /// run button's gesture for "working", at the run button's own pace.
+    ///
+    /// The word is a child of its own so it can be animated apart from the
+    /// box: GPUI gives one animation to one element, and the box is busy
+    /// breathing.
+    fn test_button(&self, form: &Form, colors: &ThemeColors, cx: &mut Context<Self>) -> AnyElement {
+        let testing = matches!(form.test, FormTest::Testing);
+        let ink = colors.text_secondary;
+        let resting = colors.elevated;
+        let word = div()
+            .flex_none()
+            .child(if testing { "testing…" } else { "test" })
+            .with_animation(
+                // The id carries which word it is, so the fade replays on
+                // the change and holds still through every other rebuild.
+                ("test-word", testing as u64),
+                Animation::new(FADE_IN).with_easing(gpui::ease_in_out),
+                move |word, delta| {
+                    let alpha = WORD_FADE_FLOOR + (1. - WORD_FADE_FLOOR) * delta;
+                    word.text_color(ink.opacity(alpha))
+                },
+            );
+        let button = toolbar_button_bare(cx)
+            .id("test-connection")
+            .flex_none()
+            // Fixed room for the longer word: see `TEST_WIDTH`. The
+            // horizontal padding the button carries is inside it, so the
+            // word is centred rather than pushed off one end.
+            .w(px(TEST_WIDTH))
+            .flex()
+            .justify_center()
+            .text_size(px(10.))
+            .child(word)
+            .on_click(cx.listener(|this, _event, _window, cx| this.test_form(cx)));
+        if !testing {
+            return button.into_any_element();
+        }
+        button
+            .with_animation(
+                // Phase-locked to the app's clock, so a keystroke elsewhere
+                // in the form does not start the breath over.
+                "test-breath",
+                Animation::new(TEST_BREATH)
+                    .repeat_synced()
+                    .with_easing(gpui::pulsating_between(0., 1.)),
+                move |button, delta| {
+                    button.bg(resting.blend(ink.opacity(TEST_BREATH_DEPTH * delta)))
+                },
             )
+            .into_any_element()
+    }
+
+    /// The form's message, under the URL and the button that tests it:
+    /// what the last test found, or what went wrong on a save.
+    ///
+    /// The room is **always taken**, whether or not there is anything to
+    /// say. A message that appeared with its answer would push every block
+    /// under it down at the moment the user is reading it, which is the
+    /// same shift `TEST_WIDTH` takes out of the button — and here it moves
+    /// half the card rather than one field. It is two lines high, so a
+    /// server's own refusal reads whole rather than cut at the pane.
+    ///
+    /// One place serves both, because only one of them is ever worth
+    /// reading: an error is set by the very press that would have tested or
+    /// saved, and a keystroke clears them together.
+    ///
+    /// The message **fades in** rather than appearing. The room under the
+    /// URL is held whether or not anything is in it, so the fade is the
+    /// whole of what says something arrived — and it arrives a round trip
+    /// after the press that asked for it, which is exactly when a change
+    /// nobody saw happen is a change nobody reads.
+    fn form_message(&self, form: &Form, colors: &ThemeColors) -> AnyElement {
+        let (color, text) = match (&form.error, &form.test) {
+            (Some(error), _) => (colors.error, first_line(error)),
+            (None, FormTest::Failed(error)) => (colors.error, first_line(error)),
+            // A server that would not say its version still answered.
+            (None, FormTest::Ok(server)) if server.is_empty() => {
+                (colors.ok, "connected".to_string())
+            }
+            (None, FormTest::Ok(server)) => (colors.ok, format!("connected · {server}")),
+            // Nothing while a test is out: the button already says so.
+            (None, FormTest::Idle | FormTest::Testing) => (colors.text_faint, String::new()),
+        };
+        let line = div()
+            .h(px(MESSAGE_HEIGHT))
+            .text_size(px(10.))
+            .text_color(color)
+            .child(text);
+        // A form that has said nothing has nothing to fade in, and the
+        // first paint of every form is exactly that.
+        if form.messages == 0 {
+            return line.into_any_element();
+        }
+        line.with_animation(
+            ("form-message", form.messages),
+            Animation::new(FADE_IN).with_easing(gpui::ease_in_out),
+            move |line, delta| line.text_color(color.opacity(delta)),
+        )
+        .into_any_element()
     }
 
     fn form_card(&self, form: &Form, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
@@ -1392,9 +1620,20 @@ impl Connections {
                             .flex_col()
                             .gap(px(5.))
                             .child(label("url"))
-                            .child(form.url.clone()),
+                            .child(
+                                // "test" sits at the end of the URL it
+                                // tests, so the question and the button
+                                // that answers it read as one line.
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(div().flex_1().min_w(px(0.)).child(form.url.clone()))
+                                    .child(self.test_button(form, colors, cx)),
+                            ),
                     ),
             )
+            .child(self.form_message(form, colors))
             .child(
                 div()
                     .flex()
@@ -1441,9 +1680,6 @@ impl Connections {
                     ),
             )
             .child(self.safety_section(form, colors, cx))
-            .children(form.error.clone().map(|error| {
-                div().text_size(px(11.)).text_color(colors.error).child(error)
-            }))
             .child(
                 div()
                     .flex()
@@ -1533,43 +1769,6 @@ fn status_dot_of(color: gpui::Hsla) -> Div {
 /// is the same one the shell's mark carries, so the two screens agree.
 fn mode_word(profile: &Profile) -> &'static str {
     if profile.read_only { "read-only" } else { "read-write" }
-}
-
-/// One of the form's two transaction buttons. Both are always on screen
-/// and one of them is always lit: the mode is a choice between two states,
-/// not a switch with an off position, and a toggle would leave the user
-/// guessing which way "off" fell.
-fn tx_mode_button(
-    mode: TxMode,
-    picked: bool,
-    colors: &ThemeColors,
-    cx: &mut Context<Connections>,
-) -> Stateful<Div> {
-    let button = div()
-        .id(SharedString::from(format!("tx-mode-{}", mode.as_str())))
-        .flex_1()
-        .min_w(px(0.))
-        .py(px(8.))
-        .border_1()
-        .rounded(px(6.))
-        .text_size(px(10.))
-        .cursor_pointer()
-        .flex()
-        .justify_center()
-        .child(mode.as_str())
-        .on_click(cx.listener(move |this, _event, _window, cx| this.set_form_tx_mode(mode, cx)));
-    if picked {
-        button
-            .border_color(colors.running_border)
-            .bg(colors.selection)
-            .text_color(colors.accent_deep)
-    } else {
-        button
-            .border_color(colors.border)
-            .bg(colors.elevated)
-            .text_color(colors.text_muted)
-            .hover(|s| s.border_color(colors.text_faint))
-    }
 }
 
 /// `postgres://host:port/database`, with no credentials in it.
@@ -1719,7 +1918,6 @@ mod tests {
             database: "meerkat".into(),
             user: Some("ada".into()),
             read_only: true,
-            tx_mode: TxMode::Auto,
         };
         assert_eq!(profile_url(&profile), "postgres://db.internal:5432/meerkat");
     }
@@ -1765,7 +1963,6 @@ mod tests {
                 database: database.into(),
                 user: Some(user.into()),
                 read_only: true,
-                tx_mode: TxMode::Auto,
             },
             last_opened: None,
             server: None,
@@ -1828,7 +2025,6 @@ mod tests {
             database: "meerkat".into(),
             user: Some("from_url".into()),
             read_only: true,
-            tx_mode: TxMode::Auto,
         };
 
         // Both fields filled: the URL's credentials are replaced.

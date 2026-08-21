@@ -118,6 +118,15 @@ impl PostgresConnection {
     /// keychain, keyed by the profile id; a profile without a stored
     /// password connects without one (trust, peer, or `.pgpass`).
     pub async fn connect_profile(profile: &Profile) -> Result<Self> {
+        Self::connect_probe(profile, Password::Keychain).await
+    }
+
+    /// Connect from a profile, saying where the password comes from. It is
+    /// what the connection form's "test" needs: the credentials it tests
+    /// have not been saved, so there may be nothing in the keychain under
+    /// that id to read, and "no password" is a different answer from "look
+    /// one up".
+    pub async fn connect_probe(profile: &Profile, password: Password<'_>) -> Result<Self> {
         let mut options = PgConnectOptions::new().database(&profile.database);
         if let Some(host) = &profile.host {
             options = options.host(host);
@@ -128,8 +137,14 @@ impl PostgresConnection {
         if let Some(user) = &profile.user {
             options = options.username(user);
         }
-        if let Some(password) = secrets::get_password(&profile.id)? {
-            options = options.password(&password);
+        match password {
+            Password::Keychain => {
+                if let Some(password) = secrets::get_password(&profile.id)? {
+                    options = options.password(&password);
+                }
+            }
+            Password::Given(Some(password)) => options = options.password(password),
+            Password::Given(None) => {}
         }
         Self::connect_with(options, profile.read_only).await
     }
@@ -211,6 +226,18 @@ impl PostgresConnection {
     }
 }
 
+/// Where a connect gets its password.
+///
+/// The keychain is the ordinary answer — a saved profile keeps its password
+/// there, keyed by its id — but the connection form tests credentials that
+/// have not been saved, and for those there is nothing under that id to
+/// read. `Given(None)` is then "connect without a password" (trust, peer or
+/// `.pgpass`), which is a different request from "look one up".
+pub enum Password<'a> {
+    Keychain,
+    Given(Option<&'a str>),
+}
+
 /// Split a `postgres://user:password@host:port/database` URL into a saved
 /// profile and the password. The password is handed back separately
 /// because it belongs in the OS keychain, never in the profiles file.
@@ -242,9 +269,6 @@ pub fn profile_from_url(id: &str, name: &str, url: &str) -> Result<(Profile, Opt
         // the flag from the form. Read-only is the value a new connection
         // starts on.
         read_only: true,
-        // Nor does a URL say who commits. Auto is what a connection does
-        // with nothing asked of it, and the form sets the other one.
-        tx_mode: db_client::TxMode::Auto,
     };
     Ok((profile, password_in(url)))
 }

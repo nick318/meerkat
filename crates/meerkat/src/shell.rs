@@ -382,11 +382,6 @@ pub struct Shell {
     /// and the two lines that name the mode read it. A command-line URL
     /// carries no setting and is read-only.
     read_only: bool,
-    /// The transaction mode a new query tab on this connection opens on,
-    /// from the profile. A tab may then be switched on its own; nothing a
-    /// tab does writes back here. A command-line URL carries no setting,
-    /// and auto is what a connection does with nothing asked of it.
-    tx_default: TxMode,
     tabs: Vec<Tab>,
     active: usize,
     next_id: u64,
@@ -640,9 +635,10 @@ struct QueryTab {
     /// not a guess: the connection is pinned to this tab, so nothing but
     /// this tab's own statements can change what it is in.
     in_transaction: bool,
-    /// Who ends this tab's transactions. It is a property of the **tab**,
-    /// because a transaction lives on one connection and a tab is one
-    /// connection; the profile carries the mode a new tab opens on.
+    /// Who ends this tab's transactions. It is a property of the **tab**
+    /// and of nothing else, because a transaction lives on one connection
+    /// and a tab is one connection. A tab opens on auto and the toolbar's
+    /// two chips switch it; the mode is remembered per tab in `open_tabs`.
     tx_mode: TxMode,
     /// How many statements have run inside the transaction that is open.
     tx_statements: usize,
@@ -983,10 +979,6 @@ impl Shell {
             read_only: match &target {
                 Target::Profile(profile) => profile.read_only,
                 Target::Url(_) => true,
-            },
-            tx_default: match &target {
-                Target::Profile(profile) => profile.tx_mode,
-                Target::Url(_) => TxMode::Auto,
             },
             tabs: Vec::new(),
             active: 0,
@@ -1639,7 +1631,9 @@ impl Shell {
             run: Run::Idle,
             landed: 0,
             in_transaction: false,
-            tx_mode: self.tx_default,
+            // A tab opens on auto, whatever connection it is on: the mode
+            // is the tab's own, and the toolbar is where it is switched.
+            tx_mode: TxMode::default(),
             tx_statements: 0,
             tx_affected: 0,
             tx_done: None,

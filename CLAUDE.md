@@ -902,18 +902,20 @@ them. So `db_client::TxMode` is a property of a **tab** — `Auto` or
 `Manual` — because a transaction lives on one connection and a tab is one
 connection.
 
-`Profile::tx_mode` is the mode a new tab opens on, set in the connection
-form beside the read-only switch. It is **not** a connect parameter —
-nothing in the startup packet says it, and the app is what holds the
-transaction open — but it belongs to the connection rather than to a
-window: "manual on prod, auto on the laptop copy" is a decision about the
-database. A command-line URL carries no setting and opens on `Auto`, and a
-profiles row an older build wrote reads as `Auto` — the mirror image of
-`read_only`, whose missing answer is the *careful* one. Here the careful
-answer is to hold nothing open. A tab remembers its own mode in
-`open_tabs`, so a tab switched to manual comes back manual; the
-transaction is not remembered, because a restored tab has no session and
-so has nothing open.
+**Every tab opens on `Auto`, whatever connection it is on, and the mode
+is asked for nowhere but the tab's own toolbar.** The connection form used
+to carry it, beside the read-only switch, and that was the wrong place: it
+is not a connect parameter — nothing in the startup packet says it, and
+the app is what holds the transaction open — and a connection-wide setting
+would open *every* tab of that database holding a transaction for a user
+who wanted one. `read_only` is a promise about a whole session and belongs
+to the connection; a transaction is one set of statements, and asking per
+tab costs one click at the moment the question is actually being asked.
+
+A tab remembers its own mode in `open_tabs`, so a tab switched to manual
+comes back manual; the transaction is not remembered, because a restored
+tab has no session and so has nothing open. A `tx_mode` column an older
+build added to `profiles` is left where it is and read by nothing.
 
 **In manual mode a run opens the transaction and nothing closes it but the
 user.** `needs_begin` is the whole of the decision, and it answers no

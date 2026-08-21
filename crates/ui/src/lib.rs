@@ -25,6 +25,14 @@ pub fn card(cx: &App) -> Div {
 
 /// A small bordered toolbar button ("filter", "export", "format").
 pub fn toolbar_button(text: impl Into<SharedString>, cx: &App) -> Div {
+    toolbar_button_bare(cx).child(text.into())
+}
+
+/// The same button with no word in it, for a button whose label is an
+/// element of its own: a word that fades as it changes has to be animated
+/// apart from the box around it, and GPUI gives one animation to one
+/// element.
+pub fn toolbar_button_bare(cx: &App) -> Div {
     let colors = &theme(cx).colors;
     div()
         .px(px(9.))
@@ -37,7 +45,6 @@ pub fn toolbar_button(text: impl Into<SharedString>, cx: &App) -> Div {
         .text_color(colors.text_secondary)
         .cursor_pointer()
         .hover(|s| s.border_color(colors.text_faint))
-        .child(text.into())
 }
 
 /// The single filled accent button ("run", "commit").
