@@ -103,6 +103,7 @@ UI crates may depend on data crates; the reverse is forbidden. `db_postgres`,
 | `storage` | Local SQLite: profiles, cached probe counts, layout, history, cached catalogs |
 | `secrets` | OS keychain wrapper for passwords |
 | `release_channel` | Which channel this build is (`local`/`dev`/`public`), its version and commit — baked in at compile time |
+| `auto_update` | Poll the channel's feed, download what is newer, lay it over the running bundle; the restart stays the user's |
 | `workspace`, `schema_tree` | Empty placeholders |
 
 ### Screens
@@ -1460,6 +1461,43 @@ paging arithmetic that must be exact.
   `main.rs` binds. Offsets in both are byte offsets on character boundaries.
 - Scroll state (`GridState`, `UniformListScrollHandle`) is held by whoever
   owns the tab, so it survives the re-render after every keystroke and page.
+
+### Self-update
+
+**Two channels, two rules for "newer".** The public channel moves by
+version, so semver answers. The dev channel ships from `main` and rarely
+bumps the version, so two dev builds are told apart by their commit —
+Zed's nightly rule. `auto_update::update_available` is pure and holds
+both; a `local` build (any plain `cargo build`) is never offered
+anything, and `init` gives it no updater at all.
+
+**The feed is a static file, never an endpoint.** One JSON per channel on
+the repo's `updates` branch, read via raw.githubusercontent.com:
+`{version, sha, assets: {"macos-aarch64": {url, sha256}}}`. The request
+is a bare GET with a plain user agent — no ids, no query, nothing that
+counts anybody. `MEERKAT_UPDATE_URL` overrides the URL, which is how the
+whole path is tested against a local `python3 -m http.server`.
+
+**The install is Zed's**: download the `.tar.gz`, check it against the
+feed's sha256 (it crossed a CDN the app does not run), unpack, and
+`rsync -a --delete` the new bundle's contents over the running one. A
+running binary may be overwritten on macOS — the old executable lives on
+unlinked — and rsync in place means there is never a moment with no app
+on disk. The check and the install run on tokio through `gpui_tokio`,
+and replies carry a generation, as a tab's queries do.
+
+**Nothing restarts the app by itself.** The updater stops at `Ready`;
+the pill in the top bar and the line in the connections footer offer the
+restart, and `main::restart_to_update` is ⌘Q's own walk with a different
+last word — every window is asked about its runs and its transactions
+first, and only the final `cx.quit()` becomes `cx.restart()`. A
+cancelled quit clears the flag, or the next plain ⌘Q would relaunch.
+
+**Errors follow who asked.** The hourly check fails quietly back to
+`Idle` — offline is normal and not news; only the footer's manual
+"check for updates" lands in `Errored`, beside its own retry. One
+updater for the whole app, a global entity: two windows must not race
+two rsyncs over one bundle.
 
 ### Persistence
 

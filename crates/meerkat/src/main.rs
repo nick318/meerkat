@@ -22,10 +22,11 @@ mod palette;
 mod root;
 mod shell;
 mod sql;
+mod update;
 
 use gpui::{
-    App, Bounds, Focusable as _, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions,
-    prelude::*, px, size,
+    App, Bounds, Focusable as _, Global, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
+    actions, prelude::*, px, size,
 };
 use gpui_platform::application;
 use root::Root;
@@ -51,6 +52,10 @@ fn main() {
         // Before anything else: the drivers run on tokio, and every view
         // reaches the database through this runtime.
         gpui_tokio::init(cx);
+
+        // The updater exists only on a distributed channel; a `cargo
+        // build` is a `local` build and gets none.
+        auto_update::init(cx);
 
         cx.text_system()
             .add_fonts(vec![
@@ -211,6 +216,10 @@ fn open_window(target: Option<Target>, cx: &mut App) {
 
 /// Call a quit off, at every window that had already agreed to it.
 pub fn quit_cancelled(cx: &mut App) {
+    // The windows that agreed before the "stay" agreed to *this* ending,
+    // and this ending is not happening — a restart asked for later must
+    // not inherit it either.
+    cx.set_global(Restarting(false));
     for window in cx.windows() {
         let Some(window) = window.downcast::<Root>() else { continue };
         window.update(cx, |root, _window, cx| root.forget_quit(cx)).ok();
@@ -252,9 +261,35 @@ pub fn quit(cx: &mut App) {
         for stop in stops {
             stop.await.ok();
         }
-        cx.update(|cx| cx.quit());
+        cx.update(|cx| {
+            // A restart is ⌘Q's walk with a different last word: the same
+            // questions were asked, the same cancels were waited for, and
+            // only what happens after the last window agrees differs.
+            if cx.default_global::<Restarting>().0 {
+                cx.restart();
+            } else {
+                cx.quit();
+            }
+        });
     })
     .detach();
+}
+
+/// Whether the quit under way is really a restart into an installed
+/// update. Read once, at the end of the quit walk; a cancelled quit
+/// clears it, so the next plain ⌘Q does not relaunch the app.
+#[derive(Default)]
+struct Restarting(bool);
+
+impl Global for Restarting {}
+
+/// Restart into the update the updater has already laid over the bundle.
+/// It is the quit walk end to end — every window is asked about its runs
+/// and its transactions first — so nothing ends without the user saying
+/// so twice being needed.
+pub fn restart_to_update(cx: &mut App) {
+    cx.set_global(Restarting(true));
+    quit(cx);
 }
 
 /// The first non-flag argument wins, then the environment.

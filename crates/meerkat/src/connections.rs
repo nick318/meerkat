@@ -243,6 +243,11 @@ impl EventEmitter<ConnectionsEvent> for Connections {}
 
 impl Connections {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // The footer carries the updater's line, so the screen repaints
+        // when the updater moves; a local build has no updater.
+        if let Some(updater) = auto_update::AutoUpdater::try_global(cx) {
+            cx.observe(&updater, |_, _, cx| cx.notify()).detach();
+        }
         let (store, error) = match Store::open_default() {
             Ok(store) => (Some(store), None),
             Err(error) => (None, Some(error.to_string())),
@@ -1186,6 +1191,7 @@ impl Connections {
                     .child("+ new connection"),
             )
             .child(div().flex_1())
+            .child(crate::update::foot_summary(colors, cx))
             .child(key("↑↓ move"))
             .child(key("⏎ connect"))
             .child(key("⌘I edit"))

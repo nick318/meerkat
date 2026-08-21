@@ -18,6 +18,7 @@ members = [
     "crates/storage",
     "crates/secrets",
     "crates/release_channel",
+    "crates/auto_update",
 ]
 
 [workspace.package]
@@ -50,11 +51,16 @@ schema_tree = { path = "crates/schema_tree" }
 storage = { path = "crates/storage" }
 secrets = { path = "crates/secrets" }
 release_channel = { path = "crates/release_channel" }
+auto_update = { path = "crates/auto_update" }
 
 # Third party
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 thiserror = "2"
+semver = "1"
+sha2 = "0.10"
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

@@ -949,6 +949,12 @@ impl Shell {
     /// Open the shell and start connecting. The window paints the
     /// connecting state immediately; the connection lands later.
     pub fn new(target: Target, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // The top bar carries the updater's pill, so the bar has to
+        // repaint when the updater moves; a local build has no updater
+        // and observes nothing.
+        if let Some(updater) = auto_update::AutoUpdater::try_global(cx) {
+            cx.observe(&updater, |_, _, cx| cx.notify()).detach();
+        }
         let (store, store_error) = match Store::open_default() {
             Ok(store) => (Some(store), None),
             Err(error) => (None, Some(error.to_string())),
@@ -4082,6 +4088,7 @@ impl Shell {
                     .child(env.as_str().to_ascii_uppercase())
             }))
             .child(self.mode_mark(colors))
+            .children(crate::update::top_bar_pill(colors, cx))
             .child(trail)
     }
 
