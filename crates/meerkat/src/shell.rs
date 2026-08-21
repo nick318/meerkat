@@ -639,9 +639,10 @@ struct Confirm {
 /// work; quitting ends every window's, and the app goes with it. One
 /// wording could not say both, and one guard could not: ⌘Q has to ask each
 /// window in turn.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Close {
-    /// ⌘W, or the × on a tab.
+    /// ⌘W, or the × on a tab — except on the last tab, which closes the
+    /// window instead. See `close_intent`.
     Tab(u64),
     /// "‹ connections". The shell is dropped, and every tab with it.
     Shell,
@@ -650,6 +651,20 @@ pub enum Close {
     Window,
     /// ⌘Q. Every window's tabs go, and the app with them.
     Quit,
+}
+
+/// What a ⌘W — or a click on a tab's × — actually ends. The last tab is
+/// the exception: a window with an empty strip is a window with nothing
+/// in it, no way back to the connections screen and no tab to open the
+/// next query in, so the gesture that took the last tab away takes the
+/// window with it. That is the browser's rule, which is the one this app
+/// already follows for ⌘T and ⌘N.
+///
+/// It is a `Close::Window`, not a tab close followed by a window close,
+/// because the guard has to ask the window's question: the dialog says
+/// what is ending, and what is ending is the window.
+fn close_intent(tabs: usize, tab_id: u64) -> Close {
+    if tabs <= 1 { Close::Window } else { Close::Tab(tab_id) }
 }
 
 /// What the workspace was opened on: a URL from the command line, or a
@@ -3346,9 +3361,9 @@ impl Shell {
 
     fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active) else { return };
-        let id = tab.id();
-        if self.guard_close(Close::Tab(id), window, cx) {
-            self.close_tab(id, window, cx);
+        let what = close_intent(self.tabs.len(), tab.id());
+        if self.guard_close(what, window, cx) {
+            self.proceed_close(what, window, cx);
         }
     }
 
@@ -4811,8 +4826,9 @@ impl Shell {
                         .cursor_pointer()
                         .hover(|s| s.text_color(colors.error))
                         .on_click(cx.listener(move |this, _event, window, cx| {
-                            if this.guard_close(Close::Tab(id), window, cx) {
-                                this.close_tab(id, window, cx);
+                            let what = close_intent(this.tabs.len(), id);
+                            if this.guard_close(what, window, cx) {
+                                this.proceed_close(what, window, cx);
                             }
                         }))
                         .child("×"),
@@ -7694,6 +7710,18 @@ mod tests {
 
     fn names(names: &[&str]) -> Vec<SharedString> {
         names.iter().map(|name| SharedString::from(name.to_string())).collect()
+    }
+
+    /// ⌘W closes a tab while there is another one to leave the window
+    /// on, and closes the window once there is not.
+    #[test]
+    fn the_last_tab_closes_the_window() {
+        assert_eq!(close_intent(3, 7), Close::Tab(7));
+        assert_eq!(close_intent(2, 7), Close::Tab(7));
+        assert_eq!(close_intent(1, 7), Close::Window);
+        // A strip that is already empty has no × and no active tab, so
+        // this is unreachable — it answers the same way regardless.
+        assert_eq!(close_intent(0, 7), Close::Window);
     }
 
     /// Each way out names itself and names what it ends. The four must

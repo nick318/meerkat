@@ -1104,20 +1104,32 @@ for — not tidiness.
 
 `Shell::guard_close` is the guard, and it answers `true` for "go ahead" or
 `false` for "the dialog is up, and the close happens when the user says so".
-**Every way out calls it.** There are four, and only one of them is ⌘W:
+**Every way out calls it.** There are five, and ⌘W is only two of them:
 
 | Way out | Asks about | Ends |
 |---|---|---|
 | ⌘W, or the × on a tab | that tab | the tab |
+| ⌘W, or the ×, on the **last** tab | every tab of this window | the window |
 | "‹ connections" | every tab of this window | the session |
 | the window's close button | every tab of this window | the window |
 | ⌘Q | every tab of every window | the app |
 
-The last two reach the shell through `Root::guard_close_window` and
-`Root::guard_quit`. `on_window_should_close` wants a yes or no on the spot
+**The last tab is the window.** An empty strip is a window with nothing in
+it — no way back to the connections screen and no tab to open the next
+query in — so the gesture that takes the last tab away takes the window
+with it, which is what ⌘W does in a browser. `shell::close_intent` is that
+one decision, a plain function over the number of tabs, and it answers
+with a `Close::Window` rather than a tab close followed by a window close:
+the guard has to ask the window's question, because the window is what is
+ending. Both paths then go through `proceed_close`, so the last ⌘W stops
+the runs, writes the strip back and waits for the cancels exactly as the
+window's close button does.
+
+The window's own button and ⌘Q reach the shell through
+`Root::guard_close_window` and `Root::guard_quit`. `on_window_should_close` wants a yes or no on the spot
 and the question takes a person to answer, so it answers **no** and puts the
 dialog up; agreeing to it closes the window from there. A guard wired only
-to ⌘W would be a lie in the other three.
+to ⌘W would be a lie in the other ways out.
 
 **⌘Q asks each window in turn, and one dialog stops the walk.** `main::quit`
 walks the windows, and the first with something at stake puts its question
