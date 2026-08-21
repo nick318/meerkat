@@ -47,10 +47,25 @@ pub enum Status {
     Errored { error: String },
 }
 
+/// Which build a `Ready` status is offering. It is what a dismissal is
+/// keyed by, so an update the user waved away stays waved away and the
+/// *next* one announces itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ready {
+    pub version: String,
+    pub sha: Option<String>,
+}
+
 pub struct AutoUpdater {
     status: Status,
     /// Bumped per check; a reply carrying an older value is dropped.
     generation: u64,
+    /// The build whose toast the user closed. **In memory on purpose**:
+    /// closing the toast says "not now", not "never" — a restart is the
+    /// one thing that update was waiting for, so a run of the app that
+    /// still has it pending says so again. Persisting it would turn one
+    /// dismissal into silence for ever.
+    dismissed: Option<Ready>,
     _poll: Task<()>,
 }
 
@@ -90,11 +105,29 @@ impl AutoUpdater {
             }
         });
 
-        Self { status: Status::Idle, generation: 0, _poll: poll }
+        Self { status: Status::Idle, generation: 0, dismissed: None, _poll: poll }
     }
 
     pub fn status(&self) -> &Status {
         &self.status
+    }
+
+    /// The update worth announcing, or `None`. It is `Some` only while an
+    /// install is `Ready` **and** the user has not closed that one's
+    /// toast: the footer's line still says so either way, because a line
+    /// the user went looking for is not the same as one that arrives.
+    pub fn announcement(&self) -> Option<Ready> {
+        let Status::Ready { version, sha } = &self.status else { return None };
+        let ready = Ready { version: version.clone(), sha: sha.clone() };
+        announces(&ready, self.dismissed.as_ref()).then_some(ready)
+    }
+
+    /// Close the toast for whatever is ready now. A later install carries
+    /// a different build, so it announces itself in its turn.
+    pub fn dismiss(&mut self, cx: &mut Context<Self>) {
+        let Status::Ready { version, sha } = &self.status else { return };
+        self.dismissed = Some(Ready { version: version.clone(), sha: sha.clone() });
+        cx.notify();
     }
 
     /// Start a check unless one is already under way. `Ready` also stays
@@ -208,6 +241,15 @@ impl AutoUpdater {
     }
 }
 
+/// Whether a ready build is still worth a toast. A plain function over
+/// the two, so the rule is argued with in a test rather than in a
+/// running window: the same build stays closed, and anything else — a
+/// new version, the same version at a new commit, or nothing dismissed
+/// yet — is news.
+pub fn announces(ready: &Ready, dismissed: Option<&Ready>) -> bool {
+    dismissed != Some(ready)
+}
+
 /// Who asked for the check. Decides only what an error does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
@@ -222,5 +264,31 @@ fn flatten<T>(outcome: Result<Result<T>, impl std::fmt::Display>) -> Result<T, S
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(format!("{error:#}")),
         Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready(version: &str, sha: Option<&str>) -> Ready {
+        Ready { version: version.to_string(), sha: sha.map(str::to_string) }
+    }
+
+    /// Closing the toast silences that one build and nothing else.
+    #[test]
+    fn a_dismissal_covers_one_build() {
+        let one = ready("0.1.0", Some("2342a00"));
+
+        assert!(announces(&one, None), "nothing dismissed yet");
+        assert!(!announces(&one, Some(&one)), "this is the one that was closed");
+
+        // The dev channel rarely bumps the version, so the commit is what
+        // says a second update landed. It gets its own toast.
+        let next = ready("0.1.0", Some("beefcaf"));
+        assert!(announces(&next, Some(&one)));
+
+        // And the public channel moves by version.
+        assert!(announces(&ready("0.2.0", None), Some(&ready("0.1.0", None))));
     }
 }

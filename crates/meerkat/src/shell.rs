@@ -4133,6 +4133,14 @@ impl Render for Shell {
         }
         root.child(framed)
             .children(self.env.map(|env| frame_overlay(env, radius, &colors)))
+            // **Under every overlay**, and painted before them for that
+            // reason: the toast is a notice that arrives on its own, and
+            // a card floating over the close dialog's scrim would offer a
+            // restart in the middle of a question about ending runs.
+            // 46px clears the status strip: a card over the row that
+            // reports the run would hide the answer to the last question
+            // the user asked.
+            .children(crate::update::toast(&colors, px(46.), cx))
             // Under the palette and the dialog, both of which clear it on
             // the way up, so the order only settles the one frame where two
             // could be painted.
@@ -4237,7 +4245,6 @@ impl Shell {
                     .child(env.as_str().to_ascii_uppercase())
             }))
             .child(self.mode_mark(colors))
-            .children(crate::update::top_bar_pill(colors, cx))
             .child(trail)
     }
 

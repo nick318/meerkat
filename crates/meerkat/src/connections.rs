@@ -810,6 +810,8 @@ impl Render for Connections {
         div()
             .track_focus(&self.focus_handle(cx))
             .key_context(KEY_CONTEXT)
+            // For the update toast, which is absolutely positioned.
+            .relative()
             .on_action(cx.listener(Self::focus_search))
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
@@ -842,6 +844,35 @@ impl Render for Connections {
                             .child(shortcuts(&colors, cx)),
                     ),
             )
+            // Both of these live outside the scrolling child, or they
+            // would scroll away with the list — the overlay scrollbar's
+            // reasoning.
+            //
+            // The version line is pinned in the window's bottom-right
+            // corner. It was inline in the list's footer, between "+ new
+            // connection" and the key hints, and that put app chrome in
+            // the row that says what the *list* answers to. The corner is
+            // where a version belongs, and it is the one place on this
+            // screen nothing else claims.
+            .child(
+                div()
+                    .absolute()
+                    .bottom(px(14.))
+                    .right(px(18.))
+                    // Its own ground, because it floats over the scrolling
+                    // column: on a narrow window the card below reaches
+                    // this far, and a version written over a list of
+                    // shortcuts is two lines of text in one place.
+                    .px(px(6.))
+                    .py(px(3.))
+                    .rounded(px(6.))
+                    .bg(colors.window)
+                    .child(crate::update::foot_summary(&colors, cx)),
+            )
+            // The toast sits above it, in the same corner: the line is
+            // where the updater is read, and the card is the one thing it
+            // ever announces.
+            .children(crate::update::toast(&colors, px(40.), cx))
     }
 }
 
@@ -1166,7 +1197,9 @@ impl Connections {
     }
 
     /// The card's last line: the way to a new connection, and the keys
-    /// the list answers to.
+    /// the list answers to. **The updater's line is not among them** — it
+    /// is app chrome rather than anything the list answers to, so it sits
+    /// pinned in the window's own corner. See `render`.
     fn footer(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
         let key = |text: &'static str| {
             div().text_size(px(10.)).text_color(colors.text_faint).child(text)
@@ -1191,7 +1224,6 @@ impl Connections {
                     .child("+ new connection"),
             )
             .child(div().flex_1())
-            .child(crate::update::foot_summary(colors, cx))
             .child(key("↑↓ move"))
             .child(key("⏎ connect"))
             .child(key("⌘I edit"))

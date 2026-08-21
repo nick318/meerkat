@@ -1539,15 +1539,55 @@ on disk. The check and the install run on tokio through `gpui_tokio`,
 and replies carry a generation, as a tab's queries do.
 
 **Nothing restarts the app by itself.** The updater stops at `Ready`;
-the pill in the top bar and the line in the connections footer offer the
-restart, and `main::restart_to_update` is ⌘Q's own walk with a different
-last word — every window is asked about its runs and its transactions
-first, and only the final `cx.quit()` becomes `cx.restart()`. A
-cancelled quit clears the flag, or the next plain ⌘Q would relaunch.
+the toast in the corner offers the restart — on both screens, and
+nowhere else — and `main::restart_to_update` is ⌘Q's own walk
+with a different last word — every window is asked about its runs and
+its transactions first, and only the final `cx.quit()` becomes
+`cx.restart()`. A cancelled quit clears the flag, or the next plain ⌘Q
+would relaunch.
+
+**The offer is a toast, because it can be closed.** It was a pill in the
+top bar, and a pill is a permanent mark: what is ready stays ready until
+the app restarts, so the bar carried "restart to update" beside the
+environment badge for the rest of the session with no way to put it
+down — and a restart is not something a viewer does mid-query, which is
+the same reason nothing here restarts by itself. `update::toast` is that
+card, absolutely positioned over the bottom-right of the shell and
+**painted before every other overlay**, so the palette, the value card
+and the close dialog cover it rather than the other way round: a restart
+must not be on offer over a question about ending runs.
+
+Closing it says *not now*, and `AutoUpdater::dismiss` keys that on the
+build being offered — `auto_update::Ready`, a version and a commit. So
+the same install stays closed, a *later* one announces itself in its
+turn, and a fresh run of the app says it again, because a restart is the
+one thing that update is waiting for. `announces` is that rule as a
+plain function, argued with in a test. **The dismissal is in memory and
+is never written down**: persisting it would turn one "not now" into
+silence for ever.
+
+**The version line no longer offers the restart either.** It carried the
+same offer beside the version, which made the whole thing as un-closable
+as the pill was: a card the user shut in the corner went on shouting
+from the line under it. So `Ready` prints the version and nothing else
+there — not even "check for updates", which `check`
+refuses while an install is ready, and a link that does nothing is worse
+than no link. The line still narrates `checking…`, `updating…` and a
+failed manual check, because a person reading the corner went looking
+for it.
+
+"updating…" left the workspace with the pill for the same reason. A
+download nobody asked for is background work with no answer to give, and
+a notice that cannot be acted on is what the pill was wrong for.
 
 **Errors follow who asked.** The hourly check fails quietly back to
-`Idle` — offline is normal and not news; only the footer's manual
-"check for updates" lands in `Errored`, beside its own retry. One
+`Idle` — offline is normal and not news; only the manual "check for
+updates" lands in `Errored`, beside its own retry. That line —
+`meerkat 0.1.0 · dev abc1234`, and whatever the updater has to say — is
+pinned in the connections screen's **bottom-right corner**, over the
+scrolling column rather than inside the list's footer: a version is app
+chrome, and the footer row is what the *list* answers to. The toast
+opens in the same corner, above it. One
 updater for the whole app, a global entity: two windows must not race
 two rsyncs over one bundle.
 
