@@ -15,10 +15,10 @@ use db_client::{
 use db_postgres::{Label, PostgresConnection};
 use gpui::{
     Animation, AnimationExt, AnyElement, App, BoxShadow, ClipboardItem, Context, CursorStyle, Div,
-    ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy, SharedString,
-    Size, Stateful, Subscription, UniformListScrollHandle, Window, actions, canvas, deferred, div,
-    prelude::*, px, uniform_list,
+    ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy,
+    SharedString, Size, Stateful, StyledText, Subscription, TextLayout, UniformListScrollHandle,
+    Window, actions, canvas, deferred, div, prelude::*, px, uniform_list,
 };
 use introspect::{Catalog, Table, TableKind};
 use query::{CommandVerb, TxVerb};
@@ -27,6 +27,7 @@ use results_grid::{
 };
 use sql_editor::{Kind, Name, SqlEditor, StatementStatus, Vocabulary};
 use std::collections::HashSet;
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -85,6 +86,7 @@ actions!(
         PeekValue,
         ClosePeek,
         CopyPeek,
+        SelectAllPeek,
         CommitTransaction,
         RollbackTransaction
     ]
@@ -175,6 +177,7 @@ pub fn peek_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("enter", ClosePeek, Some(PEEK_KEY_CONTEXT)),
         gpui::KeyBinding::new("escape", ClosePeek, Some(PEEK_KEY_CONTEXT)),
         gpui::KeyBinding::new("cmd-c", CopyPeek, Some(PEEK_KEY_CONTEXT)),
+        gpui::KeyBinding::new("cmd-a", SelectAllPeek, Some(PEEK_KEY_CONTEXT)),
     ]
 }
 
@@ -604,6 +607,15 @@ struct Peek {
     /// The card holds the focus while it is up, so its key context is the
     /// deepest one and ⏎ closes rather than opening another.
     focus: FocusHandle,
+    /// What the user has marked, as byte offsets into the text the card
+    /// **painted** — not into the value, which may be longer than what
+    /// `PEEK_CHARS` let on screen. Empty means nothing is marked, and ⌘C
+    /// then means the whole value, as it always did.
+    selection: Range<usize>,
+    /// Where the pointer went down, while the button is still down. A
+    /// drag is anchored there and every move extends to it, so dragging
+    /// backwards marks the same run of text as dragging forwards.
+    anchor: Option<usize>,
 }
 
 /// One "stop this run" request on its way to the server.
@@ -2871,7 +2883,7 @@ impl Shell {
         // element says the focus is already placed; the flag is reset on the
         // next input, so it costs nothing on the ⏎ path.
         window.prevent_default();
-        self.peek = Some(Peek { tab, cell, focus });
+        self.peek = Some(Peek { tab, cell, focus, selection: 0..0, anchor: None });
         // Nothing worth showing means nothing shown: an out-of-range cell
         // is a cell the result no longer has.
         if self.peek_value().is_none() {
@@ -2912,6 +2924,88 @@ impl Shell {
         Some((name.clone().into(), first_row + peek.cell.row, value.display()))
     }
 
+    /// The text the card paints: the value, cut to `PEEK_CHARS`.
+    ///
+    /// The marked range indexes into **this** rather than into the value,
+    /// so both are worked out from one string and a selection can never
+    /// name characters that were never on screen.
+    fn peek_shown(&self) -> Option<String> {
+        let (_, _, value) = self.peek_value()?;
+        Some(value.chars().take(PEEK_CHARS).collect())
+    }
+
+    /// The pointer went down in the text. One click starts a drag from
+    /// there, two mark the word under it, three the whole line — the
+    /// three gestures every text view answers to.
+    fn peek_press(&mut self, offset: usize, clicks: usize, cx: &mut Context<Self>) {
+        let Some(shown) = self.peek_shown() else { return };
+        let Some(peek) = self.peek.as_mut() else { return };
+        peek.selection = match clicks {
+            0 | 1 => {
+                let offset = clamp_to_boundary(&shown, offset);
+                peek.anchor = Some(offset);
+                offset..offset
+            }
+            2 => {
+                peek.anchor = None;
+                word_at(&shown, offset)
+            }
+            _ => {
+                peek.anchor = None;
+                line_at(&shown, offset)
+            }
+        };
+        cx.notify();
+    }
+
+    /// The pointer moved with the button still down. The mark runs from
+    /// the press to here, so a drag backwards marks the same text as a
+    /// drag forwards over it.
+    fn peek_drag(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let Some(shown) = self.peek_shown() else { return };
+        let Some(peek) = self.peek.as_mut() else { return };
+        let Some(anchor) = peek.anchor else { return };
+        let offset = clamp_to_boundary(&shown, offset);
+        peek.selection = anchor.min(offset)..anchor.max(offset);
+        cx.notify();
+    }
+
+    /// The button came up, so the drag is over. What is marked stays
+    /// marked: it is what ⌘C is about to copy.
+    fn end_peek_drag(&mut self) {
+        if let Some(peek) = self.peek.as_mut() {
+            peek.anchor = None;
+        }
+    }
+
+    /// ⌘A marks everything the card painted, which on a cut value is
+    /// everything there is to mark — the rest was never on screen.
+    fn select_all_peek(&mut self, cx: &mut Context<Self>) {
+        let Some(shown) = self.peek_shown() else { return };
+        let Some(peek) = self.peek.as_mut() else { return };
+        peek.selection = 0..shown.len();
+        cx.notify();
+    }
+
+    /// What ⌘C takes: the marked text, or the whole value when nothing is
+    /// marked.
+    ///
+    /// **Marked wins, and it is the painted string that is sliced.** A
+    /// value longer than `PEEK_CHARS` is on screen in part, and a mark
+    /// inside that part must copy exactly what it covers rather than the
+    /// megabyte behind it.
+    fn peek_copy_text(&self) -> Option<String> {
+        let peek = self.peek.as_ref()?;
+        if !peek.selection.is_empty() {
+            let shown = self.peek_shown()?;
+            if let Some(marked) = shown.get(peek.selection.clone()) {
+                return Some(marked.to_string());
+            }
+        }
+        let (_, _, value) = self.peek_value()?;
+        Some(value)
+    }
+
     fn close_peek(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.peek = None;
         // Back to the result the card was opened over, not to the tab's
@@ -2920,15 +3014,15 @@ impl Shell {
         cx.notify();
     }
 
-    /// ⌘C in the card copies **this value**, whole — not the slice the card
-    /// painted, and not the selection the grid's own ⌘C would take.
+    /// ⌘C in the card copies **what is marked, and the whole value when
+    /// nothing is** — never the selection the grid's own ⌘C would take.
     ///
     /// It is written bare, with none of CSV's quoting: a value read on its
     /// own is not a row, so a URL with a comma in it must not come back
     /// wrapped in quotes it never had.
     fn copy_peek(&mut self, cx: &mut Context<Self>) {
-        let Some((_, _, value)) = self.peek_value() else { return };
-        cx.write_to_clipboard(ClipboardItem::new_string(value));
+        let Some(text) = self.peek_copy_text() else { return };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     // --- walking the tabs -------------------------------------------------
@@ -3428,6 +3522,10 @@ impl Shell {
 
     fn on_copy_peek(&mut self, _: &CopyPeek, _: &mut Window, cx: &mut Context<Self>) {
         self.copy_peek(cx);
+    }
+
+    fn on_select_all_peek(&mut self, _: &SelectAllPeek, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_all_peek(cx);
     }
 
     fn on_toggle_palette(
@@ -6332,6 +6430,25 @@ impl Shell {
         // What is painted is bounded; what ⌘C copies is not.
         let shown: String = value.chars().take(PEEK_CHARS).collect();
         let cut = characters > PEEK_CHARS;
+        // What is marked is painted by the text itself, as a highlight
+        // over a byte range, because only the shaped text knows where a
+        // character sits: a wash drawn by the card would have to lay the
+        // string out a second time to work that out.
+        let marked = peek.selection.clone();
+        let mut body = StyledText::new(shown.clone());
+        if !marked.is_empty() && marked.end <= shown.len() {
+            body = body.with_highlights([(
+                marked.clone(),
+                HighlightStyle {
+                    background_color: Some(colors.selection),
+                    ..Default::default()
+                },
+            )]);
+        }
+        // The layout is what turns a pointer into an offset, and it is
+        // filled in by the paint that follows this frame — so the
+        // handlers below hold **this** frame's layout, never a stale one.
+        let layout = body.layout().clone();
         let meta = match (characters, cut) {
             (1, _) => "1 character".to_string(),
             (n, false) => format!("{} characters", format_count(n as u64)),
@@ -6355,6 +6472,31 @@ impl Shell {
                 .pt(px(PEEK_TOP_MARGIN))
                 .occlude()
                 .on_click(cx.listener(|this, _event, window, cx| this.close_peek(window, cx)))
+                // A drag that marks text leaves the text almost at once —
+                // the pointer runs past the card's edge on the way to the
+                // end of a line — so the move and the release are heard
+                // here, over the whole window, the way the grid's own drag
+                // surface hears them.
+                .on_mouse_move({
+                    let layout = layout.clone();
+                    cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                        if this.peek.as_ref().and_then(|peek| peek.anchor).is_none() {
+                            return;
+                        }
+                        // A release nothing here heard about must not leave
+                        // the card marking text for ever.
+                        if event.pressed_button != Some(MouseButton::Left) {
+                            this.end_peek_drag();
+                            return;
+                        }
+                        let offset = offset_at(&layout, event.position);
+                        this.peek_drag(offset, cx);
+                    })
+                })
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _event: &MouseUpEvent, _window, _cx| this.end_peek_drag()),
+                )
                 .child(
                     div()
                         .id("peek")
@@ -6362,6 +6504,7 @@ impl Shell {
                         .track_focus(&peek.focus)
                         .on_action(cx.listener(Self::on_close_peek))
                         .on_action(cx.listener(Self::on_copy_peek))
+                        .on_action(cx.listener(Self::on_select_all_peek))
                         // A click in the card is not a click on the scrim,
                         // so it must not close it.
                         .occlude()
@@ -6430,7 +6573,15 @@ impl Shell {
                                 } else {
                                     colors.text_body
                                 })
-                                .child(shown),
+                                .cursor(CursorStyle::IBeam)
+                                .on_mouse_down(MouseButton::Left, {
+                                    let layout = layout.clone();
+                                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                                        let offset = offset_at(&layout, event.position);
+                                        this.peek_press(offset, event.click_count, cx);
+                                    })
+                                })
+                                .child(body),
                         )
                         .child(
                             div()
@@ -6445,16 +6596,16 @@ impl Shell {
                                 .bg(colors.panel)
                                 .text_size(px(10.))
                                 .text_color(colors.text_muted)
-                                .child(if cut {
-                                    "⌘C copies the whole value"
-                                } else {
-                                    "⌘C copies this value"
+                                .child(match (marked.is_empty(), cut) {
+                                    (false, _) => "⌘C copies what is marked",
+                                    (true, true) => "⌘C copies the whole value",
+                                    (true, false) => "⌘C copies this value",
                                 })
                                 .child(div().flex_1())
                                 .child(
                                     div()
                                         .text_color(colors.text_faint)
-                                        .child("⏎ or ⎋ closes"),
+                                        .child("drag to mark · ⌘A all · ⏎ or ⎋ closes"),
                                 ),
                         ),
                 ),
@@ -7071,6 +7222,63 @@ fn column_row(
 ///
 /// [`key_badge`] is the flat cousin, for a key named in a hint or a footer
 /// rather than written on a button.
+/// Pull an offset onto a character boundary, and inside the text. The
+/// offsets come from a text layout, which answers in bytes off the line
+/// it hit, so a value the card has since re-read may be shorter.
+/// Where in the text a pointer landed. The layout answers `Err` for a
+/// position off the end of a line, naming the nearest offset — which is
+/// the one a drag reaching past the text is asking for.
+fn offset_at(layout: &TextLayout, position: Point<Pixels>) -> usize {
+    layout.index_for_position(position).unwrap_or_else(|offset| offset)
+}
+
+fn clamp_to_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+/// The word under `offset`, for a double click.
+///
+/// A word here is a run of letters, digits and underscores, which is what
+/// a name, an identifier or a UUID's parts are made of. Land anywhere
+/// else — a comma, a brace, a space — and the mark is that one character:
+/// the click said "this", and guessing a wider run around punctuation
+/// marks text the user did not point at.
+fn word_at(text: &str, offset: usize) -> Range<usize> {
+    let offset = clamp_to_boundary(text, offset);
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let Some(here) = text[offset..].chars().next() else {
+        return offset..offset;
+    };
+    if !word(here) {
+        return offset..offset + here.len_utf8();
+    }
+    let start = text[..offset]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| word(*c))
+        .last()
+        .map_or(offset, |(ix, _)| ix);
+    let end = text[offset..]
+        .char_indices()
+        .find(|(_, c)| !word(*c))
+        .map_or(text.len(), |(ix, _)| offset + ix);
+    start..end
+}
+
+/// The line under `offset`, for a triple click. The newline itself is
+/// left out: a mark that carried it would paste as a line break the user
+/// cannot see they copied.
+fn line_at(text: &str, offset: usize) -> Range<usize> {
+    let offset = clamp_to_boundary(text, offset);
+    let start = text[..offset].rfind('\n').map_or(0, |ix| ix + 1);
+    let end = text[offset..].find('\n').map_or(text.len(), |ix| offset + ix);
+    start..end
+}
+
 fn keycap(keys: &'static str, size: f32, surface: Hsla, border: Hsla, ink: Hsla) -> Div {
     div()
         .flex_none()
@@ -7433,6 +7641,39 @@ fn redact(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_double_click_marks_the_word_it_landed_in() {
+        let text = "select from user_id, name";
+        assert_eq!(word_at(text, 14), 12..19);
+        assert_eq!(&text[word_at(text, 12)], "user_id");
+        assert_eq!(&text[word_at(text, 21)], "name");
+    }
+
+    #[test]
+    fn a_double_click_on_punctuation_marks_that_character_alone() {
+        let text = "{\"a\": 1}";
+        assert_eq!(word_at(text, 0), 0..1);
+        // A click past the end of the text marks nothing.
+        assert_eq!(word_at(text, text.len()), text.len()..text.len());
+    }
+
+    #[test]
+    fn a_triple_click_marks_the_line_without_its_newline() {
+        let text = "one\ntwo\nthree";
+        assert_eq!(&text[line_at(text, 0)], "one");
+        assert_eq!(&text[line_at(text, 5)], "two");
+        assert_eq!(&text[line_at(text, 12)], "three");
+    }
+
+    #[test]
+    fn an_offset_is_pulled_onto_a_character_boundary() {
+        let text = "héllo";
+        // The layout can name an offset the text no longer has.
+        assert_eq!(clamp_to_boundary(text, 99), text.len());
+        // 2 is inside the two-byte é.
+        assert_eq!(clamp_to_boundary(text, 2), 1);
+    }
     use introspect::Schema;
 
     /// The arming window, which is the whole of why the button's state is a

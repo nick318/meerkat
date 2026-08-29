@@ -601,13 +601,32 @@ would go on saying what used to be there. `Shell::peek_value` reads the
 cell out of the result in hand and answers `None` when the result no
 longer has it.
 
+**The text can be marked with the pointer, and ⌘C then takes the mark.**
+A card that could only copy the value whole is no use to somebody who
+wants the id out of a `jsonb` blob. A press marks from where it landed, a
+double click the word under it, a triple click the line; ⌘A marks
+everything on screen. The **move and the release are heard on the scrim**,
+not on the text: a drag reaching the end of a line has left the card
+almost at once, so handlers bound to the text would go deaf exactly when
+they are needed — the grid's own drag surface, for the same reason. A
+move with no button held ends the drag, so a release nothing here heard
+about cannot leave the card marking text for ever.
+
+The mark is painted by the text itself, as a `HighlightStyle` over a byte
+range, because only the shaped text knows where a character sits. Offsets
+index the **painted** string rather than the value: a value longer than
+`PEEK_CHARS` is on screen in part, and a mark inside that part must copy
+what it covers rather than the megabyte behind it. `Peek` holds the range
+and the drag's anchor and nothing else, so a page turn under the card
+still leaves it holding no text of its own.
+
 **What is painted is bounded; what ⌘C copies is not.** `MAX_CELL_BYTES`
 lets a megabyte of text into one cell, and laying a megabyte of wrapped
 text out on the GPUI thread would freeze the window, so the card paints
 the first `PEEK_CHARS` and says how much there is. ⌘C is bound in the
-card's own context and means something narrower than the grid's: **this
-value**, whole, written bare — a value read on its own is not a row, so
-none of CSV's quoting applies to it.
+card's own context and means something narrower than the grid's: **what
+is marked, or this value whole when nothing is**, written bare — a value
+read on its own is not a row, so none of CSV's quoting applies to it.
 
 The status strip lists the keys a result answers to, as the comp's footer
 does. It is the only place ⏎ and ⌘J are written down, and a gesture
