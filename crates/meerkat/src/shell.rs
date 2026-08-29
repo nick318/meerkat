@@ -2972,9 +2972,13 @@ impl Shell {
 
     /// The button came up, so the drag is over. What is marked stays
     /// marked: it is what ⌘C is about to copy.
-    fn end_peek_drag(&mut self) {
-        if let Some(peek) = self.peek.as_mut() {
-            peek.anchor = None;
+    fn end_peek_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(peek) = self.peek.as_mut() else { return };
+        if peek.anchor.take().is_some() {
+            // The surface is painted only while the anchor is set, so this
+            // is what takes the window listeners and the I-beam cursor
+            // back off the window.
+            cx.notify();
         }
     }
 
@@ -4546,6 +4550,60 @@ impl Shell {
     /// frame, so handlers bound to its hitbox would go deaf exactly when
     /// they are needed — the grid's `DragSurface` reasoning, and this is
     /// its pattern: an element that paints nothing and takes no room.
+    /// The window listeners a marking drag runs on, for as long as the
+    /// button is down.
+    ///
+    /// It is the pane divider's own pattern, and here the reason is the
+    /// grid's: a `div` hears a move only while its hitbox is hovered, and
+    /// the pointer marking a line runs off the card in the first few
+    /// pixels. It paints nothing and takes no room; it exists to hang
+    /// listeners from.
+    fn peek_drag_surface(
+        &self,
+        layout: &TextLayout,
+        cx: &Context<Self>,
+    ) -> Option<gpui::Canvas<()>> {
+        self.peek.as_ref()?.anchor?;
+        let shell = cx.entity();
+        let layout = layout.clone();
+        Some(
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, _cx| {
+                    window.set_window_cursor_style(CursorStyle::IBeam);
+                    window.on_mouse_event({
+                        let shell = shell.clone();
+                        let layout = layout.clone();
+                        move |event: &MouseMoveEvent, phase, _window, cx| {
+                            if !phase.bubble() {
+                                return;
+                            }
+                            // A release nothing here heard about must not
+                            // leave the card marking text for ever.
+                            if event.pressed_button != Some(MouseButton::Left) {
+                                shell.update(cx, |this, cx| this.end_peek_drag(cx));
+                                return;
+                            }
+                            let offset = offset_at(&layout, event.position);
+                            shell.update(cx, |this, cx| this.peek_drag(offset, cx));
+                        }
+                    });
+                    window.on_mouse_event({
+                        let shell = shell.clone();
+                        move |event: &MouseUpEvent, phase, _window, cx| {
+                            if phase.bubble() && event.button == MouseButton::Left {
+                                shell.update(cx, |this, cx| this.end_peek_drag(cx));
+                            }
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .w(px(0.))
+            .h(px(0.)),
+        )
+    }
+
     fn pane_drag_surface(&self, cx: &Context<Self>) -> Option<gpui::Canvas<()>> {
         let drag = self.pane_drag?;
         let shell = cx.entity();
@@ -6472,31 +6530,12 @@ impl Shell {
                 .pt(px(PEEK_TOP_MARGIN))
                 .occlude()
                 .on_click(cx.listener(|this, _event, window, cx| this.close_peek(window, cx)))
-                // A drag that marks text leaves the text almost at once —
-                // the pointer runs past the card's edge on the way to the
-                // end of a line — so the move and the release are heard
-                // here, over the whole window, the way the grid's own drag
-                // surface hears them.
-                .on_mouse_move({
-                    let layout = layout.clone();
-                    cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
-                        if this.peek.as_ref().and_then(|peek| peek.anchor).is_none() {
-                            return;
-                        }
-                        // A release nothing here heard about must not leave
-                        // the card marking text for ever.
-                        if event.pressed_button != Some(MouseButton::Left) {
-                            this.end_peek_drag();
-                            return;
-                        }
-                        let offset = offset_at(&layout, event.position);
-                        this.peek_drag(offset, cx);
-                    })
-                })
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this, _event: &MouseUpEvent, _window, _cx| this.end_peek_drag()),
-                )
+                // Everything after the press lives on the window, in a
+                // canvas that paints nothing: a `div`'s own listeners fire
+                // only while its hitbox is hovered, and the card occludes
+                // the scrim, so a drag over the very text being marked
+                // would be heard by nobody.
+                .children(self.peek_drag_surface(&layout, cx))
                 .child(
                     div()
                         .id("peek")

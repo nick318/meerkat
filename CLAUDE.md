@@ -605,12 +605,15 @@ longer has it.
 A card that could only copy the value whole is no use to somebody who
 wants the id out of a `jsonb` blob. A press marks from where it landed, a
 double click the word under it, a triple click the line; ⌘A marks
-everything on screen. The **move and the release are heard on the scrim**,
-not on the text: a drag reaching the end of a line has left the card
-almost at once, so handlers bound to the text would go deaf exactly when
-they are needed — the grid's own drag surface, for the same reason. A
-move with no button held ends the drag, so a release nothing here heard
-about cannot leave the card marking text for ever.
+everything on screen. **Everything after the press lives on the window**,
+in `peek_drag_surface` — the pane divider's canvas, which paints nothing
+and takes no room. A `div` hears a move only while its own hitbox is
+hovered, and the card `occlude`s the scrim, so listeners bound to either
+one would go deaf over the very text being marked. The surface is painted
+only while the drag's anchor is set, and it holds the window's cursor on
+the I-beam for as long as it is. A move with no button held ends the
+drag, so a release nothing here heard about cannot leave the card marking
+text for ever.
 
 The mark is painted by the text itself, as a `HighlightStyle` over a byte
 range, because only the shaped text knows where a character sits. Offsets
