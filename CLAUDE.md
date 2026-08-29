@@ -1775,6 +1775,8 @@ opt-level = 2` is set because GPUI is unusably slow unoptimized; leave it.
 
 ## Conventions
 
+- Run `cargo fmt --all` before every commit, so a later formatting run
+  cannot bury a change under whitespace it has nothing to do with.
 - Commit subjects are short imperative sentences in sentence case, no
   conventional-commit prefix: "Add scrollbars to the results grid".
 - Commit straight to `main`. This is a single-author repository with no
