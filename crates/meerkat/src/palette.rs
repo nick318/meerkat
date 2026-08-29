@@ -165,7 +165,10 @@ pub type OnPick = Rc<dyn Fn(Pick, bool, &mut Window, &mut App)>;
 
 /// The list, flattened: a heading per section, then that section's rows.
 pub enum Row {
-    Header { label: SharedString, count: SharedString },
+    Header {
+        label: SharedString,
+        count: SharedString,
+    },
     Item(Item),
 }
 
@@ -255,7 +258,11 @@ pub fn build(
     needle: &str,
     today: NaiveDate,
 ) -> Results {
-    let cap = if scope == Scope::All { SECTION_CAP } else { SCOPE_CAP };
+    let cap = if scope == Scope::All {
+        SECTION_CAP
+    } else {
+        SCOPE_CAP
+    };
     let mut rows = Vec::new();
     let mut matches = 0;
 
@@ -336,8 +343,16 @@ fn dress(found: Vec<Candidate>) -> (Vec<Item>, bool) {
     let items = found
         .into_iter()
         .map(|candidate| {
-            let from = if spread { 0 } else { candidate.from.min(candidate.named) };
-            let path = if candidate.completes { candidate.parts.clone() } else { Vec::new() };
+            let from = if spread {
+                0
+            } else {
+                candidate.from.min(candidate.named)
+            };
+            let path = if candidate.completes {
+                candidate.parts.clone()
+            } else {
+                Vec::new()
+            };
 
             let mut label = String::new();
             let mut hits = Vec::new();
@@ -373,13 +388,17 @@ fn dress(found: Vec<Candidate>) -> (Vec<Item>, bool) {
 /// The relations the query names, ranked by where the hit sits and then by
 /// how short the name is: `users` before `active_users_7d`.
 fn tables(catalog: Option<&Catalog>, needle: &str) -> Vec<Candidate> {
-    let Some(catalog) = catalog else { return Vec::new() };
+    let Some(catalog) = catalog else {
+        return Vec::new();
+    };
     let mut found = Vec::new();
     for schema in &catalog.schemas {
         for table in &schema.tables {
             let parts = vec![schema.name.clone(), table.name.clone()];
             // A bare schema name answers with the tables it holds.
-            let Some(aligned) = find_path(&parts, needle) else { continue };
+            let Some(aligned) = find_path(&parts, needle) else {
+                continue;
+            };
             let named = aligned.named;
             found.push(Candidate {
                 rank: rank(&aligned, parts.len(), &table.name),
@@ -466,7 +485,9 @@ pub fn completion(rows: &[Row], selected: usize, needle: &str) -> Option<String>
     if needle.is_empty() {
         return None;
     }
-    let Some(Row::Item(item)) = rows.get(selected) else { return None };
+    let Some(Row::Item(item)) = rows.get(selected) else {
+        return None;
+    };
     if item.path.is_empty() {
         return None;
     }
@@ -558,7 +579,12 @@ fn find_path(parts: &[String], needle: &str) -> Option<Aligned> {
             score += hit.score;
             hits[named + ix] = hit.ranges;
         }
-        Some(Aligned { hits, named, typed: typed.len(), score })
+        Some(Aligned {
+            hits,
+            named,
+            typed: typed.len(),
+            score,
+        })
     })
 }
 
@@ -632,7 +658,9 @@ fn find(haystack: &str, needle: &str) -> Option<Range<usize>> {
     if needle.is_empty() {
         return Some(0..0);
     }
-    let start = haystack.to_ascii_lowercase().find(&needle.to_ascii_lowercase())?;
+    let start = haystack
+        .to_ascii_lowercase()
+        .find(&needle.to_ascii_lowercase())?;
     Some(start..start + needle.len())
 }
 
@@ -649,8 +677,15 @@ fn clip(label: &str, hits: Vec<Range<usize>>, max_chars: usize) -> (String, Vec<
     // The window is placed around the first hit, with a little text before
     // it so it does not sit flush against the leading ellipsis.
     const LEAD: usize = 8;
-    let hit_char = hits.first().map(|hit| label[..hit.start].chars().count()).unwrap_or(0);
-    let start_char = if hit_char > max_chars.saturating_sub(LEAD) { hit_char - LEAD } else { 0 };
+    let hit_char = hits
+        .first()
+        .map(|hit| label[..hit.start].chars().count())
+        .unwrap_or(0);
+    let start_char = if hit_char > max_chars.saturating_sub(LEAD) {
+        hit_char - LEAD
+    } else {
+        0
+    };
     let end_char = (start_char + max_chars).min(total);
     let (start, end) = (char_offset(label, start_char), char_offset(label, end_char));
 
@@ -674,7 +709,9 @@ fn clip(label: &str, hits: Vec<Range<usize>>, max_chars: usize) -> (String, Vec<
 
 /// The byte offset of the nth character, or the end of the string.
 fn char_offset(text: &str, chars: usize) -> usize {
-    text.char_indices().nth(chars).map_or(text.len(), |(offset, _)| offset)
+    text.char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(offset, _)| offset)
 }
 
 // --- painting ------------------------------------------------------------
@@ -710,8 +747,16 @@ pub fn palette_row(
         Row::Item(item) => {
             let on_pick = on_pick.clone();
             let pick = item.pick.clone();
-            let text = if item.failed { colors.error } else { colors.text_body };
-            let meta = if item.failed { colors.error_secondary } else { colors.text_muted };
+            let text = if item.failed {
+                colors.error
+            } else {
+                colors.text_body
+            };
+            let meta = if item.failed {
+                colors.error_secondary
+            } else {
+                colors.text_muted
+            };
 
             let mut card = div()
                 .id(ElementId::NamedInteger("palette-row".into(), ix as u64))
@@ -726,12 +771,12 @@ pub fn palette_row(
                 .on_click(move |event, window, cx| {
                     on_pick(pick.clone(), event.modifiers().platform, window, cx)
                 })
-                .child(
-                    div()
-                        .w(px(GLYPH_WIDTH))
-                        .flex_none()
-                        .child(glyph(&item.glyph, selected, colors, cx)),
-                )
+                .child(div().w(px(GLYPH_WIDTH)).flex_none().child(glyph(
+                    &item.glyph,
+                    selected,
+                    colors,
+                    cx,
+                )))
                 .child(
                     div()
                         .flex_1()
@@ -739,8 +784,16 @@ pub fn palette_row(
                         .flex()
                         .overflow_hidden()
                         .text_size(px(12.))
-                        .font_weight(if selected { FontWeight::MEDIUM } else { FontWeight::NORMAL })
-                        .text_color(if selected && !item.failed { colors.text } else { text })
+                        .font_weight(if selected {
+                            FontWeight::MEDIUM
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .text_color(if selected && !item.failed {
+                            colors.text
+                        } else {
+                            text
+                        })
                         .children(spans(item, selected, colors)),
                 )
                 .child(
@@ -759,7 +812,11 @@ pub fn palette_row(
                         .flex()
                         .justify_end()
                         .text_size(px(10.))
-                        .text_color(if selected { colors.accent } else { colors.text_faint })
+                        .text_color(if selected {
+                            colors.accent
+                        } else {
+                            colors.text_faint
+                        })
                         .truncate()
                         // The selected row is the one that says what ⏎
                         // would do; the rest keep their own last column.
@@ -771,7 +828,11 @@ pub fn palette_row(
                 );
 
             card = if selected {
-                card.bg(if item.failed { colors.error_surface } else { colors.selection })
+                card.bg(if item.failed {
+                    colors.error_surface
+                } else {
+                    colors.selection
+                })
             } else {
                 let hover = colors.hairline;
                 card.hover(move |s| s.bg(hover))
@@ -823,11 +884,19 @@ fn glyph(glyph: &Glyph, selected: bool, colors: &ThemeColors, cx: &App) -> gpui:
             .size(px(5.))
             .rounded_full()
             .border_1()
-            .border_color(if selected { colors.accent } else { colors.text_faint }),
+            .border_color(if selected {
+                colors.accent
+            } else {
+                colors.text_faint
+            }),
         // The letter the history screen is reached by.
         Glyph::Run => div()
             .text_size(px(10.))
-            .text_color(if selected { colors.accent } else { colors.text_faint })
+            .text_color(if selected {
+                colors.accent
+            } else {
+                colors.text_faint
+            })
             .child("h"),
     }
 }
@@ -844,8 +913,16 @@ pub fn scope_chip(scope: Scope, active: bool, colors: &ThemeColors) -> gpui::Sta
         .py(px(5.))
         .rounded(px(5.))
         .text_size(px(10.))
-        .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
-        .text_color(if active { colors.accent_deep } else { colors.text_secondary })
+        .font_weight(if active {
+            FontWeight::MEDIUM
+        } else {
+            FontWeight::NORMAL
+        })
+        .text_color(if active {
+            colors.accent_deep
+        } else {
+            colors.text_secondary
+        })
         .cursor_pointer()
         .child(scope.label());
     if let Some(prefix) = scope.prefix() {
@@ -910,7 +987,11 @@ mod tests {
             ],
         };
         Catalog {
-            schemas: vec![of("sample_dev_sample"), of("sample_big_dummy"), of("public")],
+            schemas: vec![
+                of("sample_dev_sample"),
+                of("sample_big_dummy"),
+                of("public"),
+            ],
         }
     }
 
@@ -941,11 +1022,16 @@ mod tests {
     /// What each hit underlines, so a test can read the highlight the way
     /// the row paints it.
     fn underlined(item: &Item) -> Vec<&str> {
-        item.hits.iter().map(|hit| &item.label[hit.clone()]).collect()
+        item.hits
+            .iter()
+            .map(|hit| &item.label[hit.clone()])
+            .collect()
     }
 
     fn only_item(results: &Results) -> &Item {
-        let Row::Item(item) = &results.rows[1] else { panic!("expected a result") };
+        let Row::Item(item) = &results.rows[1] else {
+            panic!("expected a result")
+        };
         item
     }
 
@@ -976,7 +1062,9 @@ mod tests {
     #[test]
     fn the_matched_part_is_reported_as_a_range_of_the_label() {
         let results = build(Some(&catalog()), &[], Scope::Tables, "US", today());
-        let Row::Item(item) = &results.rows[3] else { panic!("expected a result") };
+        let Row::Item(item) = &results.rows[3] else {
+            panic!("expected a result")
+        };
         assert_eq!(item.label, "active_users_7d");
         // Case-insensitive, and the range points at the original casing.
         assert_eq!(underlined(item), ["us"]);
@@ -987,22 +1075,52 @@ mod tests {
     /// schema among many, without typing the schema out.
     #[test]
     fn a_dot_names_the_schema_and_the_table() {
-        let results = build(Some(&schemas()), &[], Scope::Tables, "sample_dev_sample.task", today());
-        assert_eq!(labels(&results), ["[TABLES 2]", "sample_dev_sample.task", "sample_dev_sample.task_run"]);
+        let results = build(
+            Some(&schemas()),
+            &[],
+            Scope::Tables,
+            "sample_dev_sample.task",
+            today(),
+        );
+        assert_eq!(
+            labels(&results),
+            [
+                "[TABLES 2]",
+                "sample_dev_sample.task",
+                "sample_dev_sample.task_run"
+            ]
+        );
         // Both halves are underlined, in order and without overlapping.
-        assert_eq!(underlined(only_item(&results)), ["sample_dev_sample", "task"]);
+        assert_eq!(
+            underlined(only_item(&results)),
+            ["sample_dev_sample", "task"]
+        );
     }
 
     #[test]
     fn each_half_of_a_dotted_query_matches_on_its_own() {
         // Neither half has to be the whole name.
         let results = build(Some(&schemas()), &[], Scope::Tables, "dev.ta", today());
-        assert_eq!(labels(&results), ["[TABLES 2]", "sample_dev_sample.task", "sample_dev_sample.task_run"]);
+        assert_eq!(
+            labels(&results),
+            [
+                "[TABLES 2]",
+                "sample_dev_sample.task",
+                "sample_dev_sample.task_run"
+            ]
+        );
         assert_eq!(underlined(only_item(&results)), ["dev", "ta"]);
 
         // A trailing dot is a schema on its own: everything it holds.
         let results = build(Some(&schemas()), &[], Scope::Tables, "big_dummy.", today());
-        assert_eq!(labels(&results), ["[TABLES 2]", "sample_big_dummy.task", "sample_big_dummy.task_run"]);
+        assert_eq!(
+            labels(&results),
+            [
+                "[TABLES 2]",
+                "sample_big_dummy.task",
+                "sample_big_dummy.task_run"
+            ]
+        );
 
         // A leading dot names no schema, so it matches every schema.
         let results = build(Some(&schemas()), &[], Scope::Tables, ".task_run", today());
@@ -1013,10 +1131,20 @@ mod tests {
     /// answers with the tables it holds rather than with nothing.
     #[test]
     fn a_bare_schema_name_answers_with_its_tables() {
-        let results = build(Some(&schemas()), &[], Scope::Tables, "sample_dev_sample", today());
+        let results = build(
+            Some(&schemas()),
+            &[],
+            Scope::Tables,
+            "sample_dev_sample",
+            today(),
+        );
         assert_eq!(
             labels(&results),
-            ["[TABLES 2]", "sample_dev_sample.task", "sample_dev_sample.task_run"]
+            [
+                "[TABLES 2]",
+                "sample_dev_sample.task",
+                "sample_dev_sample.task_run"
+            ]
         );
         // The schema is what matched, so the schema is what is underlined.
         assert_eq!(underlined(only_item(&results)), ["sample_dev_sample"]);
@@ -1038,7 +1166,10 @@ mod tests {
             ],
         };
         let results = build(Some(&catalog), &[], Scope::Tables, "task", today());
-        assert_eq!(labels(&results), ["[TABLES 2]", "public.task", "task_archive.orders"]);
+        assert_eq!(
+            labels(&results),
+            ["[TABLES 2]", "public.task", "task_archive.orders"]
+        );
     }
 
     /// A column name is not something the palette offers. Every row of it
@@ -1068,10 +1199,21 @@ mod tests {
         // that starts `settings` — and it ranks below both names that hold
         // `users` whole, because a name matched in one piece beats a name
         // matched in two.
-        let results = build(Some(&catalog()), &[], Scope::Tables, "public.users", today());
+        let results = build(
+            Some(&catalog()),
+            &[],
+            Scope::Tables,
+            "public.users",
+            today(),
+        );
         assert_eq!(
             labels(&results),
-            ["[TABLES 3]", "public.users", "public.user_settings", "public.active_users_7d"]
+            [
+                "[TABLES 3]",
+                "public.users",
+                "public.user_settings",
+                "public.active_users_7d"
+            ]
         );
 
         // Without the dot, the heading carries the schema instead.
@@ -1094,12 +1236,18 @@ mod tests {
     fn a_dot_in_a_history_query_is_matched_literally() {
         let results = build(
             None,
-            &[run("select * from public.users"), run("select * from public_users")],
+            &[
+                run("select * from public.users"),
+                run("select * from public_users"),
+            ],
             Scope::History,
             "public.users",
             today(),
         );
-        assert_eq!(labels(&results), ["[RECENT QUERIES 1]", "select * from public.users"]);
+        assert_eq!(
+            labels(&results),
+            ["[RECENT QUERIES 1]", "select * from public.users"]
+        );
         assert_eq!(underlined(only_item(&results)), ["public.users"]);
     }
 
@@ -1121,12 +1269,24 @@ mod tests {
 
     #[test]
     fn a_capped_section_says_how_many_it_left_out() {
-        let mut schema = Schema { name: "public".to_string(), tables: Vec::new() };
+        let mut schema = Schema {
+            name: "public".to_string(),
+            tables: Vec::new(),
+        };
         for ix in 0..9 {
-            schema.tables.push(table(&format!("log_{ix}"), TableKind::Table, Vec::new()));
+            schema
+                .tables
+                .push(table(&format!("log_{ix}"), TableKind::Table, Vec::new()));
         }
-        let results =
-            build(Some(&Catalog { schemas: vec![schema] }), &[], Scope::All, "log", today());
+        let results = build(
+            Some(&Catalog {
+                schemas: vec![schema],
+            }),
+            &[],
+            Scope::All,
+            "log",
+            today(),
+        );
         assert_eq!(labels(&results)[0], "[TABLES · PUBLIC 6 of 9]");
         assert_eq!(results.rows.len(), 1 + SECTION_CAP);
         // The count in the footer is what matched, not what fitted.
@@ -1162,7 +1322,10 @@ mod tests {
         assert!(item.trailing.starts_with("today "));
         // Opening a run gives back the statement as it was written, not
         // the single line the palette painted.
-        assert_eq!(item.pick, Pick::Query("select *\n  from public.users\n  order by id".into()));
+        assert_eq!(
+            item.pick,
+            Pick::Query("select *\n  from public.users\n  order by id".into())
+        );
     }
 
     /// ⇥ walks in one part at a time: schema, then relation, then done.
@@ -1170,15 +1333,21 @@ mod tests {
     fn completing_drills_one_part_at_a_time() {
         let step = |needle: &str| {
             let results = build(Some(&schemas()), &[], Scope::Tables, needle, today());
-            let selected =
-                results.rows.iter().position(|row| row.pick().is_some()).expect("a result");
+            let selected = results
+                .rows
+                .iter()
+                .position(|row| row.pick().is_some())
+                .expect("a result");
             completion(&results.rows, selected, needle)
         };
 
         // A hit in the middle of a schema still completes to the whole of
         // it, with the dot that leads into the relation.
         assert_eq!(step("dev").as_deref(), Some("sample_dev_sample."));
-        assert_eq!(step("sample_dev_sample.").as_deref(), Some("sample_dev_sample.task"));
+        assert_eq!(
+            step("sample_dev_sample.").as_deref(),
+            Some("sample_dev_sample.task")
+        );
         // A path that is already whole has nothing left to add, which is
         // what frees ⇥ to go back to walking the chips.
         assert_eq!(step("sample_dev_sample.task"), None);
@@ -1189,7 +1358,10 @@ mod tests {
         // What the sidebar's filter asks for: no rows, just the path of
         // the first match. It walks in the same steps as the palette.
         let path = ["sample_dev_sample".to_string(), "task".to_string()];
-        assert_eq!(complete_path(&path, "dev").as_deref(), Some("sample_dev_sample."));
+        assert_eq!(
+            complete_path(&path, "dev").as_deref(),
+            Some("sample_dev_sample.")
+        );
         assert_eq!(
             complete_path(&path, "sample_dev_sample.").as_deref(),
             Some("sample_dev_sample.task")
@@ -1210,14 +1382,26 @@ mod tests {
         // `sam_dev` finds the schema by its word starts, so ⇥ replaces the
         // line. Painting the completion as a suffix would read
         // `sam_devsample_dev_sample.`, so it is marked as what it is.
-        assert_eq!(ghost("sam_dev", "sample_dev_sample."), "  ⇥ sample_dev_sample.");
+        assert_eq!(
+            ghost("sam_dev", "sample_dev_sample."),
+            "  ⇥ sample_dev_sample."
+        );
         // The whole line typed out already: nothing carries on from it.
-        assert_eq!(ghost("sample_dev_sample.", "sample_dev_sample.task"), "task");
+        assert_eq!(
+            ghost("sample_dev_sample.", "sample_dev_sample.task"),
+            "task"
+        );
     }
 
     #[test]
     fn there_is_nothing_to_complete_from_a_run_or_an_empty_line() {
-        let results = build(None, &[run("select * from users")], Scope::History, "users", today());
+        let results = build(
+            None,
+            &[run("select * from users")],
+            Scope::History,
+            "users",
+            today(),
+        );
         // A statement is prose, not a path.
         assert_eq!(completion(&results.rows, 1, "users"), None);
 
@@ -1242,12 +1426,17 @@ mod tests {
 
     #[test]
     fn a_long_label_keeps_its_hit_in_view() {
-        let long = format!("select {} from users where name = 'meerkat'", "a, ".repeat(30));
+        let long = format!(
+            "select {} from users where name = 'meerkat'",
+            "a, ".repeat(30)
+        );
         let hits = find(&long, "meerkat").into_iter().collect();
         let (text, hits) = clip(&long, hits, LABEL_CHARS);
         assert!(text.starts_with('…'));
         assert!(text.chars().count() <= LABEL_CHARS + 2);
-        let hit = hits.first().expect("the hit is what the window was placed around");
+        let hit = hits
+            .first()
+            .expect("the hit is what the window was placed around");
         assert_eq!(&text[hit.clone()], "meerkat");
     }
 

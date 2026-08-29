@@ -144,7 +144,11 @@ pub fn meerkat_mark(size: f32, cx: &App) -> Div {
             .size(unit(13.))
             .rounded_full()
             .bg(colors.mark_ears);
-        ear = if left { ear.left(unit(2.)) } else { ear.right(unit(2.)) };
+        ear = if left {
+            ear.left(unit(2.))
+        } else {
+            ear.right(unit(2.))
+        };
         ear
     };
     let eye = |offset: f32| {
@@ -235,9 +239,7 @@ pub fn play_glyph(color: gpui::Hsla) -> impl gpui::IntoElement {
         move |bounds, _state, window, _cx| {
             let mut path = gpui::Path::new(bounds.origin);
             path.line_to(bounds.origin + gpui::point(px(0.), bounds.size.height));
-            path.line_to(
-                bounds.origin + gpui::point(bounds.size.width, bounds.size.height / 2.),
-            );
+            path.line_to(bounds.origin + gpui::point(bounds.size.width, bounds.size.height / 2.));
             window.paint_path(path, color);
         },
     )
@@ -269,7 +271,13 @@ pub fn search_glyph(color: gpui::Hsla) -> Div {
                 .border_1()
                 .border_color(color),
         )
-        .child(div().absolute().left(px(6.)).top(px(6.)).child(lens_handle(color)))
+        .child(
+            div()
+                .absolute()
+                .left(px(6.))
+                .top(px(6.))
+                .child(lens_handle(color)),
+        )
 }
 
 /// The magnifier's handle: a stroke from one corner of a small box to the
@@ -311,7 +319,11 @@ pub fn switch(on: bool, cx: &App) -> Div {
         .items_center()
         .rounded_full()
         .p(px(2.))
-        .bg(if on { colors.accent } else { colors.border_strong })
+        .bg(if on {
+            colors.accent
+        } else {
+            colors.border_strong
+        })
         .child(div().size(px(13.)).rounded_full().bg(colors.elevated));
     if on {
         track = track.justify_end();

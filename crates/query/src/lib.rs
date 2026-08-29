@@ -21,7 +21,10 @@ use std::ops::Range;
 
 /// Every non-empty statement in `sql`, in order, ready to send.
 pub fn statements(sql: &str) -> Vec<String> {
-    statement_ranges(sql).into_iter().map(|range| sql[range].to_string()).collect()
+    statement_ranges(sql)
+        .into_iter()
+        .map(|range| sql[range].to_string())
+        .collect()
 }
 
 /// Where each of those statements sits in `sql`, in the same order.
@@ -65,7 +68,9 @@ pub enum TxVerb {
 /// all, because [`statements`] hands such a body over whole.
 pub fn transaction_verb(statement: &str) -> Option<TxVerb> {
     let body = skip_leading_comments(statement);
-    let mut words = body.split(|c: char| c.is_whitespace() || c == ';').filter(|w| !w.is_empty());
+    let mut words = body
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .filter(|w| !w.is_empty());
     let first = words.next()?.to_ascii_lowercase();
     let second = words.next().unwrap_or_default().to_ascii_lowercase();
     match first.as_str() {
@@ -143,7 +148,9 @@ pub fn command_verb(statement: &str) -> Option<CommandVerb> {
 /// part of the statement that follows it.
 /// Whether a word is one of SQL's own, whatever case it is written in.
 pub fn is_keyword(word: &str) -> bool {
-    KEYWORDS.binary_search(&word.to_ascii_lowercase().as_str()).is_ok()
+    KEYWORDS
+        .binary_search(&word.to_ascii_lowercase().as_str())
+        .is_ok()
 }
 
 /// The keywords the app knows, sorted so the lookup can bisect.
@@ -153,14 +160,85 @@ pub fn is_keyword(word: &str) -> bool {
 /// a syntax error's mark reaches. A list per reader would be three lists
 /// that drifted.
 pub const KEYWORDS: &[&str] = &[
-    "all", "alter", "and", "any", "array", "as", "asc", "begin", "between", "by", "case", "cast",
-    "coalesce", "commit", "count", "create", "cross", "current_date", "current_timestamp",
-    "delete", "desc", "distinct", "drop", "else", "end", "except", "exists", "explain", "false",
-    "filter", "first", "from", "full", "group", "having", "ilike", "in", "index", "inner",
-    "insert", "intersect", "into", "is", "join", "lateral", "left", "like", "limit", "max", "min",
-    "not", "null", "nulls", "offset", "on", "or", "order", "outer", "over", "partition",
-    "returning", "right", "rollback", "select", "set", "some", "sum", "table", "then", "true",
-    "union", "update", "using", "values", "view", "when", "where", "window", "with",
+    "all",
+    "alter",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "begin",
+    "between",
+    "by",
+    "case",
+    "cast",
+    "coalesce",
+    "commit",
+    "count",
+    "create",
+    "cross",
+    "current_date",
+    "current_timestamp",
+    "delete",
+    "desc",
+    "distinct",
+    "drop",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "explain",
+    "false",
+    "filter",
+    "first",
+    "from",
+    "full",
+    "group",
+    "having",
+    "ilike",
+    "in",
+    "index",
+    "inner",
+    "insert",
+    "intersect",
+    "into",
+    "is",
+    "join",
+    "lateral",
+    "left",
+    "like",
+    "limit",
+    "max",
+    "min",
+    "not",
+    "null",
+    "nulls",
+    "offset",
+    "on",
+    "or",
+    "order",
+    "outer",
+    "over",
+    "partition",
+    "returning",
+    "right",
+    "rollback",
+    "select",
+    "set",
+    "some",
+    "sum",
+    "table",
+    "then",
+    "true",
+    "union",
+    "update",
+    "using",
+    "values",
+    "view",
+    "when",
+    "where",
+    "window",
+    "with",
 ];
 
 /// The relation a statement names, for the statements the server will not
@@ -243,12 +321,14 @@ pub fn relation_target(statement: &str) -> Option<RelationTarget> {
     // Whatever is left has to look like a name. A bracket or a keyword
     // here means the statement is not the shape this reads.
     let first = body[word.clone()].as_bytes().first().copied()?;
-    let name_like =
-        first.is_ascii_alphabetic() || first == b'_' || first == b'"' || first >= 0x80;
+    let name_like = first.is_ascii_alphabetic() || first == b'_' || first == b'"' || first >= 0x80;
     if !name_like {
         return None;
     }
-    Some(RelationTarget { name: shift + word.start..shift + word.end, if_exists })
+    Some(RelationTarget {
+        name: shift + word.start..shift + word.end,
+        if_exists,
+    })
 }
 
 /// Every token of a statement, in order, as ranges into it. A qualified
@@ -311,7 +391,9 @@ pub fn word_before(statement: &str, offset: usize) -> Option<Range<usize>> {
 /// so, and is the known gap.
 pub fn changes_names(statement: &str) -> bool {
     let body = skip_leading_comments(statement);
-    let Some(first) = body.split(|c: char| c.is_whitespace() || c == ';').find(|w| !w.is_empty())
+    let Some(first) = body
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .find(|w| !w.is_empty())
     else {
         return false;
     };
@@ -490,7 +572,9 @@ fn ranges(text: &str) -> Vec<Range<usize>> {
             b'\'' => ix = end_of_quoted(bytes, ix, b'\''),
             b'"' => ix = end_of_quoted(bytes, ix, b'"'),
             b'-' if bytes.get(ix + 1) == Some(&b'-') => {
-                ix = memchr(bytes, b'\n', ix).map(|ix| ix + 1).unwrap_or(bytes.len());
+                ix = memchr(bytes, b'\n', ix)
+                    .map(|ix| ix + 1)
+                    .unwrap_or(bytes.len());
             }
             b'/' if bytes.get(ix + 1) == Some(&b'*') => ix = end_of_block_comment(bytes, ix),
             b'$' => match end_of_dollar_quoted(bytes, ix) {
@@ -524,7 +608,10 @@ fn trim(text: &str, range: Range<usize>) -> Range<usize> {
 }
 
 fn memchr(bytes: &[u8], needle: u8, from: usize) -> Option<usize> {
-    bytes[from..].iter().position(|byte| *byte == needle).map(|ix| from + ix)
+    bytes[from..]
+        .iter()
+        .position(|byte| *byte == needle)
+        .map(|ix| from + ix)
 }
 
 /// Index just past the closing quote, treating a doubled quote as an
@@ -608,8 +695,7 @@ mod tests {
     }
 
     fn target(statement: &str) -> Option<(&str, bool)> {
-        relation_target(statement)
-            .map(|found| (&statement[found.name], found.if_exists))
+        relation_target(statement).map(|found| (&statement[found.name], found.if_exists))
     }
 
     /// The statements Postgres will not resolve a name for until it runs
@@ -624,7 +710,10 @@ mod tests {
         assert_eq!(target("truncate t"), Some(("t", false)));
         assert_eq!(target("truncate table only t"), Some(("t", false)));
         assert_eq!(target("-- go\n  drop view v"), Some(("v", false)));
-        assert_eq!(target("drop table \"My Table\""), Some(("\"My Table\"", false)));
+        assert_eq!(
+            target("drop table \"My Table\""),
+            Some(("\"My Table\"", false))
+        );
         // Only the first of a list; the rest go unchecked rather than
         // wrongly checked.
         assert_eq!(target("drop table a, b"), Some(("a", false)));
@@ -683,7 +772,13 @@ mod tests {
         ] {
             assert!(changes_names(statement), "{statement}");
         }
-        for statement in ["select * from t", "insert into t values (1)", "begin", "", "   "] {
+        for statement in [
+            "select * from t",
+            "insert into t values (1)",
+            "begin",
+            "",
+            "   ",
+        ] {
             assert!(!changes_names(statement), "{statement}");
         }
     }
@@ -697,7 +792,10 @@ mod tests {
         let statement = "select * from tenant_dev_tenant.effor limit 100";
         assert_eq!(marked(statement, 14), "tenant_dev_tenant.effor");
         assert_eq!(marked("select a.b.c from t", 7), "a.b.c");
-        assert_eq!(marked("select \"my schema\".t from x", 7), "\"my schema\".t");
+        assert_eq!(
+            marked("select \"my schema\".t from x", 7),
+            "\"my schema\".t"
+        );
         // A dot with no name after it is not part of the name, and `*` is
         // not a name part either.
         assert_eq!(marked("select * from schema. limit 1", 14), "schema");
@@ -758,7 +856,10 @@ mod tests {
     fn the_mark_is_never_empty() {
         assert_eq!(marked("select  frm", 6), "frm");
         for offset in 0..=12 {
-            assert!(!error_span("select 1 frm", offset).is_empty(), "offset {offset}");
+            assert!(
+                !error_span("select 1 frm", offset).is_empty(),
+                "offset {offset}"
+            );
         }
         // Nothing to mark in nothing.
         assert_eq!(error_span("", 0), 0..0);
@@ -814,7 +915,10 @@ mod tests {
         assert_eq!(texts(text), vec!["select 1 -- ; not a split", "select 2"]);
 
         let text = "select /* ; nested /* ; */ still */ 1; select 2";
-        assert_eq!(texts(text), vec!["select /* ; nested /* ; */ still */ 1", "select 2"]);
+        assert_eq!(
+            texts(text),
+            vec!["select /* ; nested /* ; */ still */ 1", "select 2"]
+        );
     }
 
     #[test]
@@ -828,7 +932,10 @@ mod tests {
             ]
         );
         // A lone `$` is not a quote opener.
-        assert_eq!(texts("select 1 $ 2; select 3"), vec!["select 1 $ 2", "select 3"]);
+        assert_eq!(
+            texts("select 1 $ 2; select 3"),
+            vec!["select 1 $ 2", "select 3"]
+        );
     }
 
     #[test]
@@ -836,7 +943,10 @@ mod tests {
         let verb = |sql| transaction_verb(sql);
         assert_eq!(verb("BEGIN"), Some(TxVerb::Begin));
         assert_eq!(verb("begin transaction"), Some(TxVerb::Begin));
-        assert_eq!(verb("BEGIN ISOLATION LEVEL SERIALIZABLE"), Some(TxVerb::Begin));
+        assert_eq!(
+            verb("BEGIN ISOLATION LEVEL SERIALIZABLE"),
+            Some(TxVerb::Begin)
+        );
         assert_eq!(verb("start transaction"), Some(TxVerb::Begin));
         assert_eq!(verb("COMMIT"), Some(TxVerb::Commit));
         assert_eq!(verb("end"), Some(TxVerb::Commit));
@@ -864,7 +974,10 @@ mod tests {
     #[test]
     fn a_comment_in_front_of_the_verb_is_skipped() {
         assert_eq!(transaction_verb("-- land it\nCOMMIT"), Some(TxVerb::Commit));
-        assert_eq!(transaction_verb("/* land it */ commit"), Some(TxVerb::Commit));
+        assert_eq!(
+            transaction_verb("/* land it */ commit"),
+            Some(TxVerb::Commit)
+        );
         assert_eq!(transaction_verb("-- nothing but a note"), None);
     }
 
@@ -883,15 +996,27 @@ mod tests {
     /// having matched nothing.
     #[test]
     fn the_command_verbs_are_read_off_the_first_word() {
-        assert_eq!(command_verb("update t set a = 1"), Some(CommandVerb::Update));
-        assert_eq!(command_verb("INSERT INTO t VALUES (1)"), Some(CommandVerb::Insert));
+        assert_eq!(
+            command_verb("update t set a = 1"),
+            Some(CommandVerb::Update)
+        );
+        assert_eq!(
+            command_verb("INSERT INTO t VALUES (1)"),
+            Some(CommandVerb::Insert)
+        );
         assert_eq!(command_verb("delete from t"), Some(CommandVerb::Delete));
-        assert_eq!(command_verb("Merge into t using s on true"), Some(CommandVerb::Merge));
+        assert_eq!(
+            command_verb("Merge into t using s on true"),
+            Some(CommandVerb::Merge)
+        );
         assert_eq!(command_verb("select 1"), None);
         assert_eq!(command_verb("create index on t (a)"), None);
         assert_eq!(command_verb(""), None);
         assert_eq!(command_verb("-- update t set a = 1"), None);
-        assert_eq!(command_verb("/* note */ delete from t"), Some(CommandVerb::Delete));
+        assert_eq!(
+            command_verb("/* note */ delete from t"),
+            Some(CommandVerb::Delete)
+        );
     }
 
     /// A statement that changes rows from inside a CTE takes the generic
@@ -911,6 +1036,9 @@ mod tests {
     fn an_unterminated_quote_swallows_the_rest() {
         // Better to send one broken statement and let the database report
         // it than to split in the middle of a string.
-        assert_eq!(texts("select 'oops; select 2"), vec!["select 'oops; select 2"]);
+        assert_eq!(
+            texts("select 'oops; select 2"),
+            vec!["select 'oops; select 2"]
+        );
     }
 }

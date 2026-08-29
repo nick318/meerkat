@@ -52,7 +52,13 @@ impl Scrollbar {
         thumb_active: Hsla,
     ) -> Option<Self> {
         let max = along(handle.max_offset(), vertical);
-        (max > px(0.)).then_some(Self { vertical, handle, drag, thumb, thumb_active })
+        (max > px(0.)).then_some(Self {
+            vertical,
+            handle,
+            drag,
+            thumb,
+            thumb_active,
+        })
     }
 }
 
@@ -179,13 +185,20 @@ impl Element for Scrollbar {
         _: &mut App,
     ) {
         let vertical = self.vertical;
-        let dragging = self.drag.get().is_some_and(|drag| drag.vertical == vertical);
+        let dragging = self
+            .drag
+            .get()
+            .is_some_and(|drag| drag.vertical == vertical);
         let active = dragging || prepaint.hitbox.is_hovered(window);
 
         window.paint_quad(quad(
             prepaint.thumb,
             Corners::all(px(THUMB_THICKNESS / 2.)),
-            if active { self.thumb_active } else { self.thumb },
+            if active {
+                self.thumb_active
+            } else {
+                self.thumb
+            },
             Edges::all(px(0.)),
             gpui::transparent_black(),
             gpui::BorderStyle::default(),
@@ -194,10 +207,18 @@ impl Element for Scrollbar {
         let view = window.current_view();
         let thumb = prepaint.thumb;
         let (max, track, length) = (prepaint.max, prepaint.track, prepaint.length);
-        let origin = if vertical { bounds.top() } else { bounds.left() };
+        let origin = if vertical {
+            bounds.top()
+        } else {
+            bounds.left()
+        };
 
         window.on_mouse_event({
-            let (handle, drag, hitbox) = (self.handle.clone(), self.drag.clone(), prepaint.hitbox.clone());
+            let (handle, drag, hitbox) = (
+                self.handle.clone(),
+                self.drag.clone(),
+                prepaint.hitbox.clone(),
+            );
             move |event: &MouseDownEvent, phase, window, cx| {
                 if !phase.bubble() || event.button != MouseButton::Left {
                     return;
@@ -207,13 +228,23 @@ impl Element for Scrollbar {
                 }
                 let position = along(event.position, vertical);
                 if thumb.contains(&event.position) {
-                    drag.set(Some(Drag { vertical, grab: position - along(thumb.origin, vertical) }));
+                    drag.set(Some(Drag {
+                        vertical,
+                        grab: position - along(thumb.origin, vertical),
+                    }));
                 } else {
                     // Clicking the track jumps the thumb to the pointer,
                     // centred, and starts a drag from there.
                     let start = position - origin - length / 2.;
-                    set_offset(&handle, vertical, offset_for_thumb(start, max, track, length));
-                    drag.set(Some(Drag { vertical, grab: length / 2. }));
+                    set_offset(
+                        &handle,
+                        vertical,
+                        offset_for_thumb(start, max, track, length),
+                    );
+                    drag.set(Some(Drag {
+                        vertical,
+                        grab: length / 2.,
+                    }));
                     cx.notify(view);
                 }
                 cx.stop_propagation();
@@ -230,7 +261,11 @@ impl Element for Scrollbar {
                     return;
                 };
                 let start = along(event.position, vertical) - origin - current.grab;
-                set_offset(&handle, vertical, offset_for_thumb(start, max, track, length));
+                set_offset(
+                    &handle,
+                    vertical,
+                    offset_for_thumb(start, max, track, length),
+                );
                 cx.notify(view);
                 cx.stop_propagation();
             }
@@ -288,16 +323,34 @@ mod tests {
     #[test]
     fn dragging_the_thumb_maps_back_to_the_offset() {
         // Track 100, thumb 50: 50px of travel covers 100px of content.
-        assert_eq!(offset_for_thumb(px(0.), px(100.), px(100.), px(50.)), px(0.));
-        assert_eq!(offset_for_thumb(px(25.), px(100.), px(100.), px(50.)), px(50.));
-        assert_eq!(offset_for_thumb(px(50.), px(100.), px(100.), px(50.)), px(100.));
+        assert_eq!(
+            offset_for_thumb(px(0.), px(100.), px(100.), px(50.)),
+            px(0.)
+        );
+        assert_eq!(
+            offset_for_thumb(px(25.), px(100.), px(100.), px(50.)),
+            px(50.)
+        );
+        assert_eq!(
+            offset_for_thumb(px(50.), px(100.), px(100.), px(50.)),
+            px(100.)
+        );
         // Past either end clamps rather than running off.
-        assert_eq!(offset_for_thumb(px(-40.), px(100.), px(100.), px(50.)), px(0.));
-        assert_eq!(offset_for_thumb(px(999.), px(100.), px(100.), px(50.)), px(100.));
+        assert_eq!(
+            offset_for_thumb(px(-40.), px(100.), px(100.), px(50.)),
+            px(0.)
+        );
+        assert_eq!(
+            offset_for_thumb(px(999.), px(100.), px(100.), px(50.)),
+            px(100.)
+        );
     }
 
     #[test]
     fn a_thumb_that_fills_the_track_cannot_move() {
-        assert_eq!(offset_for_thumb(px(10.), px(100.), px(50.), px(50.)), px(0.));
+        assert_eq!(
+            offset_for_thumb(px(10.), px(100.), px(50.), px(50.)),
+            px(0.)
+        );
     }
 }

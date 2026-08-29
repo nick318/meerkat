@@ -29,10 +29,7 @@ pub fn page_query(schema: &str, table: &Table, page: usize) -> String {
     if let Some(order) = order_by(table) {
         sql.push_str(&format!(" ORDER BY {order}"));
     }
-    sql.push_str(&format!(
-        " LIMIT {PAGE_SIZE} OFFSET {}",
-        page * PAGE_SIZE
-    ));
+    sql.push_str(&format!(" LIMIT {PAGE_SIZE} OFFSET {}", page * PAGE_SIZE));
     sql
 }
 
@@ -55,7 +52,11 @@ fn order_by(table: &Table) -> Option<String> {
     let columns: Vec<&String> = if table.has_primary_key() {
         table.primary_key.iter().collect()
     } else {
-        table.columns.first().map(|c| vec![&c.name]).unwrap_or_default()
+        table
+            .columns
+            .first()
+            .map(|c| vec![&c.name])
+            .unwrap_or_default()
     };
     if columns.is_empty() {
         return None;

@@ -11,9 +11,7 @@
 //! yesterday belongs to yesterday even though it is nearer in time.
 
 use chrono::{Datelike, Local, NaiveDate, TimeZone};
-use gpui::{
-    AnyElement, App, ElementId, FontWeight, SharedString, Window, div, prelude::*, px,
-};
+use gpui::{AnyElement, App, ElementId, FontWeight, SharedString, Window, div, prelude::*, px};
 use std::rc::Rc;
 use storage::QueryRun;
 use theme::ThemeColors;
@@ -61,10 +59,14 @@ pub fn flatten(runs: &[QueryRun], today: NaiveDate) -> Vec<HistoryRow> {
     let mut rows = Vec::with_capacity(runs.len() + 4);
     let mut current: Option<NaiveDate> = None;
     for run in runs {
-        let Some(at) = Local.timestamp_opt(run.ran_at, 0).single() else { continue };
+        let Some(at) = Local.timestamp_opt(run.ran_at, 0).single() else {
+            continue;
+        };
         let day = at.date_naive();
         if current != Some(day) {
-            rows.push(HistoryRow::Day { label: day_label(day, today).into() });
+            rows.push(HistoryRow::Day {
+                label: day_label(day, today).into(),
+            });
             current = Some(day);
         }
         rows.push(HistoryRow::Run(RunRow {
@@ -160,7 +162,11 @@ pub fn history_row(
             let open = open.clone();
             let statement = run.statement.clone();
             let cell = |text: SharedString, color| {
-                div().text_size(px(10.)).text_color(color).truncate().child(text)
+                div()
+                    .text_size(px(10.))
+                    .text_color(color)
+                    .truncate()
+                    .child(text)
             };
 
             div()
@@ -174,9 +180,17 @@ pub fn history_row(
                         .gap(px(14.))
                         .px(px(12.))
                         .border_1()
-                        .border_color(if run.failed { colors.error_border } else { colors.border })
+                        .border_color(if run.failed {
+                            colors.error_border
+                        } else {
+                            colors.border
+                        })
                         .rounded(px(7.))
-                        .bg(if run.failed { colors.error_surface } else { colors.elevated })
+                        .bg(if run.failed {
+                            colors.error_surface
+                        } else {
+                            colors.elevated
+                        })
                         .cursor_pointer()
                         .hover(move |s| {
                             s.border_color(if run.failed {
@@ -185,34 +199,36 @@ pub fn history_row(
                                 colors.text_faint
                             })
                         })
-                        .on_click(move |_event, window, cx| {
-                            open(statement.clone(), window, cx)
-                        })
+                        .on_click(move |_event, window, cx| open(statement.clone(), window, cx))
                         .child(
                             div()
                                 .flex_1()
                                 .min_w(px(0.))
                                 .text_size(px(11.))
-                                .text_color(if run.failed { colors.error } else { colors.text_body })
+                                .text_color(if run.failed {
+                                    colors.error
+                                } else {
+                                    colors.text_body
+                                })
                                 .truncate()
                                 .child(run.statement.clone()),
                         )
-                        .child(
-                            div().w(px(ROWS_WIDTH)).flex_none().child(cell(
-                                run.detail.clone(),
-                                if run.failed { colors.error_secondary } else { colors.text_muted },
-                            )),
-                        )
-                        .child(
-                            div().w(px(TIMING_WIDTH)).flex_none().child(cell(
-                                run.timing.clone(),
-                                match (run.failed, run.slow) {
-                                    (true, _) => colors.error_secondary,
-                                    (false, true) => colors.accent_deep,
-                                    (false, false) => colors.ok,
-                                },
-                            )),
-                        )
+                        .child(div().w(px(ROWS_WIDTH)).flex_none().child(cell(
+                            run.detail.clone(),
+                            if run.failed {
+                                colors.error_secondary
+                            } else {
+                                colors.text_muted
+                            },
+                        )))
+                        .child(div().w(px(TIMING_WIDTH)).flex_none().child(cell(
+                            run.timing.clone(),
+                            match (run.failed, run.slow) {
+                                (true, _) => colors.error_secondary,
+                                (false, true) => colors.accent_deep,
+                                (false, false) => colors.ok,
+                            },
+                        )))
                         .child(
                             div()
                                 .w(px(CLOCK_WIDTH))
@@ -221,7 +237,11 @@ pub fn history_row(
                                 .justify_end()
                                 .child(cell(
                                     run.clock.clone(),
-                                    if run.failed { colors.error_faint } else { colors.text_faint },
+                                    if run.failed {
+                                        colors.error_faint
+                                    } else {
+                                        colors.text_faint
+                                    },
                                 )),
                         ),
                 )
@@ -243,14 +263,36 @@ pub fn filter_chip(
         .px(px(9.))
         .py(px(5.))
         .border_1()
-        .border_color(if active { colors.accent } else { colors.border_strong })
+        .border_color(if active {
+            colors.accent
+        } else {
+            colors.border_strong
+        })
         .rounded(px(6.))
-        .bg(if active { colors.selection } else { colors.elevated })
+        .bg(if active {
+            colors.selection
+        } else {
+            colors.elevated
+        })
         .text_size(px(11.))
-        .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
-        .text_color(if active { colors.accent_deep } else { colors.text_secondary })
+        .font_weight(if active {
+            FontWeight::MEDIUM
+        } else {
+            FontWeight::NORMAL
+        })
+        .text_color(if active {
+            colors.accent_deep
+        } else {
+            colors.text_secondary
+        })
         .cursor_pointer()
-        .hover(move |s| s.border_color(if active { colors.accent_deep } else { colors.text_faint }))
+        .hover(move |s| {
+            s.border_color(if active {
+                colors.accent_deep
+            } else {
+                colors.text_faint
+            })
+        })
         .child(label)
 }
 
@@ -303,13 +345,16 @@ mod tests {
             })
             .collect();
         // One heading per day, however many runs it holds.
-        assert_eq!(read[..5], [
-            "[TODAY]".to_string(),
-            "select 1".to_string(),
-            "select 2".to_string(),
-            "[YESTERDAY]".to_string(),
-            "select 3".to_string(),
-        ]);
+        assert_eq!(
+            read[..5],
+            [
+                "[TODAY]".to_string(),
+                "select 1".to_string(),
+                "select 2".to_string(),
+                "[YESTERDAY]".to_string(),
+                "select 3".to_string(),
+            ]
+        );
         assert!(read[5].starts_with('['));
         assert_eq!(read[6], "select 4");
     }
@@ -322,7 +367,9 @@ mod tests {
         failed.row_count = None;
 
         let rows = flatten(&[failed], Local::now().date_naive());
-        let HistoryRow::Run(row) = &rows[1] else { panic!("expected a run") };
+        let HistoryRow::Run(row) = &rows[1] else {
+            panic!("expected a run")
+        };
         assert_eq!(row.detail, "relation \"user_setings\" does not exist");
         assert_eq!(row.timing, "error");
         assert!(row.failed);
@@ -337,7 +384,9 @@ mod tests {
         updated.row_count = Some(0);
         updated.affected = Some(1);
         let rows = flatten(&[updated], Local::now().date_naive());
-        let HistoryRow::Run(row) = &rows[1] else { panic!("expected a run") };
+        let HistoryRow::Run(row) = &rows[1] else {
+            panic!("expected a run")
+        };
         assert_eq!(row.detail, "1 row changed");
 
         assert_eq!(changed_label(0), "no rows changed");
@@ -345,7 +394,9 @@ mod tests {
 
         // A run that returned rows keeps the count it always had.
         let rows = flatten(&[run("select 1", noon(0))], Local::now().date_naive());
-        let HistoryRow::Run(row) = &rows[1] else { panic!("expected a run") };
+        let HistoryRow::Run(row) = &rows[1] else {
+            panic!("expected a run")
+        };
         assert_eq!(row.detail, "6 rows");
     }
 
@@ -358,7 +409,9 @@ mod tests {
         let mut slow = run("select 1", noon(0));
         slow.elapsed_ms = Some(1_900);
         let rows = flatten(&[slow], Local::now().date_naive());
-        let HistoryRow::Run(row) = &rows[1] else { panic!("expected a run") };
+        let HistoryRow::Run(row) = &rows[1] else {
+            panic!("expected a run")
+        };
         assert_eq!(row.timing, "1.9 s");
         assert!(row.slow);
     }

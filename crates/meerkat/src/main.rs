@@ -119,21 +119,53 @@ fn main() {
             KeyBinding::new("left", shell::SelectLeft, Some(shell::GRID_KEY_CONTEXT)),
             KeyBinding::new("right", shell::SelectRight, Some(shell::GRID_KEY_CONTEXT)),
             KeyBinding::new("shift-up", shell::ExtendUp, Some(shell::GRID_KEY_CONTEXT)),
-            KeyBinding::new("shift-down", shell::ExtendDown, Some(shell::GRID_KEY_CONTEXT)),
-            KeyBinding::new("shift-left", shell::ExtendLeft, Some(shell::GRID_KEY_CONTEXT)),
-            KeyBinding::new("shift-right", shell::ExtendRight, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new(
+                "shift-down",
+                shell::ExtendDown,
+                Some(shell::GRID_KEY_CONTEXT),
+            ),
+            KeyBinding::new(
+                "shift-left",
+                shell::ExtendLeft,
+                Some(shell::GRID_KEY_CONTEXT),
+            ),
+            KeyBinding::new(
+                "shift-right",
+                shell::ExtendRight,
+                Some(shell::GRID_KEY_CONTEXT),
+            ),
             // ⌘ with an arrow means "as far as it goes" on this platform,
             // and it means the same here.
-            KeyBinding::new("cmd-left", shell::SelectRowStart, Some(shell::GRID_KEY_CONTEXT)),
-            KeyBinding::new("cmd-right", shell::SelectRowEnd, Some(shell::GRID_KEY_CONTEXT)),
-            KeyBinding::new("cmd-up", shell::SelectFirstRow, Some(shell::GRID_KEY_CONTEXT)),
-            KeyBinding::new("cmd-down", shell::SelectLastRow, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new(
+                "cmd-left",
+                shell::SelectRowStart,
+                Some(shell::GRID_KEY_CONTEXT),
+            ),
+            KeyBinding::new(
+                "cmd-right",
+                shell::SelectRowEnd,
+                Some(shell::GRID_KEY_CONTEXT),
+            ),
+            KeyBinding::new(
+                "cmd-up",
+                shell::SelectFirstRow,
+                Some(shell::GRID_KEY_CONTEXT),
+            ),
+            KeyBinding::new(
+                "cmd-down",
+                shell::SelectLastRow,
+                Some(shell::GRID_KEY_CONTEXT),
+            ),
             KeyBinding::new("cmd-a", shell::SelectAll, Some(shell::GRID_KEY_CONTEXT)),
             KeyBinding::new("cmd-c", shell::CopySelection, Some(shell::GRID_KEY_CONTEXT)),
             // Space ticks the row the cursor is on: ↓ then space walks a
             // result and picks out of it without the mouse.
             KeyBinding::new("space", shell::TogglePick, Some(shell::GRID_KEY_CONTEXT)),
-            KeyBinding::new("escape", shell::ClearSelection, Some(shell::GRID_KEY_CONTEXT)),
+            KeyBinding::new(
+                "escape",
+                shell::ClearSelection,
+                Some(shell::GRID_KEY_CONTEXT),
+            ),
             KeyBinding::new("cmd-q", Quit, None),
             // A window, like a browser's ⌘N. Bound globally on purpose:
             // it means the same thing on the connections screen and inside
@@ -208,7 +240,9 @@ fn open_window(target: Option<Target>, cx: &mut App) {
                 if !go {
                     return false;
                 }
-                handle.update(cx, |root, _window, cx| root.remember(cx)).ok();
+                handle
+                    .update(cx, |root, _window, cx| root.remember(cx))
+                    .ok();
                 true
             });
         })
@@ -222,8 +256,12 @@ pub fn quit_cancelled(cx: &mut App) {
     // not inherit it either.
     cx.set_global(Restarting(false));
     for window in cx.windows() {
-        let Some(window) = window.downcast::<Root>() else { continue };
-        window.update(cx, |root, _window, cx| root.forget_quit(cx)).ok();
+        let Some(window) = window.downcast::<Root>() else {
+            continue;
+        };
+        window
+            .update(cx, |root, _window, cx| root.forget_quit(cx))
+            .ok();
     }
 }
 
@@ -239,8 +277,11 @@ pub fn quit_cancelled(cx: &mut App) {
 /// `pg_cancel_backend` that has not left yet never leaves, and the statement
 /// outlives the app that started it.
 pub fn quit(cx: &mut App) {
-    let windows: Vec<_> =
-        cx.windows().into_iter().filter_map(|window| window.downcast::<Root>()).collect();
+    let windows: Vec<_> = cx
+        .windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<Root>())
+        .collect();
     for window in &windows {
         let go = window
             .update(cx, |root, window, cx| root.guard_quit(window, cx))

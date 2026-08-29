@@ -692,7 +692,11 @@ pub enum Close {
 /// because the guard has to ask the window's question: the dialog says
 /// what is ending, and what is ending is the window.
 fn close_intent(tabs: usize, tab_id: u64) -> Close {
-    if tabs <= 1 { Close::Window } else { Close::Tab(tab_id) }
+    if tabs <= 1 {
+        Close::Window
+    } else {
+        Close::Tab(tab_id)
+    }
 }
 
 /// What the workspace was opened on: a URL from the command line, or a
@@ -881,7 +885,9 @@ enum Run {
     /// nicely, which is the only reason this is a state of its own.
     Cancelling(Live),
     /// Stopped on the user's word, after this many milliseconds.
-    Cancelled { elapsed: u128 },
+    Cancelled {
+        elapsed: u128,
+    },
 }
 
 /// A run in flight.
@@ -932,7 +938,11 @@ struct Timing {
 
 impl Timing {
     fn new(total_ms: u128, wire: Wire) -> Self {
-        Self { total_ms, wire, server: None }
+        Self {
+            total_ms,
+            wire,
+            server: None,
+        }
     }
 
     /// The server's share, and whether that is a measurement or an
@@ -1132,7 +1142,9 @@ impl Shell {
         // the sidebar and feeds completion straight away; the introspection
         // running behind it replaces it when it lands. A store that cannot
         // be read is a miss, not an error: the session works without it.
-        let cached = store.as_ref().and_then(|store| store.cached_catalog(&scope).ok().flatten());
+        let cached = store
+            .as_ref()
+            .and_then(|store| store.cached_catalog(&scope).ok().flatten());
         // What this connection was left with. It is read here, beside the
         // catalog, for the same reason: a local SQLite row, so the strip
         // is painted on the first frame rather than after a round trip.
@@ -1233,7 +1245,12 @@ impl Shell {
         self.restoring = true;
         for tab in saved.tabs {
             match tab {
-                SavedTab::Query { title, statement, relation, tx_mode } => {
+                SavedTab::Query {
+                    title,
+                    statement,
+                    relation,
+                    tx_mode,
+                } => {
                     self.new_query_with(&statement, window, cx);
                     if let Some(Tab::Query(tab)) = self.tabs.last_mut() {
                         if !title.is_empty() {
@@ -1246,9 +1263,11 @@ impl Shell {
                         tab.tx_mode = tx_mode;
                     }
                 }
-                SavedTab::Table { schema, table, page } => {
-                    self.restore_table(schema, table, page, cx)
-                }
+                SavedTab::Table {
+                    schema,
+                    table,
+                    page,
+                } => self.restore_table(schema, table, page, cx),
                 SavedTab::History => self.open_history(cx),
             }
         }
@@ -1270,7 +1289,13 @@ impl Shell {
     /// by hand because the catalog names the table's kind and the catalog
     /// may still be on its way — a tab the user had open is opened whether
     /// or not the shell can describe it yet.
-    fn restore_table(&mut self, schema: String, table: String, page: usize, cx: &mut Context<Self>) {
+    fn restore_table(
+        &mut self,
+        schema: String,
+        table: String,
+        page: usize,
+        cx: &mut Context<Self>,
+    ) {
         let model = self.table_model(&schema, &table);
         let kind = model.map_or(TableKind::Table, |model| model.kind);
         let approx_rows = model.and_then(|model| model.approx_rows);
@@ -1391,7 +1416,8 @@ impl Shell {
             // `Nearest` and not `Center`: the cursor walks one row at a
             // time, and a list that re-centred on every press would move
             // further than the cursor did.
-            self.catalog_scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
+            self.catalog_scroll
+                .scroll_to_item(ix, ScrollStrategy::Nearest);
         }
         // ⇥ finishes the line from the cursor, so moving it changes what
         // the hint offers.
@@ -1416,7 +1442,8 @@ impl Shell {
             .filter_completion(cx)
             .map(|completed| palette::ghost(&needle, &completed))
             .unwrap_or_default();
-        self.catalog_filter.update(cx, |field, cx| field.set_ghost(ghost, cx));
+        self.catalog_filter
+            .update(cx, |field, cx| field.set_ghost(ghost, cx));
     }
 
     /// Take the first match's name into the filter line, one part at a
@@ -1424,10 +1451,13 @@ impl Shell {
     /// rather than appending to it, because a hit sits anywhere inside a
     /// name: `dev` completes to `sample_dev_sample.`.
     fn complete_filter(&mut self, cx: &mut Context<Self>) {
-        let Some(completed) = self.filter_completion(cx) else { return };
+        let Some(completed) = self.filter_completion(cx) else {
+            return;
+        };
         // Setting the text emits `Changed`, which filters again, so the
         // list already follows the completed line when this returns.
-        self.catalog_filter.update(cx, |field, cx| field.set_text(completed, cx));
+        self.catalog_filter
+            .update(cx, |field, cx| field.set_text(completed, cx));
     }
 
     /// Put the keys on the filter line, wherever they were, and mark what
@@ -1447,7 +1477,8 @@ impl Shell {
             return;
         }
         self.close_column_find(window, cx);
-        self.catalog_filter.update(cx, |field, cx| field.select_everything(cx));
+        self.catalog_filter
+            .update(cx, |field, cx| field.select_everything(cx));
         window.focus(&self.catalog_filter.focus_handle(cx), cx);
         cx.notify();
     }
@@ -1513,12 +1544,18 @@ impl Shell {
         // so the sidebar does not close under them when the real catalog
         // replaces the cached one.
         self.rebuild_catalog_rows(cx);
-        self.relation_total = catalog.schemas.iter().map(|schema| schema.tables.len()).sum();
+        self.relation_total = catalog
+            .schemas
+            .iter()
+            .map(|schema| schema.tables.len())
+            .sum();
         self.catalog = Some(catalog);
         let vocabulary = self.vocabulary.clone();
         for tab in &self.tabs {
             if let Tab::Query(tab) = tab {
-                tab.editor.update(cx, |editor, cx| editor.set_vocabulary(vocabulary.clone(), cx));
+                tab.editor.update(cx, |editor, cx| {
+                    editor.set_vocabulary(vocabulary.clone(), cx)
+                });
             }
         }
     }
@@ -1578,7 +1615,9 @@ impl Shell {
     /// cached catalog keeps painting it until this lands, and keeps it if
     /// this fails — a stale sidebar beats no sidebar.
     fn introspect(&mut self, cx: &mut Context<Self>) {
-        let Some(connection) = self.connection.clone() else { return };
+        let Some(connection) = self.connection.clone() else {
+            return;
+        };
         self.catalog_loading = true;
         self.catalog_error = None;
         let task = gpui_tokio::Tokio::spawn(cx, async move { connection.introspect().await });
@@ -1698,7 +1737,9 @@ impl Shell {
     fn load_page(&mut self, tab_id: u64, page: usize, cx: &mut Context<Self>) {
         let connection = self.connection.clone();
         let failed = matches!(self.status, Status::Failed(_));
-        let Some(Tab::Table(tab)) = self.tab_mut(tab_id) else { return };
+        let Some(Tab::Table(tab)) = self.tab_mut(tab_id) else {
+            return;
+        };
         // The cached catalog can open a table before the connection is
         // there. Leave the tab loading; `resume_pending_pages` asks again
         // as soon as the connection lands. Once the connect has failed
@@ -1714,10 +1755,14 @@ impl Shell {
         };
 
         let (schema, table) = (tab.schema.clone(), tab.table.clone());
-        let Some(model) = self.table_model(&schema, &table).cloned() else { return };
+        let Some(model) = self.table_model(&schema, &table).cloned() else {
+            return;
+        };
         let sql = page_query(&schema, &model, page);
 
-        let Some(Tab::Table(tab)) = self.tab_mut(tab_id) else { return };
+        let Some(Tab::Table(tab)) = self.tab_mut(tab_id) else {
+            return;
+        };
         tab.page = page;
         tab.loading = true;
         tab.error = None;
@@ -1736,7 +1781,9 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
             this.update(cx, |this, cx| {
-                let Some(Tab::Table(tab)) = this.tab_mut(tab_id) else { return };
+                let Some(Tab::Table(tab)) = this.tab_mut(tab_id) else {
+                    return;
+                };
                 if tab.generation != generation {
                     return;
                 }
@@ -1765,7 +1812,12 @@ impl Shell {
                     Err(error) => {
                         tab.error = Some(error.clone());
                         tab.data = empty_grid();
-                        Outcome { elapsed: None, rows: None, affected: None, error: Some(error) }
+                        Outcome {
+                            elapsed: None,
+                            rows: None,
+                            affected: None,
+                            error: Some(error),
+                        }
                     }
                 };
                 this.record_run(&recorded, RunSource::App, &run);
@@ -1792,11 +1844,14 @@ impl Shell {
         status: StatementStatus,
         cx: &mut Context<Self>,
     ) {
-        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else { return };
+        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else {
+            return;
+        };
         if tab.generation != generation {
             return;
         }
-        tab.editor.update(cx, |editor, cx| editor.set_statement_status(ix, status, cx));
+        tab.editor
+            .update(cx, |editor, cx| editor.set_statement_status(ix, status, cx));
     }
 
     /// Mark every statement from `from` on as never sent.
@@ -1807,11 +1862,14 @@ impl Shell {
         from: usize,
         cx: &mut Context<Self>,
     ) {
-        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else { return };
+        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else {
+            return;
+        };
         if tab.generation != generation {
             return;
         }
-        tab.editor.update(cx, |editor, cx| editor.skip_statements_from(from, cx));
+        tab.editor
+            .update(cx, |editor, cx| editor.skip_statements_from(from, cx));
     }
 
     /// Ask the server whether the buffer parses, once the typing stops.
@@ -1831,7 +1889,9 @@ impl Shell {
         let connection = self.connection.clone();
         let active =
             matches!(self.tabs.get(self.active), Some(Tab::Query(tab)) if tab.id == tab_id);
-        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else { return };
+        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else {
+            return;
+        };
         // The edit has already dropped the marks the last check left, so
         // there is nothing to clear here: a buffer with no connection
         // simply goes unmarked.
@@ -1846,7 +1906,9 @@ impl Shell {
             // Every keystroke schedules one of these, and all but the last
             // are on their way to finding the text has moved on.
             let Ok(Some((sql, session))) = this.update(cx, |this, cx| {
-                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return None };
+                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else {
+                    return None;
+                };
                 if tab.checked != checked {
                     return None;
                 }
@@ -1857,15 +1919,21 @@ impl Shell {
                 // holding that connection, so the pool answers instead
                 // rather than queue the check behind the statement the
                 // user is waiting for.
-                let session = (!tab.run.in_flight()).then(|| tab.session.clone()).flatten();
+                let session = (!tab.run.in_flight())
+                    .then(|| tab.session.clone())
+                    .flatten();
                 Some((tab.editor.read(cx).text().to_string(), session))
             }) else {
                 return;
             };
-            let ranges: Vec<Range<usize>> =
-                query::statement_ranges(&sql).into_iter().take(CHECK_STATEMENTS).collect();
-            let statements: Vec<String> =
-                ranges.iter().map(|range| sql[range.clone()].to_string()).collect();
+            let ranges: Vec<Range<usize>> = query::statement_ranges(&sql)
+                .into_iter()
+                .take(CHECK_STATEMENTS)
+                .collect();
+            let statements: Vec<String> = ranges
+                .iter()
+                .map(|range| sql[range.clone()].to_string())
+                .collect();
             let Ok(task) = this.update(cx, |_, cx| {
                 gpui_tokio::Tokio::spawn(cx, async move {
                     let mut found = Vec::new();
@@ -1894,10 +1962,14 @@ impl Shell {
             }) else {
                 return;
             };
-            let Ok(found) = flatten(task.await) else { return };
+            let Ok(found) = flatten(task.await) else {
+                return;
+            };
             this.update(cx, |this, cx| {
                 let vocabulary = this.vocabulary.clone();
-                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return };
+                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else {
+                    return;
+                };
                 if tab.checked != checked {
                     return;
                 }
@@ -1916,7 +1988,9 @@ impl Shell {
     /// question, and an unmarked query that will not parse is the state
     /// this whole path exists to end.
     fn check_active(&mut self, cx: &mut Context<Self>) {
-        let Some(Tab::Query(tab)) = self.tabs.get(self.active) else { return };
+        let Some(Tab::Query(tab)) = self.tabs.get(self.active) else {
+            return;
+        };
         let id = tab.id;
         self.schedule_check(id, cx);
     }
@@ -1979,7 +2053,9 @@ impl Shell {
 
     fn run_active_query(&mut self, cx: &mut Context<Self>) {
         let connection = self.connection.clone();
-        let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else { return };
+        let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else {
+            return;
+        };
         // ⌘⏎ while the last run is still out does nothing: the key that
         // starts a run is not the key that stops one, and a second run
         // over the top of the first would leave the first unstoppable.
@@ -2004,7 +2080,10 @@ impl Shell {
         // A driver runs one command at a time, so send the statements in
         // turn rather than handing the server a whole scratchpad.
         let ranges = query::statement_ranges(&sql);
-        let statements: Vec<String> = ranges.iter().map(|range| sql[range.clone()].to_string()).collect();
+        let statements: Vec<String> = ranges
+            .iter()
+            .map(|range| sql[range.clone()].to_string())
+            .collect();
         if statements.is_empty() {
             return;
         }
@@ -2023,30 +2102,42 @@ impl Shell {
         // to report whichever mode the tab is in: a `COMMIT` typed by hand
         // is the same event as the button. The **last** verb wins, because
         // `BEGIN; …; COMMIT` in one buffer leaves nothing open.
-        let buffer_verb = statements.iter().rev().find_map(|sql| query::transaction_verb(sql));
+        let buffer_verb = statements
+            .iter()
+            .rev()
+            .find_map(|sql| query::transaction_verb(sql));
         // What the bar counts as having landed *inside* the transaction:
         // the statements that are not boundaries. A bare `BEGIN` therefore
         // opens a transaction with nothing in it, which is what it did.
-        let plain_statements =
-            statements.iter().filter(|sql| query::transaction_verb(sql).is_none()).count();
+        let plain_statements = statements
+            .iter()
+            .filter(|sql| query::transaction_verb(sql).is_none())
+            .count();
         // A tab about to open its first session may be the one too many.
         // Give back the session that has gone longest without a question;
         // with nothing spare to give, say so here rather than let the pool
         // wait out its connect timeout and answer with something about
         // connections.
         if session.is_none() && !self.make_room_for_session(cx) {
-            let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else { return };
+            let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else {
+                return;
+            };
             tab.error = Some(NO_SESSION_LEFT.to_string());
             cx.notify();
             return;
         }
-        let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else { return };
+        let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else {
+            return;
+        };
         // The backend is the *session's*, so it is known before the run
         // leaves — there is no id to wait for any more. A tab running for
         // the first time has no session yet, and `None` says so: the run
         // is alive, and nothing is out on the server to stop.
         let backend = session.as_ref().and_then(|session| session.backend());
-        tab.run = Run::Running(Live { started: Instant::now(), backend });
+        tab.run = Run::Running(Live {
+            started: Instant::now(),
+            backend,
+        });
         tab.error = None;
         // "committed" was the answer to the last question. This is a new
         // one, so the bar stops saying it: news about a transaction that
@@ -2060,18 +2151,23 @@ impl Shell {
         // Every statement queued, none of them sent. The gutter says so
         // from the moment ⌘⏎ lands, so a slow first statement is a run the
         // user can already see the shape of.
-        tab.editor.update(cx, |editor, cx| editor.set_statements(ranges, offset, cx));
+        tab.editor
+            .update(cx, |editor, cx| editor.set_statements(ranges, offset, cx));
 
         let recorded = sql;
         // The buffer has been edited since the tab was opened, and this is
         // the moment the user says it is worth something.
         self.remember_tabs(cx);
-        let task = run_statements(connection, session, begin, statements, tab_id, generation, cx);
+        let task = run_statements(
+            connection, session, begin, statements, tab_id, generation, cx,
+        );
         self.start_timer(cx);
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
             this.update(cx, |this, cx| {
-                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return };
+                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else {
+                    return;
+                };
                 if tab.generation != generation {
                     return;
                 }
@@ -2080,8 +2176,15 @@ impl Shell {
                 // as a failure, because the user is the one who asked —
                 // but the history still keeps what the server said.
                 let stopped = matches!(tab.run, Run::Cancelling(_));
-                let waited = tab.run.live().map(|live| live.started.elapsed().as_millis());
-                let RunOutcome { session, result, began } = outcome;
+                let waited = tab
+                    .run
+                    .live()
+                    .map(|live| live.started.elapsed().as_millis());
+                let RunOutcome {
+                    session,
+                    result,
+                    began,
+                } = outcome;
                 // The `BEGIN` went out, so a transaction is open whether or
                 // not the statements after it worked: a statement that fails
                 // inside a transaction leaves it open and aborted, which is
@@ -2108,7 +2211,14 @@ impl Shell {
                 let one_statement = matches!(&result, Ok(ran) if ran.ran == 1);
                 let run = match result {
                     Ok(ran) => {
-                        let Ran { result, affected, counted, verb, elapsed_ms, ran } = ran;
+                        let Ran {
+                            result,
+                            affected,
+                            counted,
+                            verb,
+                            elapsed_ms,
+                            ran,
+                        } = ran;
                         tab.run = Run::Idle;
                         // The run button settles on this, so it counts a
                         // result rather than a reply: a failure is not
@@ -2122,7 +2232,10 @@ impl Shell {
                         // A count of zero is still a count, so this turns on
                         // the *number of counted statements* rather than on
                         // the number itself.
-                        tab.changed = (counted > 0).then_some(Changed { rows: affected, verb });
+                        tab.changed = (counted > 0).then_some(Changed {
+                            rows: affected,
+                            verb,
+                        });
                         tab.truncated = result.truncated;
                         tab.statements_run = ran;
                         tab.data = Rc::new(GridData::new(result.columns, result.rows));
@@ -2166,7 +2279,9 @@ impl Shell {
                     }
                     Err(error) => {
                         if stopped {
-                            tab.run = Run::Cancelled { elapsed: waited.unwrap_or_default() };
+                            tab.run = Run::Cancelled {
+                                elapsed: waited.unwrap_or_default(),
+                            };
                         } else {
                             tab.run = Run::Idle;
                             tab.error = Some(error.clone());
@@ -2178,7 +2293,12 @@ impl Shell {
                         tab.truncated = false;
                         tab.data = empty_grid();
                         tab.selection.clear();
-                        Outcome { elapsed: None, rows: None, affected: None, error: Some(error) }
+                        Outcome {
+                            elapsed: None,
+                            rows: None,
+                            affected: None,
+                            error: Some(error),
+                        }
                     }
                 };
                 this.record_run(&recorded, RunSource::User, &run);
@@ -2203,7 +2323,9 @@ impl Shell {
     /// waiting on the server, and the server is what has to let go.
     fn stop_active_query(&mut self, cx: &mut Context<Self>) {
         let connection = self.connection.clone();
-        let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else { return };
+        let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else {
+            return;
+        };
         let (how, live) = match &tab.run {
             Run::Running(live) => (Stop::Cancel, live),
             Run::Cancelling(live) => (Stop::Terminate, live),
@@ -2242,7 +2364,9 @@ impl Shell {
                     // The tab this stop was for, not whichever tab is in
                     // front when the answer lands, and only while it is
                     // still the same run.
-                    let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return };
+                    let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else {
+                        return;
+                    };
                     if tab.generation == generation {
                         tab.error = Some(error);
                         cx.notify();
@@ -2302,8 +2426,12 @@ impl Shell {
     /// Take one tab's session back: rolled back, returned to the pool, and
     /// the tab told so it can say why its next run starts fresh.
     fn end_session(&mut self, tab_id: u64, cx: &mut Context<Self>) {
-        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else { return };
-        let Some(session) = tab.session.take() else { return };
+        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else {
+            return;
+        };
+        let Some(session) = tab.session.take() else {
+            return;
+        };
         tab.session_ended = true;
         gpui_tokio::Tokio::spawn(cx, async move { session.close().await }).detach();
         cx.notify();
@@ -2323,9 +2451,10 @@ impl Shell {
                 cx.background_executor().timer(IDLE_TICK).await;
                 let more = this.update(cx, |this, cx| {
                     this.sweep_idle_sessions(cx);
-                    let more = this.tabs.iter().any(
-                        |tab| matches!(tab, Tab::Query(tab) if tab.session.is_some()),
-                    );
+                    let more = this
+                        .tabs
+                        .iter()
+                        .any(|tab| matches!(tab, Tab::Query(tab) if tab.session.is_some()));
                     if !more {
                         this.sweeping = false;
                     }
@@ -2349,17 +2478,25 @@ impl Shell {
     /// A session that cannot answer is left as it was rather than reported
     /// as clean: the safe reading of a missing answer is the careful one.
     fn refresh_transaction(&mut self, tab_id: u64, cx: &mut Context<Self>) {
-        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else { return };
-        let Some(session) = tab.session.clone() else { return };
+        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else {
+            return;
+        };
+        let Some(session) = tab.session.clone() else {
+            return;
+        };
         cx.spawn(async move |this, cx| {
             let Ok(task) = this.update(cx, |_, cx| {
                 gpui_tokio::Tokio::spawn(cx, async move { session.in_transaction().await })
             }) else {
                 return;
             };
-            let Ok(open) = flatten(task.await) else { return };
+            let Ok(open) = flatten(task.await) else {
+                return;
+            };
             this.update(cx, |this, cx| {
-                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return };
+                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else {
+                    return;
+                };
                 if tab.in_transaction != open {
                     tab.in_transaction = open;
                     // Nothing is open, so there is nothing for the count to
@@ -2388,7 +2525,9 @@ impl Shell {
     /// transaction the tab says it is not in. Commit or roll back first;
     /// the bar is right there.
     fn set_tx_mode(&mut self, mode: TxMode, cx: &mut Context<Self>) {
-        let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else { return };
+        let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else {
+            return;
+        };
         if tab.tx_mode == mode {
             return;
         }
@@ -2415,7 +2554,9 @@ impl Shell {
     /// boundary is refused rather than queued behind one. The user has ⌘.
     /// for that, and the bar says so.
     fn end_transaction(&mut self, how: TxEnd, cx: &mut Context<Self>) {
-        let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else { return };
+        let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else {
+            return;
+        };
         if !tab.in_transaction || tab.tx_ending {
             return;
         }
@@ -2444,7 +2585,9 @@ impl Shell {
             };
             let outcome = flatten(task.await);
             this.update(cx, |this, cx| {
-                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return };
+                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else {
+                    return;
+                };
                 tab.tx_ending = false;
                 tab.last_used = Instant::now();
                 match &outcome {
@@ -2497,8 +2640,12 @@ impl Shell {
     /// The generation is checked twice over, as every reply to this tab is:
     /// a slow answer must not land on the run after the one it describes.
     fn refresh_server_timing(&mut self, tab_id: u64, generation: u64, cx: &mut Context<Self>) {
-        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else { return };
-        let Some(session) = tab.session.clone() else { return };
+        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else {
+            return;
+        };
+        let Some(session) = tab.session.clone() else {
+            return;
+        };
         cx.spawn(async move |this, cx| {
             let Ok(task) = this.update(cx, |_, cx| {
                 gpui_tokio::Tokio::spawn(cx, async move { session.server_timing().await })
@@ -2508,9 +2655,13 @@ impl Shell {
             // Nothing to say is the ordinary answer here — no extension, or
             // a statement the server has not counted — and it is not worth
             // a word on screen. The client's own split stands.
-            let Ok(Some(server)) = flatten(task.await) else { return };
+            let Ok(Some(server)) = flatten(task.await) else {
+                return;
+            };
             this.update(cx, |this, cx| {
-                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return };
+                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else {
+                    return;
+                };
                 if tab.generation != generation {
                     return;
                 }
@@ -2586,7 +2737,11 @@ impl Shell {
     /// Focus the history tab, opening it if this session has none. One
     /// history tab is enough: it is a view of one file, not of a query.
     fn open_history(&mut self, cx: &mut Context<Self>) {
-        if let Some(ix) = self.tabs.iter().position(|tab| matches!(tab, Tab::History(_))) {
+        if let Some(ix) = self
+            .tabs
+            .iter()
+            .position(|tab| matches!(tab, Tab::History(_)))
+        {
             self.activate(ix, cx);
             let id = self.tabs[ix].id();
             self.load_history(id, cx);
@@ -2611,7 +2766,9 @@ impl Shell {
     /// database, not for a file next to the profiles.
     fn load_history(&mut self, tab_id: u64, cx: &mut Context<Self>) {
         let scope = self.scope.clone();
-        let Some(Tab::History(tab)) = self.tab_mut(tab_id) else { return };
+        let Some(Tab::History(tab)) = self.tab_mut(tab_id) else {
+            return;
+        };
         let filter = HistoryFilter {
             user_only: tab.user_only,
             errors_only: tab.errors_only,
@@ -2620,15 +2777,24 @@ impl Shell {
         };
 
         if self.store.is_none() {
-            let reason = self.store_error.clone().unwrap_or_else(|| "no history file".into());
+            let reason = self
+                .store_error
+                .clone()
+                .unwrap_or_else(|| "no history file".into());
             if let Some(Tab::History(tab)) = self.tab_mut(tab_id) {
                 tab.error = Some(reason);
             }
             cx.notify();
             return;
         }
-        let read = self.store.as_ref().expect("checked above").list_history(&scope, filter);
-        let Some(Tab::History(tab)) = self.tab_mut(tab_id) else { return };
+        let read = self
+            .store
+            .as_ref()
+            .expect("checked above")
+            .list_history(&scope, filter);
+        let Some(Tab::History(tab)) = self.tab_mut(tab_id) else {
+            return;
+        };
         match read {
             Ok(runs) => {
                 let rows = history::flatten(&runs, history::today());
@@ -2659,7 +2825,9 @@ impl Shell {
     }
 
     fn toggle_history_filter(&mut self, tab_id: u64, errors: bool, cx: &mut Context<Self>) {
-        let Some(Tab::History(tab)) = self.tab_mut(tab_id) else { return };
+        let Some(Tab::History(tab)) = self.tab_mut(tab_id) else {
+            return;
+        };
         if errors {
             tab.errors_only = !tab.errors_only;
         } else {
@@ -2689,8 +2857,7 @@ impl Shell {
         self.column_find = None;
         self.peek = None;
         let query = cx.new(|cx| {
-            TextField::new("Search tables and history…", cx)
-                .bare(palette::INPUT_FONT_SIZE)
+            TextField::new("Search tables and history…", cx).bare(palette::INPUT_FONT_SIZE)
         });
         let subscriptions = vec![cx.subscribe_in(&query, window, Self::on_palette_event)];
         window.focus(&query.focus_handle(cx), cx);
@@ -2698,7 +2865,11 @@ impl Shell {
         let runs = self
             .store
             .as_ref()
-            .and_then(|store| store.list_history(&self.scope, HistoryFilter::default()).ok())
+            .and_then(|store| {
+                store
+                    .list_history(&self.scope, HistoryFilter::default())
+                    .ok()
+            })
             .unwrap_or_default();
 
         self.palette = Some(Palette {
@@ -2737,11 +2908,19 @@ impl Shell {
             history::today(),
         );
 
-        let Some(palette) = &mut self.palette else { return };
-        palette.selected = found.rows.iter().position(|row| row.pick().is_some()).unwrap_or(0);
+        let Some(palette) = &mut self.palette else {
+            return;
+        };
+        palette.selected = found
+            .rows
+            .iter()
+            .position(|row| row.pick().is_some())
+            .unwrap_or(0);
         palette.rows = Rc::new(found.rows);
         palette.matches = found.matches;
-        palette.scroll.scroll_to_item(palette.selected, ScrollStrategy::Top);
+        palette
+            .scroll
+            .scroll_to_item(palette.selected, ScrollStrategy::Top);
         self.update_ghost(cx);
         cx.notify();
     }
@@ -2758,14 +2937,18 @@ impl Shell {
         let ghost = palette::completion(&palette.rows, palette.selected, needle)
             .map(|completed| palette::ghost(needle, &completed))
             .unwrap_or_default();
-        palette.query.update(cx, |field, cx| field.set_ghost(ghost, cx));
+        palette
+            .query
+            .update(cx, |field, cx| field.set_ghost(ghost, cx));
     }
 
     /// Take the selected row's real name into the search line, so the next
     /// thing typed narrows inside it. Reports whether there was anything
     /// to take.
     fn complete_palette(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(palette) = &self.palette else { return false };
+        let Some(palette) = &self.palette else {
+            return false;
+        };
         let typed = palette.query.read(cx).text().to_string();
         let (_, needle) = palette::parse(&typed, palette.chip);
         let Some(completed) = palette::completion(&palette.rows, palette.selected, needle) else {
@@ -2778,7 +2961,9 @@ impl Shell {
         // Setting the text emits `Changed`, which searches again, so the
         // list is already following the completed line by the time this
         // returns.
-        palette.query.update(cx, |field, cx| field.set_text(line, cx));
+        palette
+            .query
+            .update(cx, |field, cx| field.set_text(line, cx));
         true
     }
 
@@ -2786,11 +2971,19 @@ impl Shell {
     /// over the headings. It stops at the ends rather than wrapping: a
     /// list that jumps back to the top loses the reader's place.
     fn step_palette(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let Some(palette) = &mut self.palette else { return };
+        let Some(palette) = &mut self.palette else {
+            return;
+        };
         let mut ix = palette.selected;
         loop {
-            let next = if forward { ix + 1 } else { ix.checked_sub(1).unwrap_or(usize::MAX) };
-            let Some(row) = palette.rows.get(next) else { return };
+            let next = if forward {
+                ix + 1
+            } else {
+                ix.checked_sub(1).unwrap_or(usize::MAX)
+            };
+            let Some(row) = palette.rows.get(next) else {
+                return;
+            };
             ix = next;
             if row.pick().is_some() {
                 break;
@@ -2805,7 +2998,9 @@ impl Shell {
     }
 
     fn set_palette_scope(&mut self, chip: Scope, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(palette) = &mut self.palette else { return };
+        let Some(palette) = &mut self.palette else {
+            return;
+        };
         palette.chip = chip;
         // A chip is only meaningful while the line has the focus.
         let query = palette.query.clone();
@@ -2814,15 +3009,30 @@ impl Shell {
     }
 
     /// Open what the selection points at.
-    fn open_palette_selection(&mut self, new_tab: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_palette_selection(
+        &mut self,
+        new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(palette) = &self.palette else { return };
-        let Some(pick) = palette.rows.get(palette.selected).and_then(|row| row.pick()) else {
+        let Some(pick) = palette
+            .rows
+            .get(palette.selected)
+            .and_then(|row| row.pick())
+        else {
             return;
         };
         self.open_pick(pick, new_tab, window, cx);
     }
 
-    fn open_pick(&mut self, pick: Pick, new_tab: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_pick(
+        &mut self,
+        pick: Pick,
+        new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // The palette closes first, so the tab it opens is the thing that
         // holds the focus afterwards.
         self.close_palette(window, cx);
@@ -2859,7 +3069,10 @@ impl Shell {
                     return;
                 }
                 let Some(palette) = &self.palette else { return };
-                let here = Scope::ALL.iter().position(|scope| *scope == palette.chip).unwrap_or(0);
+                let here = Scope::ALL
+                    .iter()
+                    .position(|scope| *scope == palette.chip)
+                    .unwrap_or(0);
                 let next = Scope::ALL[(here + 1) % Scope::ALL.len()];
                 self.set_palette_scope(next, window, cx);
             }
@@ -2886,7 +3099,9 @@ impl Shell {
     }
 
     fn open_column_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(self.active).map(Tab::id) else { return };
+        let Some(tab) = self.tabs.get(self.active).map(Tab::id) else {
+            return;
+        };
         // A tab with no result has no column to jump to. Nothing is said
         // about it: the button is not there either.
         if self.result_columns().is_empty() {
@@ -2926,7 +3141,9 @@ impl Shell {
     /// Which lanes the typed line names, as indices into the result. Worked
     /// out rather than remembered — see [`ColumnFind`].
     fn column_matches(&self, cx: &App) -> Vec<usize> {
-        let Some(find) = &self.column_find else { return Vec::new() };
+        let Some(find) = &self.column_find else {
+            return Vec::new();
+        };
         find_columns(self.result_columns(), find.query.read(cx).text())
     }
 
@@ -2935,12 +3152,18 @@ impl Shell {
     /// top loses the reader's place.
     fn step_column_find(&mut self, forward: bool, cx: &mut Context<Self>) {
         let count = self.column_matches(cx).len();
-        let Some(find) = &mut self.column_find else { return };
+        let Some(find) = &mut self.column_find else {
+            return;
+        };
         if count == 0 {
             return;
         }
         let here = find.selected.min(count - 1);
-        let next = if forward { (here + 1).min(count - 1) } else { here.saturating_sub(1) };
+        let next = if forward {
+            (here + 1).min(count - 1)
+        } else {
+            here.saturating_sub(1)
+        };
         find.selected = next;
         find.scroll.scroll_to_item(next, ScrollStrategy::Nearest);
         cx.notify();
@@ -2949,8 +3172,12 @@ impl Shell {
     /// ⏎: jump to the row the list has selected.
     fn jump_to_selected_column(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let matches = self.column_matches(cx);
-        let Some(find) = &self.column_find else { return };
-        let Some(column) = matches.get(find.selected.min(matches.len().saturating_sub(1))).copied()
+        let Some(find) = &self.column_find else {
+            return;
+        };
+        let Some(column) = matches
+            .get(find.selected.min(matches.len().saturating_sub(1)))
+            .copied()
         else {
             return;
         };
@@ -2962,7 +3189,9 @@ impl Shell {
     /// not for a cell somewhere else in the result.
     fn jump_to_column(&mut self, column: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.column_find = None;
-        let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else { return };
+        let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else {
+            return;
+        };
         let extent = Extent::of(marked.data);
         // The result can have been replaced since the list was painted, so
         // the lane is checked against the result in hand rather than trusted.
@@ -3015,7 +3244,9 @@ impl Shell {
         if self.palette.is_some() || self.confirm.is_some() {
             return;
         }
-        let Some(tab) = self.tabs.get(self.active).map(Tab::id) else { return };
+        let Some(tab) = self.tabs.get(self.active).map(Tab::id) else {
+            return;
+        };
         self.column_find = None;
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
@@ -3027,7 +3258,13 @@ impl Shell {
         // element says the focus is already placed; the flag is reset on the
         // next input, so it costs nothing on the ⏎ path.
         window.prevent_default();
-        self.peek = Some(Peek { tab, cell, focus, selection: 0..0, anchor: None });
+        self.peek = Some(Peek {
+            tab,
+            cell,
+            focus,
+            selection: 0..0,
+            anchor: None,
+        });
         // Nothing worth showing means nothing shown: an out-of-range cell
         // is a cell the result no longer has.
         if self.peek_value().is_none() {
@@ -3040,7 +3277,11 @@ impl Shell {
 
     /// ⏎ from the grid: the cursor's own cell.
     fn peek_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(cell) = self.tabs.get(self.active).and_then(Tab::selection).and_then(Selection::cursor)
+        let Some(cell) = self
+            .tabs
+            .get(self.active)
+            .and_then(Tab::selection)
+            .and_then(Selection::cursor)
         else {
             return;
         };
@@ -3055,7 +3296,10 @@ impl Shell {
     /// page turn under an open card leaves behind.
     fn peek_value(&self) -> Option<(SharedString, usize, String)> {
         let peek = self.peek.as_ref()?;
-        let tab = self.tabs.get(self.active).filter(|tab| tab.id() == peek.tab)?;
+        let tab = self
+            .tabs
+            .get(self.active)
+            .filter(|tab| tab.id() == peek.tab)?;
         let (data, first_row) = match tab {
             // A table tab is a window on the table, so the row wears the
             // number its gutter gives it rather than its index in the page.
@@ -3065,7 +3309,11 @@ impl Shell {
         };
         let value = data.rows.get(peek.cell.row)?.get(peek.cell.column)?;
         let name = data.columns.get(peek.cell.column)?;
-        Some((name.clone().into(), first_row + peek.cell.row, value.display()))
+        Some((
+            name.clone().into(),
+            first_row + peek.cell.row,
+            value.display(),
+        ))
     }
 
     /// The text the card paints: the value, cut to `PEEK_CHARS`.
@@ -3082,8 +3330,12 @@ impl Shell {
     /// there, two mark the word under it, three the whole line — the
     /// three gestures every text view answers to.
     fn peek_press(&mut self, offset: usize, clicks: usize, cx: &mut Context<Self>) {
-        let Some(shown) = self.peek_shown() else { return };
-        let Some(peek) = self.peek.as_mut() else { return };
+        let Some(shown) = self.peek_shown() else {
+            return;
+        };
+        let Some(peek) = self.peek.as_mut() else {
+            return;
+        };
         peek.selection = match clicks {
             0 | 1 => {
                 let offset = clamp_to_boundary(&shown, offset);
@@ -3106,8 +3358,12 @@ impl Shell {
     /// the press to here, so a drag backwards marks the same text as a
     /// drag forwards over it.
     fn peek_drag(&mut self, offset: usize, cx: &mut Context<Self>) {
-        let Some(shown) = self.peek_shown() else { return };
-        let Some(peek) = self.peek.as_mut() else { return };
+        let Some(shown) = self.peek_shown() else {
+            return;
+        };
+        let Some(peek) = self.peek.as_mut() else {
+            return;
+        };
         let Some(anchor) = peek.anchor else { return };
         let offset = clamp_to_boundary(&shown, offset);
         peek.selection = anchor.min(offset)..anchor.max(offset);
@@ -3117,7 +3373,9 @@ impl Shell {
     /// The button came up, so the drag is over. What is marked stays
     /// marked: it is what ⌘C is about to copy.
     fn end_peek_drag(&mut self, cx: &mut Context<Self>) {
-        let Some(peek) = self.peek.as_mut() else { return };
+        let Some(peek) = self.peek.as_mut() else {
+            return;
+        };
         if peek.anchor.take().is_some() {
             // The surface is painted only while the anchor is set, so this
             // is what takes the window listeners and the I-beam cursor
@@ -3129,8 +3387,12 @@ impl Shell {
     /// ⌘A marks everything the card painted, which on a cut value is
     /// everything there is to mark — the rest was never on screen.
     fn select_all_peek(&mut self, cx: &mut Context<Self>) {
-        let Some(shown) = self.peek_shown() else { return };
-        let Some(peek) = self.peek.as_mut() else { return };
+        let Some(shown) = self.peek_shown() else {
+            return;
+        };
+        let Some(peek) = self.peek.as_mut() else {
+            return;
+        };
         peek.selection = 0..shown.len();
         cx.notify();
     }
@@ -3169,7 +3431,9 @@ impl Shell {
     /// own is not a row, so a URL with a comma in it must not come back
     /// wrapped in quotes it never had.
     fn copy_peek(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = self.peek_copy_text() else { return };
+        let Some(text) = self.peek_copy_text() else {
+            return;
+        };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
@@ -3232,7 +3496,12 @@ impl Shell {
         self.peek = None;
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
-        self.confirm = Some(Confirm { what, running, open, focus });
+        self.confirm = Some(Confirm {
+            what,
+            running,
+            open,
+            focus,
+        });
         cx.notify();
         false
     }
@@ -3267,7 +3536,9 @@ impl Shell {
     /// the session work closes it for good, because a session knows its
     /// backend from the moment it opens.
     pub(crate) fn cancel_runs(&mut self, what: Close, cx: &mut Context<Self>) -> Vec<StopTask> {
-        let Some(connection) = self.connection.clone() else { return Vec::new() };
+        let Some(connection) = self.connection.clone() else {
+            return Vec::new();
+        };
         let mut stops = Vec::new();
         for tab in self.tabs.iter_mut().filter(|tab| match what {
             Close::Tab(id) => tab.id() == id,
@@ -3345,7 +3616,9 @@ impl Shell {
                         stop.await.ok();
                     }
                     cx.update(|cx| {
-                        handle.update(cx, |_, window, _| window.remove_window()).ok();
+                        handle
+                            .update(cx, |_, window, _| window.remove_window())
+                            .ok();
                     });
                 })
                 .detach();
@@ -3361,7 +3634,10 @@ impl Shell {
         // this one was asked. Their agreement was to *this* quit, and this
         // quit is not happening; leaving them marked would let the next ⌘Q
         // end their runs without asking.
-        if let Some(Confirm { what: Close::Quit, .. }) = self.confirm {
+        if let Some(Confirm {
+            what: Close::Quit, ..
+        }) = self.confirm
+        {
             cx.emit(ShellEvent::QuitCancelled);
         }
         self.confirm = None;
@@ -3375,7 +3651,9 @@ impl Shell {
     /// active index counts tabs, not ids, so closing a tab to the left of
     /// the active one has to walk it back or the selection jumps.
     fn close_tab(&mut self, tab_id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ix) = self.tabs.iter().position(|tab| tab.id() == tab_id) else { return };
+        let Some(ix) = self.tabs.iter().position(|tab| tab.id() == tab_id) else {
+            return;
+        };
         let closed = self.tabs.remove(ix);
         // The tab's connection goes back to the pool, so it is rolled back
         // first: whatever acquires it next must not inherit a transaction
@@ -3427,7 +3705,9 @@ impl Shell {
     }
 
     fn step_page(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let Some(Tab::Table(tab)) = self.tabs.get(self.active) else { return };
+        let Some(Tab::Table(tab)) = self.tabs.get(self.active) else {
+            return;
+        };
         if tab.loading {
             return;
         }
@@ -3482,9 +3762,13 @@ impl Shell {
     /// with them — so a cursor that has walked off the edge of the pane is
     /// always brought back into view, whichever key moved it.
     fn step_cursor(&mut self, step: Step, extend: bool, cx: &mut Context<Self>) {
-        let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else { return };
+        let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else {
+            return;
+        };
         let extent = Extent::of(marked.data);
-        let Some(cell) = marked.selection.step(step, extend, extent) else { return };
+        let Some(cell) = marked.selection.step(step, extend, extent) else {
+            return;
+        };
         marked.scroll.reveal(cell, marked.data);
         cx.notify();
     }
@@ -3544,7 +3828,9 @@ impl Shell {
     }
 
     fn on_select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else { return };
+        let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else {
+            return;
+        };
         let extent = Extent::of(marked.data);
         marked.selection.select_all(extent);
         cx.notify();
@@ -3554,23 +3840,33 @@ impl Shell {
     /// copy that took 500 rows because the user pressed the key with an
     /// empty selection is a copy nobody asked for.
     fn on_copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else { return };
-        let Some(text) = clipboard_text(marked.data, marked.selection) else { return };
+        let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else {
+            return;
+        };
+        let Some(text) = clipboard_text(marked.data, marked.selection) else {
+            return;
+        };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     /// Space ticks the row the cursor is on, so a run of rows can be picked
     /// without the mouse: ↓ then space, down the result.
     fn on_toggle_pick(&mut self, _: &TogglePick, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else { return };
-        let Some(cursor) = marked.selection.cursor() else { return };
+        let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else {
+            return;
+        };
+        let Some(cursor) = marked.selection.cursor() else {
+            return;
+        };
         marked.selection.toggle_pick(cursor.row);
         cx.notify();
     }
 
     /// ⎋ drops what is marked.
     fn on_clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else { return };
+        let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else {
+            return;
+        };
         marked.selection.clear();
         cx.notify();
     }
@@ -3613,7 +3909,9 @@ impl Shell {
     }
 
     fn on_confirm_close(&mut self, _: &ConfirmClose, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(confirm) = self.confirm.take() else { return };
+        let Some(confirm) = self.confirm.take() else {
+            return;
+        };
         cx.notify();
         self.proceed_close(confirm.what, window, cx);
     }
@@ -3753,7 +4051,11 @@ fn step_wrapping(len: usize, from: usize, forward: bool) -> usize {
     if len == 0 {
         return 0;
     }
-    if forward { (from + 1) % len } else { (from + len - 1) % len }
+    if forward {
+        (from + 1) % len
+    } else {
+        (from + len - 1) % len
+    }
 }
 
 /// What a finished run is worth remembering by: the timing and the row
@@ -3901,7 +4203,11 @@ impl RunOutcome {
     /// The shell went away mid-run. Nothing will read this, and the pool
     /// it belonged to is going with it.
     fn abandoned() -> Self {
-        Self { session: None, result: Err("the workspace closed".to_string()), began: false }
+        Self {
+            session: None,
+            result: Err("the workspace closed".to_string()),
+            began: false,
+        }
     }
 }
 
@@ -3958,7 +4264,9 @@ fn run_statements(
                 let opening = this.update(cx, |_, cx| {
                     gpui_tokio::Tokio::spawn(cx, async move { connection.open_session().await })
                 });
-                let Ok(opening) = opening else { return RunOutcome::abandoned() };
+                let Ok(opening) = opening else {
+                    return RunOutcome::abandoned();
+                };
                 match flatten(opening.await) {
                     Ok(session) => session,
                     Err(error) => {
@@ -3968,7 +4276,11 @@ fn run_statements(
                             this.skip_statements(tab_id, generation, 0, cx)
                         })
                         .ok();
-                        return RunOutcome { session: None, result: Err(error), began: false };
+                        return RunOutcome {
+                            session: None,
+                            result: Err(error),
+                            began: false,
+                        };
                     }
                 }
             }
@@ -3981,7 +4293,9 @@ fn run_statements(
         // ends. Nothing was sent, so calling it off costs the server
         // nothing — which is why a stop in that window needs no waiting.
         let go = this.update(cx, |this, cx| {
-            let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return false };
+            let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else {
+                return false;
+            };
             if tab.generation != generation {
                 return false;
             }
@@ -3995,7 +4309,10 @@ fn run_statements(
         if !matches!(go, Ok(true)) {
             // Nothing was sent, so nothing was begun: a run called off in
             // this window costs the server nothing at all.
-            this.update(cx, |this, cx| this.skip_statements(tab_id, generation, 0, cx)).ok();
+            this.update(cx, |this, cx| {
+                this.skip_statements(tab_id, generation, 0, cx)
+            })
+            .ok();
             return RunOutcome {
                 session: Some(session),
                 result: Err(CALLED_OFF.to_string()),
@@ -4013,12 +4330,21 @@ fn run_statements(
                 let session = session.clone();
                 gpui_tokio::Tokio::spawn(cx, async move { session.begin().await })
             });
-            let Ok(opening) = opening else { return RunOutcome::abandoned() };
+            let Ok(opening) = opening else {
+                return RunOutcome::abandoned();
+            };
             if let Err(error) = flatten(opening.await) {
                 // The transaction never opened, so none of the statements
                 // behind it were sent either.
-                this.update(cx, |this, cx| this.skip_statements(tab_id, generation, 0, cx)).ok();
-                return RunOutcome { session: Some(session), result: Err(error), began: false };
+                this.update(cx, |this, cx| {
+                    this.skip_statements(tab_id, generation, 0, cx)
+                })
+                .ok();
+                return RunOutcome {
+                    session: Some(session),
+                    result: Err(error),
+                    began: false,
+                };
             }
             began = true;
         }
@@ -4033,7 +4359,9 @@ fn run_statements(
         let mut tally = Tally::default();
         for (ix, statement) in statements.iter().enumerate() {
             let go = this.update(cx, |this, cx| {
-                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return false };
+                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else {
+                    return false;
+                };
                 if tab.generation != generation {
                     return false;
                 }
@@ -4063,7 +4391,9 @@ fn run_statements(
                 let sql = statement.clone();
                 gpui_tokio::Tokio::spawn(cx, async move { session.execute(&sql).await })
             });
-            let Ok(running) = running else { return RunOutcome::abandoned() };
+            let Ok(running) = running else {
+                return RunOutcome::abandoned();
+            };
             match flatten(running.await) {
                 Ok(result) => {
                     tally.add(statement, result);
@@ -4102,12 +4432,20 @@ fn run_statements(
                         }
                     })
                     .ok();
-                    return RunOutcome { session: Some(session), result: Err(error), began };
+                    return RunOutcome {
+                        session: Some(session),
+                        result: Err(error),
+                        began,
+                    };
                 }
             }
         }
 
-        RunOutcome { session: Some(session), result: Ok(tally.finish(started)), began }
+        RunOutcome {
+            session: Some(session),
+            result: Ok(tally.finish(started)),
+            began,
+        }
     })
 }
 
@@ -4293,7 +4631,11 @@ impl Render for Shell {
         // box, so a border on `root` would shove `frame_overlay` inward
         // by the ring's own width. `root` still rounds its background,
         // which keeps the corners outside the ring dark under the mask.
-        let radius = if window.is_fullscreen() { px(0.) } else { px(window_corner_radius()) };
+        let radius = if window.is_fullscreen() {
+            px(0.)
+        } else {
+            px(window_corner_radius())
+        };
         let inner_radius = (radius - px(RING_WIDTH)).max(px(0.));
         let mut content = div()
             .size_full()
@@ -4332,7 +4674,10 @@ impl Render for Shell {
 
         let mut framed = div().size_full().flex().flex_col().child(content);
         if let Some(env) = self.env {
-            framed = framed.border_3().border_color(env.ring(&colors)).rounded_b(radius);
+            framed = framed
+                .border_3()
+                .border_color(env.ring(&colors))
+                .rounded_b(radius);
         }
 
         let mut root = div()
@@ -4562,7 +4907,11 @@ impl Shell {
     /// The same fact in a word, for the lines that carry it as text: the
     /// sidebar's foot and the query toolbar.
     fn mode_word(&self) -> &'static str {
-        if self.read_only { "read-only" } else { "read-write" }
+        if self.read_only {
+            "read-only"
+        } else {
+            "read-write"
+        }
     }
 
     /// What to call this session on screen. The profile's name first, then
@@ -4601,7 +4950,12 @@ impl Shell {
     /// divider back where the comp drew it. The reset also ends any drag
     /// the first click of the pair began, or the pane would chase the
     /// pointer away from the default it was just given.
-    fn on_divider_down(&mut self, divider: Divider, event: &MouseDownEvent, cx: &mut Context<Self>) {
+    fn on_divider_down(
+        &mut self,
+        divider: Divider,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
         if event.click_count > 1 {
             self.pane_drag = None;
             self.set_pane_size(divider, divider.default_size(), cx);
@@ -4613,7 +4967,11 @@ impl Shell {
             Divider::Sidebar => f32::from(event.position.x),
             Divider::Editor => f32::from(event.position.y),
         };
-        self.pane_drag = Some(PaneDrag { divider, anchor, start: self.pane_size(divider) });
+        self.pane_drag = Some(PaneDrag {
+            divider,
+            anchor,
+            start: self.pane_size(divider),
+        });
         cx.notify();
     }
 
@@ -4629,7 +4987,11 @@ impl Shell {
             Divider::Editor => f32::from(position.y),
         };
         let (min, max) = drag.divider.range(viewport);
-        self.set_pane_size(drag.divider, dragged_size(drag.start, drag.anchor, at, min, max), cx);
+        self.set_pane_size(
+            drag.divider,
+            dragged_size(drag.start, drag.anchor, at, min, max),
+            cx,
+        );
     }
 
     /// The button coming up anywhere ends the drag, and only then is the
@@ -4637,7 +4999,9 @@ impl Shell {
     /// mouse-move frame would still be a write per frame for nothing —
     /// the size on screen is already the truth for the whole drag.
     fn end_pane_drag(&mut self, cx: &mut Context<Self>) {
-        let Some(drag) = self.pane_drag.take() else { return };
+        let Some(drag) = self.pane_drag.take() else {
+            return;
+        };
         self.remember_pane_size(drag.divider);
         cx.notify();
     }
@@ -4821,38 +5185,42 @@ impl Shell {
             .border_color(colors.border)
             .bg(colors.panel)
             .child(
-                div().p(px(12.)).border_b_1().border_color(colors.hairline).child(
-                    card(cx)
-                        .flex()
-                        .items_center()
-                        .gap(px(9.))
-                        .px(px(8.))
-                        .py(px(7.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.))
-                                .child(
-                                    div()
-                                        .text_size(px(12.))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(colors.text)
-                                        .truncate()
-                                        .child(self.session_name()),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(10.))
-                                        .text_color(colors.text_muted)
-                                        .truncate()
-                                        .child(host),
-                                ),
-                        )
-                        .child(status_dot(dot)),
-                ),
+                div()
+                    .p(px(12.))
+                    .border_b_1()
+                    .border_color(colors.hairline)
+                    .child(
+                        card(cx)
+                            .flex()
+                            .items_center()
+                            .gap(px(9.))
+                            .px(px(8.))
+                            .py(px(7.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(colors.text)
+                                            .truncate()
+                                            .child(self.session_name()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(colors.text_muted)
+                                            .truncate()
+                                            .child(host),
+                                    ),
+                            )
+                            .child(status_dot(dot)),
+                    ),
             )
             .child(self.catalog_filter_row(colors, cx))
             .child(self.catalog_list(colors, cx))
@@ -4888,9 +5256,17 @@ impl Shell {
                             // comp puts it, and in the mark's own ink: the
                             // sidebar is where a session is read, and it
                             // must not have to be read against the top bar.
-                            .child(div().text_color(self.mode_ink(colors)).child(self.mode_word())),
+                            .child(
+                                div()
+                                    .text_color(self.mode_ink(colors))
+                                    .child(self.mode_word()),
+                            ),
                     )
-                    .child(div().text_color(colors.text_faint).child(self.table_total())),
+                    .child(
+                        div()
+                            .text_color(colors.text_faint)
+                            .child(self.table_total()),
+                    ),
             )
     }
 
@@ -4933,7 +5309,12 @@ impl Shell {
                             .text_color(colors.text_faint)
                             .child("⌕"),
                     )
-                    .child(div().flex_1().min_w(px(0.)).child(self.catalog_filter.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(self.catalog_filter.clone()),
+                    )
                     // ⌘E reaches this line from anywhere, and a gesture
                     // nothing on screen names is a gesture nobody finds.
                     // It gives way to the clear mark, which is about the
@@ -4995,9 +5376,10 @@ impl Shell {
         // The row the active tab came from, whichever kind of tab that is:
         // a query tab opened from the sidebar marks its row too.
         let active = match self.tabs.get(self.active) {
-            Some(Tab::Table(tab)) => {
-                Some((SharedString::from(tab.schema.clone()), SharedString::from(tab.table.clone())))
-            }
+            Some(Tab::Table(tab)) => Some((
+                SharedString::from(tab.schema.clone()),
+                SharedString::from(tab.table.clone()),
+            )),
             Some(Tab::Query(tab)) => tab
                 .relation
                 .as_ref()
@@ -5008,32 +5390,31 @@ impl Shell {
         let cursor = self.catalog_selected;
         let shell = cx.entity().downgrade();
 
-        let mut list = uniform_list(
-            "catalog",
-            rows.len(),
-            move |range, _window, cx| {
-                let colors = theme(cx).colors.clone();
-                range
-                    .map(|ix| {
-                        catalog_row(
-                            ix,
-                            &rows[ix],
-                            active.as_ref(),
-                            cursor == Some(ix),
-                            &shell,
-                            &colors,
-                            cx,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            },
-        );
+        let mut list = uniform_list("catalog", rows.len(), move |range, _window, cx| {
+            let colors = theme(cx).colors.clone();
+            range
+                .map(|ix| {
+                    catalog_row(
+                        ix,
+                        &rows[ix],
+                        active.as_ref(),
+                        cursor == Some(ix),
+                        &shell,
+                        &colors,
+                        cx,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
         // `UniformList` carries an `Interactivity` but not
         // `StatefulInteractiveElement`, so the flag that
         // `restrict_scroll_to_axis()` would set is set by hand, as the
         // results grid does.
         list.style().restrict_scroll_to_axis = Some(true);
-        let list = list.track_scroll(&self.catalog_scroll).size_full().px(px(8.));
+        let list = list
+            .track_scroll(&self.catalog_scroll)
+            .size_full()
+            .px(px(8.));
 
         // The bar sits outside the scrolling list, or it would scroll away
         // with it. `uniform_list` keeps a plain handle inside its own, and
@@ -5110,9 +5491,16 @@ impl Shell {
                     }
                     // Views and query results are both "not a table": the
                     // sidebar marks them with a ring, so tabs match.
-                    _ => div().size(px(5.)).flex_none().rounded_full().border_1().border_color(
-                        if is_active { colors.accent } else { colors.text_faint },
-                    ),
+                    _ => div()
+                        .size(px(5.))
+                        .flex_none()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(if is_active {
+                            colors.accent
+                        } else {
+                            colors.text_faint
+                        }),
                 })
                 .child(
                     // The title is what gives way when the tab is at its
@@ -5122,8 +5510,16 @@ impl Shell {
                         .flex_1()
                         .min_w(px(0.))
                         .text_size(px(11.))
-                        .font_weight(if is_active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
-                        .text_color(if is_active { colors.text } else { colors.text_muted })
+                        .font_weight(if is_active {
+                            FontWeight::MEDIUM
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .text_color(if is_active {
+                            colors.text
+                        } else {
+                            colors.text_muted
+                        })
                         .truncate()
                         .child(tab.title()),
                 )
@@ -5202,14 +5598,19 @@ impl Shell {
     /// is what made a working `UPDATE` look like a failure. The same shape
     /// showed on a tab that had run nothing at all.
     fn result_body(&self, tab_id: u64, colors: &ThemeColors, cx: &Context<Self>) -> Div {
-        let Some(tab) = self.tabs.iter().find(|tab| tab.id() == tab_id) else { return div() };
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id() == tab_id) else {
+            return div();
+        };
         let columns = match tab {
             Tab::Table(tab) => tab.data.columns.len(),
             Tab::Query(tab) => tab.data.columns.len(),
             Tab::History(_) => 0,
         };
         if columns == 0 {
-            return div().flex_1().min_h(px(0.)).children(no_result_note(tab, colors));
+            return div()
+                .flex_1()
+                .min_h(px(0.))
+                .children(no_result_note(tab, colors));
         }
         let (data, selection, scroll, first_row) = match tab {
             Tab::Table(tab) => (
@@ -5258,7 +5659,9 @@ impl Shell {
                 if !dragging {
                     this.column_find = None;
                 }
-                let Some(tab) = this.tab_mut(tab_id) else { return };
+                let Some(tab) = this.tab_mut(tab_id) else {
+                    return;
+                };
                 let Some(marked) = tab.marked() else { return };
                 let extent = Extent::of(marked.data);
                 let mut asked_to_peek = None;
@@ -5344,7 +5747,10 @@ impl Shell {
                     .child(format!("{rows} · {columns} columns")),
             )
             .children(tab.loading.then(|| {
-                div().text_size(px(11.)).text_color(colors.accent).child("loading…")
+                div()
+                    .text_size(px(11.))
+                    .text_color(colors.accent)
+                    .child("loading…")
             }))
             .child(div().flex_1())
             .children(self.column_find_control(colors, cx))
@@ -5480,7 +5886,12 @@ impl Shell {
                     .child(div().flex_1().min_w(px(0.)).child(find.query.clone()))
                     // How much of the result is left, so a search that has
                     // narrowed to one column says so without counting rows.
-                    .child(div().text_size(px(10.)).text_color(colors.text_faint).child(count)),
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(colors.text_faint)
+                            .child(count),
+                    ),
             )
             .child(self.column_find_list(find, &matches, colors, cx))
             .child(
@@ -5524,7 +5935,10 @@ impl Shell {
 
         let columns = self.result_columns();
         let rows: Rc<Vec<(usize, SharedString)>> = Rc::new(
-            matches.iter().map(|&ix| (ix, columns[ix].clone().into())).collect(),
+            matches
+                .iter()
+                .map(|&ix| (ix, columns[ix].clone().into()))
+                .collect(),
         );
         // Which lane the cursor is in, so the list can say so: the user is
         // being shown where they are as well as where they could go.
@@ -5648,9 +6062,17 @@ impl Shell {
             .gap(px(3.))
             .p(px(3.))
             .border_1()
-            .border_color(if manual { colors.running_border } else { colors.border_strong })
+            .border_color(if manual {
+                colors.running_border
+            } else {
+                colors.border_strong
+            })
             .rounded(px(6.))
-            .bg(if manual { colors.running_surface } else { colors.panel })
+            .bg(if manual {
+                colors.running_surface
+            } else {
+                colors.panel
+            })
             .child(
                 div()
                     .px(px(4.))
@@ -6089,8 +6511,10 @@ impl Shell {
                 // line has to say both: the grid below shows the query's
                 // rows and says nothing whatever about the rows the update
                 // wrote.
-                let changed =
-                    tab.changed.map(|c| format!("{} · ", changed_copy(c))).unwrap_or_default();
+                let changed = tab
+                    .changed
+                    .map(|c| format!("{} · ", changed_copy(c)))
+                    .unwrap_or_default();
                 (
                     "RESULT",
                     format!(
@@ -6101,7 +6525,9 @@ impl Shell {
                         // server and lag lives on the status strip, which
                         // is already the line about what is on screen —
                         // saying it twice would crowd both.
-                        tab.timing.map(|t| format_millis(t.total_ms)).unwrap_or_default()
+                        tab.timing
+                            .map(|t| format_millis(t.total_ms))
+                            .unwrap_or_default()
                     ),
                     colors.text_muted,
                 )
@@ -6120,7 +6546,9 @@ impl Shell {
                     "DONE",
                     format!(
                         "{statements}{changed} · {}",
-                        tab.timing.map(|t| format_millis(t.total_ms)).unwrap_or_default()
+                        tab.timing
+                            .map(|t| format_millis(t.total_ms))
+                            .unwrap_or_default()
                     ),
                     colors.text_muted,
                 )
@@ -6178,11 +6606,7 @@ impl Shell {
                                 .text_size(px(11.))
                                 .text_color(colors.text_muted)
                                 .truncate()
-                                .child(format!(
-                                    "{} · {}",
-                                    self.session_name(),
-                                    self.mode_word()
-                                )),
+                                .child(format!("{} · {}", self.session_name(), self.mode_word())),
                         )
                         .children(session_mark(tab, colors))
                         // With several statements in the buffer, say which
@@ -6236,7 +6660,12 @@ impl Shell {
                 .bg(colors.panel)
                 .text_size(px(10.))
                 .text_color(ink)
-                .child(div().font_weight(FontWeight::SEMIBOLD).text_color(ink).child(label))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ink)
+                        .child(label),
+                )
                 .child(summary)
                 .children(cap_note(tab, colors))
                 .child(div().flex_1())
@@ -6280,7 +6709,10 @@ impl Shell {
                     div()
                         .text_size(px(11.))
                         .text_color(colors.text_muted)
-                        .child(format!("{} · last {HISTORY_DAYS} days", self.session_name())),
+                        .child(format!(
+                            "{} · last {HISTORY_DAYS} days",
+                            self.session_name()
+                        )),
                 )
                 .child(div().flex_1())
                 .child(
@@ -6379,7 +6811,11 @@ impl Shell {
                 div()
                     .max_w(px(560.))
                     .text_size(px(11.))
-                    .text_color(if failed { colors.error } else { colors.text_muted })
+                    .text_color(if failed {
+                        colors.error
+                    } else {
+                        colors.text_muted
+                    })
                     .child(detail),
             )
     }
@@ -6453,12 +6889,8 @@ impl Shell {
             .text_color(colors.text_muted)
             .child(range)
             .children(paging.then(|| divider()))
-            .children(paging.then(|| {
-                self.page_link("prev", false, colors, cx)
-            }))
-            .children(paging.then(|| {
-                self.page_link("next", true, colors, cx)
-            }))
+            .children(paging.then(|| self.page_link("prev", false, colors, cx)))
+            .children(paging.then(|| self.page_link("next", true, colors, cx)))
             .children(marks.as_ref().map(|_| divider()))
             .children(marks.map(|marks| div().text_color(colors.accent_deep).child(marks)))
             // The keys the result answers to, as the comp's own footer lists
@@ -6498,8 +6930,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<Stateful<Div>> {
         let confirm = self.confirm.as_ref()?;
-        let (title, body, keep, act) =
-            confirm_copy(confirm.what, &confirm.running, &confirm.open);
+        let (title, body, keep, act) = confirm_copy(confirm.what, &confirm.running, &confirm.open);
         // Every tab the close would touch, named once even when it is in
         // both lists.
         let mut named: Vec<String> = Vec::new();
@@ -6553,7 +6984,10 @@ impl Shell {
                                 .child(title),
                         )
                         .children(body.into_iter().map(|line| {
-                            div().text_size(px(11.)).text_color(colors.text_secondary).child(line)
+                            div()
+                                .text_size(px(11.))
+                                .text_color(colors.text_secondary)
+                                .child(line)
                         }))
                         // With more than one tab at stake, name them: the
                         // user is about to end work they cannot see from
@@ -6613,7 +7047,9 @@ impl Shell {
                                         .text_color(colors.window)
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _event, window, cx| {
-                                            let Some(confirm) = this.confirm.take() else { return };
+                                            let Some(confirm) = this.confirm.take() else {
+                                                return;
+                                            };
                                             cx.notify();
                                             this.proceed_close(confirm.what, window, cx);
                                         }))
@@ -6857,7 +7293,12 @@ impl Shell {
         )
     }
 
-    fn palette_header(&self, palette: &Palette, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
+    fn palette_header(
+        &self,
+        palette: &Palette,
+        colors: &ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> Div {
         div()
             .flex_none()
             .flex()
@@ -6874,13 +7315,18 @@ impl Shell {
                     .id("close-palette")
                     .cursor_pointer()
                     .hover(|s| s.text_color(colors.accent))
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        this.close_palette(window, cx)
-                    })),
+                    .on_click(
+                        cx.listener(|this, _event, window, cx| this.close_palette(window, cx)),
+                    ),
             )
     }
 
-    fn palette_chips(&self, palette: &Palette, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
+    fn palette_chips(
+        &self,
+        palette: &Palette,
+        colors: &ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> Div {
         // The chip that is lit is the one the search is actually running
         // in, so a typed `t:` lights the tables chip too.
         let (scope, _) = palette::parse(palette.query.read(cx).text(), palette.chip);
@@ -7015,10 +7461,24 @@ impl Shell {
 #[derive(Clone)]
 enum CatalogRow {
     /// A schema, and how many relations it holds.
-    Schema { key: SharedString, label: SharedString, count: usize, open: bool },
+    Schema {
+        key: SharedString,
+        label: SharedString,
+        count: usize,
+        open: bool,
+    },
     /// `TABLES` or `VIEWS` inside the schema above it.
-    Section { key: SharedString, label: SharedString, count: usize, open: bool },
-    Relation { schema: SharedString, name: SharedString, kind: TableKind },
+    Section {
+        key: SharedString,
+        label: SharedString,
+        count: usize,
+        open: bool,
+    },
+    Relation {
+        schema: SharedString,
+        name: SharedString,
+        kind: TableKind,
+    },
 }
 
 /// One schema of the sidebar tree, with its relations split into the two
@@ -7230,11 +7690,18 @@ fn catalog_row(
     match row {
         // The two header levels differ in where they sit and how loud
         // they read; the chevron, the count and the click are the same.
-        CatalogRow::Schema { key, label, count, open } => {
+        CatalogRow::Schema {
+            key,
+            label,
+            count,
+            open,
+        } => {
             let (key, shell) = (key.clone(), shell.clone());
             header_row(ix, "schema", 6., *open, colors)
                 .on_click(move |_event, _window, cx| {
-                    shell.update(cx, |shell, cx| shell.toggle_schema(key.clone(), cx)).ok();
+                    shell
+                        .update(cx, |shell, cx| shell.toggle_schema(key.clone(), cx))
+                        .ok();
                 })
                 .child(
                     div()
@@ -7249,13 +7716,25 @@ fn catalog_row(
                 .child(count_label(*count, colors))
                 .into_any_element()
         }
-        CatalogRow::Section { key, label, count, open } => {
+        CatalogRow::Section {
+            key,
+            label,
+            count,
+            open,
+        } => {
             let (key, shell) = (key.clone(), shell.clone());
             header_row(ix, "section", 19., *open, colors)
                 .on_click(move |_event, _window, cx| {
-                    shell.update(cx, |shell, cx| shell.toggle_section(key.clone(), cx)).ok();
+                    shell
+                        .update(cx, |shell, cx| shell.toggle_section(key.clone(), cx))
+                        .ok();
                 })
-                .child(div().flex_1().min_w(px(0.)).child(section_label(label.clone(), cx)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .child(section_label(label.clone(), cx)),
+                )
                 .child(count_label(*count, colors))
                 .into_any_element()
         }
@@ -7268,43 +7747,56 @@ fn catalog_row(
             let shell = shell.clone();
             let (schema_name, table_name) = (schema.to_string(), name.to_string());
 
-            let item = div()
-                .id(ElementId::NamedInteger("relation".into(), ix as u64))
-                .h(px(CATALOG_ROW_HEIGHT))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                // Indented under its section's chevron, so the schema and
-                // the section a relation sits in read off the left edge.
-                .pl(px(32.))
-                .pr(px(8.))
-                .rounded(px(5.))
-                .cursor_pointer()
-                .on_click(move |_event, window, cx| {
-                    shell
-                        .update(cx, |shell, cx| {
-                            shell.browse_table(&schema_name, &table_name, window, cx)
-                        })
-                        .ok();
-                })
-                .child(match kind {
-                    TableKind::Table => table_glyph(lit, cx),
-                    TableKind::View => div()
-                        .size(px(5.))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(if lit { colors.accent } else { colors.text_faint }),
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .text_size(px(12.))
-                        .font_weight(if lit { FontWeight::MEDIUM } else { FontWeight::NORMAL })
-                        .text_color(if lit { colors.text } else { colors.text_secondary })
-                        .truncate()
-                        .child(name.clone()),
-                );
+            let item =
+                div()
+                    .id(ElementId::NamedInteger("relation".into(), ix as u64))
+                    .h(px(CATALOG_ROW_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    // Indented under its section's chevron, so the schema and
+                    // the section a relation sits in read off the left edge.
+                    .pl(px(32.))
+                    .pr(px(8.))
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .on_click(move |_event, window, cx| {
+                        shell
+                            .update(cx, |shell, cx| {
+                                shell.browse_table(&schema_name, &table_name, window, cx)
+                            })
+                            .ok();
+                    })
+                    .child(match kind {
+                        TableKind::Table => table_glyph(lit, cx),
+                        TableKind::View => div()
+                            .size(px(5.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(if lit {
+                                colors.accent
+                            } else {
+                                colors.text_faint
+                            }),
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_size(px(12.))
+                            .font_weight(if lit {
+                                FontWeight::MEDIUM
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(if lit {
+                                colors.text
+                            } else {
+                                colors.text_secondary
+                            })
+                            .truncate()
+                            .child(name.clone()),
+                    );
 
             match (cursor, is_active) {
                 // The cursor's mark is the deeper of the two, and it has
@@ -7374,11 +7866,21 @@ fn column_row(
                 .flex_1()
                 .min_w(px(0.))
                 .text_size(px(11.))
-                .text_color(if selected { colors.text } else { colors.text_secondary })
+                .text_color(if selected {
+                    colors.text
+                } else {
+                    colors.text_secondary
+                })
                 .truncate()
                 .child(name.clone()),
         )
-        .child(div().flex_none().text_size(px(10.)).text_color(mark_ink).child(mark));
+        .child(
+            div()
+                .flex_none()
+                .text_size(px(10.))
+                .text_color(mark_ink)
+                .child(mark),
+        );
     row = if selected {
         row.bg(colors.selection)
     } else {
@@ -7419,7 +7921,9 @@ fn column_row(
 /// position off the end of a line, naming the nearest offset — which is
 /// the one a drag reaching past the text is asking for.
 fn offset_at(layout: &TextLayout, position: Point<Pixels>) -> usize {
-    layout.index_for_position(position).unwrap_or_else(|offset| offset)
+    layout
+        .index_for_position(position)
+        .unwrap_or_else(|offset| offset)
 }
 
 fn clamp_to_boundary(text: &str, offset: usize) -> usize {
@@ -7465,7 +7969,9 @@ fn word_at(text: &str, offset: usize) -> Range<usize> {
 fn line_at(text: &str, offset: usize) -> Range<usize> {
     let offset = clamp_to_boundary(text, offset);
     let start = text[..offset].rfind('\n').map_or(0, |ix| ix + 1);
-    let end = text[offset..].find('\n').map_or(text.len(), |ix| offset + ix);
+    let end = text[offset..]
+        .find('\n')
+        .map_or(text.len(), |ix| offset + ix);
     start..end
 }
 
@@ -7514,18 +8020,34 @@ fn confirm_copy(what: Close, running: &[SharedString], open: &[SharedString]) ->
         Close::Tab(_) => {
             let named = running.first().or_else(|| open.first());
             let first = named.map(|name| name.to_string()).unwrap_or_default();
-            (format!("Close “{first}”?"), "Closing the tab", "Keep tab", "Close it")
+            (
+                format!("Close “{first}”?"),
+                "Closing the tab",
+                "Keep tab",
+                "Close it",
+            )
         }
-        Close::Shell => {
-            ("Leave this connection?".to_string(), "Leaving", "Stay", "Leave anyway")
-        }
+        Close::Shell => (
+            "Leave this connection?".to_string(),
+            "Leaving",
+            "Stay",
+            "Leave anyway",
+        ),
         // Two windows, two questions. Closing one window ends what that
         // window is doing; ⌘Q ends every window's, so it is the one that
         // says "quit".
-        Close::Window => {
-            ("Close this window?".to_string(), "Closing the window", "Stay", "Close anyway")
-        }
-        Close::Quit => ("Quit Meerkat?".to_string(), "Quitting", "Stay", "Quit anyway"),
+        Close::Window => (
+            "Close this window?".to_string(),
+            "Closing the window",
+            "Stay",
+            "Close anyway",
+        ),
+        Close::Quit => (
+            "Quit Meerkat?".to_string(),
+            "Quitting",
+            "Stay",
+            "Quit anyway",
+        ),
     };
 
     // One line per thing at stake, because they are lost in different
@@ -7552,9 +8074,15 @@ fn confirm_copy(what: Close, running: &[SharedString], open: &[SharedString]) ->
         // costs nothing but the transaction itself. Saying the work is
         // lost would be a warning the app cannot always stand behind.
         body.push(if open.len() == 1 {
-            format!("“{}” has a transaction open. {verb} rolls it back.", open[0])
+            format!(
+                "“{}” has a transaction open. {verb} rolls it back.",
+                open[0]
+            )
         } else {
-            format!("{} tabs have transactions open. {verb} rolls them back.", open.len())
+            format!(
+                "{} tabs have transactions open. {verb} rolls them back.",
+                open.len()
+            )
         });
     }
     (title, body, keep, act)
@@ -7601,7 +8129,11 @@ fn idle_sessions(states: &[SessionState], after: Duration) -> Vec<u64> {
 /// the caller must refuse rather than pick a session that is holding
 /// something.
 fn evictable(states: &[SessionState]) -> Option<u64> {
-    states.iter().filter(|state| spare(state)).max_by_key(|state| state.idle).map(|s| s.tab_id)
+    states
+        .iter()
+        .filter(|state| spare(state))
+        .max_by_key(|state| state.idle)
+        .map(|s| s.tab_id)
 }
 
 /// Whether a run has to open a transaction before it sends anything.
@@ -7775,7 +8307,10 @@ fn mark_for(
         None => 0..text.len(),
     };
     let range = statement.start + span.start..statement.start + span.end;
-    (!range.is_empty()).then(|| Diagnostic { range, message: error.message.clone() })
+    (!range.is_empty()).then(|| Diagnostic {
+        range,
+        message: error.message.clone(),
+    })
 }
 
 /// Reach a syntax error's mark back over the word the parser had just
@@ -7809,7 +8344,9 @@ fn reach_back(
     if refusal != Refusal::Syntax {
         return span;
     }
-    let Some(before) = query::word_before(text, span.start) else { return span };
+    let Some(before) = query::word_before(text, span.start) else {
+        return span;
+    };
     let word = &text[before.clone()];
     if query::is_keyword(word) || vocabulary.contains(word) {
         return span;
@@ -7877,7 +8414,10 @@ fn tx_copy(state: TxState) -> Option<(&'static str, String)> {
             1 => " · 1 row touched".to_string(),
             n => format!(" · {} rows touched", format_count(n)),
         };
-        return Some((title, format!("{held}{touched} · nothing visible to anyone else yet")));
+        return Some((
+            title,
+            format!("{held}{touched} · nothing visible to anyone else yet"),
+        ));
     }
     match state.done? {
         // What happens *next* differs by mode, and the line has to be
@@ -7893,9 +8433,10 @@ fn tx_copy(state: TxState) -> Option<(&'static str, String)> {
                 }
             },
         )),
-        TxEnd::Rollback => {
-            Some(("rolled back", "all changes discarded · nothing was written".to_string()))
-        }
+        TxEnd::Rollback => Some((
+            "rolled back",
+            "all changes discarded · nothing was written".to_string(),
+        )),
     }
 }
 
@@ -7989,7 +8530,13 @@ fn syntax_strip(tab: &QueryTab, colors: &ThemeColors, cx: &App) -> Option<Div> {
             .bg(colors.panel)
             .text_size(px(11.))
             .text_color(colors.error)
-            .child(div().flex_1().min_w(px(0.)).truncate().child(diagnostic.message.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .child(diagnostic.message.clone()),
+            )
             .children((found.len() > 1).then(|| {
                 div()
                     .flex_none()
@@ -8024,9 +8571,13 @@ fn error_strip(message: String, colors: &ThemeColors) -> Div {
 
 /// Never paint a password, not even in the "could not connect" card.
 fn redact(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else { return url.to_string() };
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
     let (scheme, rest) = url.split_at(scheme_end + 3);
-    let Some(at) = rest.find('@') else { return url.to_string() };
+    let Some(at) = rest.find('@') else {
+        return url.to_string();
+    };
     let (credentials, host) = rest.split_at(at);
     match credentials.split_once(':') {
         Some((user, _)) => format!("{scheme}{user}:•••{host}"),
@@ -8201,8 +8752,14 @@ mod tests {
     #[test]
     fn the_strip_speaks_for_the_mark_the_caret_is_in() {
         let marks = [
-            Diagnostic { range: 4..8, message: "first".to_string() },
-            Diagnostic { range: 20..24, message: "second".to_string() },
+            Diagnostic {
+                range: 4..8,
+                message: "first".to_string(),
+            },
+            Diagnostic {
+                range: 20..24,
+                message: "second".to_string(),
+            },
         ];
         assert_eq!(spoken_for(&marks, 22), 1);
         // The caret at the very end of a mark is still in it: that is
@@ -8252,7 +8809,10 @@ mod tests {
     /// button still says "run".
     #[test]
     fn the_button_offers_a_stop_only_once_a_run_has_lasted() {
-        let ago = |ago: Duration| Live { started: Instant::now() - ago, backend: None };
+        let ago = |ago: Duration| Live {
+            started: Instant::now() - ago,
+            backend: None,
+        };
         assert_eq!(Run::Idle.phase(), RunPhase::Ready);
         assert_eq!(Run::Cancelled { elapsed: 120 }.phase(), RunPhase::Ready);
         // A statement that answers inside the window never swaps the verb,
@@ -8293,13 +8853,31 @@ mod tests {
     /// ceiling falls below its floor on a tiny window.
     #[test]
     fn the_divider_rails_follow_the_window() {
-        let viewport = |w: f32, h: f32| gpui::Size { width: px(w), height: px(h) };
-        assert_eq!(Divider::Sidebar.range(viewport(1400., 900.)), (SIDEBAR_MIN, SIDEBAR_MAX));
+        let viewport = |w: f32, h: f32| gpui::Size {
+            width: px(w),
+            height: px(h),
+        };
+        assert_eq!(
+            Divider::Sidebar.range(viewport(1400., 900.)),
+            (SIDEBAR_MIN, SIDEBAR_MAX)
+        );
         // Half of an 800px window is under the 520 cap.
-        assert_eq!(Divider::Sidebar.range(viewport(800., 900.)), (SIDEBAR_MIN, 400.));
-        assert_eq!(Divider::Sidebar.range(viewport(200., 900.)), (SIDEBAR_MIN, SIDEBAR_MIN));
-        assert_eq!(Divider::Editor.range(viewport(1400., 1000.)), (EDITOR_MIN, 700.));
-        assert_eq!(Divider::Editor.range(viewport(1400., 80.)), (EDITOR_MIN, EDITOR_MIN));
+        assert_eq!(
+            Divider::Sidebar.range(viewport(800., 900.)),
+            (SIDEBAR_MIN, 400.)
+        );
+        assert_eq!(
+            Divider::Sidebar.range(viewport(200., 900.)),
+            (SIDEBAR_MIN, SIDEBAR_MIN)
+        );
+        assert_eq!(
+            Divider::Editor.range(viewport(1400., 1000.)),
+            (EDITOR_MIN, 700.)
+        );
+        assert_eq!(
+            Divider::Editor.range(viewport(1400., 80.)),
+            (EDITOR_MIN, EDITOR_MIN)
+        );
     }
 
     /// The sidebar cursor's ring, with the filter line itself in it: ↓
@@ -8385,7 +8963,10 @@ mod tests {
         let (_, sub) = tx_copy(state(1, 1)).unwrap();
         assert!(sub.starts_with("1 statement · 1 row touched · "), "{sub}");
         let (_, sub) = tx_copy(state(2, 30)).unwrap();
-        assert!(sub.starts_with("2 statements · 30 rows touched · "), "{sub}");
+        assert!(
+            sub.starts_with("2 statements · 30 rows touched · "),
+            "{sub}"
+        );
         // Nothing touched, nothing said about rows.
         let (_, sub) = tx_copy(state(2, 0)).unwrap();
         assert!(sub.starts_with("2 statements · nothing visible"), "{sub}");
@@ -8441,9 +9022,15 @@ mod tests {
         };
         let (title, sub) = tx_copy(ended(TxMode::Manual, TxEnd::Commit)).unwrap();
         assert_eq!(title, "committed");
-        assert!(sub.ends_with("a new transaction opens on your next run"), "{sub}");
+        assert!(
+            sub.ends_with("a new transaction opens on your next run"),
+            "{sub}"
+        );
         let (_, sub) = tx_copy(ended(TxMode::Auto, TxEnd::Commit)).unwrap();
-        assert!(sub.ends_with("statements commit on their own again"), "{sub}");
+        assert!(
+            sub.ends_with("statements commit on their own again"),
+            "{sub}"
+        );
         let (title, sub) = tx_copy(ended(TxMode::Auto, TxEnd::Rollback)).unwrap();
         assert_eq!(title, "rolled back");
         assert!(sub.contains("nothing was written"), "{sub}");
@@ -8465,7 +9052,12 @@ mod tests {
         };
         let (_, sub) = tx_copy(state).unwrap();
         assert!(sub.contains("⌘."), "{sub}");
-        let (_, sub) = tx_copy(TxState { running: false, ending: true, ..state }).unwrap();
+        let (_, sub) = tx_copy(TxState {
+            running: false,
+            ending: true,
+            ..state
+        })
+        .unwrap();
         assert!(sub.contains("waiting for the server"), "{sub}");
     }
 
@@ -8474,21 +9066,43 @@ mod tests {
     /// milliseconds' work. One number could not have said that.
     #[test]
     fn the_server_and_the_lag_are_reported_apart() {
-        let mut timing =
-            Timing::new(340, Wire { link_ms: Some(33), first_row_ms: Some(46), fetch_ms: Some(294) });
-        timing.server = Some(ServerTiming { exec_ms: 12.4, plan_ms: Some(0.6), exact: true });
-        assert_eq!(timing.summary(), "queried in 340 ms · server 13 ms · lag 327 ms");
+        let mut timing = Timing::new(
+            340,
+            Wire {
+                link_ms: Some(33),
+                first_row_ms: Some(46),
+                fetch_ms: Some(294),
+            },
+        );
+        timing.server = Some(ServerTiming {
+            exec_ms: 12.4,
+            plan_ms: Some(0.6),
+            exact: true,
+        });
+        assert_eq!(
+            timing.summary(),
+            "queried in 340 ms · server 13 ms · lag 327 ms"
+        );
     }
 
     /// Until the server answers — and for ever without
     /// `pg_stat_statements` — the estimate stands, and `~` says it is one.
     #[test]
     fn an_estimated_server_time_is_marked() {
-        let timing =
-            Timing::new(340, Wire { link_ms: Some(33), first_row_ms: Some(46), fetch_ms: Some(294) });
+        let timing = Timing::new(
+            340,
+            Wire {
+                link_ms: Some(33),
+                first_row_ms: Some(46),
+                fetch_ms: Some(294),
+            },
+        );
         // The same numbers as the measured run above, and only the `~`
         // between them: the mark is the whole of what says which is which.
-        assert_eq!(timing.summary(), "queried in 340 ms · server ~13 ms · lag 327 ms");
+        assert_eq!(
+            timing.summary(),
+            "queried in 340 ms · server ~13 ms · lag 327 ms"
+        );
     }
 
     /// The estimate is time-to-first-row **less the round trip**. Leaving
@@ -8496,8 +9110,22 @@ mod tests {
     /// the mistake the whole split is here to fix.
     #[test]
     fn the_estimate_takes_the_round_trip_off() {
-        let far = Timing::new(400, Wire { link_ms: Some(120), first_row_ms: Some(132), fetch_ms: Some(268) });
-        let near = Timing::new(280, Wire { link_ms: Some(1), first_row_ms: Some(13), fetch_ms: Some(267) });
+        let far = Timing::new(
+            400,
+            Wire {
+                link_ms: Some(120),
+                first_row_ms: Some(132),
+                fetch_ms: Some(268),
+            },
+        );
+        let near = Timing::new(
+            280,
+            Wire {
+                link_ms: Some(1),
+                first_row_ms: Some(13),
+                fetch_ms: Some(267),
+            },
+        );
         // The same server work, seen down two very different links.
         assert_eq!(far.server_ms().map(|(ms, _)| ms), Some(12.));
         assert_eq!(near.server_ms().map(|(ms, _)| ms), Some(12.));
@@ -8510,7 +9138,11 @@ mod tests {
     #[test]
     fn the_lag_never_goes_negative() {
         let mut timing = Timing::new(10, Wire::default());
-        timing.server = Some(ServerTiming { exec_ms: 14., plan_ms: None, exact: true });
+        timing.server = Some(ServerTiming {
+            exec_ms: 14.,
+            plan_ms: None,
+            exact: true,
+        });
         assert_eq!(timing.lag_ms(), Some(0.));
     }
 
@@ -8524,11 +9156,20 @@ mod tests {
     }
 
     fn relation(name: &str, kind: TableKind) -> Table {
-        Table { name: name.to_string(), kind, columns: Vec::new(), primary_key: Vec::new(), approx_rows: None }
+        Table {
+            name: name.to_string(),
+            kind,
+            columns: Vec::new(),
+            primary_key: Vec::new(),
+            approx_rows: None,
+        }
     }
 
     fn names(names: &[&str]) -> Vec<SharedString> {
-        names.iter().map(|name| SharedString::from(name.to_string())).collect()
+        names
+            .iter()
+            .map(|name| SharedString::from(name.to_string()))
+            .collect()
     }
 
     /// ⌘W closes a tab while there is another one to leave the window
@@ -8574,7 +9215,10 @@ mod tests {
         // the dialog must say which tab it is asking about.
         let (title, body, ..) = confirm_copy(Close::Tab(7), &none, &one);
         assert_eq!(title, "Close “query 3”?");
-        assert_eq!(body, vec!["“query 3” has a transaction open. Closing the tab rolls it back."]);
+        assert_eq!(
+            body,
+            vec!["“query 3” has a transaction open. Closing the tab rolls it back."]
+        );
     }
 
     /// Leaving with one run out names it; leaving with several counts
@@ -8596,7 +9240,10 @@ mod tests {
         );
 
         let body = confirm_copy(Close::Shell, &none, &names(&["a", "b", "c"])).1;
-        assert_eq!(body, vec!["3 tabs have transactions open. Leaving rolls them back."]);
+        assert_eq!(
+            body,
+            vec!["3 tabs have transactions open. Leaving rolls them back."]
+        );
     }
 
     /// A tab can be both, and then the dialog says both — they are lost in
@@ -8625,7 +9272,10 @@ mod tests {
         let states = vec![session(1, 900), session(2, 60), session(3, 601)];
         assert_eq!(idle_sessions(&states, IDLE_SESSION), vec![1, 3]);
         // Ten minutes on the nose is not yet ten minutes past.
-        assert_eq!(idle_sessions(&[session(1, 599)], IDLE_SESSION), Vec::<u64>::new());
+        assert_eq!(
+            idle_sessions(&[session(1, 599)], IDLE_SESSION),
+            Vec::<u64>::new()
+        );
     }
 
     /// The two states a session is never taken in. A run is using it; a
@@ -8633,9 +9283,18 @@ mod tests {
     /// thing the close dialog exists to refuse to do quietly.
     #[test]
     fn the_sweep_never_takes_a_busy_or_transacting_session() {
-        let running = SessionState { running: true, ..session(1, 9000) };
-        let holding = SessionState { in_transaction: true, ..session(2, 9000) };
-        assert_eq!(idle_sessions(&[running, holding], IDLE_SESSION), Vec::<u64>::new());
+        let running = SessionState {
+            running: true,
+            ..session(1, 9000)
+        };
+        let holding = SessionState {
+            in_transaction: true,
+            ..session(2, 9000)
+        };
+        assert_eq!(
+            idle_sessions(&[running, holding], IDLE_SESSION),
+            Vec::<u64>::new()
+        );
         assert_eq!(evictable(&[running, holding]), None);
     }
 
@@ -8648,9 +9307,18 @@ mod tests {
         let states = vec![session(1, 30), session(2, 300), session(3, 120)];
         assert_eq!(evictable(&states), Some(2));
 
-        let held = vec![SessionState { in_transaction: true, ..session(1, 9000) }, {
-            SessionState { running: true, ..session(2, 9000) }
-        }];
+        let held = vec![
+            SessionState {
+                in_transaction: true,
+                ..session(1, 9000)
+            },
+            {
+                SessionState {
+                    running: true,
+                    ..session(2, 9000)
+                }
+            },
+        ];
         assert_eq!(evictable(&held), None);
     }
 
@@ -8676,15 +9344,18 @@ mod tests {
     /// `()`, both with their count and whether they are open, and a
     /// relation as its own name.
     fn read(rows: &[CatalogRow]) -> Vec<String> {
-        let shown = |count: &usize, open: &bool| {
-            format!("{count}{}", if *open { " open" } else { "" })
-        };
+        let shown =
+            |count: &usize, open: &bool| format!("{count}{}", if *open { " open" } else { "" });
         rows.iter()
             .map(|row| match row {
-                CatalogRow::Schema { label, count, open, .. } => {
+                CatalogRow::Schema {
+                    label, count, open, ..
+                } => {
                     format!("[{label} {}]", shown(count, open))
                 }
-                CatalogRow::Section { label, count, open, .. } => {
+                CatalogRow::Section {
+                    label, count, open, ..
+                } => {
                     format!("({label} {})", shown(count, open))
                 }
                 CatalogRow::Relation { name, .. } => name.to_string(),
@@ -8724,8 +9395,11 @@ mod tests {
         let read: Vec<String> = groups.iter().map(|group| group.label.to_string()).collect();
         assert_eq!(read, ["PUBLIC", "REPORTING"]);
 
-        let sections: Vec<String> =
-            groups[0].sections.iter().map(|section| section.label.to_string()).collect();
+        let sections: Vec<String> = groups[0]
+            .sections
+            .iter()
+            .map(|section| section.label.to_string())
+            .collect();
         assert_eq!(sections, ["TABLES", "VIEWS"]);
         assert_eq!(groups[0].sections[0].relations, ["users", "orders"]);
         // A schema of views only carries the one section.
@@ -8762,7 +9436,13 @@ mod tests {
         let closed = HashSet::from([groups[0].sections[0].key.clone()]);
         assert_eq!(
             read(&catalog_rows(&groups, &open, &closed, "")),
-            ["[PUBLIC 3 open]", "(TABLES 2)", "(VIEWS 1 open)", "active_users", "[REPORTING 1]"]
+            [
+                "[PUBLIC 3 open]",
+                "(TABLES 2)",
+                "(VIEWS 1 open)",
+                "active_users",
+                "[REPORTING 1]"
+            ]
         );
     }
 
@@ -8773,7 +9453,13 @@ mod tests {
         // the two sets stand, and the counts are of the hits.
         assert_eq!(
             read(&rows(&groups, "user")),
-            ["[PUBLIC 2 open]", "(TABLES 1 open)", "users", "(VIEWS 1 open)", "active_users"]
+            [
+                "[PUBLIC 2 open]",
+                "(TABLES 1 open)",
+                "users",
+                "(VIEWS 1 open)",
+                "active_users"
+            ]
         );
         // A schema's own name keeps everything under it.
         assert_eq!(
@@ -8817,7 +9503,12 @@ mod tests {
         let open = HashSet::from([groups[0].key.clone()]);
         assert_eq!(
             read(&catalog_rows(&groups, &open, &HashSet::new(), ""))[2..],
-            ["correspondence_master", "master_assignment", "master", "master_rate"]
+            [
+                "correspondence_master",
+                "master_assignment",
+                "master",
+                "master_rate"
+            ]
         );
     }
 

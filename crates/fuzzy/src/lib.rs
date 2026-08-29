@@ -153,7 +153,11 @@ impl Pattern {
                 opens = true;
                 continue;
             }
-            chars.push(Typed { folded: fold(typed), typed, opens });
+            chars.push(Typed {
+                folded: fold(typed),
+                typed,
+                opens,
+            });
             opens = false;
         }
         Self { chars, strict_case }
@@ -168,7 +172,10 @@ impl Pattern {
     /// How well `name` answers this query, or `None` when it does not.
     pub fn score(&self, name: &str) -> Option<Match> {
         if self.is_empty() {
-            return Some(Match { score: 0, ranges: Vec::new() });
+            return Some(Match {
+                score: 0,
+                ranges: Vec::new(),
+            });
         }
         // A cheap ordered-subsequence scan first. It allocates nothing and
         // throws out most of a large vocabulary, which the table below
@@ -209,7 +216,13 @@ impl Pattern {
         if m > n {
             return None;
         }
-        let mut table = vec![Cell { score: NONE, from: 0 }; n * m];
+        let mut table = vec![
+            Cell {
+                score: NONE,
+                from: 0
+            };
+            n * m
+        ];
 
         // The first character of the query may land anywhere.
         for i in 0..n {
@@ -234,8 +247,10 @@ impl Pattern {
                     // `_` has to line up with something.
                     let tight = table[above + i - 1].score;
                     if tight > NONE && (!opens || name.chars[i].bonus > 0) {
-                        table[row + i] =
-                            Cell { score: tight + points + BONUS_CONSECUTIVE, from: i - 1 };
+                        table[row + i] = Cell {
+                            score: tight + points + BONUS_CONSECUTIVE,
+                            from: i - 1,
+                        };
                     }
                     // Or the query skipped ahead, which it may only do onto
                     // the start of a word. This is the whole of the gate.
@@ -243,7 +258,10 @@ impl Pattern {
                         && name.chars[i].bonus > 0
                         && jump + points > table[row + i].score
                     {
-                        table[row + i] = Cell { score: jump + points, from: jump_from };
+                        table[row + i] = Cell {
+                            score: jump + points,
+                            from: jump_from,
+                        };
                     }
                 }
                 // Roll the running jump forward one place, for the next
@@ -283,7 +301,10 @@ impl Pattern {
             }
         }
         places.reverse();
-        Some(Match { score, ranges: name.runs(&places, &self.chars) })
+        Some(Match {
+            score,
+            ranges: name.runs(&places, &self.chars),
+        })
     }
 
     /// What the query's character `j` is worth on the name's character `i`,
@@ -408,7 +429,9 @@ fn bonus(before: Option<char>, ch: char) -> i32 {
     if !ch.is_alphanumeric() {
         return 0;
     }
-    let Some(before) = before else { return BONUS_NAME_START };
+    let Some(before) = before else {
+        return BONUS_NAME_START;
+    };
     if !before.is_alphanumeric() {
         return BONUS_BOUNDARY;
     }
@@ -442,7 +465,10 @@ mod tests {
     #[test]
     fn a_query_names_the_starts_of_the_words() {
         assert!(matches("master_client_reference", "mast_cl"));
-        assert_eq!(ranges("master_client_reference", "mast_cl"), vec![0..4, 7..9]);
+        assert_eq!(
+            ranges("master_client_reference", "mast_cl"),
+            vec![0..4, 7..9]
+        );
         assert!(matches("master_client_reference", "master_client"));
         assert!(matches("master_client_reference", "mas_cli_ref"));
     }
@@ -461,7 +487,10 @@ mod tests {
     #[test]
     fn a_run_of_word_starts_is_a_match() {
         assert!(matches("master_client_reference", "mcr"));
-        assert_eq!(ranges("master_client_reference", "mcr"), vec![0..1, 7..8, 14..15]);
+        assert_eq!(
+            ranges("master_client_reference", "mcr"),
+            vec![0..1, 7..8, 14..15]
+        );
         assert!(matches("LAST_SEEN", "ls"));
     }
 
@@ -492,12 +521,18 @@ mod tests {
     /// tighter match beats a scattered one.
     #[test]
     fn a_closer_match_scores_higher() {
-        let front = score("master_state_type_code", "mast").expect("matches").score;
+        let front = score("master_state_type_code", "mast")
+            .expect("matches")
+            .score;
         let middle = score("invoice_master_name", "mast").expect("matches").score;
         assert!(front > middle, "{front} should beat {middle}");
 
-        let tight = score("master_client_reference", "mast_cl").expect("matches").score;
-        let loose = score("master_client_reference", "mcr").expect("matches").score;
+        let tight = score("master_client_reference", "mast_cl")
+            .expect("matches")
+            .score;
+        let loose = score("master_client_reference", "mcr")
+            .expect("matches")
+            .score;
         assert!(tight > loose, "{tight} should beat {loose}");
     }
 
@@ -511,7 +546,9 @@ mod tests {
         assert!(whole > split, "{whole} should beat {split}");
 
         let tight = score("order_items", "order_it").expect("matches").score;
-        let jumped = score("order_invoice_total", "order_it").expect("matches").score;
+        let jumped = score("order_invoice_total", "order_it")
+            .expect("matches")
+            .score;
         assert!(tight > jumped, "{tight} should beat {jumped}");
     }
 
@@ -520,11 +557,17 @@ mod tests {
     /// bars between them left out.
     #[test]
     fn a_matched_separator_is_part_of_the_hit() {
-        assert_eq!(ranges("sample_dev_sample", "sample_dev_sample"), vec![0..17]);
+        assert_eq!(
+            ranges("sample_dev_sample", "sample_dev_sample"),
+            vec![0..17]
+        );
         assert_eq!(ranges("sample_dev_sample", "dev_sample"), vec![7..17]);
         // Only where the name really does end the word there. `mast` stops
         // inside `master`, so the two pieces stay apart.
-        assert_eq!(ranges("master_client_reference", "mast_cl"), vec![0..4, 7..9]);
+        assert_eq!(
+            ranges("master_client_reference", "mast_cl"),
+            vec![0..4, 7..9]
+        );
     }
 
     /// The alignment is the best one, not the first one found: `cl` in
@@ -572,10 +615,11 @@ mod tests {
         let name = "größe_wert";
         let hit = score(name, "grö_we").expect("matches");
         for range in &hit.ranges {
-            assert!(name.get(range.clone()).is_some(), "{range:?} splits a character");
+            assert!(
+                name.get(range.clone()).is_some(),
+                "{range:?} splits a character"
+            );
         }
         assert_eq!(hit.ranges, vec![0..4, 8..10]);
     }
 }
-
-

@@ -70,7 +70,11 @@ pub enum Hit {
     /// starting a new one. `peek` is the second click of a double click,
     /// which asks to read the whole value: a lane is capped, so a long value
     /// truncates on screen and the click is how the rest of it is asked for.
-    Cell { cell: Cell, extend: bool, peek: bool },
+    Cell {
+        cell: Cell,
+        extend: bool,
+        peek: bool,
+    },
     /// The pointer has moved onto this cell with the button still down, so
     /// the range grows to it. It is not a fresh click: the press that
     /// started the drag has already taken the focus and set the anchor.
@@ -143,7 +147,9 @@ impl GridState {
     pub fn reveal(&self, cell: Cell, data: &GridData) {
         self.rows.scroll_to_item(cell.row, ScrollStrategy::Nearest);
 
-        let Some((left, width)) = data.lane_span(cell.column) else { return };
+        let Some((left, width)) = data.lane_span(cell.column) else {
+            return;
+        };
         let viewport = f32::from(self.columns.bounds().size.width);
         // Nothing is painted yet on the frame a result lands: there is no
         // pane to be inside of, and the next frame's scroll would be
@@ -183,7 +189,11 @@ pub struct GridData {
 impl GridData {
     pub fn new(columns: Vec<String>, rows: Vec<Vec<Value>>) -> Self {
         let widths = column_widths(&columns, &rows);
-        Self { columns, rows, widths }
+        Self {
+            columns,
+            rows,
+            widths,
+        }
     }
 
     pub fn empty() -> Self {
@@ -200,7 +210,10 @@ impl GridData {
     /// round for scrolling something into view.
     pub fn lane_span(&self, column: usize) -> Option<(f32, f32)> {
         let width = *self.widths.get(column)?;
-        Some((GUTTER_WIDTH + self.widths[..column].iter().sum::<f32>(), width))
+        Some((
+            GUTTER_WIDTH + self.widths[..column].iter().sum::<f32>(),
+            width,
+        ))
     }
 }
 
@@ -266,8 +279,7 @@ pub fn column_widths(columns: &[String], rows: &[Vec<Value>]) -> Vec<f32> {
                 .max()
                 .unwrap_or(0)
                 .max(name.chars().count());
-            (widest as f32 * CHAR_WIDTH + CELL_PADDING)
-                .clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH)
+            (widest as f32 * CHAR_WIDTH + CELL_PADDING).clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH)
         })
         .collect()
 }
@@ -290,7 +302,14 @@ impl<'a> Grid<'a> {
         state: &'a GridState,
         selection: &'a Selection,
     ) -> Self {
-        Self { id: id.into(), data, state, selection, first_row: 1, on_hit: None }
+        Self {
+            id: id.into(),
+            data,
+            state,
+            selection,
+            first_row: 1,
+            on_hit: None,
+        }
     }
 
     /// The number the gutter gives the first row on screen. A table page is
@@ -307,7 +326,14 @@ impl<'a> Grid<'a> {
     }
 
     pub fn render(self, cx: &App) -> Div {
-        let Self { id, data, state, selection, first_row, on_hit } = self;
+        let Self {
+            id,
+            data,
+            state,
+            selection,
+            first_row,
+            on_hit,
+        } = self;
         let colors = theme(cx).colors.clone();
         // The content can be wider than the pane; the whole grid scrolls
         // sideways as one, gutter and header included. The gutter goes with
@@ -319,7 +345,14 @@ impl<'a> Grid<'a> {
         // selection of its own. One clone of a small set per frame.
         let marks = Rc::new(selection.clone());
         let extent = Extent::of(&data);
-        let rows = row_list(&id, data.clone(), state, marks.clone(), first_row, on_hit.clone());
+        let rows = row_list(
+            &id,
+            data.clone(),
+            state,
+            marks.clone(),
+            first_row,
+            on_hit.clone(),
+        );
 
         // The bars sit outside the scrolling content, or they would scroll
         // away with it.
@@ -562,7 +595,11 @@ fn drag_to(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let row = row_at(f32::from(at.y), f32::from(rows.bounds().top()), f32::from(rows.offset().y));
+    let row = row_at(
+        f32::from(at.y),
+        f32::from(rows.bounds().top()),
+        f32::from(rows.offset().y),
+    );
     let column = column_at(
         f32::from(at.x),
         f32::from(columns.bounds().left()),
@@ -636,7 +673,11 @@ fn stepped_offset(handle: &ScrollHandle, vertical: bool, step: f32) -> Option<Po
     if wanted == travelled {
         return None;
     }
-    Some(if vertical { point(offset.x, px(-wanted)) } else { point(px(-wanted), offset.y) })
+    Some(if vertical {
+        point(offset.x, px(-wanted))
+    } else {
+        point(px(-wanted), offset.y)
+    })
 }
 
 /// The virtualized row list. Built here rather than inline so the axis
@@ -659,7 +700,10 @@ fn row_list(
             let colors = theme(cx).colors.clone();
             // The view id is only knowable while a frame is being built,
             // and the hover listeners need one to ask for a repaint.
-            let frame = PointerFrame { pointer: pointer.clone(), view: window.current_view() };
+            let frame = PointerFrame {
+                pointer: pointer.clone(),
+                view: window.current_view(),
+            };
             range
                 .map(|ix| {
                     data_row(
@@ -717,7 +761,11 @@ fn header_row(
         .justify_center()
         .border_r_1()
         .border_color(colors.hairline)
-        .text_color(if all { colors.accent_deep } else { colors.text_faint })
+        .text_color(if all {
+            colors.accent_deep
+        } else {
+            colors.text_faint
+        })
         .child(if all { TICK } else { "#" });
     if let Some(on_hit) = on_hit.clone() {
         head = head
@@ -728,7 +776,9 @@ fn header_row(
     row = row.child(head);
 
     let last = data.columns.len().saturating_sub(1);
-    let selected_columns = marks.rect().filter(|rect| rect.rows() == extent.rows.max(1));
+    let selected_columns = marks
+        .rect()
+        .filter(|rect| rect.rows() == extent.rows.max(1));
     let cursor_column = marks.cursor().map(|cursor| cursor.column);
     for (ix, name) in data.columns.iter().enumerate() {
         // A column reads as selected only when the range covers all of it,
@@ -844,7 +894,11 @@ fn data_row(
             (false, Some(cursor)) if cursor.row == ix => colors.text_secondary,
             _ => colors.line_number,
         })
-        .child(if picked { TICK.to_string() } else { (first_row + ix).to_string() });
+        .child(if picked {
+            TICK.to_string()
+        } else {
+            (first_row + ix).to_string()
+        });
     if let Some(on_hit) = on_hit.clone() {
         let gutter_hover = colors.hairline;
         let hover_row = frame.pointer.hover_row.clone();
@@ -865,7 +919,14 @@ fn data_row(
                 cx.notify(view);
             })
             .on_click(move |event, window, cx| {
-                on_hit(Hit::Pick { row: ix, through: event.modifiers().shift }, window, cx);
+                on_hit(
+                    Hit::Pick {
+                        row: ix,
+                        through: event.modifiers().shift,
+                    },
+                    window,
+                    cx,
+                );
             });
     }
     row = row.child(gutter);
@@ -874,7 +935,9 @@ fn data_row(
     for (column, value) in values.iter().enumerate() {
         // A row can be shorter than the header when a driver returns
         // ragged rows; lay out only what the header has room for.
-        let Some(width) = widths.get(column) else { break };
+        let Some(width) = widths.get(column) else {
+            break;
+        };
         let cursor = marks.is_cursor(ix, column);
         let mut cell = lane(div().id(column), *width, column == last)
             .px(px(12.))
@@ -1073,14 +1136,26 @@ mod tests {
     #[test]
     fn a_drag_past_the_edge_scrolls_by_how_far_past_it_is() {
         // A hair over the line still moves, and moves readably.
-        assert_eq!(autoscroll_step(px(501.), px(100.), px(500.)), AUTOSCROLL_MIN);
-        assert_eq!(autoscroll_step(px(99.), px(100.), px(500.)), -AUTOSCROLL_MIN);
+        assert_eq!(
+            autoscroll_step(px(501.), px(100.), px(500.)),
+            AUTOSCROLL_MIN
+        );
+        assert_eq!(
+            autoscroll_step(px(99.), px(100.), px(500.)),
+            -AUTOSCROLL_MIN
+        );
         // In between, the overshoot is the speed.
         assert_eq!(autoscroll_step(px(520.), px(100.), px(500.)), 20.);
         assert_eq!(autoscroll_step(px(80.), px(100.), px(500.)), -20.);
         // Flung to the far side of the screen, it is still bounded.
-        assert_eq!(autoscroll_step(px(2_000.), px(100.), px(500.)), AUTOSCROLL_MAX);
-        assert_eq!(autoscroll_step(px(-900.), px(100.), px(500.)), -AUTOSCROLL_MAX);
+        assert_eq!(
+            autoscroll_step(px(2_000.), px(100.), px(500.)),
+            AUTOSCROLL_MAX
+        );
+        assert_eq!(
+            autoscroll_step(px(-900.), px(100.), px(500.)),
+            -AUTOSCROLL_MAX
+        );
     }
 
     /// The gutter scrolls with the content, so it counts in every lane's
@@ -1094,7 +1169,10 @@ mod tests {
         let (left, width) = data.lane_span(0).unwrap();
         assert_eq!((left, width), (GUTTER_WIDTH, data.widths[0]));
         let (left, width) = data.lane_span(1).unwrap();
-        assert_eq!((left, width), (GUTTER_WIDTH + data.widths[0], data.widths[1]));
+        assert_eq!(
+            (left, width),
+            (GUTTER_WIDTH + data.widths[0], data.widths[1])
+        );
         assert_eq!(data.lane_span(2), None);
     }
 }

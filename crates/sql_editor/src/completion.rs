@@ -171,8 +171,10 @@ impl Vocabulary {
                 .then(a.completion.kind.cmp(&b.completion.kind))
                 .then(a.completion.label.cmp(&b.completion.label))
         });
-        let mut candidates: Vec<Completion> =
-            candidates.into_iter().map(|ranked| ranked.completion).collect();
+        let mut candidates: Vec<Completion> = candidates
+            .into_iter()
+            .map(|ranked| ranked.completion)
+            .collect();
         candidates.dedup_by(|a, b| a.label == b.label && a.kind == b.kind);
         candidates.truncate(MAX_CANDIDATES);
         candidates
@@ -271,7 +273,10 @@ mod tests {
         let text = "from public.";
         let prefix = prefix_range(text, text.len());
         assert!(prefix.is_empty());
-        assert_eq!(&text[qualifier_range(text, prefix.start).unwrap()], "public");
+        assert_eq!(
+            &text[qualifier_range(text, prefix.start).unwrap()],
+            "public"
+        );
 
         // A bare word is not qualified.
         assert!(qualifier_range("from users", 5).is_none());
@@ -281,9 +286,15 @@ mod tests {
     fn a_qualifier_narrows_to_its_children() {
         let vocabulary = vocabulary();
         // A table offers its columns, and nothing else.
-        assert_eq!(labels(&vocabulary.candidates("", Some("users"))), vec!["email", "seen_on"]);
+        assert_eq!(
+            labels(&vocabulary.candidates("", Some("users"))),
+            vec!["email", "seen_on"]
+        );
         // A schema offers its relations.
-        assert_eq!(labels(&vocabulary.candidates("", Some("public"))), vec!["users", "sessions"]);
+        assert_eq!(
+            labels(&vocabulary.candidates("", Some("public"))),
+            vec!["users", "sessions"]
+        );
         // A keyword never appears behind a dot.
         assert!(
             vocabulary
@@ -313,7 +324,10 @@ mod tests {
 
     #[test]
     fn matching_ignores_case() {
-        assert_eq!(labels(&vocabulary().candidates("EMA", Some("USERS"))), vec!["email"]);
+        assert_eq!(
+            labels(&vocabulary().candidates("EMA", Some("USERS"))),
+            vec!["email"]
+        );
     }
 
     #[test]
@@ -334,14 +348,14 @@ mod tests {
     /// matched on the prefix alone and offered nothing at all here.
     #[test]
     fn a_word_may_name_the_parts_of_a_name() {
-        let vocabulary = Vocabulary::new(["master_client_reference", "master_state_type_code"].map(
-            |name| Name {
+        let vocabulary = Vocabulary::new(
+            ["master_client_reference", "master_state_type_code"].map(|name| Name {
                 name: name.into(),
                 detail: "text".into(),
                 kind: Kind::Column,
                 owner: Some("masters".into()),
-            },
-        ));
+            }),
+        );
         assert_eq!(
             labels(&vocabulary.candidates("mast_cl", Some("masters"))),
             vec!["master_client_reference"]

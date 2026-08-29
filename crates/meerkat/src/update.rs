@@ -60,7 +60,11 @@ pub fn toast(colors: &ThemeColors, bottom: Pixels, cx: &mut App) -> Option<AnyEl
 
     let mut headline = format!("Meerkat {} is ready", ready.version);
     if let Some(sha) = &ready.sha {
-        headline = format!("Meerkat {} ({}) is ready", ready.version, &sha[..sha.len().min(7)]);
+        headline = format!(
+            "Meerkat {} ({}) is ready",
+            ready.version,
+            &sha[..sha.len().min(7)]
+        );
     }
 
     let close = {
@@ -165,11 +169,12 @@ pub fn foot_summary(colors: &ThemeColors, cx: &mut App) -> AnyElement {
         identity.push_str(sha);
     }
 
-    let line = div()
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .child(div().text_size(px(10.)).text_color(colors.text_faint).child(identity));
+    let line = div().flex().items_center().gap(px(8.)).child(
+        div()
+            .text_size(px(10.))
+            .text_color(colors.text_faint)
+            .child(identity),
+    );
 
     let Some(updater) = AutoUpdater::try_global(cx) else {
         // A local build: the version is worth a line, an update story is
@@ -192,7 +197,10 @@ pub fn foot_summary(colors: &ThemeColors, cx: &mut App) -> AnyElement {
     };
 
     let faint = |text: &'static str| {
-        div().text_size(px(10.)).text_color(colors.text_faint).child(text)
+        div()
+            .text_size(px(10.))
+            .text_color(colors.text_faint)
+            .child(text)
     };
 
     match updater.read(cx).status().clone() {

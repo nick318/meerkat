@@ -12,11 +12,19 @@ pub fn is_word_char(ch: char) -> bool {
 }
 
 pub fn previous_boundary(text: &str, offset: usize) -> usize {
-    text[..offset].char_indices().next_back().map(|(ix, _)| ix).unwrap_or(0)
+    text[..offset]
+        .char_indices()
+        .next_back()
+        .map(|(ix, _)| ix)
+        .unwrap_or(0)
 }
 
 pub fn next_boundary(text: &str, offset: usize) -> usize {
-    text[offset..].char_indices().nth(1).map(|(ix, _)| offset + ix).unwrap_or(text.len())
+    text[offset..]
+        .char_indices()
+        .nth(1)
+        .map(|(ix, _)| offset + ix)
+        .unwrap_or(text.len())
 }
 
 fn char_before(text: &str, offset: usize) -> Option<char> {
@@ -107,7 +115,10 @@ pub fn line_start(text: &str, offset: usize) -> usize {
 }
 
 pub fn line_end(text: &str, offset: usize) -> usize {
-    text[offset..].find('\n').map(|ix| offset + ix).unwrap_or(text.len())
+    text[offset..]
+        .find('\n')
+        .map(|ix| offset + ix)
+        .unwrap_or(text.len())
 }
 
 #[cfg(test)]
@@ -136,7 +147,10 @@ mod tests {
         // Forward from the end of "name" lands on the break, not past it.
         assert_eq!(next_word_end(SQL, end_of_first_line), end_of_first_line + 1);
         // Backward from the start of "from" lands on the break.
-        assert_eq!(previous_word_start(SQL, end_of_first_line + 1), end_of_first_line);
+        assert_eq!(
+            previous_word_start(SQL, end_of_first_line + 1),
+            end_of_first_line
+        );
     }
 
     #[test]
@@ -178,6 +192,9 @@ mod tests {
     #[test]
     fn lines_bound_at_the_break() {
         let ix = SQL.find("public").unwrap();
-        assert_eq!(&SQL[line_start(SQL, ix)..line_end(SQL, ix)], "from public.users");
+        assert_eq!(
+            &SQL[line_start(SQL, ix)..line_end(SQL, ix)],
+            "from public.users"
+        );
     }
 }

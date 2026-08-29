@@ -41,10 +41,15 @@ pub enum Status {
     /// the whole of it, and the split earned nobody anything.
     Updating,
     /// Installed over the bundle; a restart picks it up.
-    Ready { version: String, sha: Option<String> },
+    Ready {
+        version: String,
+        sha: Option<String>,
+    },
     /// Only a manual check lands here. The hourly one fails quietly back
     /// to `Idle`, because offline is normal and not news.
-    Errored { error: String },
+    Errored {
+        error: String,
+    },
 }
 
 /// Which build a `Ready` status is offering. It is what a dismissal is
@@ -105,7 +110,12 @@ impl AutoUpdater {
             }
         });
 
-        Self { status: Status::Idle, generation: 0, dismissed: None, _poll: poll }
+        Self {
+            status: Status::Idle,
+            generation: 0,
+            dismissed: None,
+            _poll: poll,
+        }
     }
 
     pub fn status(&self) -> &Status {
@@ -117,16 +127,26 @@ impl AutoUpdater {
     /// toast: the footer's line still says so either way, because a line
     /// the user went looking for is not the same as one that arrives.
     pub fn announcement(&self) -> Option<Ready> {
-        let Status::Ready { version, sha } = &self.status else { return None };
-        let ready = Ready { version: version.clone(), sha: sha.clone() };
+        let Status::Ready { version, sha } = &self.status else {
+            return None;
+        };
+        let ready = Ready {
+            version: version.clone(),
+            sha: sha.clone(),
+        };
         announces(&ready, self.dismissed.as_ref()).then_some(ready)
     }
 
     /// Close the toast for whatever is ready now. A later install carries
     /// a different build, so it announces itself in its turn.
     pub fn dismiss(&mut self, cx: &mut Context<Self>) {
-        let Status::Ready { version, sha } = &self.status else { return };
-        self.dismissed = Some(Ready { version: version.clone(), sha: sha.clone() });
+        let Status::Ready { version, sha } = &self.status else {
+            return;
+        };
+        self.dismissed = Some(Ready {
+            version: version.clone(),
+            sha: sha.clone(),
+        });
         cx.notify();
     }
 
@@ -272,7 +292,10 @@ mod tests {
     use super::*;
 
     fn ready(version: &str, sha: Option<&str>) -> Ready {
-        Ready { version: version.to_string(), sha: sha.map(str::to_string) }
+        Ready {
+            version: version.to_string(),
+            sha: sha.map(str::to_string),
+        }
     }
 
     /// Closing the toast silences that one build and nothing else.
@@ -281,7 +304,10 @@ mod tests {
         let one = ready("0.1.0", Some("2342a00"));
 
         assert!(announces(&one, None), "nothing dismissed yet");
-        assert!(!announces(&one, Some(&one)), "this is the one that was closed");
+        assert!(
+            !announces(&one, Some(&one)),
+            "this is the one that was closed"
+        );
 
         // The dev channel rarely bumps the version, so the commit is what
         // says a second update landed. It gets its own toast.
@@ -289,6 +315,9 @@ mod tests {
         assert!(announces(&next, Some(&one)));
 
         // And the public channel moves by version.
-        assert!(announces(&ready("0.2.0", None), Some(&ready("0.1.0", None))));
+        assert!(announces(
+            &ready("0.2.0", None),
+            Some(&ready("0.1.0", None))
+        ));
     }
 }

@@ -16,9 +16,9 @@
 //! a keyword from a name.
 
 use crate::completion::Vocabulary;
-use query::is_keyword;
 #[cfg(test)]
 use crate::completion::{Kind, Name};
+use query::is_keyword;
 use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +116,6 @@ fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte >= 0x80
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,8 +145,10 @@ mod tests {
             "",
             "select 'héllo wörld' as greeting",
         ] {
-            let total: usize =
-                spans(line, &Vocabulary::default()).iter().map(|(range, _)| range.len()).sum();
+            let total: usize = spans(line, &Vocabulary::default())
+                .iter()
+                .map(|(range, _)| range.len())
+                .sum();
             assert_eq!(total, line.len(), "{line}");
         }
     }
@@ -206,10 +207,7 @@ mod tests {
     #[test]
     fn a_keyword_that_is_also_a_column_stays_a_keyword() {
         let vocabulary = names(&["order"]);
-        assert_eq!(
-            spans("order", &vocabulary),
-            vec![(0..5, Token::Keyword)]
-        );
+        assert_eq!(spans("order", &vocabulary), vec![(0..5, Token::Keyword)]);
     }
 
     #[test]

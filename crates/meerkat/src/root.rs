@@ -49,14 +49,20 @@ impl Root {
         let screen = cx.new(|cx| Connections::new(window, cx));
         let subscription = cx.subscribe_in(&screen, window, Self::on_connections_event);
         window.focus(&screen.focus_handle(cx), cx);
-        Self { screen: Screen::Connections(screen), _subscription: subscription }
+        Self {
+            screen: Screen::Connections(screen),
+            _subscription: subscription,
+        }
     }
 
     fn workspace(target: Target, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let workspace = cx.new(|cx| Shell::new(target, window, cx));
         let subscription = cx.subscribe_in(&workspace, window, Self::on_shell_event);
         window.focus(&workspace.focus_handle(cx), cx);
-        Self { screen: Screen::Workspace(workspace), _subscription: subscription }
+        Self {
+            screen: Screen::Workspace(workspace),
+            _subscription: subscription,
+        }
     }
 
     /// Write an open workspace's tabs back to the local file. The window

@@ -41,7 +41,11 @@ pub struct Blink {
 
 impl Default for Blink {
     fn default() -> Self {
-        Self { on: true, epoch: 0, focused: false }
+        Self {
+            on: true,
+            epoch: 0,
+            focused: false,
+        }
     }
 }
 

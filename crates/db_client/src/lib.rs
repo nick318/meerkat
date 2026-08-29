@@ -351,7 +351,10 @@ pub const MAX_CELL_BYTES: usize = 1024 * 1024;
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_bytes: MAX_BYTES, max_cell_bytes: MAX_CELL_BYTES }
+        Self {
+            max_bytes: MAX_BYTES,
+            max_cell_bytes: MAX_CELL_BYTES,
+        }
     }
 }
 
@@ -374,7 +377,13 @@ pub struct RowSink {
 
 impl RowSink {
     pub fn new(limits: Limits) -> Self {
-        Self { limits, columns: Vec::new(), rows: Vec::new(), bytes: 0, truncated: false }
+        Self {
+            limits,
+            columns: Vec::new(),
+            rows: Vec::new(),
+            bytes: 0,
+            truncated: false,
+        }
     }
 
     /// Name the columns, which the driver reads off the first row it gets.
@@ -673,7 +682,10 @@ mod tests {
     use super::*;
 
     fn small() -> Limits {
-        Limits { max_bytes: 4096, max_cell_bytes: 8 }
+        Limits {
+            max_bytes: 4096,
+            max_cell_bytes: 8,
+        }
     }
 
     fn row(n: i64) -> Vec<Value> {
@@ -694,7 +706,10 @@ mod tests {
             }
         }
         assert!(kept > 120_000, "only {kept} narrow rows fit the budget");
-        assert!(!sink.truncated(), "a narrow result of {kept} rows was capped");
+        assert!(
+            !sink.truncated(),
+            "a narrow result of {kept} rows was capped"
+        );
     }
 
     /// The shape the cap is for. Rows of a megabyte each stop long before
@@ -715,7 +730,10 @@ mod tests {
     fn a_result_that_ends_on_the_cap_is_whole() {
         // Room for exactly three of these rows and nothing more.
         let one = std::mem::size_of::<Vec<Value>>() + std::mem::size_of::<Value>();
-        let mut sink = RowSink::new(Limits { max_bytes: one * 3, max_cell_bytes: 8 });
+        let mut sink = RowSink::new(Limits {
+            max_bytes: one * 3,
+            max_cell_bytes: 8,
+        });
         for n in 0..3 {
             assert!(sink.push(row(n)), "row {n} was refused");
         }
@@ -727,7 +745,10 @@ mod tests {
     #[test]
     fn the_row_past_the_cap_is_dropped_and_reported() {
         let one = std::mem::size_of::<Vec<Value>>() + std::mem::size_of::<Value>();
-        let mut sink = RowSink::new(Limits { max_bytes: one * 3, max_cell_bytes: 8 });
+        let mut sink = RowSink::new(Limits {
+            max_bytes: one * 3,
+            max_cell_bytes: 8,
+        });
         for n in 0..3 {
             assert!(sink.push(row(n)));
         }
@@ -741,7 +762,10 @@ mod tests {
     /// empty grid would say the query returned nothing, which is a lie.
     #[test]
     fn the_first_row_is_kept_however_big_it_is() {
-        let mut sink = RowSink::new(Limits { max_bytes: 16, max_cell_bytes: 1024 });
+        let mut sink = RowSink::new(Limits {
+            max_bytes: 16,
+            max_cell_bytes: 1024,
+        });
         assert!(sink.push(vec![Value::Text("x".repeat(500))]));
         assert!(!sink.push(vec![Value::Text("x".repeat(500))]));
         let result = sink.finish(0);
@@ -771,7 +795,10 @@ mod tests {
     #[test]
     fn bytes_are_cut_without_a_marker() {
         // Wider than the 16 bytes `display` renders, as the real cap is.
-        let limits = Limits { max_cell_bytes: 32, ..small() };
+        let limits = Limits {
+            max_cell_bytes: 32,
+            ..small()
+        };
         let mut sink = RowSink::new(limits);
         sink.push(vec![Value::Bytes(vec![0xAB; 400])]);
         let result = sink.finish(0);

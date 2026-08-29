@@ -25,12 +25,18 @@ impl SqliteConnection {
         let pool = SqlitePool::connect_with(options)
             .await
             .with_context(|| format!("failed to open {}", path.display()))?;
-        Ok(Self { pool, limits: Limits::default() })
+        Ok(Self {
+            pool,
+            limits: Limits::default(),
+        })
     }
 
     pub async fn open_in_memory() -> Result<Self> {
         let pool = SqlitePool::connect("sqlite::memory:").await?;
-        Ok(Self { pool, limits: Limits::default() })
+        Ok(Self {
+            pool,
+            limits: Limits::default(),
+        })
     }
 
     /// Hold a smaller result than the app's own budget. See the Postgres
@@ -105,7 +111,9 @@ impl Session for SqliteSession {
     }
 
     async fn close(&self) {
-        let Some(mut conn) = self.conn.lock().await.take() else { return };
+        let Some(mut conn) = self.conn.lock().await.take() else {
+            return;
+        };
         match sqlx::query("ROLLBACK").execute(&mut *conn).await {
             Ok(_) => drop(conn),
             // SQLite answers "cannot rollback - no transaction is active",
@@ -147,7 +155,11 @@ impl Drop for SqliteSession {
 #[async_trait]
 impl Connection for SqliteConnection {
     async fn open_session(&self) -> Result<Arc<dyn Session>> {
-        let conn = self.pool.acquire().await.context("no connection for the session")?;
+        let conn = self
+            .pool
+            .acquire()
+            .await
+            .context("no connection for the session")?;
         Ok(Arc::new(SqliteSession {
             conn: futures::lock::Mutex::new(Some(conn)),
             limits: self.limits,
@@ -191,7 +203,11 @@ impl Connection for SqliteConnection {
 
             tables.push(Table {
                 name,
-                kind: if kind == "view" { TableKind::View } else { TableKind::Table },
+                kind: if kind == "view" {
+                    TableKind::View
+                } else {
+                    TableKind::Table
+                },
                 columns,
                 primary_key: pk.into_iter().map(|(_, col)| col).collect(),
                 // SQLite keeps no row estimate; a per-table COUNT(*) would
@@ -201,7 +217,10 @@ impl Connection for SqliteConnection {
         }
 
         Ok(Catalog {
-            schemas: vec![Schema { name: "main".to_string(), tables }],
+            schemas: vec![Schema {
+                name: "main".to_string(),
+                tables,
+            }],
         })
     }
 
@@ -291,7 +310,10 @@ mod tests {
         assert_eq!(table.primary_key, vec!["id".to_string()]);
         assert_eq!(table.columns.len(), 2);
 
-        let result = conn.execute("SELECT id, name FROM users ORDER BY id").await.unwrap();
+        let result = conn
+            .execute("SELECT id, name FROM users ORDER BY id")
+            .await
+            .unwrap();
         assert_eq!(result.columns, vec!["id", "name"]);
         assert_eq!(result.rows[0][1], Value::Text("ada".to_string()));
         assert_eq!(result.rows[1][0], Value::Int(2));
@@ -305,17 +327,29 @@ mod tests {
         let conn = SqliteConnection::open_in_memory().await.unwrap();
         let session = conn.open_session().await.unwrap();
 
-        session.execute("CREATE TABLE t (id INTEGER)").await.unwrap();
-        let inserted = session.execute("INSERT INTO t VALUES (1), (2), (3)").await.unwrap();
+        session
+            .execute("CREATE TABLE t (id INTEGER)")
+            .await
+            .unwrap();
+        let inserted = session
+            .execute("INSERT INTO t VALUES (1), (2), (3)")
+            .await
+            .unwrap();
         assert_eq!(inserted.rows_affected, 3);
         assert!(inserted.columns.is_empty());
 
-        let updated = session.execute("UPDATE t SET id = id + 1 WHERE id > 1").await.unwrap();
+        let updated = session
+            .execute("UPDATE t SET id = id + 1 WHERE id > 1")
+            .await
+            .unwrap();
         assert_eq!(updated.rows_affected, 2);
 
         // Matched nothing, and says so with a count rather than an empty
         // table: the statement worked.
-        let nothing = session.execute("DELETE FROM t WHERE id = 999").await.unwrap();
+        let nothing = session
+            .execute("DELETE FROM t WHERE id = 999")
+            .await
+            .unwrap();
         assert_eq!(nothing.rows_affected, 0);
         assert!(nothing.columns.is_empty());
     }
@@ -327,8 +361,14 @@ mod tests {
         let conn = SqliteConnection::open_in_memory().await.unwrap();
         let session = conn.open_session().await.unwrap();
 
-        session.execute("CREATE TEMP TABLE probe (id INTEGER)").await.unwrap();
-        session.execute("INSERT INTO probe VALUES (1), (2)").await.unwrap();
+        session
+            .execute("CREATE TEMP TABLE probe (id INTEGER)")
+            .await
+            .unwrap();
+        session
+            .execute("INSERT INTO probe VALUES (1), (2)")
+            .await
+            .unwrap();
         let result = session.execute("SELECT count(*) FROM probe").await.unwrap();
         assert_eq!(result.rows[0][0], Value::Int(2));
 
@@ -347,6 +387,11 @@ mod tests {
 
         std::thread::spawn(move || drop(session)).join().unwrap();
 
-        conn.open_session().await.unwrap().execute("SELECT 1").await.unwrap();
+        conn.open_session()
+            .await
+            .unwrap()
+            .execute("SELECT 1")
+            .await
+            .unwrap();
     }
 }

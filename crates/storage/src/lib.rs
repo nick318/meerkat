@@ -110,7 +110,11 @@ pub struct HistoryFilter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SavedTab {
     /// The paged table view, on the page it was left on.
-    Table { schema: String, table: String, page: usize },
+    Table {
+        schema: String,
+        table: String,
+        page: usize,
+    },
     /// A query tab: its statement, the name on the strip, the relation it
     /// was opened on when it came from the sidebar, and which way it
     /// commits. The mode is kept and the transaction is not: a restored tab
@@ -136,7 +140,12 @@ pub struct SavedTabs {
 
 impl Default for HistoryFilter {
     fn default() -> Self {
-        Self { user_only: false, errors_only: false, since: None, limit: HISTORY_LIMIT }
+        Self {
+            user_only: false,
+            errors_only: false,
+            since: None,
+            limit: HISTORY_LIMIT,
+        }
     }
 }
 
@@ -256,9 +265,8 @@ impl Store {
         };
         for (column, kind) in columns {
             if !existing.iter().any(|name| name == column) {
-                self.conn.execute_batch(&format!(
-                    "ALTER TABLE {table} ADD COLUMN {column} {kind}"
-                ))?;
+                self.conn
+                    .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
             }
         }
         Ok(())
@@ -295,7 +303,11 @@ impl Store {
     }
 
     pub fn list_profiles(&self) -> Result<Vec<Profile>> {
-        Ok(self.list_connections()?.into_iter().map(|c| c.profile).collect())
+        Ok(self
+            .list_connections()?
+            .into_iter()
+            .map(|c| c.profile)
+            .collect())
     }
 
     /// Every saved connection, most recently opened first. A profile that
@@ -382,7 +394,9 @@ impl Store {
     pub fn env_of(&self, id: &str) -> Result<Option<String>> {
         Ok(self
             .conn
-            .query_row("SELECT env FROM profiles WHERE id = ?1", [id], |row| row.get(0))
+            .query_row("SELECT env FROM profiles WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
             .optional()?
             .flatten())
     }
@@ -391,8 +405,10 @@ impl Store {
     /// the tag away with `None`. The tag is display metadata, so it is
     /// written beside the profile rather than through `save_profile`.
     pub fn set_env(&self, id: &str, env: Option<&str>) -> Result<()> {
-        self.conn
-            .execute("UPDATE profiles SET env = ?2 WHERE id = ?1", rusqlite::params![id, env])?;
+        self.conn.execute(
+            "UPDATE profiles SET env = ?2 WHERE id = ?1",
+            rusqlite::params![id, env],
+        )?;
         Ok(())
     }
 
@@ -417,7 +433,8 @@ impl Store {
     }
 
     pub fn delete_profile(&self, id: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM profiles WHERE id = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM profiles WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -431,9 +448,11 @@ impl Store {
     pub fn cached_catalog(&self, scope: &str) -> Result<Option<Catalog>> {
         let json: Option<String> = self
             .conn
-            .query_row("SELECT catalog FROM catalog_cache WHERE scope = ?1", [scope], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT catalog FROM catalog_cache WHERE scope = ?1",
+                [scope],
+                |row| row.get(0),
+            )
             .optional()?;
         let Some(json) = json else { return Ok(None) };
         match serde_json::from_str(&json) {
@@ -462,7 +481,8 @@ impl Store {
     }
 
     pub fn forget_catalog(&self, scope: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM catalog_cache WHERE scope = ?1", [scope])?;
+        self.conn
+            .execute("DELETE FROM catalog_cache WHERE scope = ?1", [scope])?;
         Ok(())
     }
 
@@ -535,7 +555,11 @@ impl Store {
         tx.execute("DELETE FROM open_tabs WHERE scope = ?1", [scope])?;
         for (position, tab) in kept.iter().enumerate() {
             let (kind, title, schema, relation, page, statement, tx_mode) = match tab {
-                SavedTab::Table { schema, table, page } => (
+                SavedTab::Table {
+                    schema,
+                    table,
+                    page,
+                } => (
                     "table",
                     None,
                     Some(schema.as_str()),
@@ -544,7 +568,12 @@ impl Store {
                     None,
                     None,
                 ),
-                SavedTab::Query { title, statement, relation, tx_mode } => (
+                SavedTab::Query {
+                    title,
+                    statement,
+                    relation,
+                    tx_mode,
+                } => (
                     "query",
                     Some(title.as_str()),
                     relation.as_ref().map(|(schema, _)| schema.as_str()),
@@ -791,7 +820,10 @@ mod tests {
 
         // An edit writes the profile again; the tag must stay.
         store.save_profile(&profile).unwrap();
-        assert_eq!(store.list_connections().unwrap()[0].env.as_deref(), Some("prod"));
+        assert_eq!(
+            store.list_connections().unwrap()[0].env.as_deref(),
+            Some("prod")
+        );
 
         store.set_env("p1", None).unwrap();
         assert_eq!(store.list_connections().unwrap()[0].env, None);
@@ -820,7 +852,10 @@ mod tests {
 
         // A row an older build wrote has no answer in the column. The
         // careful reading is the one that wins.
-        store.conn.execute("UPDATE profiles SET read_only = NULL", []).unwrap();
+        store
+            .conn
+            .execute("UPDATE profiles SET read_only = NULL", [])
+            .unwrap();
         assert!(store.list_connections().unwrap()[0].profile.read_only);
     }
 
@@ -848,9 +883,15 @@ mod tests {
     #[test]
     fn history_reads_back_newest_first_and_per_connection() {
         let store = store_at("history.sqlite");
-        store.record_query(run("prod", "select 1", 100, RunSource::User)).unwrap();
-        store.record_query(run("prod", "select 2", 200, RunSource::User)).unwrap();
-        store.record_query(run("staging", "select 3", 300, RunSource::User)).unwrap();
+        store
+            .record_query(run("prod", "select 1", 100, RunSource::User))
+            .unwrap();
+        store
+            .record_query(run("prod", "select 2", 200, RunSource::User))
+            .unwrap();
+        store
+            .record_query(run("staging", "select 3", 300, RunSource::User))
+            .unwrap();
 
         let seen: Vec<String> = store
             .list_history("prod", HistoryFilter::default())
@@ -876,9 +917,13 @@ mod tests {
                 ..run("prod", "update t set a = 1", 100, RunSource::User)
             })
             .unwrap();
-        store.record_query(run("prod", "select 1", 90, RunSource::User)).unwrap();
+        store
+            .record_query(run("prod", "select 1", 90, RunSource::User))
+            .unwrap();
 
-        let seen = store.list_history("prod", HistoryFilter::default()).unwrap();
+        let seen = store
+            .list_history("prod", HistoryFilter::default())
+            .unwrap();
         assert_eq!(seen[0].affected, Some(3));
         assert_eq!(seen[0].row_count, Some(0));
         assert_eq!(seen[1].affected, None);
@@ -887,8 +932,12 @@ mod tests {
     #[test]
     fn the_filters_narrow_the_history() {
         let store = store_at("history-filters.sqlite");
-        store.record_query(run("prod", "select 1", 100, RunSource::User)).unwrap();
-        store.record_query(run("prod", "select * from users", 150, RunSource::App)).unwrap();
+        store
+            .record_query(run("prod", "select 1", 100, RunSource::User))
+            .unwrap();
+        store
+            .record_query(run("prod", "select * from users", 150, RunSource::App))
+            .unwrap();
         store
             .record_query(NewRun {
                 elapsed_ms: None,
@@ -898,16 +947,25 @@ mod tests {
             })
             .unwrap();
 
-        let user_only = HistoryFilter { user_only: true, ..Default::default() };
+        let user_only = HistoryFilter {
+            user_only: true,
+            ..Default::default()
+        };
         assert_eq!(store.list_history("prod", user_only).unwrap().len(), 2);
 
-        let errors_only = HistoryFilter { errors_only: true, ..Default::default() };
+        let errors_only = HistoryFilter {
+            errors_only: true,
+            ..Default::default()
+        };
         let failed = store.list_history("prod", errors_only).unwrap();
         assert_eq!(failed.len(), 1);
         assert!(failed[0].error.is_some());
         assert_eq!(failed[0].elapsed_ms, None);
 
-        let recent = HistoryFilter { since: Some(150), ..Default::default() };
+        let recent = HistoryFilter {
+            since: Some(150),
+            ..Default::default()
+        };
         assert_eq!(store.list_history("prod", recent).unwrap().len(), 2);
     }
 
@@ -919,7 +977,9 @@ mod tests {
                 .record_query(run("prod", &format!("select {ix}"), ix, RunSource::User))
                 .unwrap();
         }
-        let kept = store.list_history("prod", HistoryFilter::default()).unwrap();
+        let kept = store
+            .list_history("prod", HistoryFilter::default())
+            .unwrap();
         assert_eq!(kept.len(), HISTORY_LIMIT);
         // The oldest runs are the ones that go.
         assert_eq!(kept[0].statement, format!("select {}", HISTORY_LIMIT + 19));
@@ -944,9 +1004,13 @@ mod tests {
 
         assert!(store.cached_catalog("prod").unwrap().is_none());
         store.cache_catalog("prod", &catalog("users"), 100).unwrap();
-        store.cache_catalog("staging", &catalog("orders"), 100).unwrap();
+        store
+            .cache_catalog("staging", &catalog("orders"), 100)
+            .unwrap();
         // The second read of the same connection replaces the first.
-        store.cache_catalog("prod", &catalog("people"), 200).unwrap();
+        store
+            .cache_catalog("prod", &catalog("people"), 200)
+            .unwrap();
 
         let prod = store.cached_catalog("prod").unwrap().unwrap();
         assert_eq!(prod.schemas[0].tables[0].name, "people");
@@ -993,7 +1057,11 @@ mod tests {
                 // them, so the mode rides in the row beside the statement.
                 tx_mode: TxMode::Manual,
             },
-            SavedTab::Table { schema: "public".into(), table: "orders".into(), page: 3 },
+            SavedTab::Table {
+                schema: "public".into(),
+                table: "orders".into(),
+                page: 3,
+            },
             SavedTab::History,
         ];
         store.save_tabs("prod", &tabs, 2).unwrap();
@@ -1003,7 +1071,10 @@ mod tests {
         assert_eq!(read.tabs, tabs);
         assert_eq!(read.active, 2);
         // One connection's tabs never show up under another.
-        assert_eq!(store.saved_tabs("staging").unwrap().tabs, [SavedTab::History]);
+        assert_eq!(
+            store.saved_tabs("staging").unwrap().tabs,
+            [SavedTab::History]
+        );
     }
 
     #[test]
@@ -1015,7 +1086,9 @@ mod tests {
             relation: None,
             tx_mode: TxMode::Auto,
         };
-        store.save_tabs("prod", &[query("select 1"), query("select 2")], 1).unwrap();
+        store
+            .save_tabs("prod", &[query("select 1"), query("select 2")], 1)
+            .unwrap();
         store.save_tabs("prod", &[query("select 3")], 0).unwrap();
 
         let read = store.saved_tabs("prod").unwrap();

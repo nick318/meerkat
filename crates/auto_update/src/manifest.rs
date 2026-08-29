@@ -109,38 +109,77 @@ mod tests {
         let mut assets = HashMap::new();
         assets.insert(
             asset_key(),
-            Asset { url: "https://example.test/a.tar.gz".into(), sha256: "aa".into() },
+            Asset {
+                url: "https://example.test/a.tar.gz".into(),
+                sha256: "aa".into(),
+            },
         );
-        Manifest { version: version.into(), sha: sha.map(Into::into), assets }
+        Manifest {
+            version: version.into(),
+            sha: sha.map(Into::into),
+            assets,
+        }
     }
 
     #[test]
     fn public_moves_by_version() {
         let m = manifest("0.2.0", None);
-        assert!(update_available(Channel::Public, "0.1.0", None, &m).unwrap().is_some());
-        assert!(update_available(Channel::Public, "0.2.0", None, &m).unwrap().is_none());
-        assert!(update_available(Channel::Public, "0.3.0", None, &m).unwrap().is_none());
+        assert!(
+            update_available(Channel::Public, "0.1.0", None, &m)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            update_available(Channel::Public, "0.2.0", None, &m)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            update_available(Channel::Public, "0.3.0", None, &m)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn dev_moves_by_commit_even_on_the_same_version() {
         let m = manifest("0.1.0", Some("bbb2222"));
-        assert!(update_available(Channel::Dev, "0.1.0", Some("aaa1111"), &m).unwrap().is_some());
-        assert!(update_available(Channel::Dev, "0.1.0", Some("bbb2222"), &m).unwrap().is_none());
+        assert!(
+            update_available(Channel::Dev, "0.1.0", Some("aaa1111"), &m)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            update_available(Channel::Dev, "0.1.0", Some("bbb2222"), &m)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn a_dev_build_that_does_not_know_its_commit_takes_the_download() {
         let m = manifest("0.1.0", Some("bbb2222"));
-        assert!(update_available(Channel::Dev, "0.1.0", None, &m).unwrap().is_some());
+        assert!(
+            update_available(Channel::Dev, "0.1.0", None, &m)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
     fn a_dev_feed_without_a_commit_falls_back_to_the_version() {
         let m = manifest("0.2.0", None);
-        assert!(update_available(Channel::Dev, "0.1.0", Some("aaa1111"), &m).unwrap().is_some());
+        assert!(
+            update_available(Channel::Dev, "0.1.0", Some("aaa1111"), &m)
+                .unwrap()
+                .is_some()
+        );
         let m = manifest("0.1.0", None);
-        assert!(update_available(Channel::Dev, "0.1.0", Some("aaa1111"), &m).unwrap().is_none());
+        assert!(
+            update_available(Channel::Dev, "0.1.0", Some("aaa1111"), &m)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -150,13 +189,21 @@ mod tests {
             sha: None,
             assets: HashMap::new(),
         };
-        assert!(update_available(Channel::Public, "0.1.0", None, &m).unwrap().is_none());
+        assert!(
+            update_available(Channel::Public, "0.1.0", None, &m)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn a_local_build_is_never_offered_anything() {
         let m = manifest("9.9.9", Some("bbb2222"));
-        assert!(update_available(Channel::Local, "0.1.0", None, &m).unwrap().is_none());
+        assert!(
+            update_available(Channel::Local, "0.1.0", None, &m)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

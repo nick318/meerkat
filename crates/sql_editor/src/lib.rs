@@ -19,18 +19,16 @@ mod completion;
 mod highlight;
 mod motion;
 
-
 pub use completion::{Kind, Name, Vocabulary};
 
 use completion::Completion;
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, Div,
-    Element, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
-    GlobalElementId, Hsla, IntoElement, KeyContext, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollHandle, ShapedLine, SharedString,
-    Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*,
-    px, relative, size,
+    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
+    FontWeight, GlobalElementId, Hsla, IntoElement, KeyContext, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollHandle,
+    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
+    fill, point, prelude::*, px, relative, size,
 };
 use highlight::Token;
 use std::ops::Range;
@@ -436,7 +434,9 @@ impl SqlEditor {
         status: StatementStatus,
         cx: &mut Context<Self>,
     ) {
-        let Some(mark) = self.statements.get_mut(ix) else { return };
+        let Some(mark) = self.statements.get_mut(ix) else {
+            return;
+        };
         mark.status = status;
         cx.notify();
     }
@@ -492,8 +492,15 @@ impl SqlEditor {
     /// frame, before there is a layout to shape into. The placeholder
     /// counts when the buffer is empty, because that is what is on screen.
     fn widest_line(&self) -> usize {
-        let text = if self.content.is_empty() { self.placeholder.as_ref() } else { &self.content };
-        text.split('\n').map(|line| line.chars().count()).max().unwrap_or(0)
+        let text = if self.content.is_empty() {
+            self.placeholder.as_ref()
+        } else {
+            &self.content
+        };
+        text.split('\n')
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0)
     }
 
     /// Swap in the names of the connected database, so the tokenizer can
@@ -616,7 +623,9 @@ impl SqlEditor {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(snapshot) = self.undo.pop() else { return };
+        let Some(snapshot) = self.undo.pop() else {
+            return;
+        };
         let current = self.restore(snapshot);
         self.redo.push(current);
         // Undo and redo are edits like any other: they move the text the
@@ -626,7 +635,9 @@ impl SqlEditor {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(snapshot) = self.redo.pop() else { return };
+        let Some(snapshot) = self.redo.pop() else {
+            return;
+        };
         let current = self.restore(snapshot);
         self.undo.push(current);
         self.edited(cx);
@@ -755,10 +766,13 @@ impl SqlEditor {
         let line_start = self.line_start(caret);
         let line = &self.content[line_start..self.line_end(caret)];
         let column = caret - line_start;
-        if highlight::spans(line, &self.vocabulary).iter().any(|(range, token)| {
-            range.contains(&column.saturating_sub(1))
-                && matches!(token, highlight::Token::Literal | highlight::Token::Comment)
-        }) {
+        if highlight::spans(line, &self.vocabulary)
+            .iter()
+            .any(|(range, token)| {
+                range.contains(&column.saturating_sub(1))
+                    && matches!(token, highlight::Token::Literal | highlight::Token::Comment)
+            })
+        {
             return;
         }
 
@@ -787,19 +801,16 @@ impl SqlEditor {
     }
 
     fn apply_completion(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(completion) = self.completions.get(ix) else { return };
+        let Some(completion) = self.completions.get(ix) else {
+            return;
+        };
         let label = completion.label.clone();
         let range = self.completion_range.clone();
 
         // Accepting is one undo step, never joined to the typing before it.
         self.last_edit = EditKind::None;
         self.selected_range = range.clone();
-        self.replace_text_in_range(
-            Some(self.range_to_utf16(&range)),
-            &label,
-            window,
-            cx,
-        );
+        self.replace_text_in_range(Some(self.range_to_utf16(&range)), &label, window, cx);
         self.last_edit = EditKind::None;
         // The word is now complete; it is not a prefix waiting for more.
         self.close_completions();
@@ -1147,7 +1158,9 @@ impl EntityInputHandler for SqlEditor {
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked_range.as_ref().map(|range| self.range_to_utf16(range))
+        self.marked_range
+            .as_ref()
+            .map(|range| self.range_to_utf16(range))
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
@@ -1268,7 +1281,10 @@ impl EntityInputHandler for SqlEditor {
         let top = bounds.top() + layout.line_height * row as f32;
         Some(Bounds::from_corners(
             point(bounds.left() + line.x_for_index(from), top),
-            point(bounds.left() + line.x_for_index(to), top + layout.line_height),
+            point(
+                bounds.left() + line.x_for_index(to),
+                top + layout.line_height,
+            ),
         ))
     }
 
@@ -1497,7 +1513,9 @@ impl Render for SqlEditor {
                                     .min_h(relative(1.))
                                     .px(px(TEXT_PADDING_X))
                                     .py(px(TEXT_PADDING_Y))
-                                    .child(EditorElement { editor: cx.entity() }),
+                                    .child(EditorElement {
+                                        editor: cx.entity(),
+                                    }),
                             ),
                     ),
             )
@@ -1582,29 +1600,25 @@ impl SqlEditor {
                     .on_click(cx.listener(move |this, _event, window, cx| {
                         this.apply_completion(ix, window, cx)
                     }))
-                    .child(
-                        div()
-                            .min_w(px(0.))
-                            .flex()
-                            .overflow_hidden()
-                            .children(spans.into_iter().enumerate().map(|(at, (text, hit))| {
-                                let span = if at == last {
-                                    // Only the last span may give way: a
-                                    // long name has to end in an ellipsis
-                                    // rather than run out of the panel.
-                                    div().truncate()
-                                } else {
-                                    div().flex_none()
-                                };
-                                if hit {
-                                    span.font_weight(FontWeight::MEDIUM)
-                                        .text_color(colors.accent_deep)
-                                        .child(text)
-                                } else {
-                                    span.text_color(colors.text).child(text)
-                                }
-                            })),
-                    )
+                    .child(div().min_w(px(0.)).flex().overflow_hidden().children(
+                        spans.into_iter().enumerate().map(|(at, (text, hit))| {
+                            let span = if at == last {
+                                // Only the last span may give way: a
+                                // long name has to end in an ellipsis
+                                // rather than run out of the panel.
+                                div().truncate()
+                            } else {
+                                div().flex_none()
+                            };
+                            if hit {
+                                span.font_weight(FontWeight::MEDIUM)
+                                    .text_color(colors.accent_deep)
+                                    .child(text)
+                            } else {
+                                span.text_color(colors.text).child(text)
+                            }
+                        }),
+                    ))
                     .child(
                         div()
                             .flex_none()
@@ -1640,10 +1654,7 @@ impl SqlEditor {
 ///
 /// A plain function over the text and the ranges, so the mapping can be
 /// argued with in a test rather than in a running window.
-fn line_marks(
-    content: &str,
-    statements: &[StatementMark],
-) -> Vec<Option<(StatementStatus, bool)>> {
+fn line_marks(content: &str, statements: &[StatementMark]) -> Vec<Option<(StatementStatus, bool)>> {
     let mut marks = vec![None; content.split('\n').count()];
     if statements.is_empty() {
         return marks;
@@ -1715,9 +1726,11 @@ fn statement_mark(line: usize, status: StatementStatus, colors: &ThemeColors) ->
             .child("!")
             .into_any_element(),
         // A dash: nothing happened here, and nothing is what it draws.
-        StatementStatus::Skipped => {
-            div().w(px(MARK_SIZE)).h(px(2.)).bg(colors.idle).into_any_element()
-        }
+        StatementStatus::Skipped => div()
+            .w(px(MARK_SIZE))
+            .h(px(2.))
+            .bg(colors.idle)
+            .into_any_element(),
     }
 }
 
@@ -1877,7 +1890,11 @@ impl Element for EditorElement {
         } else {
             editor.content.clone()
         };
-        let text_color = if placeholder { colors.text_faint } else { style.color };
+        let text_color = if placeholder {
+            colors.text_faint
+        } else {
+            style.color
+        };
 
         let mut lines = Vec::new();
         let mut line_starts = Vec::new();
@@ -1889,8 +1906,11 @@ impl Element for EditorElement {
                 single_run(line, style.font(), text_color, underline)
             } else {
                 let marks = marks_on_line(&editor.diagnostics, offset, line.len());
-                let squiggle =
-                    UnderlineStyle { color: Some(colors.error), thickness: px(1.), wavy: true };
+                let squiggle = UnderlineStyle {
+                    color: Some(colors.error),
+                    thickness: px(1.),
+                    wavy: true,
+                };
                 split_spans(highlight::spans(line, &editor.vocabulary), &marks)
                     .into_iter()
                     .map(|(range, token, marked)| TextRun {
@@ -1915,7 +1935,11 @@ impl Element for EditorElement {
             offset += line.len() + 1;
         }
 
-        let layout = EditorLayout { lines, line_starts, line_height };
+        let layout = EditorLayout {
+            lines,
+            line_starts,
+            line_height,
+        };
 
         let (quads, cursor, cursor_top, cursor_left) = if placeholder {
             (Vec::new(), None, None, None)
@@ -1939,7 +1963,13 @@ impl Element for EditorElement {
             self.draw_completions_menu(&layout, bounds, window, cx);
         }
 
-        PrepaintState { layout: Some(layout), quads, cursor, cursor_top, cursor_left }
+        PrepaintState {
+            layout: Some(layout),
+            quads,
+            cursor,
+            cursor_top,
+            cursor_left,
+        }
     }
 
     fn paint(
@@ -1963,11 +1993,24 @@ impl Element for EditorElement {
             window.paint_quad(quad);
         }
 
-        let layout = prepaint.layout.take().expect("prepaint always builds a layout");
+        let layout = prepaint
+            .layout
+            .take()
+            .expect("prepaint always builds a layout");
         for (row, line) in layout.lines.iter().enumerate() {
-            let origin = point(bounds.left(), bounds.top() + layout.line_height * row as f32);
-            line.paint(origin, layout.line_height, gpui::TextAlign::Left, None, window, cx)
-                .ok();
+            let origin = point(
+                bounds.left(),
+                bounds.top() + layout.line_height * row as f32,
+            );
+            line.paint(
+                origin,
+                layout.line_height,
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            )
+            .ok();
         }
 
         if focus_handle.is_focused(window)
@@ -2010,18 +2053,24 @@ impl EditorElement {
             let offset = editor.cursor_offset();
             (offset, row_for_offset(&layout.line_starts, offset))
         };
-        let Some(line) = layout.lines.get(row) else { return };
+        let Some(line) = layout.lines.get(row) else {
+            return;
+        };
         // Anchor to the start of the word, so the popup lines up with what
         // it is completing rather than drifting right as the user types.
         let anchor = {
             let editor = self.editor.read(cx);
             editor.completion_range.start.min(offset)
         };
-        let x = line.x_for_index(anchor.saturating_sub(layout.line_starts[row]).min(line.len()));
+        let x = line.x_for_index(
+            anchor
+                .saturating_sub(layout.line_starts[row])
+                .min(line.len()),
+        );
 
-        let mut menu = self
-            .editor
-            .update(cx, |editor, cx| editor.completions_menu(cx).into_any_element());
+        let mut menu = self.editor.update(cx, |editor, cx| {
+            editor.completions_menu(cx).into_any_element()
+        });
         let size = menu.layout_as_root(gpui::AvailableSpace::min_size(), window, cx);
 
         let line_top = bounds.top() + layout.line_height * row as f32;
@@ -2034,7 +2083,9 @@ impl EditorElement {
         } else {
             below
         };
-        let x = (bounds.left() + x).min(viewport.width - size.width).max(px(0.));
+        let x = (bounds.left() + x)
+            .min(viewport.width - size.width)
+            .max(px(0.));
 
         window.defer_draw(menu, point(x, y), 1, None);
     }
@@ -2104,7 +2155,8 @@ impl EditorElement {
             }
         }
 
-        self.editor.update(cx, |editor, _| editor.pending_autoscroll = false);
+        self.editor
+            .update(cx, |editor, _| editor.pending_autoscroll = false);
         if moved {
             window.refresh();
         }
@@ -2176,7 +2228,10 @@ fn split_spans(
     marks: &[Range<usize>],
 ) -> Vec<(Range<usize>, Token, bool)> {
     if marks.is_empty() {
-        return spans.into_iter().map(|(range, token)| (range, token, false)).collect();
+        return spans
+            .into_iter()
+            .map(|(range, token)| (range, token, false))
+            .collect();
     }
     let mut pieces = Vec::new();
     for (range, token) in spans {
@@ -2189,7 +2244,9 @@ fn split_spans(
         cuts.dedup();
         let mut start = range.start;
         for cut in cuts.into_iter().chain([range.end]) {
-            let marked = marks.iter().any(|mark| mark.start <= start && start < mark.end);
+            let marked = marks
+                .iter()
+                .any(|mark| mark.start <= start && start < mark.end);
             pieces.push((start..cut, token, marked));
             start = cut;
         }
@@ -2279,7 +2336,10 @@ mod tests {
     use super::*;
 
     fn diagnostic(range: Range<usize>) -> Diagnostic {
-        Diagnostic { range, message: "syntax error".to_string() }
+        Diagnostic {
+            range,
+            message: "syntax error".to_string(),
+        }
     }
 
     /// The squiggle is cut out of the colour, not painted over it: the
@@ -2297,7 +2357,11 @@ mod tests {
         assert_eq!(marked, vec!["frm"]);
         let total: usize = pieces.iter().map(|(range, _, _)| range.len()).sum();
         assert_eq!(total, line.len());
-        assert!(pieces.windows(2).all(|pair| pair[0].0.end == pair[1].0.start));
+        assert!(
+            pieces
+                .windows(2)
+                .all(|pair| pair[0].0.end == pair[1].0.start)
+        );
     }
 
     /// The colour survives the cut. A keyword half inside a mark is still
@@ -2305,7 +2369,10 @@ mod tests {
     #[test]
     fn a_split_piece_keeps_its_colour() {
         let pieces = split_spans(highlight::spans("select", &Vocabulary::default()), &[0..3]);
-        assert_eq!(pieces, vec![(0..3, Token::Keyword, true), (3..6, Token::Keyword, false)]);
+        assert_eq!(
+            pieces,
+            vec![(0..3, Token::Keyword, true), (3..6, Token::Keyword, false)]
+        );
     }
 
     #[test]
@@ -2323,7 +2390,10 @@ mod tests {
         assert_eq!(marks_on_line(&diagnostics, 0, 8), vec![4..8]);
         assert_eq!(marks_on_line(&diagnostics, 9, 9), vec![0..3]);
         // A line the mark does not reach carries nothing.
-        assert_eq!(marks_on_line(&diagnostics, 19, 5), Vec::<Range<usize>>::new());
+        assert_eq!(
+            marks_on_line(&diagnostics, 19, 5),
+            Vec::<Range<usize>>::new()
+        );
     }
 
     fn mark(range: Range<usize>, status: StatementStatus) -> StatementMark {
@@ -2333,7 +2403,10 @@ mod tests {
     #[test]
     fn a_statement_marks_every_line_it_covers() {
         let text = "select 1;\nupdate t\n   set a = 1;\n";
-        let marks = [mark(0..8, StatementStatus::Done), mark(10..31, StatementStatus::Running)];
+        let marks = [
+            mark(0..8, StatementStatus::Done),
+            mark(10..31, StatementStatus::Running),
+        ];
         assert_eq!(
             line_marks(text, &marks),
             vec![

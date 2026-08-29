@@ -10,6 +10,7 @@
 //! Offsets are byte offsets into the value and always sit on a character
 //! boundary.
 
+use crate::blink::{Blink, Blinking};
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla,
@@ -17,7 +18,6 @@ use gpui::{
     PaintQuad, Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
     UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, size,
 };
-use crate::blink::{Blink, Blinking};
 use std::ops::Range;
 use theme::theme;
 
@@ -632,7 +632,9 @@ impl EntityInputHandler for TextField {
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked_range.as_ref().map(|range| self.range_to_utf16(range))
+        self.marked_range
+            .as_ref()
+            .map(|range| self.range_to_utf16(range))
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
@@ -715,7 +717,10 @@ impl EntityInputHandler for TextField {
         let from = self.to_display(range.start).min(line.len());
         let to = self.to_display(range.end).min(line.len());
         Some(Bounds::from_corners(
-            point(bounds.left() + line.x_for_index(from) - self.scroll, bounds.top()),
+            point(
+                bounds.left() + line.x_for_index(from) - self.scroll,
+                bounds.top(),
+            ),
             point(
                 bounds.left() + line.x_for_index(to) - self.scroll,
                 bounds.bottom(),
@@ -794,7 +799,11 @@ impl Render for TextField {
                     .border_1()
                     // The focused field is the one wearing the accent;
                     // every other border on the screen stays a hairline.
-                    .border_color(if focused { colors.accent } else { colors.border_strong })
+                    .border_color(if focused {
+                        colors.accent
+                    } else {
+                        colors.border_strong
+                    })
                     .rounded(px(6.))
                     .bg(colors.elevated)
                     .text_size(px(FONT_SIZE))
@@ -872,9 +881,15 @@ impl Element for FieldElement {
         } else {
             field.display_text().into()
         };
-        let color = if placeholder { colors.text_faint } else { style.color };
+        let color = if placeholder {
+            colors.text_faint
+        } else {
+            style.color
+        };
         let runs = single_run(&text, style.font(), color, underline_for(field));
-        let line = window.text_system().shape_line(text, font_size, &runs, None);
+        let line = window
+            .text_system()
+            .shape_line(text, font_size, &runs, None);
 
         // Keep the caret inside the field: scroll only as far as it must.
         let cursor_x = if placeholder {
@@ -912,12 +927,20 @@ impl Element for FieldElement {
         let ghost = (!placeholder && !field.masked && !field.ghost.is_empty()).then(|| {
             let runs = single_run(&field.ghost, style.font(), colors.text_faint, None);
             (
-                window.text_system().shape_line(field.ghost.clone(), font_size, &runs, None),
+                window
+                    .text_system()
+                    .shape_line(field.ghost.clone(), font_size, &runs, None),
                 line.width(),
             )
         });
 
-        PrepaintState { line, scroll, selection, cursor, ghost }
+        PrepaintState {
+            line,
+            scroll,
+            selection,
+            cursor,
+            ghost,
+        }
     }
 
     fn paint(
@@ -943,8 +966,15 @@ impl Element for FieldElement {
 
         let line = prepaint.line.clone();
         let origin = point(bounds.left() - prepaint.scroll, bounds.top());
-        line.paint(origin, bounds.size.height, gpui::TextAlign::Left, None, window, cx)
-            .ok();
+        line.paint(
+            origin,
+            bounds.size.height,
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        )
+        .ok();
 
         if let Some((ghost, at)) = prepaint.ghost.take() {
             ghost
@@ -1072,11 +1102,19 @@ mod motion {
     }
 
     pub fn previous_boundary(text: &str, offset: usize) -> usize {
-        text[..offset].char_indices().next_back().map(|(ix, _)| ix).unwrap_or(0)
+        text[..offset]
+            .char_indices()
+            .next_back()
+            .map(|(ix, _)| ix)
+            .unwrap_or(0)
     }
 
     pub fn next_boundary(text: &str, offset: usize) -> usize {
-        text[offset..].char_indices().nth(1).map(|(ix, _)| offset + ix).unwrap_or(text.len())
+        text[offset..]
+            .char_indices()
+            .nth(1)
+            .map(|(ix, _)| offset + ix)
+            .unwrap_or(text.len())
     }
 
     fn char_before(text: &str, offset: usize) -> Option<char> {
@@ -1158,7 +1196,10 @@ mod tests {
     fn word_motion_walks_a_url_part_by_part() {
         assert_eq!(&URL[..motion::next_word_end(URL, 0)], "postgres");
         let after_scheme = motion::next_word_end(URL, 0);
-        assert_eq!(&URL[..motion::next_word_end(URL, after_scheme)], "postgres://ada");
+        assert_eq!(
+            &URL[..motion::next_word_end(URL, after_scheme)],
+            "postgres://ada"
+        );
         // Backwards from the end: the database name, then the port.
         let back = motion::previous_word_start(URL, URL.len());
         assert_eq!(&URL[back..], "app");

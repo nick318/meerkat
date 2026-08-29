@@ -66,12 +66,9 @@ const SYNTAX_ERROR: &str = "42601";
 /// the user typed on purpose, not a name they got wrong.
 const NAME_ERRORS: &[&str] = &[
     // undefined_table, and a schema that does not exist with it.
-    "42P01",
-    // undefined_column.
-    "42703",
-    // undefined_function.
-    "42883",
-    // undefined_object, which is what a type that does not exist is.
+    "42P01", // undefined_column.
+    "42703", // undefined_function.
+    "42883", // undefined_object, which is what a type that does not exist is.
     "42704",
 ];
 
@@ -133,7 +130,11 @@ async fn check_statement(conn: &mut sqlx::PgConnection, sql: &str) -> Option<Che
         Some(PgErrorPosition::Original(position)) => byte_offset(sql, position),
         _ => None,
     };
-    Some(CheckError { refusal, message: error.message().to_string(), offset })
+    Some(CheckError {
+        refusal,
+        message: error.message().to_string(),
+        offset,
+    })
 }
 
 /// How long a run may take before the server gives it up, when nothing else
@@ -346,7 +347,11 @@ pub fn profile_from_url(id: &str, name: &str, url: &str) -> Result<(Profile, Opt
         id: id.to_string(),
         // An unnamed connection goes by its database, as the design's
         // rows do: `meerkat_prod` over the URL it came from.
-        name: if name.trim().is_empty() { database.clone() } else { name.trim().to_string() },
+        name: if name.trim().is_empty() {
+            database.clone()
+        } else {
+            name.trim().to_string()
+        },
         engine: db_client::Engine::Postgres,
         host: Some(options.get_host().to_string()),
         port: Some(options.get_port()),
@@ -382,7 +387,10 @@ fn short_version(reported: &str) -> &str {
 /// position like any other: the caller has a rule for marking the end.
 fn byte_offset(sql: &str, position: usize) -> Option<usize> {
     let index = position.checked_sub(1)?;
-    sql.char_indices().map(|(offset, _)| offset).chain([sql.len()]).nth(index)
+    sql.char_indices()
+        .map(|(offset, _)| offset)
+        .chain([sql.len()])
+        .nth(index)
 }
 
 /// One row of the table listing, before columns and keys are attached.
@@ -461,7 +469,11 @@ impl Connection for PostgresConnection {
     /// cancel the statement it stopped reading, even when nothing is
     /// watching the run.
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
-        let mut conn = self.pool.acquire().await.context("no connection to run the statement")?;
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .context("no connection to run the statement")?;
         let (backend, link) = prepare_run(&mut *conn, &self.statement_timeout).await?;
         let mut result = collect_capped(&mut conn, &self.pool, backend, sql, self.limits).await;
         // The connection goes back to the pool here.
@@ -502,12 +514,20 @@ impl Connection for PostgresConnection {
     /// so a temp table and a `search_path` are invisible to it. A tab with
     /// a session should ask [`Session::check`] instead.
     async fn check(&self, sql: &str) -> Result<Option<CheckError>> {
-        let mut conn = self.pool.acquire().await.context("no connection to check the statement")?;
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .context("no connection to check the statement")?;
         Ok(check_statement(&mut conn, sql).await)
     }
 
     async fn relation_exists(&self, name: &str) -> Result<Option<bool>> {
-        let mut conn = self.pool.acquire().await.context("no connection to ask about a name")?;
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .context("no connection to ask about a name")?;
         relation_on(&mut conn, name).await
     }
 
@@ -651,8 +671,14 @@ impl Session for PostgresSession {
                 return Ok(None);
             }
         };
-        let Some((queryid, calls, exec_ms, plan_ms)) = row else { return Ok(None) };
-        let now = Counted { calls, exec_ms, plan_ms };
+        let Some((queryid, calls, exec_ms, plan_ms)) = row else {
+            return Ok(None);
+        };
+        let now = Counted {
+            calls,
+            exec_ms,
+            plan_ms,
+        };
         let before = self
             .counted
             .lock()
@@ -693,7 +719,9 @@ impl Session for PostgresSession {
     }
 
     async fn close(&self) {
-        let Some(mut conn) = self.conn.lock().await.take() else { return };
+        let Some(mut conn) = self.conn.lock().await.take() else {
+            return;
+        };
         // Sent whether or not a transaction is open, because it costs one
         // round trip to send and one to ask. Outside a transaction Postgres
         // answers "there is no transaction in progress" and carries on, so
@@ -908,7 +936,13 @@ async fn collect_capped(
         // result still renders its headers. DDL and other statements
         // without a result set simply describe to nothing.
         if let Ok(described) = app.describe(sql).await {
-            sink.columns(described.columns().iter().map(|c| c.name().to_string()).collect());
+            sink.columns(
+                described
+                    .columns()
+                    .iter()
+                    .map(|c| c.name().to_string())
+                    .collect(),
+            );
         }
     }
     let mut result = sink.finish(affected);
@@ -1005,7 +1039,10 @@ fn build_catalog(tables: Vec<TableRow>, columns: Vec<ColumnRow>, keys: Vec<KeyRo
         };
         match schemas.last_mut() {
             Some(schema) if schema.name == schema_name => schema.tables.push(table),
-            _ => schemas.push(Schema { name: schema_name, tables: vec![table] }),
+            _ => schemas.push(Schema {
+                name: schema_name,
+                tables: vec![table],
+            }),
         }
     }
     Catalog { schemas }
@@ -1093,7 +1130,9 @@ fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
 /// rendering it as a negative number would be a lie rather than a limit,
 /// so those digits go through as text.
 fn transaction_id(id: u64) -> Value {
-    i64::try_from(id).map(Value::Int).unwrap_or_else(|_| Value::Text(id.to_string()))
+    i64::try_from(id)
+        .map(Value::Int)
+        .unwrap_or_else(|_| Value::Text(id.to_string()))
 }
 
 /// `tsvector`'s binary form, rendered the way `tsvector_out` renders it:
@@ -1158,7 +1197,12 @@ fn tsvector(mut bytes: &[u8]) -> Result<String> {
 // build the ISO strings by hand.
 
 fn format_date(date: sqlx::types::time::Date) -> String {
-    format!("{:04}-{:02}-{:02}", date.year(), date.month() as u8, date.day())
+    format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        date.month() as u8,
+        date.day()
+    )
 }
 
 fn format_time(time: sqlx::types::time::Time) -> String {
@@ -1193,7 +1237,11 @@ mod tests {
     use db_client::{MAX_BYTES, MAX_CELL_BYTES};
 
     fn counted(calls: i64, exec_ms: f64) -> Counted {
-        Counted { calls, exec_ms, plan_ms: 0. }
+        Counted {
+            calls,
+            exec_ms,
+            plan_ms: 0.,
+        }
     }
 
     #[test]
@@ -1275,8 +1323,16 @@ mod tests {
         assert_eq!(untracked.plan_ms, None);
 
         let tracked = between(
-            Some(Counted { calls: 1, exec_ms: 10., plan_ms: 1. }),
-            Counted { calls: 2, exec_ms: 22., plan_ms: 1.5 },
+            Some(Counted {
+                calls: 1,
+                exec_ms: 10.,
+                plan_ms: 1.,
+            }),
+            Counted {
+                calls: 2,
+                exec_ms: 22.,
+                plan_ms: 1.5,
+            },
         )
         .unwrap();
         assert_eq!(tracked.plan_ms, Some(0.5));
@@ -1301,7 +1357,9 @@ mod tests {
         // This one builds the fixture, so it is the writable session.
         let conn = PostgresConnection::connect_url(&url, false).await.unwrap();
 
-        conn.execute("DROP SCHEMA IF EXISTS meerkat_test CASCADE").await.unwrap();
+        conn.execute("DROP SCHEMA IF EXISTS meerkat_test CASCADE")
+            .await
+            .unwrap();
         conn.execute("CREATE SCHEMA meerkat_test").await.unwrap();
         conn.execute(
             "CREATE TABLE meerkat_test.users (
@@ -1356,10 +1414,16 @@ mod tests {
         assert_eq!(result.columns[0], "id");
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0][0], Value::Int(1));
-        assert_eq!(result.rows[0][1], Value::Text("ada@example.com".to_string()));
+        assert_eq!(
+            result.rows[0][1],
+            Value::Text("ada@example.com".to_string())
+        );
         // Trailing zeroes drop: see the NUMERIC arm of `decode`.
         assert_eq!(result.rows[0][3], Value::Text("1280".to_string()));
-        assert_eq!(result.rows[0][7], Value::Text("2026-08-15 09:12:00 +00:00".to_string()));
+        assert_eq!(
+            result.rows[0][7],
+            Value::Text("2026-08-15 09:12:00 +00:00".to_string())
+        );
         assert_eq!(result.rows[0][4], Value::Bool(true));
         assert_eq!(result.rows[0][5], Value::Text("{\"a\":1}".to_string()));
         assert_eq!(
@@ -1370,7 +1434,9 @@ mod tests {
         assert_eq!(result.rows[1][2], Value::Null);
         assert_eq!(result.rows[1][3], Value::Null);
 
-        conn.execute("DROP SCHEMA meerkat_test CASCADE").await.unwrap();
+        conn.execute("DROP SCHEMA meerkat_test CASCADE")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1380,7 +1446,10 @@ mod tests {
 
         // `point` has no mapping in the driver; it must render as a
         // placeholder instead of failing the query.
-        let result = conn.execute("SELECT point(1, 2) AS p, 1 AS n").await.unwrap();
+        let result = conn
+            .execute("SELECT point(1, 2) AS p, 1 AS n")
+            .await
+            .unwrap();
         assert_eq!(result.rows[0][0], Value::Text("<POINT>".to_string()));
         assert_eq!(result.rows[0][1], Value::Int(1));
     }
@@ -1405,10 +1474,16 @@ mod tests {
             .unwrap();
         assert_eq!(result.rows[0][0], Value::Int(42));
         assert_eq!(result.rows[0][1], Value::Int(4294967300));
-        assert_eq!(result.rows[0][2], Value::Text("'brown':3 'fox':4 'quick':2".to_string()));
+        assert_eq!(
+            result.rows[0][2],
+            Value::Text("'brown':3 'fox':4 'quick':2".to_string())
+        );
         // The weight is the top two bits of the position, so a wrong
         // reading would put the letter on the wrong lexeme or lose it.
-        assert_eq!(result.rows[0][3], Value::Text("'fox':2A 'quick':1A".to_string()));
+        assert_eq!(
+            result.rows[0][3],
+            Value::Text("'fox':2A 'quick':1A".to_string())
+        );
         assert_eq!(result.rows[0][4], Value::Text("'a''b'".to_string()));
     }
 
@@ -1433,28 +1508,40 @@ mod tests {
         let conn = PostgresConnection::connect_url(&url, false).await.unwrap();
         let session = conn.open_session().await.unwrap();
 
-        session.execute("CREATE TEMP TABLE meerkat_affected (id int)").await.unwrap();
-        let inserted =
-            session.execute("INSERT INTO meerkat_affected VALUES (1), (2), (3)").await.unwrap();
+        session
+            .execute("CREATE TEMP TABLE meerkat_affected (id int)")
+            .await
+            .unwrap();
+        let inserted = session
+            .execute("INSERT INTO meerkat_affected VALUES (1), (2), (3)")
+            .await
+            .unwrap();
         assert_eq!(inserted.rows_affected, 3);
         // No result set: the columns are what the app reads to know there
         // is no grid to paint.
         assert!(inserted.columns.is_empty(), "{:?}", inserted.columns);
 
-        let updated =
-            session.execute("UPDATE meerkat_affected SET id = id + 1 WHERE id > 1").await.unwrap();
+        let updated = session
+            .execute("UPDATE meerkat_affected SET id = id + 1 WHERE id > 1")
+            .await
+            .unwrap();
         assert_eq!(updated.rows_affected, 2);
 
         // The reading that matters: the statement worked and matched
         // nothing, which is a different answer from an empty table.
-        let matched_nothing =
-            session.execute("DELETE FROM meerkat_affected WHERE id = 999").await.unwrap();
+        let matched_nothing = session
+            .execute("DELETE FROM meerkat_affected WHERE id = 999")
+            .await
+            .unwrap();
         assert_eq!(matched_nothing.rows_affected, 0);
         assert!(matched_nothing.columns.is_empty());
 
         // A statement with a `RETURNING` clause is a result set as well as
         // a count, and it keeps both.
-        let returning = session.execute("DELETE FROM meerkat_affected RETURNING id").await.unwrap();
+        let returning = session
+            .execute("DELETE FROM meerkat_affected RETURNING id")
+            .await
+            .unwrap();
         assert_eq!(returning.rows_affected, 3);
         assert_eq!(returning.columns, vec!["id".to_string()]);
         assert_eq!(returning.rows.len(), 3);
@@ -1469,7 +1556,10 @@ mod tests {
         let Some(url) = test_url() else { return };
         let conn = PostgresConnection::connect(&url).await.unwrap();
 
-        let result = conn.execute("SELECT * FROM generate_series(1, 5)").await.unwrap();
+        let result = conn
+            .execute("SELECT * FROM generate_series(1, 5)")
+            .await
+            .unwrap();
         assert_eq!(result.rows_affected, 5);
         assert_eq!(result.columns.len(), 1);
     }
@@ -1482,8 +1572,15 @@ mod tests {
         let conn = PostgresConnection::connect(&url).await.unwrap();
         let session = conn.open_session().await.unwrap();
 
-        let wire = session.execute("SELECT * FROM generate_series(1, 20000)").await.unwrap().wire;
-        assert!(wire.link_ms.is_some(), "the session did not time its round trip");
+        let wire = session
+            .execute("SELECT * FROM generate_series(1, 20000)")
+            .await
+            .unwrap()
+            .wire;
+        assert!(
+            wire.link_ms.is_some(),
+            "the session did not time its round trip"
+        );
         assert!(wire.first_row_ms.is_some(), "no row was timed");
         assert!(wire.fetch_ms.is_some(), "the fetch was not timed");
 
@@ -1518,7 +1615,11 @@ mod tests {
         // With a baseline in hand, the next run of the same statement is
         // exact, and it is the sleep the statement asked for.
         session.execute("SELECT pg_sleep(0.2)").await.unwrap();
-        let second = session.server_timing().await.unwrap().expect("no second reading");
+        let second = session
+            .server_timing()
+            .await
+            .unwrap()
+            .expect("no second reading");
         assert!(second.exact, "one run between two readings is exact");
         assert!(
             (150. ..600.).contains(&second.exec_ms),
@@ -1537,13 +1638,21 @@ mod tests {
         assert_eq!(conn.check("SELECT 1").await.unwrap(), None);
 
         let sql = "SELECT 1 FROM";
-        let error = conn.check(sql).await.unwrap().expect("no error for an unfinished statement");
+        let error = conn
+            .check(sql)
+            .await
+            .unwrap()
+            .expect("no error for an unfinished statement");
         assert!(error.message.contains("syntax error"), "{}", error.message);
         // "at end of input": one past the last character.
         assert_eq!(error.offset, Some(sql.len()));
 
         let sql = "SELECT 1 frm t";
-        let error = conn.check(sql).await.unwrap().expect("no error for a broken statement");
+        let error = conn
+            .check(sql)
+            .await
+            .unwrap()
+            .expect("no error for a broken statement");
         assert_eq!(&sql[error.offset.unwrap()..], "t");
     }
 
@@ -1556,15 +1665,25 @@ mod tests {
         let conn = PostgresConnection::connect(&url).await.unwrap();
 
         let sql = "SELECT * FROM public.no_such_table_here";
-        let error = conn.check(sql).await.unwrap().expect("no error for a table that is not there");
+        let error = conn
+            .check(sql)
+            .await
+            .unwrap()
+            .expect("no error for a table that is not there");
         assert_eq!(error.refusal, Refusal::Name);
         assert_eq!(&sql[error.offset.unwrap()..], "public.no_such_table_here");
 
         // A column, a function and a type answer the same way.
-        for sql in
-            ["SELECT no_such_column FROM pg_class", "SELECT no_such_fn(1)", "SELECT 1::no_such_ty"]
-        {
-            let error = conn.check(sql).await.unwrap().expect("{sql} was not refused");
+        for sql in [
+            "SELECT no_such_column FROM pg_class",
+            "SELECT no_such_fn(1)",
+            "SELECT 1::no_such_ty",
+        ] {
+            let error = conn
+                .check(sql)
+                .await
+                .unwrap()
+                .expect("{sql} was not refused");
             assert_eq!(error.refusal, Refusal::Name, "{sql}");
         }
     }
@@ -1584,7 +1703,12 @@ mod tests {
         ] {
             assert_eq!(conn.check(sql).await.unwrap(), None, "{sql}");
         }
-        assert_eq!(conn.relation_exists("public.no_such_table_here").await.unwrap(), Some(false));
+        assert_eq!(
+            conn.relation_exists("public.no_such_table_here")
+                .await
+                .unwrap(),
+            Some(false)
+        );
     }
 
     /// `to_regclass` resolves a name the way the parser does, which is the
@@ -1594,14 +1718,25 @@ mod tests {
         let Some(url) = test_url() else { return };
         let conn = PostgresConnection::connect(&url).await.unwrap();
 
-        assert_eq!(conn.relation_exists("pg_catalog.pg_class").await.unwrap(), Some(true));
+        assert_eq!(
+            conn.relation_exists("pg_catalog.pg_class").await.unwrap(),
+            Some(true)
+        );
         // Unqualified, so it goes through `search_path`.
         assert_eq!(conn.relation_exists("pg_class").await.unwrap(), Some(true));
         // Unquoted parts fold to lower case, as SQL does.
         assert_eq!(conn.relation_exists("PG_CLASS").await.unwrap(), Some(true));
         // A quoted one does not, so this is a different name.
-        assert_eq!(conn.relation_exists("\"PG_CLASS\"").await.unwrap(), Some(false));
-        assert_eq!(conn.relation_exists("public.no_such_table_here").await.unwrap(), Some(false));
+        assert_eq!(
+            conn.relation_exists("\"PG_CLASS\"").await.unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            conn.relation_exists("public.no_such_table_here")
+                .await
+                .unwrap(),
+            Some(false)
+        );
         // A name that is not a name answers rather than raising.
         assert_eq!(conn.relation_exists("a b c").await.unwrap(), Some(false));
     }
@@ -1626,18 +1761,34 @@ mod tests {
         // Read-only refuses a temp table, so this one asks to write.
         let conn = PostgresConnection::connect_url(&url, false).await.unwrap();
         let session = conn.open_session().await.unwrap();
-        session.execute("CREATE TEMP TABLE meerkat_check_probe (id int)").await.unwrap();
+        session
+            .execute("CREATE TEMP TABLE meerkat_check_probe (id int)")
+            .await
+            .unwrap();
 
         let sql = "SELECT * FROM meerkat_check_probe";
         assert_eq!(session.check(sql).await.unwrap(), None);
         // The pool is a different connection, and it cannot see it.
-        let pooled = conn.check(sql).await.unwrap().expect("the pool saw a temp table");
+        let pooled = conn
+            .check(sql)
+            .await
+            .unwrap()
+            .expect("the pool saw a temp table");
         assert_eq!(pooled.refusal, Refusal::Name);
 
         // And the same split for the name a `DROP TABLE` would be marked
         // on, which is the whole reason the probe follows the session too.
-        assert_eq!(session.relation_exists("meerkat_check_probe").await.unwrap(), Some(true));
-        assert_eq!(conn.relation_exists("meerkat_check_probe").await.unwrap(), Some(false));
+        assert_eq!(
+            session
+                .relation_exists("meerkat_check_probe")
+                .await
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            conn.relation_exists("meerkat_check_probe").await.unwrap(),
+            Some(false)
+        );
 
         session.close().await;
     }
@@ -1648,7 +1799,10 @@ mod tests {
         let Some(url) = test_url() else { return };
         let conn = PostgresConnection::connect(&url).await.unwrap();
 
-        assert_eq!(conn.check("DROP TABLE IF EXISTS pg_class").await.unwrap(), None);
+        assert_eq!(
+            conn.check("DROP TABLE IF EXISTS pg_class").await.unwrap(),
+            None
+        );
         // Still there, so nothing ran.
         let result = conn.execute("SELECT count(*) FROM pg_class").await.unwrap();
         assert_eq!(result.rows.len(), 1);
@@ -1659,7 +1813,10 @@ mod tests {
         let Some(url) = test_url() else { return };
         let conn = PostgresConnection::connect(&url).await.unwrap();
 
-        let error = conn.execute("SELECT * FROM no_such_table_here").await.unwrap_err();
+        let error = conn
+            .execute("SELECT * FROM no_such_table_here")
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("no_such_table_here"), "{error}");
     }
 
@@ -1677,7 +1834,10 @@ mod tests {
         assert!(error.contains("read-only transaction"), "{error}");
 
         // Reading is the whole point of the session, and it still works.
-        assert_eq!(conn.execute("SELECT 1 AS x").await.unwrap().rows[0][0], Value::Int(1));
+        assert_eq!(
+            conn.execute("SELECT 1 AS x").await.unwrap().rows[0][0],
+            Value::Int(1)
+        );
     }
 
     /// The whole point of the backend id: a statement that would run for
@@ -1701,15 +1861,24 @@ mod tests {
         // Let the statement reach the server before asking it to stop.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert!(conn.stop(id, Stop::Cancel).await.unwrap(), "the server refused the cancel");
+        assert!(
+            conn.stop(id, Stop::Cancel).await.unwrap(),
+            "the server refused the cancel"
+        );
         let error = runner.await.unwrap().unwrap_err().to_string();
         assert!(error.contains("canceling statement"), "{error}");
         // It slept for 30 seconds and this test did not.
-        assert!(started.elapsed() < Duration::from_secs(10), "the cancel did not land");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the cancel did not land"
+        );
 
         // The session outlives a cancelled statement, as the tab holding
         // it expects: a cancel ends the statement, not the connection.
-        assert_eq!(session.execute("SELECT 1 AS x").await.unwrap().rows[0][0], Value::Int(1));
+        assert_eq!(
+            session.execute("SELECT 1 AS x").await.unwrap().rows[0][0],
+            Value::Int(1)
+        );
     }
 
     /// The second press. A terminated backend takes its connection with
@@ -1731,12 +1900,21 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert!(conn.stop(id, Stop::Terminate).await.unwrap());
-        assert!(runner.await.unwrap().is_err(), "the statement outlived its backend");
-        assert!(started.elapsed() < Duration::from_secs(10), "the terminate did not land");
+        assert!(
+            runner.await.unwrap().is_err(),
+            "the statement outlived its backend"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the terminate did not land"
+        );
 
         // The app pool is still good afterwards: it throws the dead
         // connection away and opens another.
-        assert_eq!(conn.execute("SELECT 1 AS x").await.unwrap().rows[0][0], Value::Int(1));
+        assert_eq!(
+            conn.execute("SELECT 1 AS x").await.unwrap().rows[0][0],
+            Value::Int(1)
+        );
     }
 
     /// The requirement the cap is sized for: a narrow result of 120,000
@@ -1761,8 +1939,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_result_past_the_budget_is_capped_not_failed() {
         let Some(url) = test_url() else { return };
-        let limits = Limits { max_bytes: 64 * 1024, max_cell_bytes: MAX_CELL_BYTES };
-        let conn = PostgresConnection::connect(&url).await.unwrap().with_limits(limits);
+        let limits = Limits {
+            max_bytes: 64 * 1024,
+            max_cell_bytes: MAX_CELL_BYTES,
+        };
+        let conn = PostgresConnection::connect(&url)
+            .await
+            .unwrap()
+            .with_limits(limits);
 
         // Ten million rows, of which the budget holds a few hundred.
         let result = conn
@@ -1770,11 +1954,17 @@ mod tests {
             .await
             .unwrap();
         assert!(result.truncated, "the result was not marked truncated");
-        assert!(!result.rows.is_empty(), "a capped result must still show rows");
+        assert!(
+            !result.rows.is_empty(),
+            "a capped result must still show rows"
+        );
         assert!(result.rows.len() < 10_000_000, "the whole result came back");
         assert_eq!(result.columns.len(), 2);
 
-        assert_eq!(conn.execute("SELECT 1 AS x").await.unwrap().rows[0][0], Value::Int(1));
+        assert_eq!(
+            conn.execute("SELECT 1 AS x").await.unwrap().rows[0][0],
+            Value::Int(1)
+        );
     }
 
     /// One value must not eat the whole budget. The cut value says it was
@@ -1782,12 +1972,23 @@ mod tests {
     #[tokio::test]
     async fn one_huge_value_is_cut_to_the_cell_cap() {
         let Some(url) = test_url() else { return };
-        let limits = Limits { max_bytes: MAX_BYTES, max_cell_bytes: 4096 };
-        let conn = PostgresConnection::connect(&url).await.unwrap().with_limits(limits);
+        let limits = Limits {
+            max_bytes: MAX_BYTES,
+            max_cell_bytes: 4096,
+        };
+        let conn = PostgresConnection::connect(&url)
+            .await
+            .unwrap()
+            .with_limits(limits);
 
-        let result = conn.execute("SELECT repeat('x', 2000000) AS wide").await.unwrap();
+        let result = conn
+            .execute("SELECT repeat('x', 2000000) AS wide")
+            .await
+            .unwrap();
         let cell = &result.rows[0][0];
-        let Value::Text(text) = cell else { panic!("not text: {cell:?}") };
+        let Value::Text(text) = cell else {
+            panic!("not text: {cell:?}")
+        };
         assert_eq!(text.len(), 4096 + '…'.len_utf8());
         assert!(text.ends_with('…'));
         // One row, and it fitted: the cell cap is not the byte cap.
@@ -1799,13 +2000,23 @@ mod tests {
     #[tokio::test]
     async fn a_run_gets_the_apps_timeout_when_nothing_else_set_one() {
         let Some(url) = test_url() else { return };
-        let conn = PostgresConnection::connect(&url).await.unwrap().with_statement_timeout("100ms");
+        let conn = PostgresConnection::connect(&url)
+            .await
+            .unwrap()
+            .with_statement_timeout("100ms");
 
-        let error = conn.execute("SELECT pg_sleep(5)").await.unwrap_err().to_string();
+        let error = conn
+            .execute("SELECT pg_sleep(5)")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("statement timeout"), "{error}");
         // The connection is still good: a timeout ends the statement, not
         // the backend.
-        assert_eq!(conn.execute("SELECT 1 AS x").await.unwrap().rows[0][0], Value::Int(1));
+        assert_eq!(
+            conn.execute("SELECT 1 AS x").await.unwrap().rows[0][0],
+            Value::Int(1)
+        );
     }
 
     /// The question the guard has to answer: was this the user's choice or
@@ -1817,7 +2028,10 @@ mod tests {
         let Some(url) = test_url() else { return };
         let joiner = if url.contains('?') { '&' } else { '?' };
         let url = format!("{url}{joiner}options=-c%20statement_timeout%3D20s");
-        let conn = PostgresConnection::connect(&url).await.unwrap().with_statement_timeout("100ms");
+        let conn = PostgresConnection::connect(&url)
+            .await
+            .unwrap()
+            .with_statement_timeout("100ms");
 
         // Well past the app's 100 ms, well inside the session's own 20 s.
         conn.execute("SELECT pg_sleep(0.5)").await.unwrap();
@@ -1839,7 +2053,10 @@ mod tests {
         let conn = PostgresConnection::connect(&url).await.unwrap();
         let session = conn.open_session().await.unwrap();
 
-        session.execute("SET statement_timeout = '5min'").await.unwrap();
+        session
+            .execute("SET statement_timeout = '5min'")
+            .await
+            .unwrap();
         let result = session
             .execute("SELECT setting, source FROM pg_settings WHERE name = 'statement_timeout'")
             .await
@@ -1868,16 +2085,28 @@ mod tests {
         let session = conn.open_session().await.unwrap();
 
         session.execute("BEGIN").await.unwrap();
-        session.execute("CREATE TEMP TABLE meerkat_session_probe (id int)").await.unwrap();
-        session.execute("INSERT INTO meerkat_session_probe VALUES (1), (2)").await.unwrap();
-        let result = session.execute("SELECT count(*) FROM meerkat_session_probe").await.unwrap();
+        session
+            .execute("CREATE TEMP TABLE meerkat_session_probe (id int)")
+            .await
+            .unwrap();
+        session
+            .execute("INSERT INTO meerkat_session_probe VALUES (1), (2)")
+            .await
+            .unwrap();
+        let result = session
+            .execute("SELECT count(*) FROM meerkat_session_probe")
+            .await
+            .unwrap();
         assert_eq!(result.rows[0][0], Value::Int(2));
 
         session.execute("ROLLBACK").await.unwrap();
         // The table went with the transaction, and the session is still
         // good enough to say so.
-        let error =
-            session.execute("SELECT * FROM meerkat_session_probe").await.unwrap_err().to_string();
+        let error = session
+            .execute("SELECT * FROM meerkat_session_probe")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("meerkat_session_probe"), "{error}");
     }
 
@@ -1890,7 +2119,10 @@ mod tests {
         let Some(url) = test_url() else { return };
         let conn = PostgresConnection::connect(&url).await.unwrap();
         let session = conn.open_session().await.unwrap();
-        let pid = session.backend().expect("a Postgres session knows its backend").0;
+        let pid = session
+            .backend()
+            .expect("a Postgres session knows its backend")
+            .0;
 
         session.execute("BEGIN").await.unwrap();
         session.execute("SELECT 1").await.unwrap();
@@ -1940,25 +2172,40 @@ mod tests {
 
         session.begin().await.unwrap();
         assert!(session.in_transaction().await.unwrap());
-        session.execute("CREATE TEMP TABLE meerkat_manual_probe (id int)").await.unwrap();
-        session.execute("INSERT INTO meerkat_manual_probe VALUES (1)").await.unwrap();
+        session
+            .execute("CREATE TEMP TABLE meerkat_manual_probe (id int)")
+            .await
+            .unwrap();
+        session
+            .execute("INSERT INTO meerkat_manual_probe VALUES (1)")
+            .await
+            .unwrap();
         // Still open across the runs, which is the whole of manual mode.
         assert!(session.in_transaction().await.unwrap());
 
         session.end_transaction(TxEnd::Rollback).await.unwrap();
         assert!(!session.in_transaction().await.unwrap());
-        let error =
-            session.execute("SELECT * FROM meerkat_manual_probe").await.unwrap_err().to_string();
+        let error = session
+            .execute("SELECT * FROM meerkat_manual_probe")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("meerkat_manual_probe"), "{error}");
 
         // And a commit keeps what the transaction did. A temp table lives
         // as long as the session, so it is proof enough without writing to
         // anything the server keeps.
         session.begin().await.unwrap();
-        session.execute("CREATE TEMP TABLE meerkat_manual_kept (id int)").await.unwrap();
+        session
+            .execute("CREATE TEMP TABLE meerkat_manual_kept (id int)")
+            .await
+            .unwrap();
         session.end_transaction(TxEnd::Commit).await.unwrap();
         assert!(!session.in_transaction().await.unwrap());
-        session.execute("SELECT * FROM meerkat_manual_kept").await.unwrap();
+        session
+            .execute("SELECT * FROM meerkat_manual_kept")
+            .await
+            .unwrap();
     }
 
     /// Ending a transaction nobody opened is not an error. The app sends it
@@ -1996,7 +2243,12 @@ mod tests {
         std::thread::spawn(move || drop(session)).join().unwrap();
 
         // The pool is unharmed and still hands out sessions.
-        conn.open_session().await.unwrap().execute("SELECT 1").await.unwrap();
+        conn.open_session()
+            .await
+            .unwrap()
+            .execute("SELECT 1")
+            .await
+            .unwrap();
     }
 
     /// A statement that fails must not cost the session. The tab keeps it
@@ -2007,15 +2259,25 @@ mod tests {
         let conn = PostgresConnection::connect(&url).await.unwrap();
         let session = conn.open_session().await.unwrap();
 
-        assert!(session.execute("SELECT * FROM no_such_table_here").await.is_err());
-        assert_eq!(session.execute("SELECT 1 AS x").await.unwrap().rows[0][0], Value::Int(1));
+        assert!(
+            session
+                .execute("SELECT * FROM no_such_table_here")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            session.execute("SELECT 1 AS x").await.unwrap().rows[0][0],
+            Value::Int(1)
+        );
     }
 
     /// What another connection sees this backend doing. It is read from
     /// the *app* pool, so it answers whether or not the session is busy.
     async fn backend_state(conn: &PostgresConnection, pid: i32) -> String {
         let result = conn
-            .execute(&format!("SELECT state FROM pg_stat_activity WHERE pid = {pid}"))
+            .execute(&format!(
+                "SELECT state FROM pg_stat_activity WHERE pid = {pid}"
+            ))
             .await
             .unwrap();
         result.rows[0][0].display()
@@ -2066,9 +2328,11 @@ mod tests {
         let error = profile_from_url("p1", "prod", "postgres://ada@db.internal").unwrap_err();
         assert!(error.to_string().contains("names no database"), "{error}");
         let error = profile_from_url("p1", "prod", "not a url").unwrap_err();
-        assert!(error.to_string().contains("not a valid PostgreSQL URL"), "{error}");
+        assert!(
+            error.to_string().contains("not a valid PostgreSQL URL"),
+            "{error}"
+        );
     }
-
 
     /// The bytes `tsvectorsend` writes, so the reader can be argued with
     /// without a server: a lexeme count, then each lexeme NUL-terminated
@@ -2132,4 +2396,3 @@ mod tests {
         assert_eq!(short_version("15.6"), "15.6");
     }
 }
-

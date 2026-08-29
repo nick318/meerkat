@@ -54,7 +54,10 @@ pub struct Extent {
 
 impl Extent {
     pub fn of(data: &GridData) -> Self {
-        Self { rows: data.rows.len(), columns: data.columns.len() }
+        Self {
+            rows: data.rows.len(),
+            columns: data.columns.len(),
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -348,8 +351,16 @@ mod tests {
         GridData::new(
             vec!["id".to_string(), "email".to_string(), "plan".to_string()],
             vec![
-                vec![Value::Int(1041), Value::Text("ida@northwind.io".into()), Value::Text("scale".into())],
-                vec![Value::Int(1040), Value::Text("m.okafor@lumen.dev".into()), Value::Null],
+                vec![
+                    Value::Int(1041),
+                    Value::Text("ida@northwind.io".into()),
+                    Value::Text("scale".into()),
+                ],
+                vec![
+                    Value::Int(1040),
+                    Value::Text("m.okafor@lumen.dev".into()),
+                    Value::Null,
+                ],
                 vec![
                     Value::Int(1039),
                     Value::Text("Reviewed report, prepared comments".into()),
@@ -360,7 +371,10 @@ mod tests {
     }
 
     fn extent() -> Extent {
-        Extent { rows: 3, columns: 3 }
+        Extent {
+            rows: 3,
+            columns: 3,
+        }
     }
 
     #[test]
@@ -368,11 +382,27 @@ mod tests {
         let mut selection = Selection::default();
         selection.focus(Cell::new(1, 1));
         selection.extend_to(Cell::new(0, 2));
-        assert_eq!(selection.rect(), Some(Rect { top: 0, bottom: 1, left: 1, right: 2 }));
+        assert_eq!(
+            selection.rect(),
+            Some(Rect {
+                top: 0,
+                bottom: 1,
+                left: 1,
+                right: 2
+            })
+        );
         // Dragging back past the anchor turns the rectangle over rather
         // than emptying it.
         selection.extend_to(Cell::new(2, 0));
-        assert_eq!(selection.rect(), Some(Rect { top: 1, bottom: 2, left: 0, right: 1 }));
+        assert_eq!(
+            selection.rect(),
+            Some(Rect {
+                top: 1,
+                bottom: 2,
+                left: 0,
+                right: 1
+            })
+        );
         assert!(selection.contains(2, 0));
         assert!(!selection.contains(0, 0));
         assert!(selection.is_cursor(2, 0));
@@ -384,7 +414,15 @@ mod tests {
     fn extending_from_nothing_selects_the_one_cell() {
         let mut selection = Selection::default();
         selection.extend_to(Cell::new(1, 2));
-        assert_eq!(selection.rect(), Some(Rect { top: 1, bottom: 1, left: 2, right: 2 }));
+        assert_eq!(
+            selection.rect(),
+            Some(Rect {
+                top: 1,
+                bottom: 1,
+                left: 2,
+                right: 2
+            })
+        );
     }
 
     #[test]
@@ -393,9 +431,15 @@ mod tests {
         selection.focus(Cell::new(0, 0));
         assert_eq!(selection.step(Step::Up, false, extent()), None);
         assert_eq!(selection.step(Step::Left, false, extent()), None);
-        assert_eq!(selection.step(Step::Last, false, extent()), Some(Cell::new(2, 0)));
+        assert_eq!(
+            selection.step(Step::Last, false, extent()),
+            Some(Cell::new(2, 0))
+        );
         assert_eq!(selection.step(Step::Down, false, extent()), None);
-        assert_eq!(selection.step(Step::RowEnd, false, extent()), Some(Cell::new(2, 2)));
+        assert_eq!(
+            selection.step(Step::RowEnd, false, extent()),
+            Some(Cell::new(2, 2))
+        );
         assert_eq!(selection.step(Step::Right, false, extent()), None);
     }
 
@@ -407,10 +451,26 @@ mod tests {
         selection.focus(Cell::new(0, 0));
         selection.step(Step::Down, true, extent());
         selection.step(Step::Right, true, extent());
-        assert_eq!(selection.rect(), Some(Rect { top: 0, bottom: 1, left: 0, right: 1 }));
+        assert_eq!(
+            selection.rect(),
+            Some(Rect {
+                top: 0,
+                bottom: 1,
+                left: 0,
+                right: 1
+            })
+        );
 
         selection.step(Step::Down, false, extent());
-        assert_eq!(selection.rect(), Some(Rect { top: 2, bottom: 2, left: 1, right: 1 }));
+        assert_eq!(
+            selection.rect(),
+            Some(Rect {
+                top: 2,
+                bottom: 2,
+                left: 1,
+                right: 1
+            })
+        );
     }
 
     /// The first keystroke on a result nobody has clicked lands on the
@@ -418,13 +478,19 @@ mod tests {
     #[test]
     fn the_first_keystroke_needs_no_click_before_it() {
         let mut selection = Selection::default();
-        assert_eq!(selection.step(Step::Down, false, extent()), Some(Cell::new(0, 0)));
+        assert_eq!(
+            selection.step(Step::Down, false, extent()),
+            Some(Cell::new(0, 0))
+        );
         assert!(selection.is_cursor(0, 0));
     }
 
     #[test]
     fn an_empty_result_takes_no_selection() {
-        let empty = Extent { rows: 0, columns: 0 };
+        let empty = Extent {
+            rows: 0,
+            columns: 0,
+        };
         let mut selection = Selection::default();
         assert_eq!(selection.step(Step::Down, false, empty), None);
         selection.select_all(empty);
@@ -436,9 +502,25 @@ mod tests {
     fn a_column_and_the_whole_result_are_ranges_too() {
         let mut selection = Selection::default();
         selection.select_column(1, extent());
-        assert_eq!(selection.rect(), Some(Rect { top: 0, bottom: 2, left: 1, right: 1 }));
+        assert_eq!(
+            selection.rect(),
+            Some(Rect {
+                top: 0,
+                bottom: 2,
+                left: 1,
+                right: 1
+            })
+        );
         selection.select_all(extent());
-        assert_eq!(selection.rect(), Some(Rect { top: 0, bottom: 2, left: 0, right: 2 }));
+        assert_eq!(
+            selection.rect(),
+            Some(Rect {
+                top: 0,
+                bottom: 2,
+                left: 0,
+                right: 2
+            })
+        );
     }
 
     #[test]
@@ -521,7 +603,10 @@ mod tests {
         );
         let mut one = Selection::default();
         one.focus(Cell::new(0, 0));
-        assert_eq!(clipboard_text(&quoted, &one).unwrap(), "\"she said \"\"yes\"\"\"");
+        assert_eq!(
+            clipboard_text(&quoted, &one).unwrap(),
+            "\"she said \"\"yes\"\"\""
+        );
 
         // A line break inside a value would paste as two rows.
         let wrapped = GridData::new(

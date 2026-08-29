@@ -128,7 +128,13 @@ const GROUP_BY_ENV_KEY: &str = "connections.group_by_env";
 
 actions!(
     connections,
-    [FocusSearch, SelectNext, SelectPrevious, OpenSelected, EditSelected]
+    [
+        FocusSearch,
+        SelectNext,
+        SelectPrevious,
+        OpenSelected,
+        EditSelected
+    ]
 );
 
 pub fn key_bindings() -> Vec<KeyBinding> {
@@ -182,7 +188,9 @@ enum Probe {
     /// paints what the store cached at the last probe, if anything.
     Idle,
     Probing,
-    Ready { server: String },
+    Ready {
+        server: String,
+    },
     Failed(String),
 }
 
@@ -254,8 +262,10 @@ impl Connections {
         };
         let search = cx.new(|cx| TextField::new("name, host, port or database", cx).bare(11.));
         let subscription = cx.subscribe_in(&search, window, Self::on_search_event);
-        let group_by_env =
-            store.as_ref().map(|store| store.flag(GROUP_BY_ENV_KEY, true)).unwrap_or(true);
+        let group_by_env = store
+            .as_ref()
+            .map(|store| store.flag(GROUP_BY_ENV_KEY, true))
+            .unwrap_or(true);
         let mut screen = Self {
             focus_handle: cx.focus_handle(),
             store,
@@ -311,7 +321,10 @@ impl Connections {
     /// The rows the search line leaves on screen, in the store's order.
     fn matching(&self, cx: &App) -> Vec<&Row> {
         let query = self.search.read(cx).trimmed().to_ascii_lowercase();
-        self.rows.iter().filter(|row| matches_query(&row.saved, &query)).collect()
+        self.rows
+            .iter()
+            .filter(|row| matches_query(&row.saved, &query))
+            .collect()
     }
 
     /// Read the saved connections back from the store, keeping whatever a
@@ -388,7 +401,10 @@ impl Connections {
                 .map(|row| row.saved.profile.id.clone())
                 .collect()
         } else {
-            self.matching(cx).into_iter().map(|row| row.saved.profile.id.clone()).collect()
+            self.matching(cx)
+                .into_iter()
+                .map(|row| row.saved.profile.id.clone())
+                .collect()
         }
     }
 
@@ -400,7 +416,10 @@ impl Connections {
         if ids.is_empty() {
             return;
         }
-        let here = self.selected.as_ref().and_then(|id| ids.iter().position(|x| x == id));
+        let here = self
+            .selected
+            .as_ref()
+            .and_then(|id| ids.iter().position(|x| x == id));
         let next = match here {
             Some(ix) => (ix as isize + delta).clamp(0, ids.len() as isize - 1) as usize,
             None => 0,
@@ -559,7 +578,9 @@ impl Connections {
         if let Some(saved) = prefill {
             let profile = &saved.profile;
             name.update(cx, |field, cx| field.set_text(profile.name.clone(), cx));
-            url.update(cx, |field, cx| field.set_text(profile_url(profile).to_string(), cx));
+            url.update(cx, |field, cx| {
+                field.set_text(profile_url(profile).to_string(), cx)
+            });
             if let Some(who) = profile.user.clone() {
                 user.update(cx, |field, cx| field.set_text(who, cx));
             }
@@ -591,7 +612,11 @@ impl Connections {
     /// away, so untagged needs no fourth chip.
     fn set_form_env(&mut self, env: Env, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.form {
-            form.env = if form.env == Some(env) { None } else { Some(env) };
+            form.env = if form.env == Some(env) {
+                None
+            } else {
+                Some(env)
+            };
             cx.notify();
         }
     }
@@ -839,7 +864,10 @@ impl Render for Connections {
                             .child(self.header(&colors, cx))
                             .child(self.list(&colors, window, cx))
                             .children(self.error.clone().map(|error| {
-                                div().text_size(px(11.)).text_color(colors.error).child(error)
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(colors.error)
+                                    .child(error)
                             }))
                             .child(shortcuts(&colors, cx)),
                     ),
@@ -902,7 +930,12 @@ impl Connections {
                             .text_color(colors.text)
                             .child(greeting()),
                     )
-                    .child(div().text_size(px(12.)).text_color(colors.text_muted).child(subtitle)),
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(colors.text_muted)
+                            .child(subtitle),
+                    ),
             )
     }
 
@@ -1070,7 +1103,11 @@ impl Connections {
                         .flex_1()
                         .min_w(px(0.))
                         .text_size(px(10.))
-                        .text_color(if failed { colors.error_secondary } else { colors.text_muted })
+                        .text_color(if failed {
+                            colors.error_secondary
+                        } else {
+                            colors.text_muted
+                        })
                         .truncate()
                         .child(meta),
                 )
@@ -1142,7 +1179,11 @@ impl Connections {
             .flex()
             .items_center()
             .flex_none()
-            .bg(if on { colors.accent } else { colors.border_strong })
+            .bg(if on {
+                colors.accent
+            } else {
+                colors.border_strong
+            })
             .child(div().size(px(7.)).rounded_full().bg(colors.window));
         if on {
             knob = knob.justify_end();
@@ -1166,7 +1207,11 @@ impl Connections {
             .child(
                 div()
                     .text_size(px(10.))
-                    .text_color(if on { colors.text_secondary } else { colors.text_muted })
+                    .text_color(if on {
+                        colors.text_secondary
+                    } else {
+                        colors.text_muted
+                    })
                     .child("group by env"),
             )
     }
@@ -1191,9 +1236,20 @@ impl Connections {
             .child(div().w(px(9.)).flex_none())
             .child(div().flex_1().min_w(px(0.)).child(heading("NAME")))
             .child(div().w(px(HOST_WIDTH)).flex_none().child(heading("HOST")))
-            .child(div().w(px(STATUS_WIDTH)).flex_none().child(heading("STATUS")))
+            .child(
+                div()
+                    .w(px(STATUS_WIDTH))
+                    .flex_none()
+                    .child(heading("STATUS")),
+            )
             .child(div().w(px(MODE_WIDTH)).flex_none().child(heading("MODE")))
-            .child(div().w(px(LAST_WIDTH)).flex_none().text_right().child(heading("LAST USED")))
+            .child(
+                div()
+                    .w(px(LAST_WIDTH))
+                    .flex_none()
+                    .text_right()
+                    .child(heading("LAST USED")),
+            )
     }
 
     /// The card's last line: the way to a new connection, and the keys
@@ -1202,7 +1258,10 @@ impl Connections {
     /// pinned in the window's own corner. See `render`.
     fn footer(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
         let key = |text: &'static str| {
-            div().text_size(px(10.)).text_color(colors.text_faint).child(text)
+            div()
+                .text_size(px(10.))
+                .text_color(colors.text_faint)
+                .child(text)
         };
         div()
             .flex()
@@ -1248,7 +1307,11 @@ impl Connections {
             .px(px(10.))
             .py(px(6.))
             .border_1()
-            .border_color(if focused { colors.accent } else { colors.border })
+            .border_color(if focused {
+                colors.accent
+            } else {
+                colors.border
+            })
             .rounded(px(6.))
             .bg(colors.panel)
             .cursor_pointer()
@@ -1257,9 +1320,19 @@ impl Connections {
                 window.focus(&this.search.focus_handle(cx), cx);
                 cx.notify();
             }))
-            .child(div().text_size(px(11.)).text_color(colors.text_faint).child("⌕"))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(colors.text_faint)
+                    .child("⌕"),
+            )
             .child(div().flex_1().min_w(px(0.)).child(self.search.clone()))
-            .child(div().text_size(px(10.)).text_color(colors.text_faint).child("⌘F"))
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(colors.text_faint)
+                    .child("⌘F"),
+            )
     }
 
     fn row(&self, row: &Row, colors: &ThemeColors, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -1270,12 +1343,13 @@ impl Connections {
         // Failure recolours the row's text, the way the comp does: warm
         // ink over the shared surface, no surface of its own.
         let (name_color, url_color, meta_color, dot) = match &row.state {
-            Probe::Ready { .. } => {
-                (colors.text, colors.text_muted, colors.text_muted, colors.ok)
-            }
-            Probe::Idle | Probe::Probing => {
-                (colors.text, colors.text_muted, colors.text_muted, colors.idle)
-            }
+            Probe::Ready { .. } => (colors.text, colors.text_muted, colors.text_muted, colors.ok),
+            Probe::Idle | Probe::Probing => (
+                colors.text,
+                colors.text_muted,
+                colors.text_muted,
+                colors.idle,
+            ),
             Probe::Failed(_) => (
                 colors.error,
                 colors.error_secondary,
@@ -1328,19 +1402,27 @@ impl Connections {
             .cursor_pointer()
             // A click selects; only a double click opens. The bar over
             // the list is where a single click's actions live.
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
-                if event.click_count() >= 2 {
-                    this.connect(&id, cx);
-                } else {
-                    this.select(&id, cx);
-                }
-            }));
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
+                    if event.click_count() >= 2 {
+                        this.connect(&id, cx);
+                    } else {
+                        this.select(&id, cx);
+                    }
+                }),
+            );
 
         if selected {
             card = card.bg(colors.selection).child(
                 // The comp's accent rail: painted over the row's left
                 // edge, so the columns keep their alignment.
-                div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(colors.accent),
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.))
+                    .bg(colors.accent),
             );
         } else {
             card = card.hover(|s| s.bg(colors.panel));
@@ -1352,7 +1434,11 @@ impl Connections {
                     .flex_1()
                     .min_w(px(0.))
                     .text_size(px(12.))
-                    .font_weight(if selected { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                    .font_weight(if selected {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
+                    })
                     .text_color(name_color)
                     .truncate()
                     .child(row.saved.profile.name.clone()),
@@ -1619,7 +1705,10 @@ impl Connections {
 
     fn form_card(&self, form: &Form, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
         let label = |text: &'static str| {
-            div().text_size(px(10.)).text_color(colors.text_muted).child(text)
+            div()
+                .text_size(px(10.))
+                .text_color(colors.text_muted)
+                .child(text)
         };
         let editing = form.editing.is_some();
 
@@ -1806,7 +1895,11 @@ fn status_dot_of(color: gpui::Hsla) -> Div {
 /// What the row and the action bar call this connection's mode. The word
 /// is the same one the shell's mark carries, so the two screens agree.
 fn mode_word(profile: &Profile) -> &'static str {
-    if profile.read_only { "read-only" } else { "read-write" }
+    if profile.read_only {
+        "read-only"
+    } else {
+        "read-write"
+    }
 }
 
 /// `postgres://host:port/database`, with no credentials in it.
@@ -1816,7 +1909,10 @@ fn profile_url(profile: &Profile) -> SharedString {
         Engine::Mysql => "mysql",
         Engine::Sqlite => "sqlite",
     };
-    let host = profile.host.clone().unwrap_or_else(|| "localhost".to_string());
+    let host = profile
+        .host
+        .clone()
+        .unwrap_or_else(|| "localhost".to_string());
     match profile.port {
         Some(port) => format!("{scheme}://{host}:{port}/{}", profile.database),
         None => format!("{scheme}://{host}/{}", profile.database),
@@ -1895,7 +1991,12 @@ fn first_line(error: &str) -> String {
 }
 
 fn greeting() -> &'static str {
-    match Local::now().format("%H").to_string().parse::<u32>().unwrap_or(9) {
+    match Local::now()
+        .format("%H")
+        .to_string()
+        .parse::<u32>()
+        .unwrap_or(9)
+    {
         5..=11 => "Good morning.",
         12..=17 => "Good afternoon.",
         _ => "Good evening.",
@@ -1965,7 +2066,14 @@ mod tests {
         let saved = saved_connection("prod", Some("db.internal"), Some(5432), "meerkat", "ada");
 
         // The name, the host, the port, the database and the user.
-        for query in ["prod", "db.internal", "5432", "meerkat", "ada", "postgres://"] {
+        for query in [
+            "prod",
+            "db.internal",
+            "5432",
+            "meerkat",
+            "ada",
+            "postgres://",
+        ] {
             assert!(matches_query(&saved, query), "{query} should match");
         }
         // An empty line hides nothing.
@@ -1976,7 +2084,8 @@ mod tests {
     #[test]
     fn every_word_of_the_search_must_hit() {
         let prod = saved_connection("prod", Some("db.internal"), Some(5432), "meerkat", "ada");
-        let staging = saved_connection("staging", Some("db.internal"), Some(5433), "meerkat", "ada");
+        let staging =
+            saved_connection("staging", Some("db.internal"), Some(5433), "meerkat", "ada");
 
         // A second word narrows: both rows are on db.internal, only one
         // answers to the port as well.
@@ -2029,7 +2138,10 @@ mod tests {
         .map(|(name, env)| {
             let mut saved = saved_connection(name, None, None, "db", "ada");
             saved.env = env.map(str::to_string);
-            Row { saved, state: Probe::Idle }
+            Row {
+                saved,
+                state: Probe::Idle,
+            }
         })
         .collect();
 
@@ -2038,9 +2150,15 @@ mod tests {
         // The groups stand in the form's order whatever the store order
         // was, "Prod" and "prod" are one group, and untagged is last
         // even though the store listed it first.
-        assert_eq!(keys, [Some(Env::Prod), Some(Env::Staging), Some(Env::Dev), None]);
-        let prod: Vec<&str> =
-            groups[0].1.iter().map(|row| row.saved.profile.name.as_str()).collect();
+        assert_eq!(
+            keys,
+            [Some(Env::Prod), Some(Env::Staging), Some(Env::Dev), None]
+        );
+        let prod: Vec<&str> = groups[0]
+            .1
+            .iter()
+            .map(|row| row.saved.profile.name.as_str())
+            .collect();
         assert_eq!(prod, ["api", "billing"]);
     }
 
@@ -2089,6 +2207,9 @@ mod tests {
 
     #[test]
     fn a_multi_line_driver_error_fits_one_row() {
-        assert_eq!(first_line("connection refused\n  caused by: ..."), "connection refused");
+        assert_eq!(
+            first_line("connection refused\n  caused by: ..."),
+            "connection refused"
+        );
     }
 }
