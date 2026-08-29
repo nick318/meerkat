@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "auto_update"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "gpui",
@@ -1357,7 +1357,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "db_client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1367,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "db_postgres"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1382,7 +1382,7 @@ dependencies = [
 
 [[package]]
 name = "db_sqlite"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "fuzzy"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "generic-array"
@@ -3104,7 +3104,7 @@ dependencies = [
 
 [[package]]
 name = "introspect"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
 ]
@@ -3569,7 +3569,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "auto_update",
@@ -4667,7 +4667,7 @@ dependencies = [
 
 [[package]]
 name = "query"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "quick-error"
@@ -5071,7 +5071,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "release_channel"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "renderdoc-sys"
@@ -5120,7 +5120,7 @@ dependencies = [
 
 [[package]]
 name = "results_grid"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "db_client",
  "fuzzy",
@@ -5362,7 +5362,7 @@ dependencies = [
 
 [[package]]
 name = "schema_tree"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "schemars"
@@ -5433,7 +5433,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "secrets"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "keyring",
@@ -5608,7 +5608,7 @@ dependencies = [
 
 [[package]]
 name = "settings"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -5835,7 +5835,7 @@ dependencies = [
 
 [[package]]
 name = "sql_editor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fuzzy",
  "gpui",
@@ -6094,7 +6094,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "db_client",
@@ -6393,7 +6393,7 @@ dependencies = [
 
 [[package]]
 name = "theme"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gpui",
 ]
@@ -6849,7 +6849,7 @@ dependencies = [
 
 [[package]]
 name = "ui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gpui",
  "theme",
@@ -8141,7 +8141,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workspace"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "writeable"
