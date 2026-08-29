@@ -141,6 +141,320 @@ pub fn command_verb(statement: &str) -> Option<CommandVerb> {
 /// The statement past whatever comments open it. A buffer's statements are
 /// trimmed already, but `-- what this does` on the line above a `COMMIT` is
 /// part of the statement that follows it.
+/// Whether a word is one of SQL's own, whatever case it is written in.
+pub fn is_keyword(word: &str) -> bool {
+    KEYWORDS.binary_search(&word.to_ascii_lowercase().as_str()).is_ok()
+}
+
+/// The keywords the app knows, sorted so the lookup can bisect.
+///
+/// It is here rather than in the editor because three things read it: the
+/// colouring, the completion panel, and the rule that decides how far back
+/// a syntax error's mark reaches. A list per reader would be three lists
+/// that drifted.
+pub const KEYWORDS: &[&str] = &[
+    "all", "alter", "and", "any", "array", "as", "asc", "begin", "between", "by", "case", "cast",
+    "coalesce", "commit", "count", "create", "cross", "current_date", "current_timestamp",
+    "delete", "desc", "distinct", "drop", "else", "end", "except", "exists", "explain", "false",
+    "filter", "first", "from", "full", "group", "having", "ilike", "in", "index", "inner",
+    "insert", "intersect", "into", "is", "join", "lateral", "left", "like", "limit", "max", "min",
+    "not", "null", "nulls", "offset", "on", "or", "order", "outer", "over", "partition",
+    "returning", "right", "rollback", "select", "set", "some", "sum", "table", "then", "true",
+    "union", "update", "using", "values", "view", "when", "where", "window", "with",
+];
+
+/// The relation a statement names, for the statements the server will not
+/// resolve one for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationTarget {
+    /// Where the name sits in the statement.
+    pub name: Range<usize>,
+    /// The statement says outright that a missing one is fine, so nothing
+    /// is wrong with it and nothing should be marked.
+    pub if_exists: bool,
+}
+
+/// The relation `DROP`, `ALTER` or `TRUNCATE` names, when that is the
+/// shape of the statement.
+///
+/// **Postgres resolves no names for a utility statement until it runs
+/// one.** `DROP TABLE nosuch` prepares perfectly happily, because the
+/// grammar is all the parser is asked for; only executing it looks the
+/// name up. So the check comes back with nothing to say about exactly the
+/// statements where being told beforehand is worth most, and the app has
+/// to name the relation itself for the server to be asked about it — see
+/// `Connection::relation_exists`.
+///
+/// It reads a few words and stops, in [`transaction_verb`]'s spirit:
+/// **anything it does not recognise answers `None`**, which costs a mark
+/// rather than paints a wrong one. So `DROP FUNCTION` and `DROP SCHEMA`
+/// are not read — they resolve in catalogs of their own — and
+/// `DROP TABLE a, b` names only `a`, the rest going unchecked.
+pub fn relation_target(statement: &str) -> Option<RelationTarget> {
+    let body = skip_leading_comments(statement);
+    let shift = statement.len() - body.len();
+    let mut words = word_ranges(body);
+    let mut next = || words.next();
+
+    let first = next()?;
+    let verb = body[first.clone()].to_ascii_lowercase();
+    let mut word = match verb.as_str() {
+        // `DROP TABLE`, `ALTER VIEW`, `DROP MATERIALIZED VIEW` — every
+        // kind here is a *relation*, which is the one thing the server can
+        // be asked about with a single call.
+        "drop" | "alter" => {
+            let kind = next()?;
+            match body[kind.clone()].to_ascii_lowercase().as_str() {
+                "table" | "view" | "index" | "sequence" => next()?,
+                // Two words, and the second is not optional.
+                "materialized" | "foreign" => {
+                    next()?;
+                    next()?
+                }
+                // A function, a type, a schema, a role: not a relation.
+                _ => return None,
+            }
+        }
+        "truncate" => {
+            let after = next()?;
+            match body[after.clone()].to_ascii_lowercase().as_str() {
+                "table" | "only" => next()?,
+                _ => after,
+            }
+        }
+        _ => return None,
+    };
+
+    // `IF EXISTS` says a missing relation is the point of the statement.
+    let mut if_exists = false;
+    if body[word.clone()].eq_ignore_ascii_case("if") {
+        let exists = next()?;
+        if !body[exists].eq_ignore_ascii_case("exists") {
+            return None;
+        }
+        if_exists = true;
+        word = next()?;
+    }
+    // `TRUNCATE TABLE ONLY t`, and `ALTER TABLE ONLY t` as well.
+    if body[word.clone()].eq_ignore_ascii_case("only") {
+        word = next()?;
+    }
+
+    // Whatever is left has to look like a name. A bracket or a keyword
+    // here means the statement is not the shape this reads.
+    let first = body[word.clone()].as_bytes().first().copied()?;
+    let name_like =
+        first.is_ascii_alphabetic() || first == b'_' || first == b'"' || first >= 0x80;
+    if !name_like {
+        return None;
+    }
+    Some(RelationTarget { name: shift + word.start..shift + word.end, if_exists })
+}
+
+/// Every token of a statement, in order, as ranges into it. A qualified
+/// name is one token, as it is everywhere else here.
+fn word_ranges(body: &str) -> impl Iterator<Item = Range<usize>> + '_ {
+    let mut ix = 0;
+    std::iter::from_fn(move || {
+        let bytes = body.as_bytes();
+        while ix < bytes.len() && bytes[ix].is_ascii_whitespace() {
+            ix += 1;
+        }
+        if ix >= bytes.len() {
+            return None;
+        }
+        let start = ix;
+        ix = token_end(body, start);
+        Some(start..ix)
+    })
+}
+
+/// The bare name the parser had just read before `offset`, if that is what
+/// is there.
+///
+/// **A syntax error points at the token the parser choked on, and the
+/// mistake is usually the word before it.** `… limi 100` is refused at
+/// `100`, because `limi` parsed perfectly well as a table alias; `select 1
+/// frm users` is refused at `users`, because `frm` is an alias too. The
+/// server is right both times and one token late both times, so the mark
+/// reaches back over this word — see the caller for what makes it safe to.
+///
+/// Only a word that begins like a **name** counts. A number, a bracket or
+/// an operator before the error is not a word the user misspelled, and
+/// reaching back over one would widen the mark for nothing.
+pub fn word_before(statement: &str, offset: usize) -> Option<Range<usize>> {
+    let head = statement.get(..offset.min(statement.len()))?.trim_end();
+    if head.is_empty() {
+        return None;
+    }
+    let range = token_before(statement, head.len());
+    let first = statement[range.clone()].as_bytes().first().copied()?;
+    (first.is_ascii_alphabetic() || first == b'_' || first >= 0x80).then_some(range)
+}
+
+/// Whether a statement can change what the names after it resolve to.
+///
+/// **It is a veto, not a claim.** A check asks the server to resolve names
+/// against a connection that has not run the buffer, so
+/// `CREATE TABLE t (…); SELECT * FROM t;` answers that `t` does not exist —
+/// which is true right now and false the moment the buffer runs. There is
+/// no way to tell those apart short of running the DDL, so the app stops
+/// believing name errors once the buffer holds a statement that could have
+/// made one.
+///
+/// It reads the first word and nothing else, in [`transaction_verb`]'s
+/// spirit, and it errs toward `true`: a wrong `true` costs a mark that is
+/// not painted, a wrong `false` paints a mark that is not real. `SET` is in
+/// the list because `SET search_path` changes what an unqualified name
+/// means, which is the same problem wearing different clothes. A
+/// `SELECT … INTO` creates a table without opening with a verb that says
+/// so, and is the known gap.
+pub fn changes_names(statement: &str) -> bool {
+    let body = skip_leading_comments(statement);
+    let Some(first) = body.split(|c: char| c.is_whitespace() || c == ';').find(|w| !w.is_empty())
+    else {
+        return false;
+    };
+    matches!(
+        first.to_ascii_lowercase().as_str(),
+        "create" | "drop" | "alter" | "set" | "reset" | "rename" | "import"
+    )
+}
+
+/// What to mark for an error the server put at `offset` in `statement`.
+///
+/// The server names a **point**, and a point cannot be underlined. So this
+/// grows the point into the token it landed on: the word, the string, or
+/// the one character of punctuation. Marking to the end of the statement
+/// instead would put a squiggle under the half of the query that is
+/// usually right.
+///
+/// **At the end of the input the point is past every token**, which is what
+/// `syntax error at end of input` reports for an unfinished statement. The
+/// mark then goes on the **last** token: there is nothing after it to
+/// underline, and the word the user stopped on is where they will look.
+///
+/// The range is always non-empty for a non-empty statement, or the
+/// squiggle would be invisible and the error would be reported by nothing
+/// at all.
+pub fn error_span(statement: &str, offset: usize) -> Range<usize> {
+    // The driver converts the server's character position into a byte
+    // offset, so this is already on a boundary — but the offset crossed a
+    // wire, and slicing off one would panic the window rather than mark
+    // the wrong token.
+    let mut offset = offset.min(statement.len());
+    while offset > 0 && !statement.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    // Past the last token: everything from here on is space. Walk back to
+    // the token the user stopped on.
+    if statement[offset..].trim().is_empty() {
+        return token_before(statement, statement.trim_end().len());
+    }
+    // The point can land on the space in front of the offending token, so
+    // step over any space first.
+    let start = offset + (statement[offset..].len() - statement[offset..].trim_start().len());
+    start..token_end(statement, start)
+}
+
+/// Where the name or token starting at `start` ends.
+///
+/// **A qualified name is one name.** The server points at the front of
+/// `schema.table` and refuses the pair — `relation "schema.table" does not
+/// exist` — so a mark that stopped at the first dot would underline the
+/// half that is usually right and leave the wrong half bare. So the walk
+/// carries on over every `.` that has another name part after it, which is
+/// how `a.b.c` is marked whole and how `t.*` still stops at `t`.
+fn token_end(statement: &str, start: usize) -> usize {
+    let bytes = statement.as_bytes();
+    let mut end = one_token_end(statement, start);
+    while bytes.get(end) == Some(&b'.') {
+        match bytes.get(end + 1) {
+            Some(&byte) if is_word_byte(byte) || byte == b'"' => {
+                end = one_token_end(statement, end + 1);
+            }
+            _ => break,
+        }
+    }
+    end
+}
+
+/// Where one part of a name — or one token that is not a name — ends.
+fn one_token_end(statement: &str, start: usize) -> usize {
+    let bytes = statement.as_bytes();
+    match bytes.get(start) {
+        None => start,
+        // A string or a quoted name is one token however long it runs. An
+        // unterminated one — which is an error in its own right — runs to
+        // the end of the statement, and marking all of it is right: the
+        // whole tail is inside the quote.
+        Some(&quote @ (b'\'' | b'"')) => {
+            let mut ix = start + 1;
+            while ix < bytes.len() {
+                if bytes[ix] == quote {
+                    // A doubled quote is an escape, not the end.
+                    if bytes.get(ix + 1) == Some(&quote) {
+                        ix += 2;
+                        continue;
+                    }
+                    return ix + 1;
+                }
+                ix += 1;
+            }
+            bytes.len()
+        }
+        Some(&byte) if is_word_byte(byte) => {
+            let mut ix = start;
+            while ix < bytes.len() && is_word_byte(bytes[ix]) {
+                ix += 1;
+            }
+            ix
+        }
+        // Punctuation, or any character the scanner has no word for: one
+        // character, on its own boundary so the slice stays valid.
+        _ => {
+            let mut ix = start + 1;
+            while ix < bytes.len() && !statement.is_char_boundary(ix) {
+                ix += 1;
+            }
+            ix
+        }
+    }
+}
+
+/// The token that ends at `end`, walking backwards.
+///
+/// A name and its dots are one run here too, so an unfinished
+/// `select * from schema.` marks the schema it stopped after rather than
+/// the lone dot.
+fn token_before(statement: &str, end: usize) -> Range<usize> {
+    let bytes = statement.as_bytes();
+    if end == 0 {
+        return 0..0;
+    }
+    let part = |byte: u8| is_word_byte(byte) || byte == b'.';
+    if part(bytes[end - 1]) {
+        let mut start = end;
+        while start > 0 && part(bytes[start - 1]) {
+            start -= 1;
+        }
+        return start..end;
+    }
+    // One character back, on its own boundary.
+    let mut start = end - 1;
+    while start > 0 && !statement.is_char_boundary(start) {
+        start -= 1;
+    }
+    start..end
+}
+
+/// A byte the scanner reads as part of a name or a number. `$` is in, for
+/// `$1` and for the `$tag$` a dollar-quoted body opens with; anything
+/// above ASCII is in, because a name may be any of it.
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte >= 0x80
+}
+
 fn skip_leading_comments(statement: &str) -> &str {
     let mut rest = statement.trim_start();
     loop {
@@ -278,6 +592,184 @@ mod tests {
 
     fn texts(text: &str) -> Vec<String> {
         statements(text)
+    }
+
+    fn marked(statement: &str, offset: usize) -> &str {
+        &statement[error_span(statement, offset)]
+    }
+
+    #[test]
+    fn the_keyword_list_is_sorted_for_bisection() {
+        let mut sorted = KEYWORDS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(KEYWORDS, sorted.as_slice());
+        assert!(is_keyword("SELECT") && is_keyword("select"));
+        assert!(!is_keyword("selected"));
+    }
+
+    fn target(statement: &str) -> Option<(&str, bool)> {
+        relation_target(statement)
+            .map(|found| (&statement[found.name], found.if_exists))
+    }
+
+    /// The statements Postgres will not resolve a name for until it runs
+    /// them, which is why the app has to name the relation itself.
+    #[test]
+    fn a_utility_statement_names_its_relation() {
+        let dropped = target("drop table tenant_dev_tenant.effort1");
+        assert_eq!(dropped, Some(("tenant_dev_tenant.effort1", false)));
+        assert_eq!(target("DROP TABLE IF EXISTS t"), Some(("t", true)));
+        assert_eq!(target("drop materialized view mv"), Some(("mv", false)));
+        assert_eq!(target("alter table only t"), Some(("t", false)));
+        assert_eq!(target("truncate t"), Some(("t", false)));
+        assert_eq!(target("truncate table only t"), Some(("t", false)));
+        assert_eq!(target("-- go\n  drop view v"), Some(("v", false)));
+        assert_eq!(target("drop table \"My Table\""), Some(("\"My Table\"", false)));
+        // Only the first of a list; the rest go unchecked rather than
+        // wrongly checked.
+        assert_eq!(target("drop table a, b"), Some(("a", false)));
+    }
+
+    /// Anything the reader does not recognise answers `None`, which costs
+    /// a mark rather than painting a wrong one.
+    #[test]
+    fn everything_else_names_nothing() {
+        for statement in [
+            // Not relations: they live in catalogs of their own.
+            "drop function f(int)",
+            "drop schema s",
+            "drop type t",
+            "drop role r",
+            // Not the shape at all.
+            "select * from t",
+            "create table t (id int)",
+            "alter",
+            "",
+            // `IF` without `EXISTS` is not this statement.
+            "drop table if t",
+        ] {
+            assert_eq!(relation_target(statement), None, "{statement}");
+        }
+    }
+
+    /// The word the parser had just read, which is where the mistake
+    /// usually is.
+    #[test]
+    fn the_word_before_an_error_is_the_one_that_was_read() {
+        let statement = "select * from t limi 100";
+        let range = word_before(statement, 21).unwrap();
+        assert_eq!(&statement[range], "limi");
+        // A qualified name comes back whole, as it is marked whole.
+        let statement = "select * from a.b 100";
+        let range = word_before(statement, 18).unwrap();
+        assert_eq!(&statement[range], "a.b");
+        // Nothing that is not a name: a number, an operator, the front of
+        // the statement.
+        assert_eq!(word_before("select 100 200", 11), None);
+        assert_eq!(word_before("select x = = 1", 11), None);
+        assert_eq!(word_before("select 1", 0), None);
+        assert_eq!(word_before("  select 1", 2), None);
+    }
+
+    #[test]
+    fn a_statement_that_could_make_a_name_is_read_as_one() {
+        for statement in [
+            "create table t (id int)",
+            "CREATE TEMP TABLE t AS SELECT 1",
+            "drop table t",
+            "alter table t add column c int",
+            "set search_path to app",
+            "-- first\n  create schema s",
+        ] {
+            assert!(changes_names(statement), "{statement}");
+        }
+        for statement in ["select * from t", "insert into t values (1)", "begin", "", "   "] {
+            assert!(!changes_names(statement), "{statement}");
+        }
+    }
+
+    /// **The case a viewer meets every day.** The server points at the
+    /// front of `schema.table` and refuses the pair, so the mark has to
+    /// carry the dots: `tenant_dev_tenant` alone is the half that is
+    /// right.
+    #[test]
+    fn a_qualified_name_is_marked_whole() {
+        let statement = "select * from tenant_dev_tenant.effor limit 100";
+        assert_eq!(marked(statement, 14), "tenant_dev_tenant.effor");
+        assert_eq!(marked("select a.b.c from t", 7), "a.b.c");
+        assert_eq!(marked("select \"my schema\".t from x", 7), "\"my schema\".t");
+        // A dot with no name after it is not part of the name, and `*` is
+        // not a name part either.
+        assert_eq!(marked("select * from schema. limit 1", 14), "schema");
+        assert_eq!(marked("select t.* from t", 7), "t");
+    }
+
+    /// An unfinished qualified name marks the part that is there.
+    #[test]
+    fn an_unfinished_qualified_name_marks_what_was_typed() {
+        assert_eq!(marked("select * from schema.", 21), "schema.");
+    }
+
+    /// The server names a point; the mark is the token it points at.
+    #[test]
+    fn the_error_marks_the_token_the_cursor_landed_on() {
+        let statement = "select 1 frm users";
+        assert_eq!(marked(statement, 13), "users");
+        assert_eq!(marked(statement, 9), "frm");
+    }
+
+    /// A statement the user has not finished: the point is past the last
+    /// token, so the mark goes on the token itself.
+    #[test]
+    fn the_end_of_the_input_marks_the_last_token() {
+        assert_eq!(marked("select", 6), "select");
+        // Trailing space is not the answer to "where did I stop".
+        assert_eq!(marked("select from  ", 13), "from");
+        assert_eq!(marked("select *", 8), "*");
+    }
+
+    /// A string is one token however long it runs, and an unterminated one
+    /// swallows the rest of the statement — which is exactly what is wrong
+    /// with it.
+    #[test]
+    fn a_string_is_marked_whole() {
+        assert_eq!(marked("select 'a b c' from t", 7), "'a b c'");
+        assert_eq!(marked("select 'a''b' from t", 7), "'a''b'");
+        assert_eq!(marked("select 'oops from t", 7), "'oops from t");
+        assert_eq!(marked("select \"a b\" from t", 7), "\"a b\"");
+    }
+
+    /// Punctuation is one character, and a multi-byte character is one
+    /// character rather than one byte — a range that split one would not
+    /// slice.
+    #[test]
+    fn punctuation_marks_one_character() {
+        assert_eq!(marked("select ) from t", 7), ")");
+        assert_eq!(marked("select § from t", 7), "§");
+        assert_eq!(marked("select §", 9), "§");
+        // An offset that landed inside a character marks the character.
+        assert_eq!(marked("select §", 8), "§");
+    }
+
+    /// A point on the space in front of a token still marks the token: an
+    /// empty range paints nothing, and an error painted by nothing is an
+    /// error the user never sees.
+    #[test]
+    fn the_mark_is_never_empty() {
+        assert_eq!(marked("select  frm", 6), "frm");
+        for offset in 0..=12 {
+            assert!(!error_span("select 1 frm", offset).is_empty(), "offset {offset}");
+        }
+        // Nothing to mark in nothing.
+        assert_eq!(error_span("", 0), 0..0);
+        assert_eq!(error_span("   ", 3), 0..0);
+    }
+
+    /// The offset is the server's, and a server that names one past the
+    /// end must not panic the app.
+    #[test]
+    fn an_offset_past_the_end_is_clamped() {
+        assert_eq!(marked("select", 99), "select");
     }
 
     #[test]

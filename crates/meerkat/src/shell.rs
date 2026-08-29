@@ -10,7 +10,8 @@
 //! away. Without that, a slow first page would overwrite a fast second one.
 
 use db_client::{
-    Connection, Profile, QueryResult, RunId, ServerTiming, Session, Stop, TxEnd, TxMode, Wire,
+    CheckError, Connection, Profile, QueryResult, Refusal, RunId, ServerTiming, Session, Stop,
+    TxEnd, TxMode, Wire,
 };
 use db_postgres::{Label, PostgresConnection};
 use gpui::{
@@ -25,7 +26,7 @@ use query::{CommandVerb, TxVerb};
 use results_grid::{
     Cell, Extent, Grid, GridData, GridState, Hit, Selection, Step, clipboard_text, find_columns,
 };
-use sql_editor::{Kind, Name, SqlEditor, StatementStatus, Vocabulary};
+use sql_editor::{Diagnostic, Kind, Name, SqlEditor, SqlEditorEvent, StatementStatus, Vocabulary};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
@@ -236,6 +237,21 @@ const HISTORY_DAYS: i64 = 7;
 /// cached catalog lets a session open tabs while the connect is still in
 /// flight, so this is reachable on a first keystroke.
 const NOT_CONNECTED: &str = "not connected yet";
+/// How long the typing has to stop before the buffer is checked.
+///
+/// A check is a round trip, and a round trip per keystroke would be a
+/// question a second about text the user is halfway through writing. It is
+/// also long enough that a squiggle never appears under the character
+/// being typed, which is the mark's worst reading: a red line that chases
+/// the caret says the user is wrong about a word they have not finished.
+const CHECK_DEBOUNCE: Duration = Duration::from_millis(500);
+/// How many statements of a buffer are checked.
+///
+/// One round trip each, and a scratchpad of two hundred statements is a
+/// file rather than a query. What is over the cap is left unmarked rather
+/// than marked wrongly — the buffer is checked from the top, which is
+/// where the user is reading.
+const CHECK_STATEMENTS: usize = 20;
 /// How often the toolbar's run timer repaints. The design prints tenths of
 /// a second, so this is the slowest tick that still reads as a clock.
 const TIMER_TICK: Duration = Duration::from_millis(100);
@@ -836,6 +852,16 @@ struct QueryTab {
     selection: Selection,
     scroll: GridState,
     generation: u64,
+    /// How many syntax checks this tab has asked for. A check is
+    /// debounced, so the answer arrives after several more keystrokes have
+    /// gone by; a reply that does not carry this number is about text that
+    /// is no longer in the buffer. It counts separately from
+    /// `generation`, which counts runs: a check must not be called off by
+    /// a run, and a run must not be called off by a keystroke.
+    checked: u64,
+    /// Held so the editor's `Changed` event reaches the shell for as long
+    /// as the tab is open. Dropping it unsubscribes.
+    _editor: Subscription,
 }
 
 /// The comp's four states for a query tab's run, and the whole of what the
@@ -1522,6 +1548,9 @@ impl Shell {
                         this.label = Some(label);
                         this.status = Status::Connected;
                         this.resume_pending_pages(cx);
+                        // The tab on screen was typed into before there
+                        // was anywhere to send the question. Ask now.
+                        this.check_active(cx);
                         this.introspect(cx);
                     }
                     Err(error) => {
@@ -1785,6 +1814,113 @@ impl Shell {
         tab.editor.update(cx, |editor, cx| editor.skip_statements_from(from, cx));
     }
 
+    /// Ask the server whether the buffer parses, once the typing stops.
+    ///
+    /// **The check is the server's, because the server is the only thing
+    /// that knows Postgres.** A grammar of the app's own would be a second
+    /// dialect to keep in step with the one the statement is actually sent
+    /// to, and every gap between the two would read as the app being wrong
+    /// about valid SQL. So the statement goes out to be *prepared* and
+    /// thrown away: nothing runs, and the answer is the same refusal the
+    /// run would have met.
+    ///
+    /// Only the **active** tab is checked. A restored strip of a hundred
+    /// tabs sets a hundred buffers as it opens, and a check apiece would
+    /// be a hundred round trips about text nobody is looking at.
+    fn schedule_check(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let connection = self.connection.clone();
+        let active =
+            matches!(self.tabs.get(self.active), Some(Tab::Query(tab)) if tab.id == tab_id);
+        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else { return };
+        // The edit has already dropped the marks the last check left, so
+        // there is nothing to clear here: a buffer with no connection
+        // simply goes unmarked.
+        tab.checked += 1;
+        let checked = tab.checked;
+        if !active {
+            return;
+        }
+        let Some(connection) = connection else { return };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CHECK_DEBOUNCE).await;
+            // Every keystroke schedules one of these, and all but the last
+            // are on their way to finding the text has moved on.
+            let Ok(Some((sql, session))) = this.update(cx, |this, cx| {
+                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return None };
+                if tab.checked != checked {
+                    return None;
+                }
+                // **Down the tab's own session when it has one**, because
+                // that is where a temp table it made and a `search_path`
+                // it set actually are — the pool is a different connection
+                // and would call both of them missing. A run in flight is
+                // holding that connection, so the pool answers instead
+                // rather than queue the check behind the statement the
+                // user is waiting for.
+                let session = (!tab.run.in_flight()).then(|| tab.session.clone()).flatten();
+                Some((tab.editor.read(cx).text().to_string(), session))
+            }) else {
+                return;
+            };
+            let ranges: Vec<Range<usize>> =
+                query::statement_ranges(&sql).into_iter().take(CHECK_STATEMENTS).collect();
+            let statements: Vec<String> =
+                ranges.iter().map(|range| sql[range.clone()].to_string()).collect();
+            let Ok(task) = this.update(cx, |_, cx| {
+                gpui_tokio::Tokio::spawn(cx, async move {
+                    let mut found = Vec::new();
+                    for statement in &statements {
+                        let answer = match &session {
+                            Some(session) => session.check(statement).await,
+                            None => connection.check(statement).await,
+                        };
+                        // A check that could not be made says nothing. It
+                        // is a question nobody asked for, so it must never
+                        // raise an error over a query that has not been
+                        // run.
+                        let mut error = answer.unwrap_or(None);
+                        if error.is_none() {
+                            error = missing_relation(
+                                statement,
+                                session.as_deref(),
+                                connection.as_ref(),
+                            )
+                            .await;
+                        }
+                        found.push(error);
+                    }
+                    anyhow::Ok(found)
+                })
+            }) else {
+                return;
+            };
+            let Ok(found) = flatten(task.await) else { return };
+            this.update(cx, |this, cx| {
+                let vocabulary = this.vocabulary.clone();
+                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else { return };
+                if tab.checked != checked {
+                    return;
+                }
+                tab.editor.update(cx, |editor, cx| {
+                    let marks = diagnostics(&sql, &ranges, &found, editor.cursor(), &vocabulary);
+                    editor.set_diagnostics(marks, cx);
+                });
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Check the tab on screen with no edit to prompt it. A buffer
+    /// restored before the connect landed had nowhere to send its
+    /// question, and an unmarked query that will not parse is the state
+    /// this whole path exists to end.
+    fn check_active(&mut self, cx: &mut Context<Self>) {
+        let Some(Tab::Query(tab)) = self.tabs.get(self.active) else { return };
+        let id = tab.id;
+        self.schedule_check(id, cx);
+    }
+
     fn new_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.new_query_with("select * from ", window, cx);
     }
@@ -1797,6 +1933,12 @@ impl Shell {
         let vocabulary = self.vocabulary.clone();
         let editor = cx.new(|cx| SqlEditor::new(sql, vocabulary, cx));
         window.focus(&editor.focus_handle(cx), cx);
+        // The editor knows nothing about a database — it holds the text
+        // and paints what it is told — so the shell is what turns an edit
+        // into a question for the server.
+        let subscription = cx.subscribe(&editor, move |this, _, event, cx| match event {
+            SqlEditorEvent::Changed => this.schedule_check(id, cx),
+        });
         self.tabs.push(Tab::Query(QueryTab {
             id,
             title: format!("query {id}").into(),
@@ -1828,6 +1970,8 @@ impl Shell {
             selection: Selection::default(),
             scroll: GridState::new(),
             generation: 0,
+            checked: 0,
+            _editor: subscription,
         }));
         self.activate(self.tabs.len() - 1, cx);
         cx.notify();
@@ -6067,6 +6211,10 @@ impl Shell {
                 .child(tab.editor.clone())
                 .child(self.pane_handle(Divider::Editor, colors, cx)),
         )
+        // Under the editor, because it is about the statement above it —
+        // and above the run's own error strip, which is about a statement
+        // that was actually sent.
+        .children(syntax_strip(tab, colors, cx))
         .children(tab.error.clone().map(|error| error_strip(error, colors)))
         // Directly over the result, because it is about what the runs have
         // done rather than about the statement above them.
@@ -7523,6 +7671,162 @@ fn no_result_note(tab: &Tab, colors: &ThemeColors) -> Option<Div> {
 ///
 /// It is pure so the wording can be argued with in a test rather than in a
 /// running window, as [`tx_copy`] and [`confirm_copy`] are.
+/// The relation a `DROP`, `ALTER` or `TRUNCATE` names, when the server
+/// turns out not to have one.
+///
+/// **This is the hole [`Connection::check`] cannot fill on its own.**
+/// Postgres resolves no names for a utility statement until it runs one,
+/// so `DROP TABLE nosuch` prepares happily and the check comes back with
+/// nothing — on exactly the statements where being told beforehand is
+/// worth most. So the app reads the name out of the statement and the
+/// **server** is still the one that answers, through `to_regclass`: it
+/// resolves the name the parser's own way, and on a session it sees that
+/// tab's temp tables and `search_path`.
+///
+/// It costs one round trip, and only for a statement that names a
+/// relation and does not say `IF EXISTS` — which says outright that a
+/// missing one is the point.
+async fn missing_relation(
+    statement: &str,
+    session: Option<&dyn Session>,
+    connection: &dyn Connection,
+) -> Option<CheckError> {
+    let target = query::relation_target(statement)?;
+    if target.if_exists {
+        return None;
+    }
+    let name = &statement[target.name.clone()];
+    let found = match session {
+        Some(session) => session.relation_exists(name).await,
+        None => connection.relation_exists(name).await,
+    };
+    // "Cannot say" is not "it is not there", and neither is a failed ask.
+    if found.ok().flatten() != Some(false) {
+        return None;
+    }
+    Some(CheckError {
+        refusal: Refusal::Name,
+        // The server's own words for the same thing, so the strip reads
+        // the same whichever way the answer was reached.
+        message: format!("relation \"{name}\" does not exist"),
+        offset: Some(target.name.start),
+    })
+}
+
+/// Turn what the server said about each statement into marks on the
+/// buffer.
+///
+/// The server answers about one statement and names a point inside it;
+/// this is where those become a range of the buffer the editor can paint —
+/// [`query::error_span`] grows the point into the token it landed on, and
+/// the statement's own start puts it back where the user typed it.
+fn diagnostics(
+    sql: &str,
+    ranges: &[Range<usize>],
+    found: &[Option<CheckError>],
+    cursor: usize,
+    vocabulary: &Vocabulary,
+) -> Vec<Diagnostic> {
+    let mut marks = Vec::new();
+    // Set by the first statement that could have made a name the ones
+    // after it use. The check asked a connection that has not run the
+    // buffer, so from here on "does not exist" says nothing.
+    let mut names_moved = false;
+    for (statement, error) in ranges.iter().zip(found) {
+        let text = &sql[statement.clone()];
+        if let Some(mark) = error
+            .as_ref()
+            .filter(|error| !(names_moved && error.refusal == Refusal::Name))
+            .and_then(|error| mark_for(sql, statement, error, cursor, vocabulary))
+        {
+            marks.push(mark);
+        }
+        // After, not before: a `CREATE TABLE a.b` in a schema that is not
+        // there is a name error about itself, and a real one.
+        names_moved |= query::changes_names(text);
+    }
+    marks
+}
+
+/// One statement's answer as a mark on the buffer, or nothing when the
+/// statement is merely unfinished under the caret.
+fn mark_for(
+    sql: &str,
+    statement: &Range<usize>,
+    error: &CheckError,
+    cursor: usize,
+    vocabulary: &Vocabulary,
+) -> Option<Diagnostic> {
+    let text = &sql[statement.clone()];
+    let at = statement.start + error.offset.unwrap_or(0);
+    if being_typed(statement, at, cursor) {
+        return None;
+    }
+    let span = match error.offset {
+        Some(offset) => {
+            let span = query::error_span(text, offset);
+            reach_back(text, span, error.refusal, vocabulary)
+        }
+        // The server named no position, so the statement as a whole is as
+        // close as anything here can point.
+        None => 0..text.len(),
+    };
+    let range = statement.start + span.start..statement.start + span.end;
+    (!range.is_empty()).then(|| Diagnostic { range, message: error.message.clone() })
+}
+
+/// Reach a syntax error's mark back over the word the parser had just
+/// read, when nothing says that word was meant.
+///
+/// **The server is right and one token late.** `… effort limi 100` is
+/// refused at `100`, because `limi` parsed perfectly well as a table
+/// alias, and `select 1 frm users` is refused at `users` for the same
+/// reason. A mark on the server's token alone points just past the typo
+/// every time, so it reaches back to cover the stretch the parser could
+/// not read — which always holds the mistake, wherever in it the mistake
+/// is.
+///
+/// **Two things stop it, and they are the two ways a word can be meant.**
+/// A keyword is SQL's own, so `select from t` marks `from` and not the
+/// `select` in front of it. And a name the connection actually has is a
+/// name the user reached for on purpose: `select * from users 100` marks
+/// the `100`, because `users` is a table. What is left is a bare word this
+/// database has never heard of, sitting where the parser expected
+/// something else — which is a typo or it is nothing.
+///
+/// Only a [`Refusal::Syntax`]. A name error already points at the name it
+/// could not find, and reaching back from one would swallow the word in
+/// front of a name that is merely missing.
+fn reach_back(
+    text: &str,
+    span: Range<usize>,
+    refusal: Refusal,
+    vocabulary: &Vocabulary,
+) -> Range<usize> {
+    if refusal != Refusal::Syntax {
+        return span;
+    }
+    let Some(before) = query::word_before(text, span.start) else { return span };
+    let word = &text[before.clone()];
+    if query::is_keyword(word) || vocabulary.contains(word) {
+        return span;
+    }
+    before.start..span.end
+}
+
+/// Whether an error is nothing but the statement being unfinished, under a
+/// caret that is still inside it.
+///
+/// `select ` is a syntax error and is also what every query looks like a
+/// second after it is started. The server reports it at the **end of the
+/// input**, which is exactly where the caret is while it is being typed —
+/// so that pair, and only that pair, reads as "not finished" rather than
+/// "wrong". Move the caret away and the mark appears: the user has stopped
+/// writing this statement, and an unfinished one is then worth saying.
+fn being_typed(statement: &Range<usize>, error_at: usize, cursor: usize) -> bool {
+    error_at >= statement.end && (statement.start..=statement.end).contains(&cursor)
+}
+
 fn changed_copy(changed: Changed) -> String {
     let Changed { rows, verb } = changed;
     match (rows, verb) {
@@ -7652,6 +7956,56 @@ fn cap_note(tab: &QueryTab, colors: &ThemeColors) -> Option<Div> {
 }
 
 /// The design's error tone: warm surface, warm border, warm text.
+/// What the last syntax check found, under the pane the marks are in.
+///
+/// **The squiggle says where and this says what**, and the caret is what
+/// keeps the two about the same error: walking onto a mark is how the user
+/// asks what it says. With the caret nowhere near one, the first is what
+/// is spoken for, and the count on the right says how many there are —
+/// otherwise a buffer with three faults would read as a buffer with one.
+///
+/// It is **not** [`error_strip`]. That one answers a run: the server was
+/// sent a statement and refused it. This one is about a statement nobody
+/// has sent, so it takes the panel's own ground and says its piece in the
+/// error ink rather than lighting a whole strip up like a failure.
+fn syntax_strip(tab: &QueryTab, colors: &ThemeColors, cx: &App) -> Option<Div> {
+    let editor = tab.editor.read(cx);
+    let found = editor.diagnostics();
+    let ix = spoken_for(found, editor.cursor());
+    let diagnostic = found.get(ix)?;
+    Some(
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(14.))
+            .py(px(7.))
+            .border_b_1()
+            .border_color(colors.hairline)
+            .bg(colors.panel)
+            .text_size(px(11.))
+            .text_color(colors.error)
+            .child(div().flex_1().min_w(px(0.)).truncate().child(diagnostic.message.clone()))
+            .children((found.len() > 1).then(|| {
+                div()
+                    .flex_none()
+                    .text_color(colors.text_faint)
+                    .child(format!("{} of {}", ix + 1, found.len()))
+            })),
+    )
+}
+
+/// Which mark the strip speaks for: the one the caret is standing in, or
+/// the first. The caret at the very end of a mark counts as inside it —
+/// that is where it lands after the user types the word.
+fn spoken_for(diagnostics: &[Diagnostic], cursor: usize) -> usize {
+    diagnostics
+        .iter()
+        .position(|diagnostic| diagnostic.range.start <= cursor && cursor <= diagnostic.range.end)
+        .unwrap_or(0)
+}
+
 fn error_strip(message: String, colors: &ThemeColors) -> Div {
     div()
         .flex_none()
@@ -7680,6 +8034,181 @@ fn redact(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connection that knows no names at all, which is what a tab has
+    /// before the catalog lands.
+    fn nothing() -> Vocabulary {
+        Vocabulary::default()
+    }
+
+    fn knows(names: &[&str]) -> Vocabulary {
+        Vocabulary::new(names.iter().map(|name| Name {
+            name: (*name).to_string(),
+            detail: "table".to_string(),
+            kind: Kind::Relation,
+            owner: None,
+        }))
+    }
+
+    fn syntax(offset: Option<usize>) -> Option<CheckError> {
+        Some(CheckError {
+            refusal: Refusal::Syntax,
+            message: "syntax error at or near \"frm\"".to_string(),
+            offset,
+        })
+    }
+
+    fn name(offset: Option<usize>) -> Option<CheckError> {
+        Some(CheckError {
+            refusal: Refusal::Name,
+            message: "relation \"t\" does not exist".to_string(),
+            offset,
+        })
+    }
+
+    /// The server answers about one statement and names a point inside it.
+    /// The mark comes back as a range of the **buffer**, on the token the
+    /// user typed.
+    #[test]
+    fn a_statements_error_is_placed_back_in_the_buffer() {
+        let sql = "select 1;\nselect 2 frm t";
+        let ranges = query::statement_ranges(sql);
+        // "select 2 frm t" starts at byte 10; `frm` is at 9 inside it.
+        let found = [None, syntax(Some(9))];
+        let marks = diagnostics(sql, &ranges, &found, 0, &nothing());
+        assert_eq!(marks.len(), 1);
+        assert_eq!(&sql[marks[0].range.clone()], "frm");
+    }
+
+    /// No position from the server is not "no error": the statement as a
+    /// whole is as close as anything here can point.
+    #[test]
+    fn an_error_with_no_position_marks_the_statement() {
+        let sql = "select 1 frm t";
+        let ranges = query::statement_ranges(sql);
+        let marks = diagnostics(sql, &ranges, &[syntax(None)], 99, &nothing());
+        assert_eq!(&sql[marks[0].range.clone()], sql);
+    }
+
+    /// The rule that keeps the marks from chasing the caret. `select ` is
+    /// a syntax error and is also what every query looks like a second
+    /// after it is started.
+    #[test]
+    fn an_unfinished_statement_under_the_caret_is_not_marked() {
+        let sql = "select 1;\nselect";
+        let ranges = query::statement_ranges(sql);
+        // The second statement stops at the end of the input, which is
+        // where the caret is while it is being typed.
+        let found = [None, syntax(Some(6))];
+        assert!(diagnostics(sql, &ranges, &found, 16, &nothing()).is_empty());
+        // The caret moved back to the statement above: the user has
+        // stopped writing this one, and an unfinished statement is then
+        // worth saying. The mark goes on the token they stopped on.
+        let marks = diagnostics(sql, &ranges, &found, 2, &nothing());
+        assert_eq!(&sql[marks[0].range.clone()], "select");
+    }
+
+    /// A name error is only true of the connection the check went down,
+    /// and a buffer that makes the name first is the case it is wrong
+    /// about. The statement that *makes* it still answers for itself.
+    #[test]
+    fn a_name_the_buffer_makes_itself_is_not_marked() {
+        let sql = "create table t (id int);\nselect * from t";
+        let ranges = query::statement_ranges(sql);
+        let found = [None, name(Some(14))];
+        assert!(diagnostics(sql, &ranges, &found, 0, &nothing()).is_empty());
+
+        // Turn the first statement into one that makes nothing, and the
+        // same answer is worth painting.
+        let sql = "select 1;\nselect * from t";
+        let ranges = query::statement_ranges(sql);
+        let marks = diagnostics(sql, &ranges, &found, 0, &nothing());
+        assert_eq!(&sql[marks[0].range.clone()], "t");
+    }
+
+    /// A syntax error is context-free, so nothing about the buffer above
+    /// it can make it untrue.
+    #[test]
+    fn a_syntax_error_survives_a_buffer_that_makes_names() {
+        let sql = "create table t (id int);\nselect 1 frm t";
+        let ranges = query::statement_ranges(sql);
+        let marks = diagnostics(sql, &ranges, &[None, syntax(Some(9))], 0, &nothing());
+        assert_eq!(&sql[marks[0].range.clone()], "frm");
+    }
+
+    /// **The server is right and one token late.** `limi` parses as a
+    /// table alias, so the refusal lands on the `100` after it — and the
+    /// mark has to cover the word that made the parser go wrong.
+    #[test]
+    fn the_mark_reaches_back_over_the_word_that_lost_the_parser() {
+        let sql = "select * from tenant.effort limi 100";
+        let ranges = query::statement_ranges(sql);
+        // The server points at `100`, which starts at byte 33.
+        let marks = diagnostics(sql, &ranges, &[syntax(Some(33))], 0, &nothing());
+        assert_eq!(&sql[marks[0].range.clone()], "limi 100");
+    }
+
+    /// The two ways a word can be meant, and each stops the reach.
+    #[test]
+    fn a_keyword_or_a_name_the_database_has_stops_the_reach() {
+        // `from` is SQL's own word, so the mark stays on the token the
+        // server named.
+        let sql = "select from t";
+        let ranges = query::statement_ranges(sql);
+        let marks = diagnostics(sql, &ranges, &[syntax(Some(7))], 99, &nothing());
+        assert_eq!(&sql[marks[0].range.clone()], "from");
+
+        // `users` is a table this connection has, so it was reached for on
+        // purpose and the `100` is what is wrong.
+        let sql = "select * from users 100";
+        let ranges = query::statement_ranges(sql);
+        let found = [syntax(Some(20))];
+        let marks = diagnostics(sql, &ranges, &found, 0, &knows(&["users"]));
+        assert_eq!(&sql[marks[0].range.clone()], "100");
+        // The same statement against a connection that has never heard of
+        // `users` reaches back, because then it is a word like any other.
+        let marks = diagnostics(sql, &ranges, &found, 0, &nothing());
+        assert_eq!(&sql[marks[0].range.clone()], "users 100");
+    }
+
+    /// A name error already points at the name it could not find, so
+    /// nothing reaches back from one.
+    #[test]
+    fn a_name_error_marks_the_name_and_nothing_before_it() {
+        let sql = "select * from tenant.effort";
+        let ranges = query::statement_ranges(sql);
+        let marks = diagnostics(sql, &ranges, &[name(Some(14))], 0, &nothing());
+        assert_eq!(&sql[marks[0].range.clone()], "tenant.effort");
+    }
+
+    #[test]
+    fn only_the_end_of_the_input_is_read_as_unfinished() {
+        let statement = 10..24;
+        // The point is inside the statement, so the caret means nothing.
+        assert!(!being_typed(&statement, 19, 19));
+        // At the end of it, with the caret in it.
+        assert!(being_typed(&statement, 24, 24));
+        assert!(being_typed(&statement, 24, 10));
+        // At the end of it, with the caret in another statement.
+        assert!(!being_typed(&statement, 24, 4));
+    }
+
+    /// The strip and the mark have to be about the same error, and the
+    /// caret is what says which.
+    #[test]
+    fn the_strip_speaks_for_the_mark_the_caret_is_in() {
+        let marks = [
+            Diagnostic { range: 4..8, message: "first".to_string() },
+            Diagnostic { range: 20..24, message: "second".to_string() },
+        ];
+        assert_eq!(spoken_for(&marks, 22), 1);
+        // The caret at the very end of a mark is still in it: that is
+        // where it lands after the word is typed.
+        assert_eq!(spoken_for(&marks, 8), 0);
+        // Nowhere near one, so the first is spoken for.
+        assert_eq!(spoken_for(&marks, 40), 0);
+        assert_eq!(spoken_for(&[], 0), 0);
+    }
 
     #[test]
     fn a_double_click_marks_the_word_it_landed_in() {

@@ -10,8 +10,13 @@
 //! It works a line at a time, so a string literal that spans lines loses
 //! its colour after the first newline. That is the price of not carrying
 //! a parser; nothing else depends on this being exact.
+//!
+//! The keywords themselves live in `query`, with the rest of what the app
+//! knows about SQL text: the editor is not the only thing that has to tell
+//! a keyword from a name.
 
 use crate::completion::Vocabulary;
+use query::is_keyword;
 #[cfg(test)]
 use crate::completion::{Kind, Name};
 use std::ops::Range;
@@ -111,21 +116,6 @@ fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte >= 0x80
 }
 
-fn is_keyword(word: &str) -> bool {
-    KEYWORDS.binary_search(&word.to_ascii_lowercase().as_str()).is_ok()
-}
-
-/// Sorted, so the lookup can bisect. Shared with the completion list.
-pub(crate) const KEYWORDS: &[&str] = &[
-    "all", "alter", "and", "any", "array", "as", "asc", "begin", "between", "by", "case", "cast",
-    "coalesce", "commit", "count", "create", "cross", "current_date", "current_timestamp",
-    "delete", "desc", "distinct", "drop", "else", "end", "except", "exists", "explain", "false",
-    "filter", "first", "from", "full", "group", "having", "ilike", "in", "index", "inner",
-    "insert", "intersect", "into", "is", "join", "lateral", "left", "like", "limit", "max", "min",
-    "not", "null", "nulls", "offset", "on", "or", "order", "outer", "over", "partition",
-    "returning", "right", "rollback", "select", "set", "some", "sum", "table", "then", "true",
-    "union", "update", "using", "values", "view", "when", "where", "window", "with",
-];
 
 #[cfg(test)]
 mod tests {
@@ -145,13 +135,6 @@ mod tests {
             .into_iter()
             .map(|(range, token)| (&line[range], token))
             .collect()
-    }
-
-    #[test]
-    fn the_keyword_list_is_sorted_for_bisection() {
-        let mut sorted = KEYWORDS.to_vec();
-        sorted.sort_unstable();
-        assert_eq!(KEYWORDS, sorted.as_slice());
     }
 
     #[test]

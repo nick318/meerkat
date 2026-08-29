@@ -4,7 +4,7 @@
 //! Everything here is pure text work over the buffer, so it is all
 //! testable without a window.
 
-use crate::highlight::KEYWORDS;
+use query::KEYWORDS;
 use std::collections::HashSet;
 use std::ops::Range;
 

@@ -932,6 +932,119 @@ statements skipped rather than leaving them queued for ever: a session that
 would not open, a `BEGIN` that failed, a run called off while the session
 was opening.
 
+### Marking what will not parse
+
+**The check is the server's, because the server is the only thing that
+knows Postgres.** A grammar of the app's own would be a second dialect to
+keep in step with the one the statement is actually sent to, and every gap
+between the two would read as the app being wrong about valid SQL. So
+`Connection::check` hands one statement over to be **prepared** and throws
+the prepared statement away: `prepare_with`, not `describe`, which would
+follow the parse with a catalog query for column nullability that nothing
+here reads. Nothing runs — a `DROP TABLE` checked this way drops nothing —
+and the answer is the same refusal the run would have met.
+
+**Two classes come back, and `db_client::Refusal` is why they are told
+apart.** A **syntax** error (SQLSTATE 42601) is context-free: the scanner
+and the grammar refuse the same text on any connection, whoever is looking,
+so it is true of the statement itself. A **name** error — 42P01 for a
+relation or a missing schema, 42703 for a column, 42883 for a function,
+42704 for a type — is only true of the connection the check went down.
+`42P18` is deliberately not in the list: a bare `$1` is a placeholder the
+user typed on purpose, not a name they got wrong.
+
+**Two rules make a name error trustworthy, and neither belongs to a
+driver.** The check goes down the **tab's own session** when the tab has
+one, which is where a temp table it made and a `SET search_path` it ran
+actually live; the app pool answers only for a tab that has never run
+anything, or one whose session a run is holding — a check must never queue
+behind the statement the user is waiting for. And `query::changes_names`
+vetoes the rest: once a buffer holds a `CREATE`, `DROP`, `ALTER` or `SET`,
+every name error after it is dropped, because
+`CREATE TABLE t (…); SELECT * FROM t;` reports a `t` that does not exist
+*yet* and there is no way to tell that from one that never will without
+running the DDL. The veto errs toward silence — a wrong veto costs a mark
+that is not painted, and the other way costs a mark that is not real. The
+statement that changes the names still answers for itself, so a
+`CREATE TABLE a.b` in a schema that is not there is still marked.
+
+**The server names a point, and a point cannot be underlined.**
+`query::error_span` grows it into the token it landed on — the word, the
+string, or the one character of punctuation — because marking to the end of
+the statement would put a squiggle under the half of the query that is
+usually right. **A qualified name is one name**: the server points at the
+front of `schema.table` and refuses the pair, so the walk carries on over
+every `.` that has another name part after it. At the **end of the input** the point is past every token,
+so the mark goes on the last one. The position arrives as a one-based
+*character* index and `db_postgres::byte_offset` converts it, because every
+offset above the driver is a byte offset.
+
+**The server is right and one token late, so the mark reaches back.**
+`… effort limi 100` is refused at `100`, because `limi` parsed perfectly
+well as a table alias; `select 1 frm users` is refused at `users` for the
+same reason. A mark on the server's token alone points just past the typo
+every time. So `shell::reach_back` covers the word in front of it as well —
+the stretch the parser could not read, which always holds the mistake. Two
+things stop it, and they are the two ways a word can be meant: a **keyword**
+is SQL's own (`select from t` marks `from`, not `select`), and a **name the
+connection has** was reached for on purpose (`select * from users 100` marks
+the `100`). What is left is a bare word this database has never heard of,
+sitting where the parser expected something else. It applies to a syntax
+error only: a name error already points at the name it could not find.
+`query::KEYWORDS` moved out of the editor's colouring module for this —
+three readers now share one list.
+
+**Postgres resolves no names for a utility statement until it runs one.**
+`DROP TABLE nosuch` prepares perfectly happily — the grammar is all the
+parser is asked for — so the check comes back with nothing to say about
+exactly the statements where being told beforehand is worth most. The way
+through is not to guess from the catalog: `query::relation_target` reads
+the relation out of the statement — `DROP`, `ALTER` or `TRUNCATE`, of a
+table, view, index, sequence or materialized view — and
+`Connection::relation_exists` asks the **server** through `to_regclass`,
+which resolves the name the parser's own way (through `search_path` when
+unqualified, folding an unquoted part and keeping a quoted one) and answers
+NULL rather than raising. On a session it sees that tab's temp tables. It
+costs one round trip and only for a statement that names a relation and
+does not say `IF EXISTS`, which says outright that a missing one is the
+point. The reader errs toward `None` — `DROP FUNCTION` and `DROP SCHEMA`
+resolve in catalogs of their own and are not read, and `DROP TABLE a, b`
+names only `a`.
+
+**An unfinished statement under the caret is not marked.** `select ` is a
+syntax error and is also what every query looks like a second after it is
+started; the server reports it at the end of the input, which is exactly
+where the caret is while it is being typed. `shell::being_typed` is that
+one pair — error at the end, caret inside — and nothing else is suppressed.
+Move the caret away and the mark appears.
+
+`SqlEditor` holds the marks and paints them as a wavy underline in
+`colors.error`. A `TextRun` carries one underline for its whole length and
+a mark rarely lines up with a colour, so `split_spans` cuts the tokenizer's
+spans at the mark's own edges and every piece keeps the colour it had.
+**Every edit drops the marks**, undo and redo included, for the reason it
+drops the run's gutter marks: the ranges name text the edit has moved.
+That is what `SqlEditor::edited` does, and it emits `SqlEditorEvent::Changed`
+— the editor knows nothing about a database, so the shell is what turns an
+edit into a question.
+
+`Shell::schedule_check` waits out `CHECK_DEBOUNCE` (500 ms) and checks the
+**active** tab alone: a restored strip of a hundred tabs sets a hundred
+buffers as it opens, and a check apiece would be a hundred round trips
+about text nobody is looking at. `CHECK_STATEMENTS` (20) bounds a
+scratchpad. `QueryTab::checked` is the generation, and it counts separately
+from `generation`, which counts runs: a check must not be called off by a
+run, and a run must not be called off by a keystroke. A failed check says
+nothing at all — it is a question nobody asked for, and it must never raise
+an error over a query that has not been run.
+
+**The squiggle says where and `syntax_strip` says what**, under the editor
+and above the run's own error strip. The caret picks which error it speaks
+for, so the two are always about the same one, and a count on the right
+says how many there are. It takes the panel's ground rather than
+`error_surface`: a statement nobody has sent must not read like a run that
+failed.
+
 ### A tab is a session
 
 **The tab is a session in the user's head, so it has to be one on the

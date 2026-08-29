@@ -206,6 +206,50 @@ pub struct QueryResult {
     pub wire: Wire,
 }
 
+/// Why the server refused a statement it was asked to prepare.
+///
+/// **The two are told apart because one of them can be wrong.** A syntax
+/// error is context-free: the scanner and the grammar refuse the same text
+/// on any connection, whoever is looking, so it is true of the statement
+/// itself. A name error is true of **this** connection — the one the check
+/// went down — and a caller that knows the buffer may know better. See
+/// [`CheckError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The scanner or the grammar would not read it.
+    Syntax,
+    /// A relation, column, function or type the server could not resolve.
+    Name,
+}
+
+/// A statement the server refused to *parse*.
+///
+/// **A name error is only as good as the connection it was asked on**, and
+/// that is what [`Refusal`] is for. The check resolves names against
+/// whatever connection carried it, so a temp table, a `SET search_path`
+/// and a table created by an earlier statement of the same buffer are all
+/// things it can be wrong about. Two rules keep it honest, and neither of
+/// them belongs to a driver: the check goes down the **tab's own session**
+/// when the tab has one, which is where a temp table and a `search_path`
+/// actually live; and the app drops name errors for statements that follow
+/// one which changes what names resolve to. What is left is a name the
+/// server would refuse the moment the statement ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckError {
+    /// Which of the two this is, and so how much it can be trusted.
+    pub refusal: Refusal,
+    /// The server's own words, unabridged.
+    pub message: String,
+    /// Byte offset into the statement that was checked, where the server
+    /// put its cursor. `None` when it named no position — the message is
+    /// then all there is, and the caller marks the statement whole.
+    ///
+    /// Bytes, not characters: Postgres counts the position in characters
+    /// and the driver converts, because every offset above this layer is a
+    /// byte offset into the text the app holds.
+    pub offset: Option<usize>,
+}
+
 /// What a run cost, timed by the **client**, around the wire.
 ///
 /// A wall clock around `execute` answers "how long until I could look at
@@ -472,6 +516,27 @@ pub trait Session: Send + Sync {
         Ok(false)
     }
 
+    /// Whether one statement parses **on this connection**.
+    ///
+    /// The same question [`Connection::check`] answers, asked where the
+    /// answer is right: a temp table this tab made, a `SET search_path` it
+    /// ran and a schema it created are all on this connection and on no
+    /// other. It costs the session one round trip and runs nothing.
+    ///
+    /// It waits for the connection like any other statement, so a caller
+    /// must not send one while a run is out — the check would queue behind
+    /// the very statement the user is waiting for.
+    async fn check(&self, _sql: &str) -> Result<Option<CheckError>> {
+        Ok(None)
+    }
+
+    /// The same question as [`Connection::relation_exists`], down the
+    /// tab's own connection — so a temp table it made and a `search_path`
+    /// it set are part of the answer.
+    async fn relation_exists(&self, _name: &str) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
     /// Open a transaction on this session.
     ///
     /// It is **not** `execute`. A transaction boundary is not a run: it has
@@ -548,6 +613,47 @@ pub trait Connection: Send + Sync {
     /// [`QueryResult::truncated`] set: the statement did not fail, the app
     /// declined to hold the rest.
     async fn execute(&self, sql: &str) -> Result<QueryResult>;
+
+    /// Ask the server whether one statement parses, without running it.
+    ///
+    /// **Nothing is executed.** The driver sends the statement to be
+    /// prepared and throws the prepared statement away: the server scans
+    /// it, runs it through the grammar, and answers. A `DELETE` checked
+    /// this way deletes nothing, takes no lock worth the name and costs
+    /// one round trip.
+    ///
+    /// One statement, never a buffer: the extended protocol refuses more
+    /// than one command in a prepared statement, so the caller splits
+    /// first — which it has to do anyway, being what the gutter marks are
+    /// worked out from.
+    ///
+    /// `Ok(None)` is "nothing to say", and an engine that cannot check
+    /// says it for ever.
+    ///
+    /// **This is the pooled answer.** Names resolve against a connection
+    /// that is nobody's session, so it cannot see a temp table or a
+    /// `search_path` a tab has set — [`Session::check`] is the one to
+    /// prefer when the tab has a session. See [`CheckError`].
+    async fn check(&self, _sql: &str) -> Result<Option<CheckError>> {
+        Ok(None)
+    }
+
+    /// Whether the server has a relation of this name, as **it** resolves
+    /// the name — schema-qualified or through `search_path`, and folding
+    /// case the way SQL does.
+    ///
+    /// It exists because [`Connection::check`] goes quiet exactly where it
+    /// would be most useful. Postgres resolves no names for a utility
+    /// statement until it runs one, so `DROP TABLE nosuch` prepares
+    /// happily and the check has nothing to report. The app reads the name
+    /// out of the statement itself — `query::relation_target` — and asks
+    /// this instead.
+    ///
+    /// `Ok(None)` is "cannot say", and it is not `Ok(false)`: an engine
+    /// with no answer must not have its silence read as "it is not there".
+    async fn relation_exists(&self, _name: &str) -> Result<Option<bool>> {
+        Ok(None)
+    }
 
     /// Stop a run this connection started. `Ok(false)` means the server had
     /// nothing to stop — the statement finished on its own first, which is

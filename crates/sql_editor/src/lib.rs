@@ -232,6 +232,26 @@ pub struct StatementMark {
     pub status: StatementStatus,
 }
 
+/// One thing the server refused to parse, and where it sits in the buffer.
+///
+/// The editor holds these rather than the message alone, because a mark
+/// under the token is the whole point: a line of prose under the pane
+/// cannot point at the third statement of five, which is the same reason
+/// [`StatementMark`] exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub range: Range<usize>,
+    pub message: String,
+}
+
+/// What the editor tells whoever owns it.
+///
+/// One event, and it is the text: a syntax check has to run again when the
+/// buffer changes and must not run again when the caret merely moves.
+pub enum SqlEditorEvent {
+    Changed,
+}
+
 pub struct SqlEditor {
     focus_handle: FocusHandle,
     /// Where the buffer is scrolled down to. The gutter is inside this one,
@@ -276,9 +296,17 @@ pub struct SqlEditor {
     /// them. So **every edit drops them**, rather than paint a tick
     /// beside a line the user has since rewritten.
     statements: Vec<StatementMark>,
+    /// What the last syntax check found, if anything. Empty is both
+    /// "nothing is wrong" and "nobody has checked since the last edit",
+    /// and the editor need not tell them apart: it paints marks, and there
+    /// are none either way. **Every edit drops these**, for the reason it
+    /// drops `statements` — the ranges name text the edit has moved.
+    diagnostics: Vec<Diagnostic>,
     /// Where the caret is in its blink.
     blink: Blink,
 }
+
+impl gpui::EventEmitter<SqlEditorEvent> for SqlEditor {}
 
 impl Blinking for SqlEditor {
     fn blink(&self) -> &Blink {
@@ -345,6 +373,7 @@ impl SqlEditor {
             completion_range: 0..0,
             completions_dismissed: false,
             statements: Vec::new(),
+            diagnostics: Vec::new(),
             blink: Blink::default(),
         }
     }
@@ -422,6 +451,27 @@ impl SqlEditor {
         cx.notify();
     }
 
+    /// Take what a syntax check found. The ranges are byte offsets into
+    /// **this** buffer; a check whose text has since been edited must be
+    /// thrown away by the caller rather than moved, because there is no
+    /// way to move it that is not a guess.
+    pub fn set_diagnostics(&mut self, diagnostics: Vec<Diagnostic>, cx: &mut Context<Self>) {
+        if self.diagnostics == diagnostics {
+            return;
+        }
+        self.diagnostics = diagnostics;
+        cx.notify();
+    }
+
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+
+    /// Where the caret is, in bytes into the buffer.
+    pub fn cursor(&self) -> usize {
+        self.cursor_offset()
+    }
+
     pub fn clear_statements(&mut self, cx: &mut Context<Self>) {
         if self.statements.is_empty() {
             return;
@@ -455,7 +505,7 @@ impl SqlEditor {
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.push_undo(EditKind::None);
-        self.statements.clear();
+        self.edited(cx);
         self.content = text.into();
         let end = self.content.len();
         self.selected_range = end..end;
@@ -465,6 +515,16 @@ impl SqlEditor {
     }
 
     // --- selection -------------------------------------------------------
+
+    /// The text has moved. Everything worked out from the old text goes
+    /// with it — the run's gutter marks and the last check's squiggles
+    /// both name byte ranges the edit has just shifted — and whoever owns
+    /// the editor is told, so the check can run again.
+    fn edited(&mut self, cx: &mut Context<Self>) {
+        self.statements.clear();
+        self.diagnostics.clear();
+        cx.emit(SqlEditorEvent::Changed);
+    }
 
     /// Redraw, and put the caret back on show. Every edit and every
     /// motion goes through here rather than calling `cx.notify()` itself.
@@ -552,9 +612,6 @@ impl SqlEditor {
         self.marked_range = None;
         self.last_edit = EditKind::None;
         self.pending_autoscroll = true;
-        // Undo and redo are edits like any other: they move the text the
-        // marks were worked out from.
-        self.statements.clear();
         current
     }
 
@@ -562,6 +619,9 @@ impl SqlEditor {
         let Some(snapshot) = self.undo.pop() else { return };
         let current = self.restore(snapshot);
         self.redo.push(current);
+        // Undo and redo are edits like any other: they move the text the
+        // marks were worked out from.
+        self.edited(cx);
         self.touched(cx);
     }
 
@@ -569,6 +629,7 @@ impl SqlEditor {
         let Some(snapshot) = self.redo.pop() else { return };
         let current = self.restore(snapshot);
         self.undo.push(current);
+        self.edited(cx);
         self.touched(cx);
     }
 
@@ -1124,7 +1185,7 @@ impl EntityInputHandler for SqlEditor {
         // The marks name byte ranges in the text that was run, and this
         // moves that text. A tick beside a line the user has rewritten
         // would say the wrong thing about the wrong statement.
-        self.statements.clear();
+        self.edited(cx);
 
         self.content =
             self.content[..range.start].to_owned() + new_text + &self.content[range.end..];
@@ -1163,7 +1224,7 @@ impl EntityInputHandler for SqlEditor {
             self.push_undo(EditKind::None);
         }
         self.last_edit = EditKind::None;
-        self.statements.clear();
+        self.edited(cx);
 
         self.content =
             self.content[..range.start].to_owned() + new_text + &self.content[range.end..];
@@ -1827,14 +1888,20 @@ impl Element for EditorElement {
             let runs = if placeholder {
                 single_run(line, style.font(), text_color, underline)
             } else {
-                highlight::spans(line, &editor.vocabulary)
+                let marks = marks_on_line(&editor.diagnostics, offset, line.len());
+                let squiggle =
+                    UnderlineStyle { color: Some(colors.error), thickness: px(1.), wavy: true };
+                split_spans(highlight::spans(line, &editor.vocabulary), &marks)
                     .into_iter()
-                    .map(|(range, token)| TextRun {
+                    .map(|(range, token, marked)| TextRun {
                         len: range.len(),
                         font: style.font(),
                         color: token_color(token, text_color, &colors),
                         background_color: None,
-                        underline,
+                        // A squiggle under an IME composition would be two
+                        // underlines in one place; the composition is what
+                        // the user is doing now, so it wins.
+                        underline: underline.or(marked.then_some(squiggle)),
                         strikethrough: None,
                     })
                     .collect()
@@ -2076,6 +2143,60 @@ fn token_color(token: Token, plain: Hsla, colors: &theme::ThemeColors) -> Hsla {
 }
 
 /// Underline the IME's marked text, if it falls on this line.
+/// The error marks that fall on one line, as byte ranges into the line.
+///
+/// A statement is often several lines long, so one diagnostic can reach
+/// two of them; the shaped line is what carries the squiggle, and it knows
+/// only its own bytes.
+fn marks_on_line(
+    diagnostics: &[Diagnostic],
+    line_start: usize,
+    line_len: usize,
+) -> Vec<Range<usize>> {
+    let line_end = line_start + line_len;
+    diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.range.start < line_end && diagnostic.range.end > line_start)
+        .map(|diagnostic| {
+            diagnostic.range.start.clamp(line_start, line_end) - line_start
+                ..diagnostic.range.end.clamp(line_start, line_end) - line_start
+        })
+        .collect()
+}
+
+/// Cut the coloured spans wherever a mark starts or ends, and say of each
+/// piece whether it is inside one.
+///
+/// A `TextRun` carries one underline for its whole length, and a mark
+/// rarely lines up with a colour: `frm` is one plain span, and the mark on
+/// `select 1 frm` covers the last third of it. So the spans are split at
+/// the mark's own edges and every piece keeps the colour it had.
+fn split_spans(
+    spans: Vec<(Range<usize>, Token)>,
+    marks: &[Range<usize>],
+) -> Vec<(Range<usize>, Token, bool)> {
+    if marks.is_empty() {
+        return spans.into_iter().map(|(range, token)| (range, token, false)).collect();
+    }
+    let mut pieces = Vec::new();
+    for (range, token) in spans {
+        let mut cuts: Vec<usize> = marks
+            .iter()
+            .flat_map(|mark| [mark.start, mark.end])
+            .filter(|cut| range.start < *cut && *cut < range.end)
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut start = range.start;
+        for cut in cuts.into_iter().chain([range.end]) {
+            let marked = marks.iter().any(|mark| mark.start <= start && start < mark.end);
+            pieces.push((start..cut, token, marked));
+            start = cut;
+        }
+    }
+    pieces
+}
+
 fn underline_for(editor: &SqlEditor, line_start: usize, line_len: usize) -> Option<UnderlineStyle> {
     let marked = editor.marked_range.as_ref()?;
     (marked.start < line_start + line_len && marked.end > line_start).then(|| UnderlineStyle {
@@ -2156,6 +2277,54 @@ fn cursor_quad(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn diagnostic(range: Range<usize>) -> Diagnostic {
+        Diagnostic { range, message: "syntax error".to_string() }
+    }
+
+    /// The squiggle is cut out of the colour, not painted over it: the
+    /// pieces still cover the line exactly once, in order.
+    #[test]
+    fn a_mark_splits_the_span_it_lands_in() {
+        let line = "select 1 frm users";
+        let spans = highlight::spans(line, &Vocabulary::default());
+        let pieces = split_spans(spans, &[9..12]);
+        let marked: Vec<&str> = pieces
+            .iter()
+            .filter(|(_, _, marked)| *marked)
+            .map(|(range, _, _)| &line[range.clone()])
+            .collect();
+        assert_eq!(marked, vec!["frm"]);
+        let total: usize = pieces.iter().map(|(range, _, _)| range.len()).sum();
+        assert_eq!(total, line.len());
+        assert!(pieces.windows(2).all(|pair| pair[0].0.end == pair[1].0.start));
+    }
+
+    /// The colour survives the cut. A keyword half inside a mark is still
+    /// a keyword on both sides of it.
+    #[test]
+    fn a_split_piece_keeps_its_colour() {
+        let pieces = split_spans(highlight::spans("select", &Vocabulary::default()), &[0..3]);
+        assert_eq!(pieces, vec![(0..3, Token::Keyword, true), (3..6, Token::Keyword, false)]);
+    }
+
+    #[test]
+    fn nothing_found_marks_nothing() {
+        let spans = highlight::spans("select 1", &Vocabulary::default());
+        assert!(split_spans(spans, &[]).iter().all(|(_, _, marked)| !marked));
+    }
+
+    /// A statement runs over several lines, and each shaped line knows
+    /// only its own bytes.
+    #[test]
+    fn a_mark_is_cut_to_the_line_it_falls_on() {
+        // "select 1\nfrm users": line two starts at byte 9.
+        let diagnostics = [diagnostic(4..12)];
+        assert_eq!(marks_on_line(&diagnostics, 0, 8), vec![4..8]);
+        assert_eq!(marks_on_line(&diagnostics, 9, 9), vec![0..3]);
+        // A line the mark does not reach carries nothing.
+        assert_eq!(marks_on_line(&diagnostics, 19, 5), Vec::<Range<usize>>::new());
+    }
 
     fn mark(range: Range<usize>, status: StatementStatus) -> StatementMark {
         StatementMark { range, status }

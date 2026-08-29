@@ -5839,6 +5839,7 @@ version = "0.1.0"
 dependencies = [
  "fuzzy",
  "gpui",
+ "query",
  "theme",
  "ui",
 ]

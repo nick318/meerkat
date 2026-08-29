@@ -13,13 +13,14 @@
 use anyhow::Context as _;
 use async_trait::async_trait;
 use db_client::{
-    Connection, Limits, Profile, QueryResult, Result, RowChange, RowSink, RunId, ServerTiming,
-    Session, Stop, TxEnd, Value, Wire,
+    CheckError, Connection, Limits, Profile, QueryResult, Refusal, Result, RowChange, RowSink,
+    RunId, ServerTiming, Session, Stop, TxEnd, Value, Wire,
 };
 use futures::TryStreamExt as _;
 use introspect::{Catalog, Column, Schema, Table, TableKind};
 use sqlx::postgres::{
-    PgConnectOptions, PgPool, PgPoolOptions, PgQueryResult, PgRow, PgValueFormat, PgValueRef,
+    PgConnectOptions, PgDatabaseError, PgErrorPosition, PgPool, PgPoolOptions, PgQueryResult,
+    PgRow, PgValueFormat, PgValueRef,
 };
 use sqlx::{Column as _, Either, Executor as _, Row as _, TypeInfo as _, ValueRef as _};
 use std::collections::HashMap;
@@ -48,6 +49,92 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// `statement_timeout` ran out on, which is the same event from the
 /// server's side: it gave the statement up.
 const QUERY_CANCELED: &str = "57014";
+
+/// SQLSTATE for `syntax_error`. The scanner and the grammar both refuse
+/// with it — an unterminated string, a missing bracket, a keyword where a
+/// name belongs — and nothing that needs the catalog does. That is what
+/// makes it true of the statement rather than of the connection it was
+/// asked on: see [`db_client::Refusal`].
+const SYNTAX_ERROR: &str = "42601";
+/// SQLSTATEs for a name the server could not resolve. `42P01` covers a
+/// missing schema as well as a missing table — the server reports
+/// `nosuchschema.t` as a relation that does not exist rather than as a bad
+/// schema name — so four codes are the whole of it.
+///
+/// `42P18` (indeterminate datatype) is deliberately **not** here. A
+/// statement holding a bare `$1` raises it, and a placeholder is a thing
+/// the user typed on purpose, not a name they got wrong.
+const NAME_ERRORS: &[&str] = &[
+    // undefined_table, and a schema that does not exist with it.
+    "42P01",
+    // undefined_column.
+    "42703",
+    // undefined_function.
+    "42883",
+    // undefined_object, which is what a type that does not exist is.
+    "42704",
+];
+
+/// Ask the server whether it has a relation of this name.
+///
+/// `to_regclass` is the whole of it, and it is the right call rather than
+/// a query over `pg_class`: it resolves the name the way the *parser*
+/// would — through `search_path` when it is unqualified, folding an
+/// unquoted part to lower case and keeping a quoted one — and it answers
+/// NULL rather than raising when there is nothing there, including for a
+/// name that is not a name at all.
+///
+/// It is asked on whichever connection carried it, so a session sees its
+/// own temp tables and its own `search_path`.
+async fn relation_on(conn: &mut sqlx::PgConnection, name: &str) -> Result<Option<bool>> {
+    let (found,): (bool,) = sqlx::query_as("SELECT to_regclass($1) IS NOT NULL")
+        .bind(name)
+        .fetch_one(conn)
+        .await
+        .context("failed to ask the server about a relation")?;
+    Ok(Some(found))
+}
+
+/// Ask the server to prepare one statement, and throw the result away.
+///
+/// **Nothing runs.** `prepare_with` rather than `describe`, and the
+/// difference is a round trip: `describe` follows the parse with a catalog
+/// query for the nullability of each column, which nothing here reads.
+/// sqlx keeps the prepared statement in the connection's own LRU cache and
+/// sends a `Close` when it falls out of it, so a session of typing leaves a
+/// bounded number of them on the server rather than one per keystroke.
+///
+/// Both callers share this, and the connection is the whole difference
+/// between them: names resolve against whatever carried the question. See
+/// [`db_client::CheckError`].
+async fn check_statement(conn: &mut sqlx::PgConnection, sql: &str) -> Option<CheckError> {
+    let error = match conn.prepare_with(sql, &[]).await {
+        Ok(_) => return None,
+        Err(sqlx::Error::Database(error)) => error,
+        // A dropped connection is not the statement's fault, and the
+        // caller has nowhere to put it: a check nobody asked for must not
+        // raise an error over a query that has not been run.
+        Err(_) => return None,
+    };
+    let error = error.try_downcast_ref::<PgDatabaseError>()?;
+    let refusal = match error.code() {
+        SYNTAX_ERROR => Refusal::Syntax,
+        code if NAME_ERRORS.contains(&code) => Refusal::Name,
+        // Everything else the parser can raise is about neither the text
+        // nor a name — a transaction that has gone wrong, a permission,
+        // an `$1` with no type to infer — and none of it is worth a mark
+        // over a statement nobody has run.
+        _ => return None,
+    };
+    // `Internal` names a position inside a statement the *server*
+    // generated — the body of a PL/pgSQL function, say — which is not an
+    // offset into anything the editor holds.
+    let offset = match error.position() {
+        Some(PgErrorPosition::Original(position)) => byte_offset(sql, position),
+        _ => None,
+    };
+    Some(CheckError { refusal, message: error.message().to_string(), offset })
+}
 
 /// How long a run may take before the server gives it up, when nothing else
 /// has an opinion. A viewer must not leave a statement on a shared server
@@ -286,6 +373,18 @@ fn short_version(reported: &str) -> &str {
     reported.split_whitespace().next().unwrap_or(reported)
 }
 
+/// Where the server's cursor lands in the statement, in bytes.
+///
+/// Postgres counts the position in **characters** and counts from one; the
+/// app counts bytes from zero, as everything above the driver does. A
+/// position one past the last character — which is what "syntax error at
+/// end of input" reports — is the length of the statement, and is a
+/// position like any other: the caller has a rule for marking the end.
+fn byte_offset(sql: &str, position: usize) -> Option<usize> {
+    let index = position.checked_sub(1)?;
+    sql.char_indices().map(|(offset, _)| offset).chain([sql.len()]).nth(index)
+}
+
 /// One row of the table listing, before columns and keys are attached.
 type TableRow = (String, String, String, Option<i64>);
 /// One row of the column listing: schema, table, column, type, nullable, default.
@@ -395,6 +494,23 @@ impl Connection for PostgresConnection {
         }))
     }
 
+    /// The pooled check, for a tab that has never run anything.
+    ///
+    /// It goes out on the **app** pool, like every other question the app
+    /// asks for itself, and the cost of that is exactly what
+    /// [`Refusal::Name`] warns about: this connection is nobody's session,
+    /// so a temp table and a `search_path` are invisible to it. A tab with
+    /// a session should ask [`Session::check`] instead.
+    async fn check(&self, sql: &str) -> Result<Option<CheckError>> {
+        let mut conn = self.pool.acquire().await.context("no connection to check the statement")?;
+        Ok(check_statement(&mut conn, sql).await)
+    }
+
+    async fn relation_exists(&self, name: &str) -> Result<Option<bool>> {
+        let mut conn = self.pool.acquire().await.context("no connection to ask about a name")?;
+        relation_on(&mut conn, name).await
+    }
+
     /// Always on the **app** pool, never a session's: the connection being
     /// stopped is busy, and waiting for it would be waiting for the thing
     /// the user just asked to stop. That reserve is why the two pools are
@@ -481,6 +597,23 @@ impl Session for PostgresSession {
             result.wire.link_ms = Some(self.link_ms);
         }
         result
+    }
+
+    /// The same question, down the tab's own connection — so a temp
+    /// table it made and a `search_path` it set are part of the answer.
+    ///
+    /// It takes the session's lock, which is why the caller must not send
+    /// one while a run is out.
+    async fn check(&self, sql: &str) -> Result<Option<CheckError>> {
+        let mut held = self.conn.lock().await;
+        let conn = held.as_mut().context("this tab's session is closed")?;
+        Ok(check_statement(conn, sql).await)
+    }
+
+    async fn relation_exists(&self, name: &str) -> Result<Option<bool>> {
+        let mut held = self.conn.lock().await;
+        let conn = held.as_mut().context("this tab's session is closed")?;
+        relation_on(conn, name).await
     }
 
     /// Read what the server counted for the statement this session ran
@@ -1063,6 +1196,26 @@ mod tests {
         Counted { calls, exec_ms, plan_ms: 0. }
     }
 
+    #[test]
+    fn the_servers_cursor_is_converted_to_a_byte_offset() {
+        // One-based characters in, zero-based bytes out.
+        assert_eq!(byte_offset("select 1", 1), Some(0));
+        assert_eq!(byte_offset("select 1", 8), Some(7));
+        // Past the last character is the end of the statement, which is
+        // what "syntax error at end of input" reports.
+        assert_eq!(byte_offset("select 1", 9), Some(8));
+        assert_eq!(byte_offset("select 1", 10), None);
+        // A position of zero is no position at all.
+        assert_eq!(byte_offset("select 1", 0), None);
+    }
+
+    /// The whole reason the conversion exists: a multi-byte character
+    /// ahead of the error moves the byte offset past the character count.
+    #[test]
+    fn a_multi_byte_character_moves_the_offset() {
+        assert_eq!(byte_offset("select 'héllo', frm", 17), Some(17));
+    }
+
     /// The case the whole delta exists for: one execution landed between
     /// the two readings, so its own time is knowable and is reported as a
     /// measurement rather than as an average.
@@ -1372,6 +1525,133 @@ mod tests {
             "a 200 ms sleep was reported as {} ms",
             second.exec_ms
         );
+    }
+
+    /// The whole of the checker: the server refuses the text and names
+    /// the character it stopped at, and nothing runs.
+    #[tokio::test]
+    async fn a_syntax_error_comes_back_with_its_position() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+
+        assert_eq!(conn.check("SELECT 1").await.unwrap(), None);
+
+        let sql = "SELECT 1 FROM";
+        let error = conn.check(sql).await.unwrap().expect("no error for an unfinished statement");
+        assert!(error.message.contains("syntax error"), "{}", error.message);
+        // "at end of input": one past the last character.
+        assert_eq!(error.offset, Some(sql.len()));
+
+        let sql = "SELECT 1 frm t";
+        let error = conn.check(sql).await.unwrap().expect("no error for a broken statement");
+        assert_eq!(&sql[error.offset.unwrap()..], "t");
+    }
+
+    /// A name the server cannot resolve comes back too, told apart from a
+    /// syntax error because it is only true of the connection it was asked
+    /// on.
+    #[tokio::test]
+    async fn an_unknown_name_is_reported_as_a_name() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+
+        let sql = "SELECT * FROM public.no_such_table_here";
+        let error = conn.check(sql).await.unwrap().expect("no error for a table that is not there");
+        assert_eq!(error.refusal, Refusal::Name);
+        assert_eq!(&sql[error.offset.unwrap()..], "public.no_such_table_here");
+
+        // A column, a function and a type answer the same way.
+        for sql in
+            ["SELECT no_such_column FROM pg_class", "SELECT no_such_fn(1)", "SELECT 1::no_such_ty"]
+        {
+            let error = conn.check(sql).await.unwrap().expect("{sql} was not refused");
+            assert_eq!(error.refusal, Refusal::Name, "{sql}");
+        }
+    }
+
+    /// **The statements `check` goes quiet about.** Postgres resolves no
+    /// names for a utility statement until it runs one, so the parse says
+    /// nothing and `to_regclass` is what answers instead.
+    #[tokio::test]
+    async fn a_utility_statement_parses_whatever_it_names() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+
+        for sql in [
+            "DROP TABLE public.no_such_table_here",
+            "ALTER TABLE public.no_such_table_here ADD COLUMN c int",
+            "TRUNCATE public.no_such_table_here",
+        ] {
+            assert_eq!(conn.check(sql).await.unwrap(), None, "{sql}");
+        }
+        assert_eq!(conn.relation_exists("public.no_such_table_here").await.unwrap(), Some(false));
+    }
+
+    /// `to_regclass` resolves a name the way the parser does, which is the
+    /// whole reason it is the call rather than a query over `pg_class`.
+    #[tokio::test]
+    async fn the_server_says_whether_it_has_a_relation() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+
+        assert_eq!(conn.relation_exists("pg_catalog.pg_class").await.unwrap(), Some(true));
+        // Unqualified, so it goes through `search_path`.
+        assert_eq!(conn.relation_exists("pg_class").await.unwrap(), Some(true));
+        // Unquoted parts fold to lower case, as SQL does.
+        assert_eq!(conn.relation_exists("PG_CLASS").await.unwrap(), Some(true));
+        // A quoted one does not, so this is a different name.
+        assert_eq!(conn.relation_exists("\"PG_CLASS\"").await.unwrap(), Some(false));
+        assert_eq!(conn.relation_exists("public.no_such_table_here").await.unwrap(), Some(false));
+        // A name that is not a name answers rather than raising.
+        assert_eq!(conn.relation_exists("a b c").await.unwrap(), Some(false));
+    }
+
+    /// A bare `$1` is a placeholder the user typed on purpose, not a name
+    /// they got wrong. The server refuses to infer its type, and that
+    /// refusal is not a mark.
+    #[tokio::test]
+    async fn a_placeholder_is_not_an_error() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+
+        assert_eq!(conn.check("SELECT $1").await.unwrap(), None);
+    }
+
+    /// **The reason a session checks for itself.** A temp table lives on
+    /// one connection, so the pool cannot see it and the tab that made it
+    /// can. Marking it as missing would be a warning about nothing.
+    #[tokio::test]
+    async fn a_session_resolves_what_it_made_itself() {
+        let Some(url) = test_url() else { return };
+        // Read-only refuses a temp table, so this one asks to write.
+        let conn = PostgresConnection::connect_url(&url, false).await.unwrap();
+        let session = conn.open_session().await.unwrap();
+        session.execute("CREATE TEMP TABLE meerkat_check_probe (id int)").await.unwrap();
+
+        let sql = "SELECT * FROM meerkat_check_probe";
+        assert_eq!(session.check(sql).await.unwrap(), None);
+        // The pool is a different connection, and it cannot see it.
+        let pooled = conn.check(sql).await.unwrap().expect("the pool saw a temp table");
+        assert_eq!(pooled.refusal, Refusal::Name);
+
+        // And the same split for the name a `DROP TABLE` would be marked
+        // on, which is the whole reason the probe follows the session too.
+        assert_eq!(session.relation_exists("meerkat_check_probe").await.unwrap(), Some(true));
+        assert_eq!(conn.relation_exists("meerkat_check_probe").await.unwrap(), Some(false));
+
+        session.close().await;
+    }
+
+    /// Nothing is executed: the statement is prepared and thrown away.
+    #[tokio::test]
+    async fn checking_a_write_writes_nothing() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+
+        assert_eq!(conn.check("DROP TABLE IF EXISTS pg_class").await.unwrap(), None);
+        // Still there, so nothing ran.
+        let result = conn.execute("SELECT count(*) FROM pg_class").await.unwrap();
+        assert_eq!(result.rows.len(), 1);
     }
 
     #[tokio::test]
@@ -1852,3 +2132,4 @@ mod tests {
         assert_eq!(short_version("15.6"), "15.6");
     }
 }
+

@@ -8,5 +8,6 @@ publish.workspace = true
 [dependencies]
 fuzzy.workspace = true
 gpui.workspace = true
+query.workspace = true
 theme.workspace = true
 ui.workspace = true
