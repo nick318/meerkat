@@ -574,6 +574,19 @@ value whole: wrapped, scrolling if it is long, ⌘C to copy it, ⏎ or ⎋ to
 close. The lane cap stays where it is; it was only ever wrong as the
 *one* way to read a value.
 
+**A cell paints one line, and `results_grid::cell_text` is the cut.** A
+row is `ROW_HEIGHT` tall and GPUI lays a shaped text out line by line
+whatever `truncate` says, so a value with a newline in it does not merely
+overflow its lane — a pretty-printed `jsonb` pushes every row under it
+out of line. So the first line is taken and cut the way a long
+single-line value already is, at `CELL_CHARS`, and `…` says a cut was
+made. The cap on characters is not tidiness: `MAX_CELL_BYTES` lets a
+megabyte into one value, and shaping a megabyte per visible cell per
+frame would freeze the window. A value that merely *ends* in a newline is
+painted whole — there is nothing after it to read. Nothing else is
+shortened: the card opens the value whole and ⌘C copies it whole, so the
+grid is the only place a value is cut.
+
 The card is the overlay pattern the palette and the close dialog already
 use — an absolutely positioned child of the shell, its own focus and its
 own `PEEK_KEY_CONTEXT` — with two differences. Its scrim carries **no

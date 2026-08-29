@@ -45,6 +45,12 @@ const CELL_PADDING: f32 = 24.;
 const MIN_COLUMN_WIDTH: f32 = 56.;
 /// Past this a column steals the pane; the rest of the value truncates.
 const MAX_COLUMN_WIDTH: f32 = 320.;
+/// The most characters a cell ever shapes. A lane is `MAX_COLUMN_WIDTH`
+/// wide, so about fifty characters is all that can be on screen; the rest
+/// is shaped, measured and thrown away by the ellipsis. `MAX_CELL_BYTES`
+/// lets a megabyte of text into one value, and shaping a megabyte of it
+/// per visible cell per frame would freeze the window.
+const CELL_CHARS: usize = 64;
 /// Rows sampled to size the lanes. The first screens decide the widths;
 /// scanning a whole 500-row page for a few pixels is not worth it.
 const WIDTH_SAMPLE: usize = 200;
@@ -217,6 +223,35 @@ fn reveal_offset(left: f32, width: f32, visible_left: f32, viewport: f32) -> f32
     }
 }
 
+/// What a cell paints for a value.
+///
+/// **A row is 28 pixels tall, so only the first line of a value can be
+/// on screen**, and a value with a newline in it is not merely too long:
+/// GPUI lays a shaped text out line by line whatever `truncate` says, so
+/// one pretty-printed `jsonb` would push every row under it out of line.
+/// So the cut is made here rather than left to the ellipsis, and the
+/// first line is cut the way a long single-line value already is.
+///
+/// `…` says the cut was made, in the character `Value::display` already
+/// uses for a shortened `bytea`. Nothing else is dropped: ⏎ over the cell
+/// or a double click opens the value whole, and ⌘C copies it whole.
+pub fn cell_text(value: &Value) -> String {
+    let text = value.display();
+    // A value that merely ends in a newline has nothing after it worth
+    // marking, and a `text` column full of them would wear an ellipsis on
+    // every row for no dropped word.
+    let body = text.trim_end_matches(['\n', '\r']);
+    let first = body.split('\n').next().unwrap_or_default();
+    // A CRLF buffer would otherwise leave the carriage return on the end
+    // of every line, which shapes as a box or as nothing at all.
+    let first = first.strip_suffix('\r').unwrap_or(first);
+    let mut out: String = first.chars().take(CELL_CHARS).collect();
+    if out.len() < body.len() {
+        out.push('…');
+    }
+    out
+}
+
 /// Size each lane to the widest value it actually holds, header included.
 pub fn column_widths(columns: &[String], rows: &[Vec<Value>]) -> Vec<f32> {
     columns
@@ -227,7 +262,7 @@ pub fn column_widths(columns: &[String], rows: &[Vec<Value>]) -> Vec<f32> {
                 .iter()
                 .take(WIDTH_SAMPLE)
                 .filter_map(|row| row.get(ix))
-                .map(|value| value.display().chars().count())
+                .map(|value| cell_text(value).chars().count())
                 .max()
                 .unwrap_or(0)
                 .max(name.chars().count());
@@ -849,7 +884,7 @@ fn data_row(
             .overflow_hidden()
             .truncate()
             .text_color(value_color(value, colors))
-            .child(value.display());
+            .child(cell_text(value));
         // The cursor's cell is the strongest mark on screen, the rest of
         // the range a wash under it. Neither carries a border: a border
         // would take a pixel out of the cell's content box and shift the
@@ -905,6 +940,27 @@ mod tests {
 
     fn text(value: &str) -> Value {
         Value::Text(value.to_string())
+    }
+
+    #[test]
+    fn a_cell_paints_the_first_line_of_a_value() {
+        assert_eq!(cell_text(&text("one\ntwo\nthree")), "one…");
+        assert_eq!(cell_text(&text("one\r\ntwo")), "one…");
+    }
+
+    #[test]
+    fn a_value_short_enough_to_fit_is_painted_whole() {
+        assert_eq!(cell_text(&text("ada@example.com")), "ada@example.com");
+        assert_eq!(cell_text(&Value::Null), "NULL");
+        // A trailing newline drops nothing anybody can read.
+        assert_eq!(cell_text(&text("one\n")), "one");
+    }
+
+    #[test]
+    fn a_long_line_is_cut_to_what_a_lane_can_hold() {
+        let cut = cell_text(&text(&"x".repeat(CELL_CHARS * 4)));
+        assert_eq!(cut.chars().count(), CELL_CHARS + 1);
+        assert!(cut.ends_with('…'));
     }
 
     #[test]
