@@ -36,6 +36,7 @@ use highlight::Token;
 use std::ops::Range;
 use std::sync::Arc;
 use theme::{ThemeColors, theme};
+use ui::blink::{Blink, Blinking};
 use ui::scrollbar::{self, DragState, Scrollbar};
 
 actions!(
@@ -275,6 +276,18 @@ pub struct SqlEditor {
     /// them. So **every edit drops them**, rather than paint a tick
     /// beside a line the user has since rewritten.
     statements: Vec<StatementMark>,
+    /// Where the caret is in its blink.
+    blink: Blink,
+}
+
+impl Blinking for SqlEditor {
+    fn blink(&self) -> &Blink {
+        &self.blink
+    }
+
+    fn blink_mut(&mut self) -> &mut Blink {
+        &mut self.blink
+    }
 }
 
 #[derive(Clone)]
@@ -332,6 +345,7 @@ impl SqlEditor {
             completion_range: 0..0,
             completions_dismissed: false,
             statements: Vec::new(),
+            blink: Blink::default(),
         }
     }
 
@@ -447,10 +461,17 @@ impl SqlEditor {
         self.selected_range = end..end;
         self.selection_reversed = false;
         self.marked_range = None;
-        cx.notify();
+        self.touched(cx);
     }
 
     // --- selection -------------------------------------------------------
+
+    /// Redraw, and put the caret back on show. Every edit and every
+    /// motion goes through here rather than calling `cx.notify()` itself.
+    fn touched(&mut self, cx: &mut Context<Self>) {
+        self.restart_blink(cx);
+        cx.notify();
+    }
 
     fn cursor_offset(&self) -> usize {
         if self.selection_reversed {
@@ -469,7 +490,7 @@ impl SqlEditor {
         // where the user stopped, not swallow the previous sentence too.
         self.last_edit = EditKind::None;
         self.pending_autoscroll = true;
-        cx.notify();
+        self.touched(cx);
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -486,7 +507,7 @@ impl SqlEditor {
         }
         self.last_edit = EditKind::None;
         self.pending_autoscroll = true;
-        cx.notify();
+        self.touched(cx);
     }
 
     /// Delete from the caret to `offset`, in one undo step.
@@ -541,14 +562,14 @@ impl SqlEditor {
         let Some(snapshot) = self.undo.pop() else { return };
         let current = self.restore(snapshot);
         self.redo.push(current);
-        cx.notify();
+        self.touched(cx);
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
         let Some(snapshot) = self.redo.pop() else { return };
         let current = self.restore(snapshot);
         self.undo.push(current);
-        cx.notify();
+        self.touched(cx);
     }
 
     // --- offset helpers --------------------------------------------------
@@ -1116,7 +1137,7 @@ impl EntityInputHandler for SqlEditor {
         // typing a different word now.
         self.completions_dismissed = false;
         self.refresh_completions(false);
-        cx.notify();
+        self.touched(cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -1164,7 +1185,7 @@ impl EntityInputHandler for SqlEditor {
             }
         };
         self.pending_autoscroll = true;
-        cx.notify();
+        self.touched(cx);
     }
 
     fn bounds_for_range(
@@ -1207,8 +1228,12 @@ impl Focusable for SqlEditor {
 }
 
 impl Render for SqlEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme(cx).colors.clone();
+        // Focus belongs to the window, and this is the one place that has
+        // one, so the blink is started and stopped from the edge here
+        // rather than from a focus listener the constructor cannot install.
+        self.track_blink_focus(self.focus_handle.is_focused(window), cx);
         let line_count = self.line_count();
         let line_marks = line_marks(&self.content, &self.statements);
         // How wide the text is, and so how far there is to scroll. The
@@ -2107,7 +2132,9 @@ fn cursor_quad(
     bounds: Bounds<Pixels>,
     color: Hsla,
 ) -> Option<PaintQuad> {
-    if !editor.selected_range.is_empty() {
+    // A selection paints its own block; the off half of the blink simply
+    // has no caret to paint.
+    if !editor.selected_range.is_empty() || !editor.blink.on() {
         return None;
     }
     let offset = editor.cursor_offset();

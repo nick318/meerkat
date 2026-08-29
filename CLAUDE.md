@@ -1511,6 +1511,14 @@ paging arithmetic that must be exact.
   custom `Element`. Their key bindings are scoped to a `KEY_CONTEXT` string
   and returned from `key_bindings()` / `text_field_key_bindings()`, which
   `main.rs` binds. Offsets in both are byte offsets on character boundaries.
+- Both carets blink through `ui::blink`: a `Blink` field and the `Blinking`
+  trait, one cycle for the whole app. It is a background timer rather than
+  a GPUI animation, because an animation asks for a frame every frame and a
+  caret is on screen for as long as a window is. Every edit and every
+  motion goes through the owner's `touched`, which puts the caret back on
+  and starts the cycle over — a caret blinking under a held arrow key is
+  one the eye cannot follow. `render` is what reads the focus, so that is
+  where the cycle starts and stops.
 - Scroll state (`GridState`, `UniformListScrollHandle`) is held by whoever
   owns the tab, so it survives the re-render after every keystroke and page.
 

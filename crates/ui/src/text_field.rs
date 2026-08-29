@@ -17,8 +17,8 @@ use gpui::{
     PaintQuad, Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
     UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, size,
 };
+use crate::blink::{Blink, Blinking};
 use std::ops::Range;
-use std::time::Duration;
 use theme::theme;
 
 actions!(
@@ -64,9 +64,6 @@ const LINE_SPACING: f32 = LINE_HEIGHT / FONT_SIZE;
 const CARET_MARGIN: f32 = 2.;
 /// What a masked field paints in place of every character.
 const MASK: char = '•';
-/// How long the caret stays on, and then off. macOS blinks a caret at
-/// roughly this rate, and a field that matches it reads as a real one.
-const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
 /// Key bindings for every text field. Bind these once at startup; they are
 /// scoped to the field's key context, so they never shadow the app's own
@@ -151,17 +148,18 @@ pub struct TextField {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
-    /// Whether the caret is in the on half of its cycle. A caret that
-    /// never goes out reads as a window that has stopped answering.
-    blink_on: bool,
-    /// Whether the field held the focus at the last paint. The blink is
-    /// started and stopped from that edge, because focus is a property of
-    /// the window and only the render pass has one.
-    was_focused: bool,
-    /// Counts the blink cycles, so a cycle that has been replaced stops
-    /// instead of fighting the one that replaced it. Typing restarts the
-    /// cycle; two of them would beat against each other.
-    blink_epoch: usize,
+    /// Where the caret is in its blink.
+    blink: Blink,
+}
+
+impl Blinking for TextField {
+    fn blink(&self) -> &Blink {
+        &self.blink
+    }
+
+    fn blink_mut(&mut self) -> &mut Blink {
+        &mut self.blink
+    }
 }
 
 impl EventEmitter<TextFieldEvent> for TextField {}
@@ -182,9 +180,7 @@ impl TextField {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
-            blink_on: true,
-            was_focused: false,
-            blink_epoch: 0,
+            blink: Blink::default(),
         }
     }
 
@@ -241,46 +237,6 @@ impl TextField {
         }
         self.ghost = ghost;
         cx.notify();
-    }
-
-    // --- the caret's blink -----------------------------------------------
-
-    /// Show the caret and start its cycle over. Called when the field
-    /// takes the focus and after every edit or motion, so the caret is
-    /// solid while the user is working and only blinks once they stop —
-    /// the way a caret behaves in every platform field.
-    fn restart_blink(&mut self, cx: &mut Context<Self>) {
-        self.blink_on = true;
-        self.blink_epoch += 1;
-        self.schedule_blink(self.blink_epoch, cx);
-    }
-
-    /// Stop the cycle and leave the caret on, for a field that has lost
-    /// the focus. An unfocused field paints no caret at all, so what
-    /// matters here is that the timer stops waking the window.
-    fn stop_blink(&mut self) {
-        self.blink_on = true;
-        self.blink_epoch += 1;
-    }
-
-    /// Turn the caret over once, then queue the next turn. The epoch is
-    /// what ends the chain: a cycle whose epoch has moved on returns
-    /// without queueing again, so the field is never left with a timer
-    /// it does not want.
-    fn schedule_blink(&mut self, epoch: usize, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(BLINK_INTERVAL).await;
-            this.update(cx, |this, cx| {
-                if this.blink_epoch != epoch {
-                    return;
-                }
-                this.blink_on = !this.blink_on;
-                cx.notify();
-                this.schedule_blink(epoch, cx);
-            })
-            .ok();
-        })
-        .detach();
     }
 
     /// Redraw, and put the caret back on show. Every edit and every
@@ -790,14 +746,7 @@ impl Render for TextField {
         // Focus belongs to the window, and this is the one place that has
         // one, so the blink is started and stopped from the edge here
         // rather than from a focus listener the constructor cannot install.
-        if focused != self.was_focused {
-            self.was_focused = focused;
-            if focused {
-                self.restart_blink(cx);
-            } else {
-                self.stop_blink();
-            }
-        }
+        self.track_blink_focus(focused, cx);
 
         div()
             .key_context(KEY_CONTEXT)
@@ -950,7 +899,8 @@ impl Element for FieldElement {
             .flatten();
         // The off half of the blink simply has no caret to paint.
         let cursor = field
-            .blink_on
+            .blink()
+            .on()
             .then(|| cursor_quad(cursor_x + origin.x, bounds, colors.accent))
             .flatten();
 
