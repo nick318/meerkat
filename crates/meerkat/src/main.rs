@@ -69,6 +69,7 @@ fn main() {
 
         cx.bind_keys(sql_editor::key_bindings());
         cx.bind_keys(ui::text_field_key_bindings());
+        cx.bind_keys(root::key_bindings());
         cx.bind_keys(connections::key_bindings());
         cx.bind_keys(palette::key_bindings());
         cx.bind_keys(shell::confirm_key_bindings());

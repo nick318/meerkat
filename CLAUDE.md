@@ -1258,6 +1258,7 @@ for — not tidiness.
 |---|---|---|
 | ⌘W, or the × on a tab | that tab | the tab |
 | ⌘W, or the ×, on the **last** tab | every tab of this window | the window |
+| ⌘W with no tab strip at all | nothing — there is nothing at stake | the window |
 | "‹ connections" | every tab of this window | the session |
 | the window's close button | every tab of this window | the window |
 | ⌘Q | every tab of every window | the app |
@@ -1272,6 +1273,18 @@ the guard has to ask the window's question, because the window is what is
 ending. Both paths then go through `proceed_close`, so the last ⌘W stops
 the runs, writes the strip back and waits for the cancels exactly as the
 window's close button does.
+
+**The connections screen answers ⌘W too, and it answers with the window.**
+There is no tab to close there and no screen behind it to go back to, so
+the gesture reads exactly as it does on the last tab of a strip. The key is
+bound twice: to `root::KEY_CONTEXT` as well as to `Shell`. GPUI gives a
+keystroke to the binding that matched deepest, and the shell's element sits
+*inside* the root's — so a window with a strip answers in the strip, and a
+window with none answers in `Root::on_close_window`, which runs
+`guard_close_window` and `remember` before removing the window, the path
+the window's own close button already takes. `on_close_tab` covers the
+third case: a strip that is somehow empty asks `close_intent` with no tab
+id, and gets a `Close::Window` back.
 
 The window's own button and ⌘Q reach the shell through
 `Root::guard_close_window` and `Root::guard_quit`. `on_window_should_close` wants a yes or no on the spot

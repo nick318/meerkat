@@ -8,8 +8,21 @@
 use crate::connections::{Connections, ConnectionsEvent};
 use crate::shell::{Close, Shell, ShellEvent, StopTask, Target};
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, Subscription, Window, div, prelude::*,
+    App, Context, Entity, FocusHandle, Focusable, KeyBinding, Subscription, Window, actions, div,
+    prelude::*,
 };
+
+actions!(root, [CloseWindow]);
+
+/// The context ⌘W falls back to. It sits *outside* the shell's, so a window
+/// with a tab strip answers ⌘W in the strip — GPUI gives a keystroke to the
+/// binding that matched deepest — and a window with no strip at all answers
+/// it here.
+pub const KEY_CONTEXT: &str = "Root";
+
+pub fn key_bindings() -> Vec<KeyBinding> {
+    vec![KeyBinding::new("cmd-w", CloseWindow, Some(KEY_CONTEXT))]
+}
 
 pub struct Root {
     screen: Screen,
@@ -68,6 +81,18 @@ impl Root {
     /// user, and the quit carries on from there.
     pub fn guard_quit(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.guard(Close::Quit, window, cx)
+    }
+
+    /// ⌘W with nothing on screen to close. The connections screen holds no
+    /// tabs, so the gesture that would take one takes the **window** — the
+    /// same reading as ⌘W on the last tab of a strip, and the reading a
+    /// browser gives a window with one tab left.
+    fn on_close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard_close_window(window, cx) {
+            return;
+        }
+        self.remember(cx);
+        window.remove_window();
     }
 
     fn guard(&self, what: Close, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -158,10 +183,14 @@ impl Focusable for Root {
 }
 
 impl Render for Root {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(match &self.screen {
-            Screen::Connections(screen) => screen.clone().into_any_element(),
-            Screen::Workspace(workspace) => workspace.clone().into_any_element(),
-        })
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(Self::on_close_window))
+            .size_full()
+            .child(match &self.screen {
+                Screen::Connections(screen) => screen.clone().into_any_element(),
+                Screen::Workspace(workspace) => workspace.clone().into_any_element(),
+            })
     }
 }

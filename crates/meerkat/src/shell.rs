@@ -3602,8 +3602,11 @@ impl Shell {
     }
 
     fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(self.active) else { return };
-        let what = close_intent(self.tabs.len(), tab.id());
+        // A strip with nothing in it still answers ⌘W, and it answers with
+        // the window: there is no tab to close and no way back to the
+        // connections screen. The id is never read on that path.
+        let id = self.tabs.get(self.active).map_or(0, |tab| tab.id());
+        let what = close_intent(self.tabs.len(), id);
         if self.guard_close(what, window, cx) {
             self.proceed_close(what, window, cx);
         }
