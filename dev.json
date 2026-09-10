@@ -1,10 +1,10 @@
 {
-  "version": "0.1.1",
-  "sha": "c1e8261",
+  "version": "0.1.2",
+  "sha": "7613e14",
   "assets": {
     "macos-aarch64": {
-      "url": "https://github.com/nick318/meerkat/releases/download/v0.1.1-dev.c1e8261/meerkat-dev-aarch64.tar.gz",
-      "sha256": "aaa6f2de774bfa78857d80360fc99ed0374dbada59ff201ec7d4cb82aa3e7174"
+      "url": "https://github.com/nick318/meerkat/releases/download/v0.1.2-dev.7613e14/meerkat-dev-aarch64.tar.gz",
+      "sha256": "8333dacc2fa9fde73f90428ec5e7f478477705e0905931e38dc8d8dffdcb484e"
     }
   }
 }
