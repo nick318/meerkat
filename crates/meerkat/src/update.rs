@@ -153,9 +153,18 @@ pub fn toast(colors: &ThemeColors, bottom: Pixels, cx: &mut App) -> Option<AnyEl
 }
 
 /// The version-and-updates line, pinned in the connections screen's
-/// bottom-right corner: `meerkat 0.1.0 · dev abc1234`, then whatever the
-/// updater has to say. It was inline in the list's footer, which put app
-/// chrome in the row that says what the *list* answers to.
+/// bottom-right corner: `meerkat 0.1.0 · dev abc1234`, and under it
+/// whatever the updater has to say. It was inline in the list's footer,
+/// which put app chrome in the row that says what the *list* answers to.
+///
+/// **Two rows, not one.** The version and the updater's word are two
+/// different things — one says what this build is, the other offers to
+/// change it — and side by side they read as one sentence in two inks.
+/// Stacked, each is its own line, and the corner keeps the same width
+/// whatever the updater says: an error is often longer than the version,
+/// and on one row it pushed the identity leftward as the status changed.
+/// The rows align to the right, because that is the edge they are pinned
+/// to.
 pub fn foot_summary(colors: &ThemeColors, cx: &mut App) -> AnyElement {
     let channel = release_channel::channel();
 
@@ -169,7 +178,7 @@ pub fn foot_summary(colors: &ThemeColors, cx: &mut App) -> AnyElement {
         identity.push_str(sha);
     }
 
-    let line = div().flex().items_center().gap(px(8.)).child(
+    let line = div().flex().flex_col().items_end().gap(px(2.)).child(
         div()
             .text_size(px(10.))
             .text_color(colors.text_faint)
@@ -215,16 +224,23 @@ pub fn foot_summary(colors: &ThemeColors, cx: &mut App) -> AnyElement {
         // `check` refuses while an install is `Ready`, and a link that
         // does nothing is worse than no link.
         Status::Ready { .. } => line,
-        Status::Errored { error } => line
-            .child(
-                div()
-                    .max_w(px(360.))
-                    .truncate()
-                    .text_size(px(10.))
-                    .text_color(colors.error)
-                    .child(format!("update failed: {error}")),
-            )
-            .child(check("retry")),
+        // The failure and its retry share the second row: the retry is
+        // the answer to the error, so it sits beside it.
+        Status::Errored { error } => line.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .max_w(px(360.))
+                        .truncate()
+                        .text_size(px(10.))
+                        .text_color(colors.error)
+                        .child(format!("update failed: {error}")),
+                )
+                .child(check("retry")),
+        ),
     }
     .into_any_element()
 }
