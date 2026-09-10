@@ -70,6 +70,63 @@ identity additionally gets the hardened runtime and a timestamp, which
 notarization requires; notarization itself runs only when
 `NOTARY_KEY_PATH`, `NOTARY_KEY_ID` and `NOTARY_ISSUER_ID` are all set.
 
+### Cutting a release
+
+**A release is both channels, every time.** The public app and the dev
+app are two installs, and a dev install left on the old feed while the
+public one moves is a dev user who is behind the public — the opposite of
+what the channel is for. So a public release is never published without
+its dev twin, built from the **same commit**, in the same sitting.
+
+Every step is run by hand from a clean `main`; there is no CI for it.
+
+1. Commit the work, then bump `version` in the workspace `Cargo.toml`,
+   run `cargo check` so `Cargo.lock` follows, and commit that alone as
+   "Bump the version to X.Y.Z". Tag it `vX.Y.Z` (annotated,
+   "Meerkat X.Y.Z"). Push `main` and the tag.
+2. Build **public**, signed with the Developer ID and notarized:
+
+   ```sh
+   MEERKAT_SIGN_IDENTITY="Developer ID Application: Nikita Salomatin (Y73YJ3KMM9)" \
+   NOTARY_KEY_PATH=~/.appstoreconnect/AuthKey_L86P33VF6Y.p8 \
+   NOTARY_KEY_ID=L86P33VF6Y \
+   NOTARY_ISSUER_ID=fef7c91a-f64e-4e72-b280-4538c2ef7f69 \
+   scripts/bundle-mac.sh public
+   ```
+
+   Wait for `status: Accepted` and "The staple and validate action
+   worked!", then `spctl -a -vv target/dist/Meerkat.app` must say
+   `source=Notarized Developer ID`. The `.p8` key lives outside the
+   repository and is never committed; the ids beside it are useless
+   without it.
+3. `gh release create vX.Y.Z --title "Meerkat X.Y.Z" --latest` with the
+   four files in `target/dist` — the `.dmg`, the `.tar.gz` and both
+   `.sha256` — and notes that open with the standing first paragraph
+   (signed and notarized; download the dmg; an older install offers the
+   update by itself), then "What is new" as bullets, then the line that
+   says the `.tar.gz` is what the updater downloads.
+4. Point the **public feed** at it: on the `updates` branch (use a
+   `git worktree`, never a checkout over `main`), rewrite `public.json`
+   with the version, the short sha, the release asset URL and the
+   sha256 out of the `.tar.gz.sha256` file. Commit as "Point the public
+   feed at the notarized X.Y.Z build" and push.
+5. Build **dev** the same way — `scripts/bundle-mac.sh dev` with the
+   same four variables; `bundle-mac.sh` clears `target/dist` first, so
+   the public files must already be uploaded. Tag the same commit
+   `vX.Y.Z-dev.<sha>`, push it, and `gh release create` it with
+   `--prerelease`, titled "Meerkat Dev X.Y.Z (<sha>)", notes opening
+   "Dev channel build of `<sha>`, the same commit as the public X.Y.Z."
+   followed by the same bullets.
+6. Point the **dev feed** at it: `dev.json` on `updates`, same shape,
+   commit "Point the dev feed at <sha>", push.
+7. Check both feeds are live —
+   `curl -s https://raw.githubusercontent.com/nick318/meerkat/updates/public.json`
+   and `dev.json` — and that each asset URL answers `302`.
+
+The dev channel compares **commits**, not versions, so a dev release
+between public versions is the same recipe from step 5 with no bump: a
+new `vX.Y.Z-dev.<sha>` tag, release and `dev.json`.
+
 The PostgreSQL driver tests skip themselves when no server is configured, so
 `cargo test` stays green without one. To actually run them:
 
