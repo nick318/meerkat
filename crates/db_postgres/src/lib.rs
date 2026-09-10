@@ -403,56 +403,12 @@ type KeyRow = (String, String, String);
 #[async_trait]
 impl Connection for PostgresConnection {
     async fn introspect(&self) -> Result<Catalog> {
-        let tables: Vec<TableRow> = sqlx::query_as(
-            "SELECT n.nspname, c.relname, c.relkind::text, c.reltuples::bigint \
-             FROM pg_class c \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') \
-               AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
-               AND n.nspname NOT LIKE 'pg_toast%' \
-               AND n.nspname NOT LIKE 'pg_temp%' \
-             ORDER BY n.nspname, c.relname",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("failed to list tables")?;
-
-        let columns: Vec<ColumnRow> = sqlx::query_as(
-            "SELECT n.nspname, c.relname, a.attname, \
-                    format_type(a.atttypid, a.atttypmod), \
-                    NOT a.attnotnull, \
-                    pg_get_expr(d.adbin, d.adrelid) \
-             FROM pg_attribute a \
-             JOIN pg_class c ON c.oid = a.attrelid \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum \
-             WHERE a.attnum > 0 AND NOT a.attisdropped \
-               AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
-               AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
-               AND n.nspname NOT LIKE 'pg_toast%' \
-               AND n.nspname NOT LIKE 'pg_temp%' \
-             ORDER BY n.nspname, c.relname, a.attnum",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("failed to list columns")?;
-
-        // `key_column_usage.ordinal_position` already gives key order.
-        let keys: Vec<KeyRow> = sqlx::query_as(
-            "SELECT tc.table_schema, tc.table_name, kcu.column_name \
-             FROM information_schema.table_constraints tc \
-             JOIN information_schema.key_column_usage kcu \
-               ON kcu.constraint_name = tc.constraint_name \
-              AND kcu.constraint_schema = tc.constraint_schema \
-             WHERE tc.constraint_type = 'PRIMARY KEY' \
-               AND tc.table_schema NOT IN ('pg_catalog', 'information_schema') \
-             ORDER BY tc.table_schema, tc.table_name, kcu.ordinal_position",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("failed to list primary keys")?;
-
-        Ok(build_catalog(tables, columns, keys))
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .context("no connection to read the catalog")?;
+        read_catalog(&mut conn).await
     }
 
     async fn server_version(&self) -> Result<String> {
@@ -696,6 +652,14 @@ impl Session for PostgresSession {
     ///
     /// `idle in transaction` and `idle in transaction (aborted)` both
     /// count — a rollback is what leaves either one.
+    /// The catalog down this tab's own connection, which is the one place
+    /// a table it created inside an open transaction exists yet.
+    async fn introspect(&self) -> Result<Option<Catalog>> {
+        let mut held = self.conn.lock().await;
+        let conn = held.as_mut().context("this tab's session is closed")?;
+        read_catalog(conn).await.map(Some)
+    }
+
     async fn in_transaction(&self) -> Result<bool> {
         let state: Option<String> =
             sqlx::query_scalar("SELECT state FROM pg_stat_activity WHERE pid = $1")
@@ -1006,6 +970,64 @@ async fn drain(
 /// Whether an error is the server saying it gave up the statement.
 fn is_cancelled(error: &sqlx::Error) -> bool {
     matches!(error, sqlx::Error::Database(db) if db.code().as_deref() == Some(QUERY_CANCELED))
+}
+
+/// The three catalog reads, on whichever connection is handed in.
+///
+/// One function for the pool and for a session, so the two cannot drift
+/// into two catalogs: a session reads it to see its own uncommitted DDL,
+/// and must see exactly what the sidebar would see once that commits.
+async fn read_catalog(conn: &mut sqlx::PgConnection) -> Result<Catalog> {
+    let tables: Vec<TableRow> = sqlx::query_as(
+        "SELECT n.nspname, c.relname, c.relkind::text, c.reltuples::bigint \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+           AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND n.nspname NOT LIKE 'pg_toast%' \
+           AND n.nspname NOT LIKE 'pg_temp%' \
+         ORDER BY n.nspname, c.relname",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to list tables")?;
+
+    let columns: Vec<ColumnRow> = sqlx::query_as(
+        "SELECT n.nspname, c.relname, a.attname, \
+                format_type(a.atttypid, a.atttypmod), \
+                NOT a.attnotnull, \
+                pg_get_expr(d.adbin, d.adrelid) \
+         FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum \
+         WHERE a.attnum > 0 AND NOT a.attisdropped \
+           AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+           AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND n.nspname NOT LIKE 'pg_toast%' \
+           AND n.nspname NOT LIKE 'pg_temp%' \
+         ORDER BY n.nspname, c.relname, a.attnum",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to list columns")?;
+
+    // `key_column_usage.ordinal_position` already gives key order.
+    let keys: Vec<KeyRow> = sqlx::query_as(
+        "SELECT tc.table_schema, tc.table_name, kcu.column_name \
+         FROM information_schema.table_constraints tc \
+         JOIN information_schema.key_column_usage kcu \
+           ON kcu.constraint_name = tc.constraint_name \
+          AND kcu.constraint_schema = tc.constraint_schema \
+         WHERE tc.constraint_type = 'PRIMARY KEY' \
+           AND tc.table_schema NOT IN ('pg_catalog', 'information_schema') \
+         ORDER BY tc.table_schema, tc.table_name, kcu.ordinal_position",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to list primary keys")?;
+
+    Ok(build_catalog(tables, columns, keys))
 }
 
 fn build_catalog(tables: Vec<TableRow>, columns: Vec<ColumnRow>, keys: Vec<KeyRow>) -> Catalog {
@@ -2204,6 +2226,56 @@ mod tests {
         assert!(!session.in_transaction().await.unwrap());
         session
             .execute("SELECT * FROM meerkat_manual_kept")
+            .await
+            .unwrap();
+    }
+
+    /// A table created inside an open transaction exists for the connection
+    /// that made it and for nobody else. The session's own catalog read is
+    /// what lets the app say what a `CREATE` did before it is committed;
+    /// the pool's read is what keeps that table out of the sidebar until
+    /// it is. Its own schema, so it cannot trip over the fixture the other
+    /// tests build and drop.
+    #[tokio::test]
+    async fn a_session_reads_the_catalog_it_can_see() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect_url(&url, false).await.unwrap();
+        conn.execute("DROP SCHEMA IF EXISTS meerkat_shape CASCADE")
+            .await
+            .unwrap();
+        conn.execute("CREATE SCHEMA meerkat_shape").await.unwrap();
+        let session = conn.open_session().await.unwrap();
+
+        session.begin().await.unwrap();
+        session
+            .execute("CREATE TABLE meerkat_shape.pending (id int, note text)")
+            .await
+            .unwrap();
+
+        let has_pending = |catalog: &Catalog| {
+            catalog
+                .schemas
+                .iter()
+                .find(|s| s.name == "meerkat_shape")
+                .is_some_and(|s| s.tables.iter().any(|t| t.name == "pending"))
+        };
+        let seen = session
+            .introspect()
+            .await
+            .unwrap()
+            .expect("a session reads the catalog");
+        assert!(has_pending(&seen), "the session sees its own table");
+        let pooled = conn.introspect().await.unwrap();
+        assert!(!has_pending(&pooled), "the pool does not, until it commits");
+
+        session.end_transaction(TxEnd::Rollback).await.unwrap();
+        let after = session.introspect().await.unwrap().unwrap();
+        assert!(
+            !has_pending(&after),
+            "rolled back, so gone for the session too"
+        );
+
+        conn.execute("DROP SCHEMA meerkat_shape CASCADE")
             .await
             .unwrap();
     }

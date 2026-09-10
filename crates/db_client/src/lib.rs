@@ -525,6 +525,22 @@ pub trait Session: Send + Sync {
         Ok(false)
     }
 
+    /// Read the catalog **as this connection sees it**.
+    ///
+    /// It is the same model [`Connection::introspect`] reads, asked on the
+    /// tab's own connection rather than the pool — and the difference is
+    /// the point: a `CREATE TABLE` inside an open transaction exists for
+    /// this connection alone until it commits, and a pooled read would
+    /// report the table as not there. The shell reads the catalog this way
+    /// after a shape-changing statement so it can say what changed, and
+    /// only takes the answer for the sidebar once nothing is uncommitted.
+    ///
+    /// `Ok(None)` is an engine that cannot answer on a session; the caller
+    /// then falls back to the pool.
+    async fn introspect(&self) -> Result<Option<Catalog>> {
+        Ok(None)
+    }
+
     /// Whether one statement parses **on this connection**.
     ///
     /// The same question [`Connection::check`] answers, asked where the

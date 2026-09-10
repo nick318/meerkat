@@ -143,6 +143,63 @@ pub fn command_verb(statement: &str) -> Option<CommandVerb> {
     }
 }
 
+/// What a statement did to the **shape** of the database, for a statement
+/// that changes tables rather than rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DdlVerb {
+    Create,
+    Alter,
+    Drop,
+    Truncate,
+}
+
+impl DdlVerb {
+    /// The past participle, for `altered · 12 ms`.
+    pub fn past(self) -> &'static str {
+        match self {
+            DdlVerb::Create => "created",
+            DdlVerb::Alter => "altered",
+            DdlVerb::Drop => "dropped",
+            DdlVerb::Truncate => "truncated",
+        }
+    }
+}
+
+/// The shape-changing verb `statement` opens with, or `None` for everything
+/// else.
+///
+/// A `CREATE`, `ALTER`, `DROP` or `TRUNCATE` is the one kind of statement
+/// whose answer is not on screen afterwards: a `SELECT` paints rows and an
+/// `UPDATE` reports a count, but a `DROP COLUMN` changes something the user
+/// is looking at *elsewhere* — the sidebar, the next query's columns. So
+/// the editor marks such a statement apart from the rest, and the shell
+/// reads the catalog again once one has landed. This says which statements
+/// those are, and nothing more: like [`command_verb`] it reads the first
+/// word past the comments and does not parse SQL. `TRUNCATE` is here
+/// although it changes rows and no shape, because it is the one row-change
+/// the server reports no count for, and it is irreversible in the same way
+/// a `DROP` is.
+///
+/// Being wrong is cheap. A missed verb costs a statement painted plain and
+/// a sidebar refreshed one run late; a false one costs a teal mark and one
+/// spare read of the catalog. `SELECT … INTO` and `CREATE … AS SELECT` both
+/// create a table: the second opens with `create` and is read, the first
+/// does not and is the known gap, as it is for [`changes_names`].
+pub fn ddl_verb(statement: &str) -> Option<DdlVerb> {
+    let body = skip_leading_comments(statement);
+    let first = body
+        .split(|c: char| c.is_whitespace() || c == ';' || c == '(')
+        .find(|word| !word.is_empty())?
+        .to_ascii_lowercase();
+    match first.as_str() {
+        "create" => Some(DdlVerb::Create),
+        "alter" => Some(DdlVerb::Alter),
+        "drop" => Some(DdlVerb::Drop),
+        "truncate" => Some(DdlVerb::Truncate),
+        _ => None,
+    }
+}
+
 /// The statement past whatever comments open it. A buffer's statements are
 /// trimmed already, but `-- what this does` on the line above a `COMMIT` is
 /// part of the statement that follows it.
@@ -1030,6 +1087,21 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn the_ddl_verb_is_the_first_word_past_the_comments() {
+        assert_eq!(ddl_verb("create table t (a int)"), Some(DdlVerb::Create));
+        assert_eq!(
+            ddl_verb("-- widen it\nALTER TABLE t ADD COLUMN b text"),
+            Some(DdlVerb::Alter)
+        );
+        assert_eq!(ddl_verb("/* gone */ drop view v"), Some(DdlVerb::Drop));
+        assert_eq!(ddl_verb("truncate t"), Some(DdlVerb::Truncate));
+        assert_eq!(ddl_verb("select * from create_log"), None);
+        assert_eq!(ddl_verb("update t set a = 1"), None);
+        assert_eq!(ddl_verb(""), None);
+        assert_eq!(DdlVerb::Alter.past(), "altered");
     }
 
     #[test]

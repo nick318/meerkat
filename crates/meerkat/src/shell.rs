@@ -21,12 +21,15 @@ use gpui::{
     SharedString, Size, Stateful, StyledText, Subscription, TextLayout, UniformListScrollHandle,
     Window, actions, canvas, deferred, div, prelude::*, px, uniform_list,
 };
-use introspect::{Catalog, Table, TableKind};
-use query::{CommandVerb, TxVerb};
+use introspect::diff::{self as schema_diff, ColumnDelta, Delta, RelationChange, RelationDelta};
+use introspect::{Catalog, Column, Table, TableKind};
+use query::{CommandVerb, DdlVerb, TxVerb};
 use results_grid::{
     Cell, Extent, Grid, GridData, GridState, Hit, Selection, Step, clipboard_text, find_columns,
 };
-use sql_editor::{Diagnostic, Kind, Name, SqlEditor, SqlEditorEvent, StatementStatus, Vocabulary};
+use sql_editor::{
+    Diagnostic, Kind, Name, SqlEditor, SqlEditorEvent, StatementKind, StatementStatus, Vocabulary,
+};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
@@ -851,6 +854,10 @@ struct QueryTab {
     /// dropping the session here would both lose the user's state and
     /// return an uncommitted connection to the pool.
     session: Option<Arc<dyn Session>>,
+    /// What the last run did to the shape of the database, when it held a
+    /// `CREATE`, `ALTER`, `DROP` or `TRUNCATE`. `None` is the ordinary
+    /// case and paints nothing. See [`SchemaReport`].
+    schema_report: Option<SchemaReport>,
     /// What the user has marked in the result. A run replaces the rows, so
     /// it clears with them.
     selection: Selection,
@@ -1842,6 +1849,7 @@ impl Shell {
         generation: u64,
         ix: usize,
         status: StatementStatus,
+        meta: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
         let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else {
@@ -1850,16 +1858,19 @@ impl Shell {
         if tab.generation != generation {
             return;
         }
-        tab.editor
-            .update(cx, |editor, cx| editor.set_statement_status(ix, status, cx));
+        tab.editor.update(cx, |editor, cx| {
+            editor.set_statement_status(ix, status, meta, cx)
+        });
     }
 
-    /// Mark every statement from `from` on as never sent.
+    /// Mark every statement from `from` on as never sent, with `meta`
+    /// saying why beside each.
     fn skip_statements(
         &mut self,
         tab_id: u64,
         generation: u64,
         from: usize,
+        meta: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
         let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else {
@@ -1869,7 +1880,109 @@ impl Shell {
             return;
         }
         tab.editor
-            .update(cx, |editor, cx| editor.skip_statements_from(from, cx));
+            .update(cx, |editor, cx| editor.skip_statements_from(from, meta, cx));
+    }
+
+    /// Read the catalog again after a run changed the shape of the
+    /// database, and put what differs into the tab's report.
+    ///
+    /// **Down the tab's own session**, because that is the only connection
+    /// the change is visible to while a transaction holds it; the pool
+    /// answers only for a tab with no session, which cannot have run a
+    /// statement, so in practice never. The catalog the shell had is what
+    /// the new one is compared with, and it is taken for the sidebar only
+    /// when nothing is uncommitted — a table one tab has not committed
+    /// must not appear in the tree every other tab reads.
+    fn report_schema(&mut self, tab_id: u64, generation: u64, cx: &mut Context<Self>) {
+        let Some(connection) = self.connection.clone() else {
+            return;
+        };
+        let before = self.catalog.clone();
+        let Some(Tab::Query(tab)) = self.tab_mut(tab_id) else {
+            return;
+        };
+        let session = tab.session.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            if let Some(session) = session
+                && let Some(catalog) = session.introspect().await?
+            {
+                return anyhow::Ok(catalog);
+            }
+            connection.introspect().await
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = flatten(task.await);
+            this.update(cx, |this, cx| {
+                let Some(Tab::Query(tab)) = this.tab_mut(tab_id) else {
+                    return;
+                };
+                if tab.generation != generation {
+                    return;
+                }
+                let Some(report) = tab.schema_report.as_mut() else {
+                    return;
+                };
+                report.pending = false;
+                let after = match outcome {
+                    Ok(after) => after,
+                    Err(error) => {
+                        report.error = Some(error);
+                        cx.notify();
+                        return;
+                    }
+                };
+                report.delta = before
+                    .as_ref()
+                    .map(|before| schema_diff::diff(before, &after))
+                    .unwrap_or_default();
+                report.held = tab.in_transaction;
+                let held = report.held;
+                // One shape-changing statement in the run, so the whole
+                // report is its doing, and its own line can say so.
+                if let [(ix, verb)] = report.statements[..]
+                    && let Some(meta) = ddl_meta(&report.delta, verb, report.ms)
+                {
+                    tab.editor
+                        .update(cx, |editor, cx| editor.set_statement_meta(ix, meta, cx));
+                }
+                if !held {
+                    if let Some(store) = &this.store {
+                        store.cache_catalog(&this.scope, &after, unix_now()).ok();
+                    }
+                    this.apply_catalog(after, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Open the sidebar on a relation the schema report names, so "what
+    /// did that do" and "where is it now" are one click apart. The filter
+    /// is emptied — a filtered tree may not hold the row — and the schema
+    /// and its section are opened, because a row under a closed header is
+    /// not revealed.
+    fn reveal_relation(
+        &mut self,
+        schema: SharedString,
+        name: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        self.catalog_filter.update(cx, |field, cx| field.clear(cx));
+        self.open_schemas.insert(schema.clone());
+        let prefix = format!("{schema}\t");
+        self.closed_sections.retain(|key| !key.starts_with(&prefix));
+        self.rebuild_catalog_rows(cx);
+        let found = self.catalog_rows.iter().position(|row| {
+            matches!(row, CatalogRow::Relation { schema: s, name: n, .. } if *s == schema && *n == name)
+        });
+        if let Some(ix) = found {
+            self.catalog_selected = Some(ix);
+            self.catalog_scroll
+                .scroll_to_item(ix, ScrollStrategy::Center);
+        }
+        cx.notify();
     }
 
     /// Ask the server whether the buffer parses, once the typing stops.
@@ -2041,6 +2154,7 @@ impl Shell {
             // hundred restored tabs must cost the server nothing until the
             // user asks one of them a question.
             session: None,
+            schema_report: None,
             selection: Selection::default(),
             scroll: GridState::new(),
             generation: 0,
@@ -2148,11 +2262,29 @@ impl Shell {
         tab.generation += 1;
         let generation = tab.generation;
 
+        // A report about a change that has committed is about the last
+        // run, and this is a new one. One still held in a transaction
+        // stays: the change is still pending, and the bar's answer to it
+        // is still the answer.
+        if !tab.schema_report.as_ref().is_some_and(|report| report.held) {
+            tab.schema_report = None;
+        }
         // Every statement queued, none of them sent. The gutter says so
         // from the moment ⌘⏎ lands, so a slow first statement is a run the
-        // user can already see the shape of.
+        // user can already see the shape of. Each carries its kind, read
+        // off the text here: the editor paints and does not parse.
+        let marked = ranges
+            .into_iter()
+            .map(|range| {
+                let kind = match query::ddl_verb(&sql[range.clone()]) {
+                    Some(_) => StatementKind::Ddl,
+                    None => StatementKind::Plain,
+                };
+                (range, kind)
+            })
+            .collect();
         tab.editor
-            .update(cx, |editor, cx| editor.set_statements(ranges, offset, cx));
+            .update(cx, |editor, cx| editor.set_statements(marked, offset, cx));
 
         let recorded = sql;
         // The buffer has been edited since the tab was opened, and this is
@@ -2184,7 +2316,22 @@ impl Shell {
                     session,
                     result,
                     began,
+                    shape,
                 } = outcome;
+                // A shape-changing statement landed, on either path. The
+                // report opens now and fills in when the catalog has been
+                // read back; the sidebar is stale until then either way.
+                let shaped = !shape.ddl.is_empty();
+                if shaped {
+                    tab.schema_report = Some(SchemaReport {
+                        delta: Delta::default(),
+                        statements: shape.ddl,
+                        ms: shape.ms,
+                        held: false,
+                        pending: true,
+                        error: None,
+                    });
+                }
                 // The `BEGIN` went out, so a transaction is open whether or
                 // not the statements after it worked: a statement that fails
                 // inside a transaction leaves it open and aborted, which is
@@ -2209,6 +2356,7 @@ impl Shell {
                 // time as the run's would be a wrong number, not a partial
                 // one — so the ask goes out only for a buffer of one.
                 let one_statement = matches!(&result, Ok(ran) if ran.ran == 1);
+                let mut committed_shape = false;
                 let run = match result {
                     Ok(ran) => {
                         let Ran {
@@ -2252,10 +2400,22 @@ impl Shell {
                             Some(TxVerb::Commit) => {
                                 tab.in_transaction = false;
                                 tab.tx_done = Some(TxEnd::Commit);
+                                // A shape change the transaction was
+                                // holding is permanent now, and the
+                                // sidebar may have it.
+                                if let Some(report) = tab.schema_report.as_mut()
+                                    && report.held
+                                {
+                                    report.held = false;
+                                    committed_shape = true;
+                                }
                             }
                             Some(TxVerb::Rollback) => {
                                 tab.in_transaction = false;
                                 tab.tx_done = Some(TxEnd::Rollback);
+                                // The change the report described never
+                                // happened.
+                                tab.schema_report = None;
                             }
                             None => {}
                         }
@@ -2306,6 +2466,13 @@ impl Shell {
                 this.refresh_transaction(tab_id, cx);
                 if one_statement {
                     this.refresh_server_timing(tab_id, generation, cx);
+                }
+                if shaped {
+                    this.report_schema(tab_id, generation, cx);
+                } else if committed_shape {
+                    // Typed `COMMIT` over a held change: the pool can see
+                    // it now, and the sidebar reads it from there.
+                    this.introspect(cx);
                 }
                 // There is a session now, so there is something to sweep.
                 this.start_session_timer(cx);
@@ -2590,11 +2757,26 @@ impl Shell {
                 };
                 tab.tx_ending = false;
                 tab.last_used = Instant::now();
+                let mut committed_shape = false;
                 match &outcome {
                     Ok(()) => {
                         tab.in_transaction = false;
                         tab.tx_statements = 0;
                         tab.tx_done = Some(how);
+                        // A shape change the transaction held is decided
+                        // with it: permanent, and the sidebar's to show, or
+                        // never happened.
+                        match how {
+                            TxEnd::Commit => {
+                                if let Some(report) = tab.schema_report.as_mut()
+                                    && report.held
+                                {
+                                    report.held = false;
+                                    committed_shape = true;
+                                }
+                            }
+                            TxEnd::Rollback => tab.schema_report = None,
+                        }
                     }
                     // The transaction is still whatever the server says it
                     // is, so the bar stays up and `refresh_transaction`
@@ -2620,6 +2802,9 @@ impl Shell {
                 );
                 this.reload_open_history(cx);
                 this.refresh_transaction(tab_id, cx);
+                if committed_shape {
+                    this.introspect(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -4149,6 +4334,42 @@ struct Changed {
     verb: Option<CommandVerb>,
 }
 
+/// What a run did to the **shape** of the database, read back off the
+/// catalog rather than guessed from the SQL.
+///
+/// A `CREATE`, `ALTER` or `DROP` answers with no rows and no count, so the
+/// result pane has nothing to say about it — and the thing it changed is
+/// on screen somewhere else, in the sidebar or in the next query's columns.
+/// So once such a statement lands the shell reads the catalog again, on the
+/// tab's own session, and compares it with the one it had: the report is
+/// that comparison, in the panel under the editor.
+///
+/// **It is read on the session because that is the only place the change
+/// exists yet.** Inside an open transaction a new table is visible to the
+/// connection that made it and to nobody else, so a pooled read would
+/// report nothing changed. `held` says the change is in that state, and
+/// it is what keeps the new catalog *out of the sidebar*: every other tab
+/// would see a table that is not there for them. A commit lets it through
+/// and a rollback throws the report away.
+struct SchemaReport {
+    /// What differs, once the catalog has been read back. Empty until
+    /// then, and empty afterwards for a change the model does not carry —
+    /// an index, a function, a grant.
+    delta: Delta,
+    /// The shape-changing statements of the run: their index in the run,
+    /// for the statistic beside them, and their verb, for the wording.
+    statements: Vec<(usize, DdlVerb)>,
+    /// What those statements took together, the app's own clock.
+    ms: u128,
+    /// The change sits inside a transaction the user has not ended.
+    held: bool,
+    /// The catalog is still being read back.
+    pending: bool,
+    /// The catalog could not be read back. The panel says so rather than
+    /// claiming nothing changed.
+    error: Option<String>,
+}
+
 /// What a buffer's statements came back with, taken together.
 ///
 /// A buffer is several statements and one result line, so the run has to
@@ -4197,6 +4418,18 @@ struct RunOutcome {
     /// is true on both paths: a statement that fails inside a transaction
     /// leaves it open, and that is the state most worth reporting.
     began: bool,
+    /// The shape-changing statements that landed, on either path: in auto
+    /// mode a `CREATE` before the statement that failed has committed all
+    /// the same, and the sidebar is stale until it is read again.
+    shape: Shape,
+}
+
+/// The `CREATE`, `ALTER`, `DROP` and `TRUNCATE` statements a run has sent
+/// and had answered, with their index in the run and what they cost.
+#[derive(Default, Clone)]
+struct Shape {
+    ddl: Vec<(usize, DdlVerb)>,
+    ms: u128,
 }
 
 impl RunOutcome {
@@ -4207,6 +4440,7 @@ impl RunOutcome {
             session: None,
             result: Err("the workspace closed".to_string()),
             began: false,
+            shape: Shape::default(),
         }
     }
 }
@@ -4222,6 +4456,14 @@ const CALLED_OFF: &str = "the run was called off before it started";
 /// paints CANCELLED for it, as it does for a statement the server gave
 /// up: it is the same answer to the same question.
 const STOPPED_BETWEEN: &str = "the run was stopped between statements";
+
+/// What the statistic beside a statement says when it never left, by why.
+/// The comp's `not run · statement 3 failed` is the shape; these are the
+/// other reasons a statement is left with the dash.
+const META_NO_SESSION: &str = "not run · no session";
+const META_NO_BEGIN: &str = "not run · begin failed";
+const META_STOPPED: &str = "not run · stopped";
+const META_RUNNING: &str = "running…";
 
 /// Said when every session is busy or holding a transaction and this tab
 /// wanted one too. It names the two ways out, because the app cannot pick
@@ -4273,13 +4515,14 @@ fn run_statements(
                         // No connection, so no statement left: the gutter
                         // must not leave a buffer queued for ever.
                         this.update(cx, |this, cx| {
-                            this.skip_statements(tab_id, generation, 0, cx)
+                            this.skip_statements(tab_id, generation, 0, META_NO_SESSION, cx)
                         })
                         .ok();
                         return RunOutcome {
                             session: None,
                             result: Err(error),
                             began: false,
+                            shape: Shape::default(),
                         };
                     }
                 }
@@ -4310,13 +4553,14 @@ fn run_statements(
             // Nothing was sent, so nothing was begun: a run called off in
             // this window costs the server nothing at all.
             this.update(cx, |this, cx| {
-                this.skip_statements(tab_id, generation, 0, cx)
+                this.skip_statements(tab_id, generation, 0, META_STOPPED, cx)
             })
             .ok();
             return RunOutcome {
                 session: Some(session),
                 result: Err(CALLED_OFF.to_string()),
                 began: false,
+                shape: Shape::default(),
             };
         }
 
@@ -4337,13 +4581,14 @@ fn run_statements(
                 // The transaction never opened, so none of the statements
                 // behind it were sent either.
                 this.update(cx, |this, cx| {
-                    this.skip_statements(tab_id, generation, 0, cx)
+                    this.skip_statements(tab_id, generation, 0, META_NO_BEGIN, cx)
                 })
                 .ok();
                 return RunOutcome {
                     session: Some(session),
                     result: Err(error),
                     began: false,
+                    shape: Shape::default(),
                 };
             }
             began = true;
@@ -4368,11 +4613,11 @@ fn run_statements(
                 let go = !matches!(tab.run, Run::Cancelling(_));
                 tab.editor.update(cx, |editor, cx| {
                     if go {
-                        editor.set_statement_status(ix, StatementStatus::Running, cx);
+                        editor.set_statement_status(ix, StatementStatus::Running, META_RUNNING, cx);
                     } else {
                         // Never sent, and the gutter says so rather than
                         // leaving them queued for ever.
-                        editor.skip_statements_from(ix, cx);
+                        editor.skip_statements_from(ix, META_STOPPED, cx);
                     }
                 });
                 cx.notify();
@@ -4383,9 +4628,15 @@ fn run_statements(
                     session: Some(session),
                     result: Err(STOPPED_BETWEEN.to_string()),
                     began,
+                    shape: tally.shape.clone(),
                 };
             }
 
+            // The statement's own clock, for the statistic beside it. The
+            // run's clock is the whole wait; this is one statement's share
+            // of it, which is the number that says *which* of five was the
+            // slow one.
+            let sent = Instant::now();
             let running = this.update(cx, |_, cx| {
                 let session = session.clone();
                 let sql = statement.clone();
@@ -4394,11 +4645,22 @@ fn run_statements(
             let Ok(running) = running else {
                 return RunOutcome::abandoned();
             };
-            match flatten(running.await) {
+            let outcome = flatten(running.await);
+            let ms = sent.elapsed().as_millis();
+            match outcome {
                 Ok(result) => {
-                    tally.add(statement, result);
+                    let verb = query::ddl_verb(statement);
+                    let meta = statement_meta(verb, statement, &result, ms);
+                    tally.add(ix, statement, verb, result, ms);
                     this.update(cx, |this, cx| {
-                        this.mark_statement(tab_id, generation, ix, StatementStatus::Done, cx);
+                        this.mark_statement(
+                            tab_id,
+                            generation,
+                            ix,
+                            StatementStatus::Done,
+                            meta,
+                            cx,
+                        );
                     })
                     .ok();
                 }
@@ -4419,16 +4681,31 @@ fn run_statements(
                             Some(Tab::Query(tab)) if matches!(tab.run, Run::Cancelling(_))
                         );
                         if stopped {
-                            this.skip_statements(tab_id, generation, ix, cx);
+                            this.mark_statement(
+                                tab_id,
+                                generation,
+                                ix,
+                                StatementStatus::Skipped,
+                                format!("stopped · {}", format_millis(ms)),
+                                cx,
+                            );
+                            this.skip_statements(tab_id, generation, ix + 1, META_STOPPED, cx);
                         } else {
                             this.mark_statement(
                                 tab_id,
                                 generation,
                                 ix,
                                 StatementStatus::Failed,
+                                format!("failed · {}", format_millis(ms)),
                                 cx,
                             );
-                            this.skip_statements(tab_id, generation, ix + 1, cx);
+                            this.skip_statements(
+                                tab_id,
+                                generation,
+                                ix + 1,
+                                format!("not run · statement {} failed", ix + 1),
+                                cx,
+                            );
                         }
                     })
                     .ok();
@@ -4436,17 +4713,134 @@ fn run_statements(
                         session: Some(session),
                         result: Err(error),
                         began,
+                        shape: tally.shape.clone(),
                     };
                 }
             }
         }
 
+        let shape = std::mem::take(&mut tally.shape);
         RunOutcome {
             session: Some(session),
             result: Ok(tally.finish(started)),
             began,
+            shape,
         }
     })
+}
+
+/// The statistic beside one statement that landed: what it answered with,
+/// and what it took. The comp's own lines — `6 rows · 34 ms`,
+/// `1,204 rows deleted · 61 ms`, `altered · 12 ms` — and the rule is the
+/// result line's: **columns say there was a result set, never the
+/// count**, so a `SELECT` that matched nothing reads `no rows` and an
+/// `UPDATE` that matched nothing reads `no rows updated`. A shape-changing
+/// statement takes its verb alone; the panel under the editor says what it
+/// changed once the catalog has been read.
+fn statement_meta(
+    verb: Option<DdlVerb>,
+    statement: &str,
+    result: &QueryResult,
+    ms: u128,
+) -> String {
+    let took = format_millis(ms);
+    if let Some(verb) = verb {
+        return format!("{} · {took}", verb.past());
+    }
+    if !result.columns.is_empty() {
+        return match result.rows.len() {
+            0 => format!("no rows · {took}"),
+            1 => format!("1 row · {took}"),
+            n => format!("{} rows · {took}", format_count(n as u64)),
+        };
+    }
+    match (result.rows_affected, query::command_verb(statement)) {
+        (_, Some(verb)) => format!(
+            "{} · {took}",
+            changed_copy(Changed {
+                rows: result.rows_affected,
+                verb: Some(verb),
+            })
+        ),
+        // No result set, no verb, no count: a `SET`, a `BEGIN` the user
+        // typed, a `VACUUM`. "done" is all the server said.
+        (0, None) => format!("done · {took}"),
+        (1, None) => format!("1 row affected · {took}"),
+        (n, None) => format!("{} rows affected · {took}", format_count(n)),
+    }
+}
+
+/// The statistic beside a shape-changing statement once the catalog has
+/// been read back, when the run held exactly one and the report can be
+/// laid at its door: `altered · +2 −1 columns · 12 ms`. `None` leaves the
+/// line as it was — nothing the model carries changed, or nothing worth
+/// counting did.
+fn ddl_meta(delta: &Delta, verb: DdlVerb, ms: u128) -> Option<String> {
+    let (mut added, mut dropped, mut changed) = (0, 0, 0);
+    for relation in &delta.relations {
+        if let RelationChange::Altered { columns } = &relation.change {
+            for column in columns {
+                match column {
+                    ColumnDelta::Added(_) => added += 1,
+                    ColumnDelta::Dropped(_) => dropped += 1,
+                    ColumnDelta::Changed { .. } => changed += 1,
+                }
+            }
+        }
+    }
+    let mut parts = Vec::new();
+    if added > 0 {
+        parts.push(format!("+{added}"));
+    }
+    if dropped > 0 {
+        parts.push(format!("−{dropped}"));
+    }
+    if changed > 0 {
+        parts.push(format!("~{changed}"));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let noun = if added + dropped + changed == 1 {
+        "column"
+    } else {
+        "columns"
+    };
+    Some(format!(
+        "{} · {} {noun} · {}",
+        verb.past(),
+        parts.join(" "),
+        format_millis(ms)
+    ))
+}
+
+/// The line under the schema report, which is the one thing about a
+/// shape change worth saying in a sentence: whether it can still be taken
+/// back. Inside an open transaction it can, and the bar's two buttons are
+/// the way; committed, a drop is gone from here. `dropped` are the names
+/// the delta removed, qualified the way the sidebar shows them.
+fn schema_note(held: bool, dropped: &[String]) -> String {
+    match (held, dropped) {
+        (true, []) => {
+            "held in the open transaction — rollback takes it back, commit makes it permanent"
+                .to_string()
+        }
+        (true, [name]) => format!(
+            "held in the open transaction — rollback puts {name} back, commit makes the drop permanent"
+        ),
+        (true, _) => {
+            "held in the open transaction — rollback puts them back, commit makes the drops permanent"
+                .to_string()
+        }
+        (false, []) => "committed on its own".to_string(),
+        (false, [name]) => {
+            format!("committed on its own — {name} is gone and cannot be recovered from here")
+        }
+        (false, names) => format!(
+            "committed on its own — {} are gone and cannot be recovered from here",
+            names.join(", ")
+        ),
+    }
 }
 
 /// What a run has added up over the statements it has sent so far.
@@ -4468,11 +4862,24 @@ struct Tally {
     /// could not be read; the outer `None` is "nothing counted yet", which
     /// is why this is not simply an `Option<CommandVerb>`.
     verb: Option<Option<CommandVerb>>,
+    /// The shape-changing statements so far, handed back on every path.
+    shape: Shape,
 }
 
 impl Tally {
-    fn add(&mut self, statement: &str, result: QueryResult) {
+    fn add(
+        &mut self,
+        ix: usize,
+        statement: &str,
+        ddl: Option<DdlVerb>,
+        result: QueryResult,
+        ms: u128,
+    ) {
         self.ran += 1;
+        if let Some(verb) = ddl {
+            self.shape.ddl.push((ix, verb));
+            self.shape.ms += ms;
+        }
         if result.columns.is_empty() {
             // No result set, so the count is the whole of what this
             // statement said — including a zero, which is the answer to
@@ -6105,6 +6512,143 @@ impl Shell {
     /// which way it went. "committed" is the answer to the question the
     /// user just asked, and a strip that vanished would leave it
     /// unanswered.
+    /// The comp's SCHEMA CHANGED panel: what the run did to the shape of
+    /// the database, read back off the catalog. See [`SchemaReport`] for
+    /// why it exists and where its numbers come from.
+    ///
+    /// It wears the DDL family — the teal the statement's own lines wear
+    /// in the editor — so the statement and its report read as one event.
+    /// A column that appeared is a `+` row on the green wash, one that
+    /// went is a `−` row on the clay wash with its name struck through,
+    /// and one that changed is a `~` row saying `text → integer`. The line
+    /// under them says whether any of it can still be taken back, which is
+    /// the one sentence a shape change is owed.
+    fn schema_strip(
+        &self,
+        tab: &QueryTab,
+        colors: &ThemeColors,
+        cx: &Context<Self>,
+    ) -> Option<Div> {
+        let report = tab.schema_report.as_ref()?;
+        let verbs = report_verbs(&report.statements);
+        let (subject, reveal) = report_subject(&report.delta);
+        let meta = if report.pending {
+            format!(
+                "{verbs} · {} · reading the catalog…",
+                format_millis(report.ms)
+            )
+        } else {
+            format!("{verbs} · {}", format_millis(report.ms))
+        };
+        let dropped = report.delta.dropped_names();
+        let (note, note_ink) = match (&report.error, report.pending) {
+            (Some(error), _) => (
+                format!("could not read the catalog back · {error}"),
+                colors.error,
+            ),
+            (None, true) => (String::new(), colors.ddl_muted),
+            (None, false) if report.delta.is_empty() => (
+                format!(
+                    "{} · nothing the sidebar lists changed — indexes, functions and grants are not compared",
+                    schema_note(report.held, &[])
+                ),
+                colors.ddl_muted,
+            ),
+            (None, false) => (
+                schema_note(report.held, &dropped),
+                if report.held || dropped.is_empty() {
+                    colors.ddl_muted
+                } else {
+                    colors.error
+                },
+            ),
+        };
+
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .bg(colors.ddl_surface)
+                .border_b_1()
+                .border_color(colors.ddl_inner)
+                .child(div().w(px(2.)).flex_none().bg(colors.ddl))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .pl(px(13.))
+                        .pr(px(14.))
+                        .pt(px(11.))
+                        .pb(px(12.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(9.))
+                                .child(
+                                    div()
+                                        .size(px(14.))
+                                        .flex_none()
+                                        .rounded(px(3.))
+                                        .bg(colors.ddl)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(9.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(colors.ddl_surface)
+                                        .child("Δ"),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(9.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(colors.ddl_text)
+                                        .child("SCHEMA CHANGED"),
+                                )
+                                .children(subject.map(|subject| {
+                                    div()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(colors.text)
+                                        .child(subject)
+                                }))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(10.))
+                                        .text_color(colors.ddl_muted)
+                                        .child(meta),
+                                )
+                                .child(div().flex_1())
+                                .children(reveal.map(|(schema, name)| {
+                                    div()
+                                        .id("reveal-relation")
+                                        .flex_none()
+                                        .cursor_pointer()
+                                        .text_size(px(10.))
+                                        .text_color(colors.ddl_text)
+                                        .hover(|s| s.text_color(colors.ddl))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.reveal_relation(schema.clone(), name.clone(), cx)
+                                        }))
+                                        .child("reveal in schema tree")
+                                })),
+                        )
+                        .children(delta_rows(&report.delta, colors))
+                        .when(!note.is_empty(), |panel| {
+                            panel.child(div().text_size(px(10.)).text_color(note_ink).child(note))
+                        }),
+                ),
+        )
+    }
+
     fn tx_bar(&self, tab: &QueryTab, colors: &ThemeColors, cx: &Context<Self>) -> Option<Div> {
         let state = TxState {
             mode: tab.tx_mode,
@@ -6638,6 +7182,10 @@ impl Shell {
                 .child(tab.editor.clone())
                 .child(self.pane_handle(Divider::Editor, colors, cx)),
         )
+        // First under the editor, because it is about what a statement up
+        // there did to the database — the one answer the result pane has
+        // no way to show.
+        .children(self.schema_strip(tab, colors, cx))
         // Under the editor, because it is about the statement above it —
         // and above the run's own error strip, which is about a statement
         // that was actually sent.
@@ -8367,6 +8915,246 @@ fn being_typed(statement: &Range<usize>, error_at: usize, cursor: usize) -> bool
     error_at >= statement.end && (statement.start..=statement.end).contains(&cursor)
 }
 
+/// The verbs of a report's statements, each once, in the order they ran:
+/// `altered`, or `created, dropped`.
+fn report_verbs(statements: &[(usize, DdlVerb)]) -> String {
+    let mut verbs: Vec<&str> = Vec::new();
+    for (_, verb) in statements {
+        if !verbs.contains(&verb.past()) {
+            verbs.push(verb.past());
+        }
+    }
+    verbs.join(", ")
+}
+
+/// What the report is about, in the header — one relation by name, or a
+/// count — and the relation "reveal in schema tree" opens, which is the
+/// first one that is still there. `None` for both with nothing changed.
+fn report_subject(delta: &Delta) -> (Option<String>, Option<(SharedString, SharedString)>) {
+    let reveal = delta
+        .relations
+        .iter()
+        .find(|relation| !matches!(relation.change, RelationChange::Dropped { .. }))
+        .map(|relation| {
+            (
+                SharedString::from(relation.schema.clone()),
+                SharedString::from(relation.name.clone()),
+            )
+        });
+    let subject = match delta.relations.as_slice() {
+        [] => None,
+        [one] => Some(format!("{}.{}", one.schema, one.name)),
+        many => Some(format!("{} relations", many.len())),
+    };
+    (subject, reveal)
+}
+
+/// How many rows the report lists before it says `… and N more`. A
+/// `DROP SCHEMA … CASCADE` can take a hundred tables with it, and a panel
+/// a hundred rows tall is a panel that hides the result.
+const DELTA_ROWS: usize = 8;
+
+/// One row of the report per thing that changed: a relation that came or
+/// went, or a column of one that stayed. Tables first, then their columns,
+/// in the order the delta has them.
+fn delta_rows(delta: &Delta, colors: &ThemeColors) -> Vec<Div> {
+    let mut rows = Vec::new();
+    let mut total = 0;
+    for relation in &delta.relations {
+        let RelationDelta {
+            schema,
+            name,
+            kind,
+            change,
+        } = relation;
+        let noun = match kind {
+            TableKind::Table => "table",
+            TableKind::View => "view",
+        };
+        match change {
+            RelationChange::Added { columns } => {
+                total += 1;
+                if rows.len() < DELTA_ROWS {
+                    rows.push(delta_row(
+                        Sign::Plus,
+                        format!("{schema}.{name}"),
+                        noun.to_string(),
+                        column_count(columns.len()),
+                        colors,
+                    ));
+                }
+            }
+            RelationChange::Dropped { columns } => {
+                total += 1;
+                if rows.len() < DELTA_ROWS {
+                    rows.push(delta_row(
+                        Sign::Minus,
+                        format!("{schema}.{name}"),
+                        noun.to_string(),
+                        column_count(columns.len()),
+                        colors,
+                    ));
+                }
+            }
+            RelationChange::Altered { columns } => {
+                for column in columns {
+                    total += 1;
+                    if rows.len() >= DELTA_ROWS {
+                        continue;
+                    }
+                    rows.push(match column {
+                        ColumnDelta::Added(column) => delta_row(
+                            Sign::Plus,
+                            column.name.clone(),
+                            column.data_type.clone(),
+                            column_note(column),
+                            colors,
+                        ),
+                        ColumnDelta::Dropped(column) => delta_row(
+                            Sign::Minus,
+                            column.name.clone(),
+                            column.data_type.clone(),
+                            column_note(column),
+                            colors,
+                        ),
+                        ColumnDelta::Changed { before, after } => delta_row(
+                            Sign::Tilde,
+                            after.name.clone(),
+                            if before.data_type == after.data_type {
+                                after.data_type.clone()
+                            } else {
+                                format!("{} → {}", before.data_type, after.data_type)
+                            },
+                            if before.data_type == after.data_type {
+                                format!("was {} · now {}", column_note(before), column_note(after))
+                            } else {
+                                column_note(after)
+                            },
+                            colors,
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    if total > rows.len() {
+        rows.push(
+            div()
+                .px(px(9.))
+                .text_size(px(10.))
+                .text_color(colors.ddl_muted)
+                .child(format!("… and {} more", total - rows.len())),
+        );
+    }
+    rows
+}
+
+/// Which way a row of the report goes.
+#[derive(Clone, Copy)]
+enum Sign {
+    Plus,
+    Minus,
+    Tilde,
+}
+
+fn delta_row(sign: Sign, name: String, kind: String, note: String, colors: &ThemeColors) -> Div {
+    let (glyph, surface, mark, name_ink, kind_ink, note_ink) = match sign {
+        Sign::Plus => (
+            "+",
+            colors.delta_add_surface,
+            colors.delta_add,
+            colors.text,
+            colors.delta_add_type,
+            colors.delta_add_text,
+        ),
+        Sign::Minus => (
+            "−",
+            colors.delta_drop_surface,
+            colors.env_prod,
+            colors.error,
+            colors.delta_drop_type,
+            colors.error,
+        ),
+        Sign::Tilde => (
+            "~",
+            colors.window,
+            colors.ddl_text,
+            colors.text,
+            colors.ddl_text,
+            colors.ddl_muted,
+        ),
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .px(px(9.))
+        .py(px(4.))
+        .rounded(px(5.))
+        .bg(surface)
+        .child(
+            div()
+                .w(px(10.))
+                .flex_none()
+                .text_center()
+                .text_size(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(mark)
+                .child(glyph),
+        )
+        .child(
+            div()
+                .w(px(150.))
+                .flex_none()
+                .truncate()
+                .text_size(px(11.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(name_ink)
+                // Struck through, as the comp strikes a dropped column:
+                // the name is still worth reading, and it is gone.
+                .when(matches!(sign, Sign::Minus), |name| name.line_through())
+                .child(name),
+        )
+        .child(
+            div()
+                .w(px(130.))
+                .flex_none()
+                .truncate()
+                .text_size(px(11.))
+                .text_color(kind_ink)
+                .child(kind),
+        )
+        .child(
+            div()
+                .min_w(px(0.))
+                .truncate()
+                .text_size(px(10.))
+                .text_color(note_ink)
+                .child(note),
+        )
+}
+
+fn column_count(n: usize) -> String {
+    match n {
+        1 => "1 column".to_string(),
+        n => format!("{n} columns"),
+    }
+}
+
+/// The words after a column's type: what the catalog says about it that
+/// the type does not.
+fn column_note(column: &Column) -> String {
+    let nullable = if column.nullable {
+        "nullable"
+    } else {
+        "not null"
+    };
+    match &column.default {
+        Some(default) => format!("{nullable} · default {default}"),
+        None => format!("{nullable} · no default"),
+    }
+}
+
 fn changed_copy(changed: Changed) -> String {
     let Changed { rows, verb } = changed;
     match (rows, verb) {
@@ -9558,5 +10346,168 @@ mod tests {
             "postgres://ada@db.internal/app"
         );
         assert_eq!(redact("postgres:///app"), "postgres:///app");
+    }
+
+    fn answered(columns: &[&str], rows: usize) -> QueryResult {
+        QueryResult {
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            rows: (0..rows).map(|_| Vec::new()).collect(),
+            ..QueryResult::default()
+        }
+    }
+
+    fn counted(rows_affected: u64) -> QueryResult {
+        QueryResult {
+            rows_affected,
+            ..QueryResult::default()
+        }
+    }
+
+    /// The statistic beside a statement reads as the comp's lines do, and
+    /// the rule is the result line's: columns say there was a result set,
+    /// never the count.
+    #[test]
+    fn a_statements_statistic_says_what_it_answered_with() {
+        assert_eq!(
+            statement_meta(None, "select 1", &answered(&["a"], 6), 34),
+            "6 rows · 34 ms"
+        );
+        assert_eq!(
+            statement_meta(None, "select 1", &answered(&["a"], 1), 3),
+            "1 row · 3 ms"
+        );
+        assert_eq!(
+            statement_meta(None, "select 1 where false", &answered(&["a"], 0), 3),
+            "no rows · 3 ms"
+        );
+        assert_eq!(
+            statement_meta(None, "delete from t", &counted(1204), 61),
+            "1.2k rows deleted · 61 ms"
+        );
+        assert_eq!(
+            statement_meta(None, "update t set a = 1", &counted(0), 2),
+            "no rows updated · 2 ms"
+        );
+        assert_eq!(
+            statement_meta(None, "set search_path to x", &counted(0), 1),
+            "done · 1 ms"
+        );
+        assert_eq!(
+            statement_meta(
+                None,
+                "with m as (delete from t returning *) insert into u select * from m",
+                &counted(7),
+                9
+            ),
+            "7 rows affected · 9 ms"
+        );
+        // A shape-changing statement takes its verb: the count the server
+        // reports for it is nothing, and the panel says what changed.
+        assert_eq!(
+            statement_meta(
+                Some(DdlVerb::Alter),
+                "alter table t add c int",
+                &counted(0),
+                12
+            ),
+            "altered · 12 ms"
+        );
+    }
+
+    fn a_column(name: &str) -> Column {
+        Column {
+            name: name.into(),
+            data_type: "text".into(),
+            nullable: true,
+            default: None,
+        }
+    }
+
+    fn altered(columns: Vec<ColumnDelta>) -> Delta {
+        Delta {
+            relations: vec![RelationDelta {
+                schema: "public".into(),
+                name: "t".into(),
+                kind: TableKind::Table,
+                change: RelationChange::Altered { columns },
+            }],
+        }
+    }
+
+    #[test]
+    fn a_shape_changing_statements_line_counts_the_columns_once_they_are_known() {
+        let delta = altered(vec![
+            ColumnDelta::Added(a_column("a")),
+            ColumnDelta::Added(a_column("b")),
+            ColumnDelta::Dropped(a_column("c")),
+        ]);
+        assert_eq!(
+            ddl_meta(&delta, DdlVerb::Alter, 12),
+            Some("altered · +2 −1 columns · 12 ms".to_string())
+        );
+        assert_eq!(
+            ddl_meta(
+                &altered(vec![ColumnDelta::Added(a_column("a"))]),
+                DdlVerb::Alter,
+                5
+            ),
+            Some("altered · +1 column · 5 ms".to_string())
+        );
+        // A table that came or went is the header's news, not the line's,
+        // and nothing changed is nothing to add.
+        assert_eq!(ddl_meta(&Delta::default(), DdlVerb::Create, 5), None);
+    }
+
+    /// The one sentence a shape change is owed: whether it can still be
+    /// taken back.
+    #[test]
+    fn the_schema_note_says_whether_the_change_can_be_taken_back() {
+        assert_eq!(
+            schema_note(true, &[]),
+            "held in the open transaction — rollback takes it back, commit makes it permanent"
+        );
+        assert_eq!(
+            schema_note(true, &["t.legacy_plan".to_string()]),
+            "held in the open transaction — rollback puts t.legacy_plan back, \
+             commit makes the drop permanent"
+        );
+        assert_eq!(schema_note(false, &[]), "committed on its own");
+        assert_eq!(
+            schema_note(false, &["t.legacy_plan".to_string()]),
+            "committed on its own — t.legacy_plan is gone and cannot be recovered from here"
+        );
+        assert_eq!(
+            schema_note(false, &["a".to_string(), "b".to_string()]),
+            "committed on its own — a, b are gone and cannot be recovered from here"
+        );
+    }
+
+    #[test]
+    fn the_report_header_names_one_relation_or_counts_them() {
+        assert_eq!(
+            report_verbs(&[(0, DdlVerb::Alter), (2, DdlVerb::Alter)]),
+            "altered"
+        );
+        assert_eq!(
+            report_verbs(&[(0, DdlVerb::Create), (1, DdlVerb::Drop)]),
+            "created, dropped"
+        );
+        let (subject, reveal) = report_subject(&altered(vec![]));
+        assert_eq!(subject.as_deref(), Some("public.t"));
+        assert_eq!(
+            reveal,
+            Some((SharedString::from("public"), SharedString::from("t")))
+        );
+        // A dropped relation is not there to reveal.
+        let gone = Delta {
+            relations: vec![RelationDelta {
+                schema: "public".into(),
+                name: "t".into(),
+                kind: TableKind::Table,
+                change: RelationChange::Dropped { columns: vec![] },
+            }],
+        };
+        assert_eq!(report_subject(&gone).1, None);
+        assert_eq!(report_subject(&Delta::default()), (None, None));
     }
 }

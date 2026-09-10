@@ -932,6 +932,78 @@ statements skipped rather than leaving them queued for ever: a session that
 would not open, a `BEGIN` that failed, a run called off while the session
 was opening.
 
+### Marking a statement that changes the shape
+
+**A `CREATE`, `ALTER`, `DROP` or `TRUNCATE` is the one statement whose
+answer is not on screen afterwards.** A `SELECT` paints rows and an
+`UPDATE` reports a count, but a `DROP COLUMN` changes something the user is
+looking at *elsewhere* — the sidebar, the next query's columns — and comes
+back with neither. So it is painted apart from the rest, and once it lands
+the app goes and looks at what it did.
+
+`query::ddl_verb` reads the verb, in `command_verb`'s spirit and with its
+economy: the first word past the comments, no parsing, and being wrong is
+cheap — a missed verb costs a statement painted plain and a sidebar
+refreshed one run late. `sql_editor::StatementKind` carries it to the
+editor, which paints and does not parse. The kind wears the comp's **DDL
+family**, a cool teal against the warm paper (`theme::ddl*`): a `DDL` chip
+on the statement's first line, a wash over every line it covers — painted
+by `wash_quads` under the text, so a three-line `ALTER` is one band and
+not three teal words — the gutter's own tint, and a rail that deepens from
+`ddl_inner` through `ddl` to `ddl_done` as the statement goes from queued
+to running to landed. A failure takes the error's surface in either kind:
+a `DROP` the server refused changed nothing, and teal would say it did.
+
+**Every statement now carries its own statistic, at the right of the
+pane.** The result line answers for the run; the column of numbers beside
+the statements answers for each — `6 rows · 34 ms`, `1,204 rows deleted ·
+61 ms`, `altered · 12 ms`, `failed · 8 ms`, `not run · statement 3
+failed`. It is the number that says *which* of five was the slow one, and
+the run's clock cannot. `shell::statement_meta` is the wording, by the
+result line's own rule — columns say there was a result set, never the
+count — and `StatementMark::meta` holds it, so every edit drops it with
+the marks it belongs to. The column is `SqlEditor::statistics_column`:
+outside the horizontal scroll for the reason the gutter is, so a long
+line slides under it rather than carrying it off the pane, and inside the
+vertical one, so it travels with its lines. It takes no room until a run
+has been made. The per-statement clock is the statement's own, around its
+tokio task.
+
+**What changed is read off the catalog, never guessed from the SQL.**
+Once a shape-changing statement lands, `Shell::report_schema` reads the
+catalog again and `introspect::diff` compares it with the one the shell
+had: tables that came or went, and for a table that stayed, columns that
+came, went, or changed type, nullability or default. `SchemaReport` on the
+tab holds the result, and `Shell::schema_strip` paints it as the comp's
+SCHEMA CHANGED panel, first under the editor: a `+` row on the green wash,
+a `−` row on the clay wash with the name struck through, a `~` row saying
+`text → integer`, and `reveal in schema tree`, which opens the sidebar on
+the relation. When the run held exactly one shape-changing statement the
+report is its doing, and `ddl_meta` rewrites its statistic to
+`altered · +2 −1 columns · 12 ms`.
+
+**It reads on the tab's own session, because that is the only place the
+change exists yet.** Inside an open transaction a new table is visible to
+the connection that made it and to nobody else; a pooled read would report
+nothing changed. So `Session::introspect` runs the same three catalog
+queries `Connection::introspect` runs — one `read_catalog` in the driver,
+so the two cannot drift — down the pinned connection. `SchemaReport::held`
+says the change is in that state, and it is what keeps the new catalog
+**out of the sidebar**: every other tab would see a table that is not
+there for them. A commit — the bar's button or a typed `COMMIT` — lets it
+through and re-reads the catalog from the pool; a rollback throws the
+report away, because the change it described never happened. A held report
+also survives the next run, because the change is still pending and the
+bar's answer to it is still the answer; a committed one is dropped at the
+next ⌘⏎, being news about the last run.
+
+The line under the rows is the one sentence a shape change is owed, and
+`schema_note` is pure: held, it says rollback puts the dropped column
+back; committed, it names what is gone and cannot be recovered from here.
+An empty delta says so rather than painting nothing — an index, a
+function or a grant is a shape change the model does not carry, and the
+panel says which those are.
+
 ### Marking what will not parse
 
 **The check is the server's, because the server is the only thing that

@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod diff;
+
 /// Everything we know about one connected database.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Catalog {
@@ -40,7 +42,7 @@ pub enum TableKind {
     View,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Column {
     pub name: String,
     /// Type name as the database reports it (e.g. `INTEGER`, `varchar(255)`).

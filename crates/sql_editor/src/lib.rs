@@ -208,9 +208,10 @@ const UNDO_DEPTH: usize = 256;
 /// The gutter is where that answer belongs: the user is reading the
 /// statements there, and a line of prose under the grid cannot point at
 /// the third of five.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StatementStatus {
     /// Sent nowhere yet: the statements ahead of it are still running.
+    #[default]
     Queued,
     /// The server has this one.
     Running,
@@ -223,11 +224,35 @@ pub enum StatementStatus {
     Skipped,
 }
 
+/// What kind of statement a mark is on, for the one kind that is painted
+/// apart from the rest.
+///
+/// A `CREATE`, `ALTER`, `DROP` or `TRUNCATE` changes something the user is
+/// looking at elsewhere — the sidebar, the next query's columns — and
+/// answers with neither rows nor a count, so it is the one statement whose
+/// effect is invisible from the result pane. The comp gives it a cool teal
+/// family of its own against the warm paper, a `DDL` chip on its first
+/// line, and a wash over every line it covers, so the statement that
+/// changed the shape of the database reads as such from across the pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatementKind {
+    #[default]
+    Plain,
+    Ddl,
+}
+
 /// One statement of the last run, and where its text sits in the buffer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StatementMark {
     pub range: Range<usize>,
     pub status: StatementStatus,
+    pub kind: StatementKind,
+    /// The statistic beside the statement, on its first line and at the
+    /// right of the pane: `6 rows · 34 ms`, `1,204 rows deleted · 61 ms`,
+    /// `altered · 12 ms`, `failed · 8 ms`, `not run · statement 3 failed`.
+    /// Whoever owns the editor decides the words; the editor paints them
+    /// in the status's colour. Empty paints nothing.
+    pub meta: SharedString,
 }
 
 /// One thing the server refused to parse, and where it sits in the buffer.
@@ -408,45 +433,74 @@ impl SqlEditor {
 
     /// Take the statements a run is about to send, all of them queued.
     /// `offset` is where the run's text starts in the buffer, so the
-    /// ranges are the buffer's own.
+    /// ranges are the buffer's own. Each comes with its kind, which the
+    /// caller reads off the text: the editor paints and does not parse.
     pub fn set_statements(
         &mut self,
-        ranges: Vec<Range<usize>>,
+        statements: Vec<(Range<usize>, StatementKind)>,
         offset: usize,
         cx: &mut Context<Self>,
     ) {
-        self.statements = ranges
+        self.statements = statements
             .into_iter()
-            .map(|range| StatementMark {
+            .map(|(range, kind)| StatementMark {
                 range: offset + range.start..offset + range.end,
                 status: StatementStatus::Queued,
+                kind,
+                meta: "queued".into(),
             })
             .collect();
         cx.notify();
     }
 
-    /// Say how the statement at `ix` ended. A run whose buffer was edited
-    /// under it has no marks left to write on, and this says nothing
-    /// rather than guessing which line the statement moved to.
+    /// Say how the statement at `ix` ended, and what to write beside it.
+    /// A run whose buffer was edited under it has no marks left to write
+    /// on, and this says nothing rather than guessing which line the
+    /// statement moved to.
     pub fn set_statement_status(
         &mut self,
         ix: usize,
         status: StatementStatus,
+        meta: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
         let Some(mark) = self.statements.get_mut(ix) else {
             return;
         };
         mark.status = status;
+        mark.meta = meta.into();
         cx.notify();
     }
 
-    /// Mark every statement from `ix` on as never sent. A run stops at its
-    /// first failure, and the statements behind it were not skipped by
-    /// anyone's choice — they never left.
-    pub fn skip_statements_from(&mut self, ix: usize, cx: &mut Context<Self>) {
+    /// Rewrite the statistic beside the statement at `ix` and nothing
+    /// else. A shape-changing statement learns what it changed one round
+    /// trip after it lands, and the line is worth updating for it.
+    pub fn set_statement_meta(
+        &mut self,
+        ix: usize,
+        meta: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mark) = self.statements.get_mut(ix) else {
+            return;
+        };
+        mark.meta = meta.into();
+        cx.notify();
+    }
+
+    /// Mark every statement from `ix` on as never sent, with `meta` saying
+    /// why. A run stops at its first failure, and the statements behind it
+    /// were not skipped by anyone's choice — they never left.
+    pub fn skip_statements_from(
+        &mut self,
+        ix: usize,
+        meta: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let meta = meta.into();
         for mark in self.statements.iter_mut().skip(ix) {
             mark.status = StatementStatus::Skipped;
+            mark.meta = meta.clone();
         }
         cx.notify();
     }
@@ -482,6 +536,75 @@ impl SqlEditor {
 
     pub fn line_count(&self) -> usize {
         self.content.split('\n').count()
+    }
+
+    /// The column at the right of the pane that carries each statement's
+    /// statistic, and the `DDL` chip beside a shape-changing one.
+    ///
+    /// It is a column of its own, outside the horizontal scroll, for the
+    /// reason the gutter is: a long line must slide under it rather than
+    /// carry it off the pane, and the number has to sit where the eye
+    /// finds it — at the right edge, on the statement's first line — however
+    /// far across the text goes. It is inside the vertical scroll, so it
+    /// travels with its lines. `None` with nothing run, so a buffer nobody
+    /// has sent gives up no room to a column of nothing.
+    fn statistics_column(
+        &self,
+        line_marks: &[Option<LineMark>],
+        colors: &ThemeColors,
+    ) -> Option<Div> {
+        if self.statements.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .flex_none()
+                .min_h(relative(1.))
+                .py(px(TEXT_PADDING_Y))
+                .flex()
+                .flex_col()
+                .items_end()
+                .children(line_marks.iter().map(|on_line| {
+                    let row = div()
+                        .h(px(LINE_HEIGHT))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap(px(10.))
+                        .pl(px(16.))
+                        .pr(px(12.));
+                    let Some(mark) = on_line else {
+                        return row;
+                    };
+                    // The wash reaches under the statistic too, so the
+                    // statement's lines read as one band from the rail to
+                    // the pane's edge.
+                    let row = match wash_color(mark.kind, mark.status, colors) {
+                        Some(color) => row.bg(color),
+                        None => row,
+                    };
+                    if !mark.first {
+                        return row;
+                    }
+                    let meta = self
+                        .statements
+                        .get(mark.ix)
+                        .map(|statement| statement.meta.clone())
+                        .filter(|meta| !meta.is_empty());
+                    row.when(mark.kind == StatementKind::Ddl, |row| {
+                        row.child(ddl_chip(colors))
+                    })
+                    .children(meta.map(|meta| {
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_size(px(10.))
+                            .text_color(meta_color(mark.kind, mark.status, colors))
+                            .child(meta)
+                    }))
+                })),
+        )
     }
 
     /// The longest line, in characters. The element sizes itself by it, so
@@ -1437,16 +1560,30 @@ impl Render for SqlEditor {
                             .flex()
                             .flex_col()
                             .children((1..=line_count).map(|n| {
-                                let mark = line_marks
-                                    .get(n - 1)
-                                    .copied()
-                                    .flatten()
-                                    .filter(|(_, first)| *first)
-                                    .map(|(status, _)| statement_mark(n, status, &colors));
+                                let on_line = line_marks.get(n - 1).copied().flatten();
+                                let mark = on_line
+                                    .filter(|mark| mark.first)
+                                    .map(|mark| statement_mark(n, mark.status, &colors));
+                                // The gutter beside a shape-changing
+                                // statement takes the family's own tint,
+                                // as the comp's does, so the teal reads
+                                // from the numbers to the far edge.
+                                let ddl =
+                                    on_line.is_some_and(|mark| mark.kind == StatementKind::Ddl);
                                 div()
                                     .h(px(LINE_HEIGHT))
                                     .flex()
                                     .items_center()
+                                    // The gutter's own padding is on the
+                                    // column, so the tint has to reach
+                                    // past this row's box to meet the
+                                    // rule: `-mr` pulls it there.
+                                    .when(ddl, |row| {
+                                        row.bg(colors.ddl_gutter)
+                                            .text_color(colors.ddl_number)
+                                            .mr(px(-8.))
+                                            .pr(px(8.))
+                                    })
                                     .child(
                                         div()
                                             .w(px(MARK_WIDTH))
@@ -1478,7 +1615,7 @@ impl Render for SqlEditor {
                                     .get(row)
                                     .copied()
                                     .flatten()
-                                    .map(|(status, _)| rail_color(status, &colors));
+                                    .map(|mark| rail_color(mark.kind, mark.status, &colors));
                                 let line = div().h(px(LINE_HEIGHT));
                                 match rail {
                                     Some(color) => line.bg(color),
@@ -1517,7 +1654,8 @@ impl Render for SqlEditor {
                                         editor: cx.entity(),
                                     }),
                             ),
-                    ),
+                    )
+                    .children(self.statistics_column(&line_marks, &colors)),
             )
             // The bars are painted outside the containers they drive, or
             // they would scroll away with the text. Both appear only when
@@ -1648,30 +1786,76 @@ impl SqlEditor {
     }
 }
 
-/// What each line of `content` wears in the gutter: the statement covering
-/// it, and whether the line is the one that statement starts on — the mark
-/// is drawn once, and the rail carries the rest of it.
+/// What one line of the buffer wears: which statement of the last run
+/// covers it, and whether it is the line that statement starts on — the
+/// mark and the statistic are drawn once, and the rail and the wash carry
+/// the rest of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LineMark {
+    /// Index of the statement in the run, so the statistic can be read
+    /// back off the mark.
+    ix: usize,
+    status: StatementStatus,
+    kind: StatementKind,
+    first: bool,
+}
+
+/// What each line of `content` wears in the gutter.
 ///
 /// A plain function over the text and the ranges, so the mapping can be
 /// argued with in a test rather than in a running window.
-fn line_marks(content: &str, statements: &[StatementMark]) -> Vec<Option<(StatementStatus, bool)>> {
+fn line_marks(content: &str, statements: &[StatementMark]) -> Vec<Option<LineMark>> {
     let mut marks = vec![None; content.split('\n').count()];
     if statements.is_empty() {
         return marks;
     }
     let mut starts = vec![0usize];
     starts.extend(content.match_indices('\n').map(|(ix, _)| ix + 1));
-    for statement in statements {
+    for (ix, statement) in statements.iter().enumerate() {
         let first = row_for_offset(&starts, statement.range.start);
         // The end offset is one past the statement's last character, so a
         // statement that ends at a line break belongs to the line before
         // it rather than opening the next one.
         let last = row_for_offset(&starts, statement.range.end.saturating_sub(1)).max(first);
         for row in first..=last.min(marks.len().saturating_sub(1)) {
-            marks[row] = Some((statement.status, row == first));
+            marks[row] = Some(LineMark {
+                ix,
+                status: statement.status,
+                kind: statement.kind,
+                first: row == first,
+            });
         }
     }
     marks
+}
+
+/// The wash behind a statement's lines, if it wears one.
+///
+/// A plain statement is washed only while it is news — running, or
+/// failed — and a shape-changing one is washed in its own family from the
+/// moment it is queued, because it is news whatever state it is in. A
+/// failure takes the error's surface in either kind: a `DROP` the server
+/// refused changed nothing, and teal would say it did.
+fn wash_color(kind: StatementKind, status: StatementStatus, colors: &ThemeColors) -> Option<Hsla> {
+    match (kind, status) {
+        (_, StatementStatus::Failed) => Some(colors.error_surface),
+        (StatementKind::Ddl, _) => Some(colors.ddl_surface),
+        (StatementKind::Plain, StatementStatus::Running) => Some(colors.running_surface),
+        (StatementKind::Plain, _) => None,
+    }
+}
+
+/// The colour of the statistic beside a statement, by how it ended. The
+/// shape-changing family keeps its own ink for a statement that landed;
+/// the rest is shared, because "failed" is failed whatever the statement.
+fn meta_color(kind: StatementKind, status: StatementStatus, colors: &ThemeColors) -> Hsla {
+    match (kind, status) {
+        (_, StatementStatus::Queued) | (_, StatementStatus::Skipped) => colors.text_faint,
+        (_, StatementStatus::Failed) => colors.env_prod,
+        (StatementKind::Ddl, _) => colors.ddl_text,
+        (StatementKind::Plain, StatementStatus::Running) => colors.accent,
+        (StatementKind::Plain, StatementStatus::Done) => colors.ok_muted,
+    }
 }
 
 /// The mark a statement wears in the gutter, on the line its text starts
@@ -1735,16 +1919,39 @@ fn statement_mark(line: usize, status: StatementStatus, colors: &ThemeColors) ->
 }
 
 /// The rail's colour beside a statement's lines. Queued and skipped take
-/// the plain rule the buffer wears everywhere else: neither is news.
-fn rail_color(status: StatementStatus, colors: &ThemeColors) -> Hsla {
-    match status {
-        StatementStatus::Queued | StatementStatus::Skipped => colors.border,
-        StatementStatus::Running => colors.running_mark,
+/// the plain rule the buffer wears everywhere else: neither is news. A
+/// shape-changing statement's rail is teal in every state but failure,
+/// deepening as the statement goes from queued to running to landed.
+fn rail_color(kind: StatementKind, status: StatementStatus, colors: &ThemeColors) -> Hsla {
+    match (kind, status) {
+        (_, StatementStatus::Failed) => colors.error_mark,
+        (StatementKind::Ddl, StatementStatus::Queued | StatementStatus::Skipped) => {
+            colors.ddl_inner
+        }
+        (StatementKind::Ddl, StatementStatus::Running) => colors.ddl,
+        (StatementKind::Ddl, StatementStatus::Done) => colors.ddl_done,
+        (StatementKind::Plain, StatementStatus::Queued | StatementStatus::Skipped) => colors.border,
+        (StatementKind::Plain, StatementStatus::Running) => colors.running_mark,
         // The dev family's green, which the read-only mark and a commit
         // already wear: this app says "that worked" in one colour.
-        StatementStatus::Done => colors.env_dev_inner,
-        StatementStatus::Failed => colors.error_mark,
+        (StatementKind::Plain, StatementStatus::Done) => colors.env_dev_inner,
     }
+}
+
+/// The `DDL` chip on a shape-changing statement's first line: the comp's
+/// 8px cap in the family's ring colour, so the kind is named and not
+/// only coloured.
+fn ddl_chip(colors: &ThemeColors) -> Div {
+    div()
+        .flex_none()
+        .px(px(6.))
+        .py(px(3.))
+        .rounded(px(4.))
+        .bg(colors.ddl)
+        .text_size(px(8.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(colors.ddl_surface)
+        .child("DDL")
 }
 
 /// A label cut into the pieces the panel paints: each piece with whether
@@ -1951,8 +2158,10 @@ impl Element for EditorElement {
                 .get(row)
                 .map(|line| line.x_for_index(offset - layout.line_starts[row]))
                 .unwrap_or_default();
+            let mut quads = wash_quads(editor, &layout, bounds, &colors);
+            quads.extend(selection_quads(editor, &layout, bounds, colors.selection));
             (
-                selection_quads(editor, &layout, bounds, colors.selection),
+                quads,
                 cursor_quad(editor, &layout, bounds, colors.accent),
                 Some(bounds.top() + line_height * row as f32),
                 Some(bounds.left() + column),
@@ -2263,6 +2472,42 @@ fn underline_for(editor: &SqlEditor, line_start: usize, line_len: usize) -> Opti
     })
 }
 
+/// The wash behind every line of a statement that wears one, the full
+/// width of the text — so a `DROP` three lines long is one teal band and
+/// not three teal words. Painted under the selection, which stays legible
+/// over it because the two are far apart in tone.
+fn wash_quads(
+    editor: &SqlEditor,
+    layout: &EditorLayout,
+    bounds: Bounds<Pixels>,
+    colors: &ThemeColors,
+) -> Vec<PaintQuad> {
+    if editor.statements.is_empty() {
+        return Vec::new();
+    }
+    line_marks(&editor.content, &editor.statements)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(row, mark)| {
+            let mark = mark?;
+            let color = wash_color(mark.kind, mark.status, colors)?;
+            let top = bounds.top() + layout.line_height * row as f32;
+            // Past the text padding on either side, so the band meets the
+            // rail on the left and the statistic on the right.
+            Some(fill(
+                Bounds::from_corners(
+                    point(bounds.left() - px(TEXT_PADDING_X), top),
+                    point(
+                        bounds.right() + px(TEXT_PADDING_X),
+                        top + layout.line_height,
+                    ),
+                ),
+                color,
+            ))
+        })
+        .collect()
+}
+
 fn selection_quads(
     editor: &SqlEditor,
     layout: &EditorLayout,
@@ -2397,7 +2642,20 @@ mod tests {
     }
 
     fn mark(range: Range<usize>, status: StatementStatus) -> StatementMark {
-        StatementMark { range, status }
+        StatementMark {
+            range,
+            status,
+            ..StatementMark::default()
+        }
+    }
+
+    fn on(ix: usize, status: StatementStatus, first: bool) -> Option<LineMark> {
+        Some(LineMark {
+            ix,
+            status,
+            kind: StatementKind::Plain,
+            first,
+        })
     }
 
     #[test]
@@ -2411,9 +2669,9 @@ mod tests {
             line_marks(text, &marks),
             vec![
                 // The mark itself sits on the first line of each.
-                Some((StatementStatus::Done, true)),
-                Some((StatementStatus::Running, true)),
-                Some((StatementStatus::Running, false)),
+                on(0, StatementStatus::Done, true),
+                on(1, StatementStatus::Running, true),
+                on(1, StatementStatus::Running, false),
                 // The line past the last semicolon belongs to no statement.
                 None,
             ]
@@ -2427,7 +2685,7 @@ mod tests {
         let marks = [mark(0..8, StatementStatus::Done)];
         assert_eq!(
             line_marks("select 1;\nselect 2;", &marks),
-            vec![Some((StatementStatus::Done, true)), None]
+            vec![on(0, StatementStatus::Done, true), None]
         );
     }
 

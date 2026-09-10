@@ -121,6 +121,40 @@ pub struct ThemeColors {
     /// and over the clay one without a tone of its own for each.
     pub key_on_fill_surface: Hsla,
     pub key_on_fill_border: Hsla,
+    /// A statement that changes the **shape** of the database — a
+    /// `CREATE`, `ALTER`, `DROP` or `TRUNCATE` — and the report of what it
+    /// changed. The family is a cool teal, on purpose: every other tone
+    /// on the query screen is warm, and a shape change is the one event
+    /// whose answer is not on screen afterwards, so it has to read apart
+    /// from a run that merely worked. The comp calls it the DDL family.
+    /// `ddl` is the ring, the chip and the running rail; `ddl_inner` the
+    /// queued rail and the edges; `ddl_surface` the wash behind the
+    /// statement's lines and the panel; `ddl_text` the ink on that wash;
+    /// `ddl_muted` a caption on it; `ddl_gutter` and `ddl_number` the
+    /// gutter's own tint and its line numbers; `ddl_done` the rail once
+    /// the statement has landed.
+    pub ddl: Hsla,
+    pub ddl_inner: Hsla,
+    pub ddl_surface: Hsla,
+    pub ddl_text: Hsla,
+    pub ddl_muted: Hsla,
+    pub ddl_gutter: Hsla,
+    pub ddl_number: Hsla,
+    pub ddl_done: Hsla,
+    /// A column or a table the schema report says appeared: the row's
+    /// wash, the `+`, its type and the note beside it.
+    pub delta_add_surface: Hsla,
+    pub delta_add: Hsla,
+    pub delta_add_type: Hsla,
+    pub delta_add_text: Hsla,
+    /// A column or a table the report says is gone. The `−` and the name
+    /// borrow `env_prod` and `error`; only the wash and the type need
+    /// tones of their own.
+    pub delta_drop_surface: Hsla,
+    pub delta_drop_type: Hsla,
+    /// The statistic beside a statement that worked: a soft green, so the
+    /// number reads as a note rather than a badge. `ok` is the tick.
+    pub ok_muted: Hsla,
     /// Success / connected.
     pub ok: Hsla,
     /// A connection that is saved but not open: the sand dot.
@@ -195,6 +229,21 @@ impl Theme {
                 accent_muted: rgb(0xA08544).into(),
                 key_on_fill_surface: rgba(0xFFFFFF29).into(),
                 key_on_fill_border: rgba(0xFFFFFF57).into(),
+                ddl: rgb(0x4A7A6B).into(),
+                ddl_inner: rgb(0xCFE0D6).into(),
+                ddl_surface: rgb(0xF3F7F4).into(),
+                ddl_text: rgb(0x3F7263).into(),
+                ddl_muted: rgb(0x7E8C82).into(),
+                ddl_gutter: rgb(0xEEF4F0).into(),
+                ddl_number: rgb(0xA9BBB0).into(),
+                ddl_done: rgb(0x6F9C8B).into(),
+                delta_add_surface: rgb(0xE9F1E7).into(),
+                delta_add: rgb(0x4E7A44).into(),
+                delta_add_type: rgb(0x5C6B60).into(),
+                delta_add_text: rgb(0x4E6152).into(),
+                delta_drop_surface: rgb(0xFAEDE5).into(),
+                delta_drop_type: rgb(0xA0765F).into(),
+                ok_muted: rgb(0x7C9A6B).into(),
                 ok: rgb(0x5C8A4E).into(),
                 idle: rgb(0xCFC8B8).into(),
                 error: rgb(0x8E4A2A).into(),
