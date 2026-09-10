@@ -12,11 +12,12 @@
 
 use crate::blink::{Blink, Blinking};
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla,
-    IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad, Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
-    UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, size,
+    App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
+    GlobalElementId, Hsla, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString, Style,
+    TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px,
+    relative, size,
 };
 use std::ops::Range;
 use theme::theme;
@@ -960,40 +961,47 @@ impl Element for FieldElement {
             cx,
         );
 
-        if let Some(selection) = prepaint.selection.take() {
-            window.paint_quad(selection);
-        }
-
+        // The line is scrolled, not cut: a value wider than the field is
+        // shaped whole and painted from `-scroll`, so without a mask the
+        // part past either edge lands on the padding and the border. GPUI
+        // clips nothing by itself, so the element clips to its own bounds
+        // here — the wrapping `div` cannot, because its box includes the
+        // padding the text must not reach.
         let line = prepaint.line.clone();
         let origin = point(bounds.left() - prepaint.scroll, bounds.top());
-        line.paint(
-            origin,
-            bounds.size.height,
-            gpui::TextAlign::Left,
-            None,
-            window,
-            cx,
-        )
-        .ok();
+        let focused = focus_handle.is_focused(window);
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            if let Some(selection) = prepaint.selection.take() {
+                window.paint_quad(selection);
+            }
 
-        if let Some((ghost, at)) = prepaint.ghost.take() {
-            ghost
-                .paint(
-                    point(origin.x + at, origin.y),
-                    bounds.size.height,
-                    gpui::TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                )
-                .ok();
-        }
+            line.paint(
+                origin,
+                bounds.size.height,
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            )
+            .ok();
 
-        if focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
-        }
+            if let Some((ghost, at)) = prepaint.ghost.take() {
+                ghost
+                    .paint(
+                        point(origin.x + at, origin.y),
+                        bounds.size.height,
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    )
+                    .ok();
+            }
+
+            if focused && let Some(cursor) = prepaint.cursor.take() {
+                window.paint_quad(cursor);
+            }
+        });
 
         let scroll = prepaint.scroll;
         self.field.update(cx, |field, _| {
