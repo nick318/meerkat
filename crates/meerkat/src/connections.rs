@@ -50,9 +50,9 @@ use chrono::Local;
 use db_client::{Connection, Engine, Profile};
 use db_postgres::{Password, PostgresConnection};
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Context, Div, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, KeyBinding, SharedString, Stateful, Subscription, Window,
-    actions, div, prelude::*, px,
+    Animation, AnimationExt, AnyElement, App, BoxShadow, Context, Div, ElementId, Entity,
+    EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, SharedString, Stateful,
+    Subscription, Window, actions, div, prelude::*, px,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage::{SavedConnection, Store};
@@ -62,17 +62,26 @@ use ui::{
     toolbar_button, toolbar_button_bare,
 };
 
-/// The comp's reading column: the list never stretches over a wide window.
-const COLUMN_WIDTH: f32 = 900.;
-/// Empty on a row that is up, so it costs nothing until a probe fails
-/// and needs the room for the error.
-const STATUS_WIDTH: f32 = 200.;
+/// The reading column: the list never stretches over a wide window. The
+/// comp draws it at 900, which left the NAME lane a hundred pixels wide
+/// once the four fixed lanes had taken theirs, and a name that truncates
+/// on a 1,400-pixel window is a column that is too narrow rather than a
+/// name that is too long. 1,200 gives the name lane the room and still
+/// reads as a column, not a stretch.
+const COLUMN_WIDTH: f32 = 1200.;
 const MODE_WIDTH: f32 = 130.;
-const HOST_WIDTH: f32 = 230.;
+/// The name is a word or two the user chose, so it takes a fixed lane; the
+/// URL is the long one, so it is the lane that flexes with the column.
+const NAME_WIDTH: f32 = 220.;
 const LAST_WIDTH: f32 = 80.;
 /// The search line sits beside the section label, so it takes a fixed
 /// share of that row rather than all of it.
 const SEARCH_WIDTH: f32 = 300.;
+/// The connection form's card. It floats over the list rather than
+/// sitting in it, so it has a width of its own instead of the column's:
+/// two fields a row is what the form reads as, and 640 holds a URL
+/// beside its name without either one truncating.
+const FORM_WIDTH: f32 = 640.;
 /// The width the form's "test" button holds whatever it says. The label
 /// changes while a test is out — "test" is 4 characters and "testing…" is
 /// 8 — and a button that resized around its own word would move the URL
@@ -901,6 +910,9 @@ impl Render for Connections {
             // where the updater is read, and the card is the one thing it
             // ever announces.
             .children(crate::update::toast(&colors, px(40.), cx))
+            // The form is painted last, so it covers the toast: a restart
+            // must not be on offer over a password field.
+            .children(self.form_overlay(&colors, cx))
     }
 }
 
@@ -991,7 +1003,7 @@ impl Connections {
         }
         card = card.child(self.footer(colors, cx));
 
-        let mut list = div()
+        div()
             .flex()
             .flex_col()
             .gap(px(9.))
@@ -1014,12 +1026,7 @@ impl Connections {
                             .child(self.search_line(colors, window, cx)),
                     ),
             )
-            .child(card);
-
-        if let Some(form) = &self.form {
-            list = list.child(self.form_card(form, colors, cx));
-        }
-        list
+            .child(card)
     }
 
     /// The bar over the list. It serves the selected row — connect, edit,
@@ -1234,14 +1241,8 @@ impl Connections {
             .border_b_1()
             .border_color(colors.border_strong)
             .child(div().w(px(9.)).flex_none())
-            .child(div().flex_1().min_w(px(0.)).child(heading("NAME")))
-            .child(div().w(px(HOST_WIDTH)).flex_none().child(heading("HOST")))
-            .child(
-                div()
-                    .w(px(STATUS_WIDTH))
-                    .flex_none()
-                    .child(heading("STATUS")),
-            )
+            .child(div().w(px(NAME_WIDTH)).flex_none().child(heading("NAME")))
+            .child(div().flex_1().min_w(px(0.)).child(heading("HOST")))
             .child(div().w(px(MODE_WIDTH)).flex_none().child(heading("MODE")))
             .child(
                 div()
@@ -1342,29 +1343,23 @@ impl Connections {
 
         // Failure recolours the row's text, the way the comp does: warm
         // ink over the shared surface, no surface of its own.
-        let (name_color, url_color, meta_color, dot) = match &row.state {
-            Probe::Ready { .. } => (colors.text, colors.text_muted, colors.text_muted, colors.ok),
-            Probe::Idle | Probe::Probing => (
-                colors.text,
-                colors.text_muted,
-                colors.text_muted,
-                colors.idle,
-            ),
-            Probe::Failed(_) => (
-                colors.error,
-                colors.error_secondary,
-                colors.error_secondary,
-                colors.error_mark,
-            ),
+        let (name_color, url_color, dot) = match &row.state {
+            Probe::Ready { .. } => (colors.text, colors.text_muted, colors.ok),
+            Probe::Idle | Probe::Probing => (colors.text, colors.text_muted, colors.idle),
+            Probe::Failed(_) => (colors.error, colors.error_secondary, colors.error_mark),
         };
 
-        // A row that is up says nothing here: the name and the URL are
-        // what identify a connection, and everything else is noise until
-        // something goes wrong.
-        let status = match &row.state {
-            Probe::Ready { .. } | Probe::Idle => String::new(),
-            Probe::Probing => "connecting…".to_string(),
-            Probe::Failed(error) => first_line(error),
+        // There is no status column: a row that is up has nothing to say
+        // beyond its name and its URL, and a 200-pixel lane that is empty
+        // on every healthy row is room taken from the name. So the two
+        // states that do have something to say borrow a lane. A failure
+        // takes the HOST lane — the URL is the thing that failed, the row
+        // is already in the error's ink, and the bar over the list repeats
+        // the URL once the row is selected — and "connecting…" takes the
+        // MODE lane for the moment the probe is out.
+        let host = match &row.state {
+            Probe::Failed(error) => SharedString::from(first_line(error)),
+            _ => profile_url(&row.saved.profile),
         };
 
         let word = mode_word(&row.saved.profile);
@@ -1373,14 +1368,15 @@ impl Connections {
                 format!("{word} · {server}")
             }
             Probe::Ready { .. } => word.to_string(),
-            Probe::Idle | Probe::Probing => row
+            Probe::Probing => "connecting…".to_string(),
+            Probe::Idle => row
                 .saved
                 .server
                 .clone()
                 .map(|server| format!("{word} · {server}"))
                 .unwrap_or_else(|| word.to_string()),
-            // The failure itself is in the status column; the mode of a
-            // row that is down is not worth a word.
+            // The failure is in the HOST lane; the mode of a row that is
+            // down is not worth a word.
             Probe::Failed(_) => String::new(),
         };
 
@@ -1431,8 +1427,8 @@ impl Connections {
         card.child(div().w(px(9.)).flex_none().child(status_dot_of(dot)))
             .child(
                 div()
-                    .flex_1()
-                    .min_w(px(0.))
+                    .w(px(NAME_WIDTH))
+                    .flex_none()
                     .text_size(px(12.))
                     .font_weight(if selected {
                         FontWeight::MEDIUM
@@ -1445,21 +1441,12 @@ impl Connections {
             )
             .child(
                 div()
-                    .w(px(HOST_WIDTH))
-                    .flex_none()
+                    .flex_1()
+                    .min_w(px(0.))
                     .text_size(px(11.))
                     .text_color(url_color)
                     .truncate()
-                    .child(profile_url(&row.saved.profile)),
-            )
-            .child(
-                div()
-                    .w(px(STATUS_WIDTH))
-                    .flex_none()
-                    .text_size(px(11.))
-                    .text_color(meta_color)
-                    .truncate()
-                    .child(status),
+                    .child(host),
             )
             .child(
                 div()
@@ -1703,7 +1690,43 @@ impl Connections {
         .into_any_element()
     }
 
-    fn form_card(&self, form: &Form, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
+    /// The connection form, as a modal over the list. It was a card at the
+    /// foot of the list, and that put it wherever the list ended — below
+    /// the fold on a long list, and beside the rows it was about to change
+    /// on a short one. A form is a question with one answer, and a modal
+    /// is what says nothing else on the screen answers until it is done.
+    ///
+    /// It is the shell's dialog pattern: an absolutely positioned child of
+    /// the screen, never a window of its own, so closing it hands the focus
+    /// straight back to the list. The scrim does **not** dismiss on a
+    /// click, as the close dialog's does not: four fields of typed text and
+    /// a password are what a stray click would throw away. ⎋ and "cancel"
+    /// are the ways out.
+    fn form_overlay(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let form = self.form.as_ref()?;
+        Some(
+            div()
+                .id("connection-form-scrim")
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .size_full()
+                .flex()
+                .justify_center()
+                .items_center()
+                .p(px(24.))
+                .bg(colors.overlay)
+                .occlude()
+                .child(self.form_card(form, colors, cx)),
+        )
+    }
+
+    fn form_card(
+        &self,
+        form: &Form,
+        colors: &ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let label = |text: &'static str| {
             div()
                 .text_size(px(10.))
@@ -1713,14 +1736,26 @@ impl Connections {
         let editing = form.editing.is_some();
 
         div()
+            .id("connection-form")
+            .occlude()
+            .w(px(FORM_WIDTH))
+            .max_w_full()
+            // A short window scrolls the card rather than clipping it.
+            .max_h_full()
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap(px(10.))
-            .p(px(16.))
+            .p(px(18.))
             .border_1()
             .border_color(colors.border_strong)
-            .rounded(px(8.))
-            .bg(colors.panel)
+            .rounded(px(10.))
+            .bg(colors.elevated)
+            .shadow(vec![
+                BoxShadow::new(px(0.), px(24.), colors.shadow)
+                    .blur_radius(px(60.))
+                    .spread_radius(px(-20.)),
+            ])
             .child(section_label(
                 if editing { "EDIT CONNECTION" } else { "NEW CONNECTION" },
                 cx,
@@ -1815,6 +1850,11 @@ impl Connections {
                     .child(
                         div()
                             .flex_1()
+                            // A flex child's floor is its content's width,
+                            // and this line is longer than the card leaves
+                            // it, so without the floor taken away it pushes
+                            // "save" out of the card. It wraps instead.
+                            .min_w(px(0.))
                             .text_size(px(10.))
                             .text_color(colors.text_faint)
                             // Say where the password goes before it is typed,
@@ -1828,6 +1868,7 @@ impl Connections {
                     .child(
                         div()
                             .id("cancel-connection")
+                            .flex_none()
                             .px(px(10.))
                             .py(px(5.))
                             .text_size(px(11.))
@@ -1841,6 +1882,7 @@ impl Connections {
                     )
                     .child(
                         accent_button("save ⏎", cx)
+                            .flex_none()
                             .id("save-connection")
                             .on_click(
                                 cx.listener(|this, _event, window, cx| this.save_form(window, cx)),
