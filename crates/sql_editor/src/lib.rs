@@ -224,8 +224,8 @@ pub enum StatementStatus {
     Skipped,
 }
 
-/// What kind of statement a mark is on, for the one kind that is painted
-/// apart from the rest.
+/// What kind of statement a line belongs to, for the one kind that is
+/// painted apart from the rest.
 ///
 /// A `CREATE`, `ALTER`, `DROP` or `TRUNCATE` changes something the user is
 /// looking at elsewhere — the sidebar, the next query's columns — and
@@ -233,7 +233,13 @@ pub enum StatementStatus {
 /// effect is invisible from the result pane. The comp gives it a cool teal
 /// family of its own against the warm paper, a `DDL` chip on its first
 /// line, and a wash over every line it covers, so the statement that
-/// changed the shape of the database reads as such from across the pane.
+/// changes the shape of the database reads as such from across the pane.
+///
+/// **It is read off the buffer, not off a run.** The kind is a property of
+/// the text — `query::ddl_verb` over `query::statement_ranges` — so a
+/// pasted script wears the family the moment it lands, before anything is
+/// sent, and the teal is a warning as much as a report. The run's marks
+/// are laid over it; they never decide it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StatementKind {
     #[default]
@@ -246,7 +252,6 @@ pub enum StatementKind {
 pub struct StatementMark {
     pub range: Range<usize>,
     pub status: StatementStatus,
-    pub kind: StatementKind,
     /// The statistic beside the statement, on its first line and at the
     /// right of the pane: `6 rows · 34 ms`, `1,204 rows deleted · 61 ms`,
     /// `altered · 12 ms`, `failed · 8 ms`, `not run · statement 3 failed`.
@@ -433,24 +438,34 @@ impl SqlEditor {
 
     /// Take the statements a run is about to send, all of them queued.
     /// `offset` is where the run's text starts in the buffer, so the
-    /// ranges are the buffer's own. Each comes with its kind, which the
-    /// caller reads off the text: the editor paints and does not parse.
+    /// ranges are the buffer's own.
     pub fn set_statements(
         &mut self,
-        statements: Vec<(Range<usize>, StatementKind)>,
+        ranges: Vec<Range<usize>>,
         offset: usize,
         cx: &mut Context<Self>,
     ) {
-        self.statements = statements
+        self.statements = ranges
             .into_iter()
-            .map(|(range, kind)| StatementMark {
+            .map(|range| StatementMark {
                 range: offset + range.start..offset + range.end,
                 status: StatementStatus::Queued,
-                kind,
                 meta: "queued".into(),
             })
             .collect();
         cx.notify();
+    }
+
+    /// Where the shape-changing statements of the buffer are, read off the
+    /// text as it is now. Worked out per frame rather than kept, because
+    /// the buffer changes under every keystroke and a kept answer would be
+    /// one edit stale exactly when it is looked at; it costs one walk over
+    /// the text, which `line_count` and `widest_line` already pay.
+    fn shape(&self) -> Vec<Range<usize>> {
+        query::statement_ranges(&self.content)
+            .into_iter()
+            .filter(|range| query::ddl_verb(&self.content[range.clone()]).is_some())
+            .collect()
     }
 
     /// Say how the statement at `ix` ended, and what to write beside it.
@@ -551,9 +566,11 @@ impl SqlEditor {
     fn statistics_column(
         &self,
         line_marks: &[Option<LineMark>],
+        shape_lines: &[Option<bool>],
         colors: &ThemeColors,
     ) -> Option<Div> {
-        if self.statements.is_empty() {
+        // Nothing run and nothing shape-changing in the buffer: no column.
+        if self.statements.is_empty() && shape_lines.iter().all(Option::is_none) {
             return None;
         }
         Some(
@@ -564,7 +581,9 @@ impl SqlEditor {
                 .flex()
                 .flex_col()
                 .items_end()
-                .children(line_marks.iter().map(|on_line| {
+                .children(line_marks.iter().enumerate().map(|(row_ix, on_line)| {
+                    let kind = kind_at(shape_lines, row_ix);
+                    let first_ddl = shape_lines.get(row_ix).copied().flatten() == Some(true);
                     let row = div()
                         .h(px(LINE_HEIGHT))
                         .w_full()
@@ -574,35 +593,33 @@ impl SqlEditor {
                         .gap(px(10.))
                         .pl(px(16.))
                         .pr(px(12.));
-                    let Some(mark) = on_line else {
-                        return row;
-                    };
                     // The wash reaches under the statistic too, so the
                     // statement's lines read as one band from the rail to
-                    // the pane's edge.
-                    let row = match wash_color(mark.kind, mark.status, colors) {
-                        Some(color) => row.bg(color),
-                        None => row,
+                    // the pane's edge. A shape-changing statement wears it
+                    // before it is run, in the queued state.
+                    let status = on_line
+                        .map(|mark| mark.status)
+                        .unwrap_or(StatementStatus::Queued);
+                    let row = match wash_color(kind, status, colors) {
+                        Some(color) if on_line.is_some() || kind == StatementKind::Ddl => {
+                            row.bg(color)
+                        }
+                        _ => row,
                     };
-                    if !mark.first {
-                        return row;
-                    }
-                    let meta = self
-                        .statements
-                        .get(mark.ix)
+                    let meta = on_line
+                        .filter(|mark| mark.first)
+                        .and_then(|mark| self.statements.get(mark.ix))
                         .map(|statement| statement.meta.clone())
                         .filter(|meta| !meta.is_empty());
-                    row.when(mark.kind == StatementKind::Ddl, |row| {
-                        row.child(ddl_chip(colors))
-                    })
-                    .children(meta.map(|meta| {
-                        div()
-                            .flex_none()
-                            .whitespace_nowrap()
-                            .text_size(px(10.))
-                            .text_color(meta_color(mark.kind, mark.status, colors))
-                            .child(meta)
-                    }))
+                    row.when(first_ddl, |row| row.child(ddl_chip(colors)))
+                        .children(meta.map(|meta| {
+                            div()
+                                .flex_none()
+                                .whitespace_nowrap()
+                                .text_size(px(10.))
+                                .text_color(meta_color(kind, status, colors))
+                                .child(meta)
+                        }))
                 })),
         )
     }
@@ -1436,6 +1453,7 @@ impl Render for SqlEditor {
         self.track_blink_focus(self.focus_handle.is_focused(window), cx);
         let line_count = self.line_count();
         let line_marks = line_marks(&self.content, &self.statements);
+        let shape_lines = line_shape(&self.content, &self.shape());
         // How wide the text is, and so how far there is to scroll. The
         // element inside fills this box; the box is what the scroll
         // container measures.
@@ -1568,8 +1586,7 @@ impl Render for SqlEditor {
                                 // statement takes the family's own tint,
                                 // as the comp's does, so the teal reads
                                 // from the numbers to the far edge.
-                                let ddl =
-                                    on_line.is_some_and(|mark| mark.kind == StatementKind::Ddl);
+                                let ddl = kind_at(&shape_lines, n - 1) == StatementKind::Ddl;
                                 div()
                                     .h(px(LINE_HEIGHT))
                                     .flex()
@@ -1611,14 +1628,21 @@ impl Render for SqlEditor {
                             .flex()
                             .flex_col()
                             .children((0..line_count).map(|row| {
-                                let rail = line_marks
+                                let kind = kind_at(&shape_lines, row);
+                                // A shape-changing statement nobody has
+                                // run yet already wears its rail, in the
+                                // queued tone: the teal is what says
+                                // "this one changes things" before ⌘⏎.
+                                let status = line_marks
                                     .get(row)
                                     .copied()
                                     .flatten()
-                                    .map(|mark| rail_color(mark.kind, mark.status, &colors));
+                                    .map(|mark| mark.status)
+                                    .or((kind == StatementKind::Ddl)
+                                        .then_some(StatementStatus::Queued));
                                 let line = div().h(px(LINE_HEIGHT));
-                                match rail {
-                                    Some(color) => line.bg(color),
+                                match status {
+                                    Some(status) => line.bg(rail_color(kind, status, &colors)),
                                     None => line,
                                 }
                             })),
@@ -1655,7 +1679,7 @@ impl Render for SqlEditor {
                                     }),
                             ),
                     )
-                    .children(self.statistics_column(&line_marks, &colors)),
+                    .children(self.statistics_column(&line_marks, &shape_lines, &colors)),
             )
             // The bars are painted outside the containers they drive, or
             // they would scroll away with the text. Both appear only when
@@ -1796,8 +1820,35 @@ struct LineMark {
     /// back off the mark.
     ix: usize,
     status: StatementStatus,
-    kind: StatementKind,
     first: bool,
+}
+
+/// Which lines the buffer's shape-changing statements cover, and on which
+/// of them each starts — `Some(true)` on the first line, `Some(false)` on
+/// the rest, `None` on a line no such statement covers. Read off the text
+/// alone, so it is right before a run and after an edit alike.
+fn line_shape(content: &str, shape: &[Range<usize>]) -> Vec<Option<bool>> {
+    let mut lines = vec![None; content.split('\n').count()];
+    if shape.is_empty() {
+        return lines;
+    }
+    let mut starts = vec![0usize];
+    starts.extend(content.match_indices('\n').map(|(ix, _)| ix + 1));
+    for range in shape {
+        let first = row_for_offset(&starts, range.start);
+        let last = row_for_offset(&starts, range.end.saturating_sub(1)).max(first);
+        for row in first..=last.min(lines.len().saturating_sub(1)) {
+            lines[row] = Some(row == first);
+        }
+    }
+    lines
+}
+
+fn kind_at(shape_lines: &[Option<bool>], row: usize) -> StatementKind {
+    match shape_lines.get(row).copied().flatten() {
+        Some(_) => StatementKind::Ddl,
+        None => StatementKind::Plain,
+    }
 }
 
 /// What each line of `content` wears in the gutter.
@@ -1821,7 +1872,6 @@ fn line_marks(content: &str, statements: &[StatementMark]) -> Vec<Option<LineMar
             marks[row] = Some(LineMark {
                 ix,
                 status: statement.status,
-                kind: statement.kind,
                 first: row == first,
             });
         }
@@ -2482,15 +2532,23 @@ fn wash_quads(
     bounds: Bounds<Pixels>,
     colors: &ThemeColors,
 ) -> Vec<PaintQuad> {
-    if editor.statements.is_empty() {
+    let shape_lines = line_shape(&editor.content, &editor.shape());
+    if editor.statements.is_empty() && shape_lines.iter().all(Option::is_none) {
         return Vec::new();
     }
     line_marks(&editor.content, &editor.statements)
         .into_iter()
         .enumerate()
         .filter_map(|(row, mark)| {
-            let mark = mark?;
-            let color = wash_color(mark.kind, mark.status, colors)?;
+            let kind = kind_at(&shape_lines, row);
+            // A shape-changing statement is washed before any run, in the
+            // queued state; a plain one only once a run has marked it.
+            let status = match (mark, kind) {
+                (Some(mark), _) => mark.status,
+                (None, StatementKind::Ddl) => StatementStatus::Queued,
+                (None, StatementKind::Plain) => return None,
+            };
+            let color = wash_color(kind, status, colors)?;
             let top = bounds.top() + layout.line_height * row as f32;
             // Past the text padding on either side, so the band meets the
             // rail on the left and the statistic on the right.
@@ -2650,12 +2708,32 @@ mod tests {
     }
 
     fn on(ix: usize, status: StatementStatus, first: bool) -> Option<LineMark> {
-        Some(LineMark {
-            ix,
-            status,
-            kind: StatementKind::Plain,
-            first,
-        })
+        Some(LineMark { ix, status, first })
+    }
+
+    /// The teal is read off the text, before any run: a pasted script
+    /// shows which of its statements change the shape of the database the
+    /// moment it lands.
+    #[test]
+    fn shape_changing_statements_are_found_in_the_buffer_before_a_run() {
+        let text = "select 1;\nalter table t\n  add c int;\ndrop table u;\n";
+        let editor_shape: Vec<Range<usize>> = query::statement_ranges(text)
+            .into_iter()
+            .filter(|range| query::ddl_verb(&text[range.clone()]).is_some())
+            .collect();
+        assert_eq!(editor_shape.len(), 2);
+        assert_eq!(
+            line_shape(text, &editor_shape),
+            vec![None, Some(true), Some(false), Some(true), None]
+        );
+        assert_eq!(
+            kind_at(&line_shape(text, &editor_shape), 0),
+            StatementKind::Plain
+        );
+        assert_eq!(
+            kind_at(&line_shape(text, &editor_shape), 2),
+            StatementKind::Ddl
+        );
     }
 
     #[test]

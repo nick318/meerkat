@@ -27,9 +27,7 @@ use query::{CommandVerb, DdlVerb, TxVerb};
 use results_grid::{
     Cell, Extent, Grid, GridData, GridState, Hit, Selection, Step, clipboard_text, find_columns,
 };
-use sql_editor::{
-    Diagnostic, Kind, Name, SqlEditor, SqlEditorEvent, StatementKind, StatementStatus, Vocabulary,
-};
+use sql_editor::{Diagnostic, Kind, Name, SqlEditor, SqlEditorEvent, StatementStatus, Vocabulary};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
@@ -2271,20 +2269,9 @@ impl Shell {
         }
         // Every statement queued, none of them sent. The gutter says so
         // from the moment ⌘⏎ lands, so a slow first statement is a run the
-        // user can already see the shape of. Each carries its kind, read
-        // off the text here: the editor paints and does not parse.
-        let marked = ranges
-            .into_iter()
-            .map(|range| {
-                let kind = match query::ddl_verb(&sql[range.clone()]) {
-                    Some(_) => StatementKind::Ddl,
-                    None => StatementKind::Plain,
-                };
-                (range, kind)
-            })
-            .collect();
+        // user can already see the shape of.
         tab.editor
-            .update(cx, |editor, cx| editor.set_statements(marked, offset, cx));
+            .update(cx, |editor, cx| editor.set_statements(ranges, offset, cx));
 
         let recorded = sql;
         // The buffer has been edited since the tab was opened, and this is

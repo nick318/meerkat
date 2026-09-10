@@ -944,15 +944,23 @@ the app goes and looks at what it did.
 `query::ddl_verb` reads the verb, in `command_verb`'s spirit and with its
 economy: the first word past the comments, no parsing, and being wrong is
 cheap — a missed verb costs a statement painted plain and a sidebar
-refreshed one run late. `sql_editor::StatementKind` carries it to the
-editor, which paints and does not parse. The kind wears the comp's **DDL
-family**, a cool teal against the warm paper (`theme::ddl*`): a `DDL` chip
-on the statement's first line, a wash over every line it covers — painted
-by `wash_quads` under the text, so a three-line `ALTER` is one band and
-not three teal words — the gutter's own tint, and a rail that deepens from
-`ddl_inner` through `ddl` to `ddl_done` as the statement goes from queued
-to running to landed. A failure takes the error's surface in either kind:
-a `DROP` the server refused changed nothing, and teal would say it did.
+refreshed one run late. **The editor reads it off its own buffer, before
+any run**: `SqlEditor::shape` walks `query::statement_ranges` over the
+text on every frame, so a pasted script shows which of its statements
+change the shape of the database the moment it lands, and the teal is a
+warning as much as a report. It is worked out per frame rather than kept
+because the buffer changes under every keystroke and `edited` runs before
+the text does; it costs one walk the render already pays twice. The run's
+marks are laid over that — they never decide the kind — and
+`sql_editor::StatementKind` is the answer per line. The kind wears the
+comp's **DDL family**, a cool teal against the warm paper (`theme::ddl*`):
+a `DDL` chip on the statement's first line, a wash over every line it
+covers — painted by `wash_quads` under the text, so a three-line `ALTER`
+is one band and not three teal words — the gutter's own tint, and a rail
+that deepens from `ddl_inner` through `ddl` to `ddl_done` as the statement
+goes from queued to running to landed. Before a run it wears the queued
+tone. A failure takes the error's surface in either kind: a `DROP` the
+server refused changed nothing, and teal would say it did.
 
 **Every statement now carries its own statistic, at the right of the
 pane.** The result line answers for the run; the column of numbers beside
