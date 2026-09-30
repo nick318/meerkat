@@ -821,15 +821,10 @@ struct QueryTab {
     /// and a tab is one connection. A tab opens on auto and the toolbar's
     /// two chips switch it; the mode is remembered per tab in `open_tabs`.
     tx_mode: TxMode,
-    /// How many statements have run inside the transaction that is open.
-    tx_statements: usize,
-    /// How many rows those statements changed, as the server counted them.
-    ///
-    /// The bar says this beside the statement count, because "what have I
-    /// touched that nobody else can see yet" is the question an open
-    /// transaction raises. It counts only the statements that answered with
-    /// a count: a `SELECT` inside the transaction changed nothing.
-    tx_affected: u64,
+    /// What has landed inside the transaction that is open: the
+    /// statements, and the rows they changed. One value rather than two
+    /// fields, so every way a transaction ends forgets both at once.
+    tx_tally: TxTally,
     /// How the last transaction ended, until the next run or the next
     /// change of mode. The bar goes on saying so for a moment, because
     /// "committed" is the answer to the question the user just asked and a
@@ -2148,8 +2143,7 @@ impl Shell {
             // A tab opens on auto, whatever connection it is on: the mode
             // is the tab's own, and the toolbar is where it is switched.
             tx_mode: TxMode::default(),
-            tx_statements: 0,
-            tx_affected: 0,
+            tx_tally: TxTally::default(),
             tx_done: None,
             tx_ending: false,
             last_used: Instant::now(),
@@ -2413,11 +2407,9 @@ impl Shell {
                             None => {}
                         }
                         if tab.in_transaction {
-                            tab.tx_statements += plain_statements;
-                            tab.tx_affected += affected;
+                            tab.tx_tally.add(plain_statements, affected);
                         } else {
-                            tab.tx_statements = 0;
-                            tab.tx_affected = 0;
+                            tab.tx_tally = TxTally::default();
                         }
                         Outcome {
                             elapsed: Some(elapsed_ms),
@@ -2665,7 +2657,7 @@ impl Shell {
                     // a statement the app did not recognise may have ended
                     // the transaction, and a stale count would outlive it.
                     if !open {
-                        tab.tx_statements = 0;
+                        tab.tx_tally = TxTally::default();
                     }
                     cx.notify();
                 }
@@ -2754,7 +2746,7 @@ impl Shell {
                 match &outcome {
                     Ok(()) => {
                         tab.in_transaction = false;
-                        tab.tx_statements = 0;
+                        tab.tx_tally = TxTally::default();
                         tab.tx_done = Some(how);
                         // A shape change the transaction held is decided
                         // with it: permanent, and the sidebar's to show, or
@@ -6705,8 +6697,8 @@ impl Shell {
             mode: tab.tx_mode,
             open: tab.in_transaction,
             done: tab.tx_done,
-            statements: tab.tx_statements,
-            affected: tab.tx_affected,
+            statements: tab.tx_tally.statements,
+            affected: tab.tx_tally.affected,
             running: tab.run.in_flight(),
             ending: tab.tx_ending,
         };
@@ -8753,6 +8745,35 @@ fn needs_begin(mode: TxMode, in_transaction: bool, first: Option<TxVerb>) -> boo
     mode == TxMode::Manual && !in_transaction && first != Some(TxVerb::Begin)
 }
 
+/// What has landed inside the open transaction.
+///
+/// The two counts live and die together. They were two fields once, and
+/// the button's commit or rollback reset the statements and forgot the
+/// rows, so the next transaction started with the last one's rows already
+/// in it: an `UPDATE` rolled back and run again read as twice the rows.
+/// A transaction that ends puts back `TxTally::default()`, which cannot
+/// forget half of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TxTally {
+    /// Statements that are not boundaries.
+    statements: usize,
+    /// Rows those statements changed, as the server counted them.
+    ///
+    /// The bar says this beside the statement count, because "what have I
+    /// touched that nobody else can see yet" is the question an open
+    /// transaction raises. It counts only the statements that answered with
+    /// a count: a `SELECT` inside the transaction changed nothing.
+    affected: u64,
+}
+
+impl TxTally {
+    /// Count one run's statements into the transaction it landed in.
+    fn add(&mut self, statements: usize, affected: u64) {
+        self.statements += statements;
+        self.affected += affected;
+    }
+}
+
 /// Everything the transaction bar reads, as plain values.
 ///
 /// Kept apart from the tab so the wording below is a function of numbers
@@ -9804,6 +9825,27 @@ mod tests {
         // Nothing touched, nothing said about rows.
         let (_, sub) = tx_copy(state(2, 0)).unwrap();
         assert!(sub.starts_with("2 statements · nothing visible"), "{sub}");
+    }
+
+    /// A transaction that ends forgets what it held, rows and statements
+    /// alike. Before, a rollback reset the statement count and kept the
+    /// rows, so an `UPDATE` of 3 rows rolled back and run again said 6.
+    #[test]
+    fn a_rolled_back_transaction_leaves_no_rows_behind() {
+        let mut tally = TxTally::default();
+        tally.add(1, 3);
+        assert_eq!(
+            tally,
+            TxTally {
+                statements: 1,
+                affected: 3
+            }
+        );
+        // What `end_transaction` and `refresh_transaction` put back.
+        tally = TxTally::default();
+        tally.add(1, 3);
+        assert_eq!(tally.affected, 3);
+        assert_eq!(tally.statements, 1);
     }
 
     /// The bar is painted for a transaction the *user* opened as well, in
