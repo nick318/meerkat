@@ -6,7 +6,7 @@ use db_client::{
     Connection, Limits, QueryResult, Result, RowChange, RowSink, RunId, Session, TxEnd, Value,
 };
 use futures::TryStreamExt as _;
-use introspect::{Catalog, Column, Schema, Table, TableKind};
+use introspect::{Catalog, Column, ForeignKey, Index, Schema, Table, TableKind, Trigger};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqliteRow};
 use sqlx::{Column as _, Either, Executor as _, Row as _, TypeInfo as _, ValueRef as _};
 use std::path::Path;
@@ -152,6 +152,159 @@ impl Drop for SqliteSession {
     }
 }
 
+/// The per-table reads `introspect` makes beside `pragma_table_info`.
+impl SqliteConnection {
+    /// A table's indexes, the implicit ones a `UNIQUE` or a `PRIMARY KEY`
+    /// makes among them. `origin` says which: `pk`, `u`, or `c` for one
+    /// made with `CREATE INDEX`.
+    async fn indexes(&self, table: &str) -> Result<Vec<Index>> {
+        let list: Vec<(String, i64, String, i64)> = sqlx::query_as(
+            "SELECT name, \"unique\", origin, partial FROM pragma_index_list(?1) ORDER BY name",
+        )
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut indexes = Vec::with_capacity(list.len());
+        for (name, unique, origin, partial) in list {
+            // A key over an expression names no column, and reads `NULL`.
+            let columns: Vec<(Option<String>,)> =
+                sqlx::query_as("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+                    .bind(&name)
+                    .fetch_all(&self.pool)
+                    .await?;
+            let key: Vec<String> = columns
+                .into_iter()
+                .map(|(column,)| column.unwrap_or_else(|| "<expression>".to_string()))
+                .collect();
+            let mut definition = format!("({})", key.join(", "));
+            if partial != 0 {
+                definition.push_str(" WHERE …");
+            }
+            indexes.push(Index {
+                name,
+                definition,
+                unique: unique != 0,
+                primary: origin == "pk",
+            });
+        }
+        Ok(indexes)
+    }
+
+    /// A table's foreign keys. SQLite names none of them, so each is
+    /// named the way Postgres would have named it: `orders_user_id_fkey`,
+    /// and `orders_user_id_fkey1` for a second key over the same columns,
+    /// which Postgres would have named that way too.
+    async fn foreign_keys(&self, table: &str) -> Result<Vec<ForeignKey>> {
+        let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, \"table\", \"from\", \"to\" FROM pragma_foreign_key_list(?1) \
+             ORDER BY id, seq",
+        )
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut keys: Vec<(i64, ForeignKey)> = Vec::new();
+        for (id, target, from, to) in rows {
+            if keys.last().is_none_or(|(last, _)| *last != id) {
+                keys.push((
+                    id,
+                    ForeignKey {
+                        name: String::new(),
+                        columns: Vec::new(),
+                        target_schema: "main".to_string(),
+                        target_table: target,
+                        target_columns: Vec::new(),
+                    },
+                ));
+            }
+            let (_, key) = keys.last_mut().expect("pushed above");
+            key.columns.push(from);
+            if let Some(to) = to {
+                key.target_columns.push(to);
+            }
+        }
+        let mut named: Vec<ForeignKey> = Vec::with_capacity(keys.len());
+        for (_, mut key) in keys {
+            // No `to` means the key names the target's primary key, which
+            // is where the columns have to be read from.
+            if key.target_columns.len() != key.columns.len() {
+                let primary: Vec<(String,)> = sqlx::query_as(
+                    "SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk",
+                )
+                .bind(&key.target_table)
+                .fetch_all(&self.pool)
+                .await?;
+                key.target_columns = primary.into_iter().map(|(name,)| name).collect();
+            }
+            let base = format!("{table}_{}_fkey", key.columns.join("_"));
+            let mut name = base.clone();
+            let mut n = 0;
+            while named.iter().any(|other| other.name == name) {
+                n += 1;
+                name = format!("{base}{n}");
+            }
+            key.name = name;
+            named.push(key);
+        }
+        Ok(named)
+    }
+
+    async fn triggers(&self, table: &str) -> Result<Vec<Trigger>> {
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT name, sql FROM sqlite_master \
+             WHERE type = 'trigger' AND tbl_name = ?1 ORDER BY name",
+        )
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, sql)| Trigger {
+                name,
+                timing: sql.as_deref().map(trigger_timing).unwrap_or_default(),
+                // The body is inline in the trigger, not a function.
+                function: String::new(),
+            })
+            .collect())
+    }
+}
+
+/// When a trigger fires, read off its own `CREATE TRIGGER`: the words
+/// between its name and `ON`, lowercased — `before insert`, `after update
+/// of email`. SQLite keeps nothing else to read it from, and a statement
+/// this walk cannot follow says nothing rather than something wrong.
+fn trigger_timing(sql: &str) -> String {
+    let words: Vec<&str> = sql.split_whitespace().collect();
+    let Some(at) = words
+        .iter()
+        .position(|word| word.eq_ignore_ascii_case("trigger"))
+    else {
+        return String::new();
+    };
+    let mut rest = &words[at + 1..];
+    if rest.len() >= 3
+        && rest[0].eq_ignore_ascii_case("if")
+        && rest[1].eq_ignore_ascii_case("not")
+        && rest[2].eq_ignore_ascii_case("exists")
+    {
+        rest = &rest[3..];
+    }
+    // The name, which a quoted name with a space in it would break.
+    let Some(rest) = rest.get(1..) else {
+        return String::new();
+    };
+    let Some(on) = rest.iter().position(|word| word.eq_ignore_ascii_case("on")) else {
+        return String::new();
+    };
+    let timing = rest[..on].join(" ").to_lowercase();
+    // A trigger with no timing word fires before the statement.
+    if timing.starts_with("before") || timing.starts_with("after") || timing.starts_with("instead")
+    {
+        timing
+    } else {
+        format!("before {timing}")
+    }
+}
+
 #[async_trait]
 impl Connection for SqliteConnection {
     async fn open_session(&self) -> Result<Arc<dyn Session>> {
@@ -202,7 +355,7 @@ impl Connection for SqliteConnection {
             pk.sort_by_key(|(ord, _)| *ord);
 
             tables.push(Table {
-                name,
+                name: name.clone(),
                 kind: if kind == "view" {
                     TableKind::View
                 } else {
@@ -213,13 +366,23 @@ impl Connection for SqliteConnection {
                 // SQLite keeps no row estimate; a per-table COUNT(*) would
                 // scan every table on connect, so report nothing.
                 approx_rows: None,
+                indexes: self.indexes(&name).await?,
+                foreign_keys: self.foreign_keys(&name).await?,
+                // SQLite keeps a check only in the `CREATE TABLE` text, and
+                // reading it back out would mean parsing SQL. A unique
+                // constraint is an index here, and is listed there.
+                constraints: Vec::new(),
+                triggers: self.triggers(&name).await?,
             });
         }
 
+        // SQLite has no sequences, stored routines or user types, so the
+        // one schema holds relations and nothing else.
         Ok(Catalog {
             schemas: vec![Schema {
                 name: "main".to_string(),
                 tables,
+                ..Default::default()
             }],
         })
     }
@@ -317,6 +480,69 @@ mod tests {
         assert_eq!(result.columns, vec!["id", "name"]);
         assert_eq!(result.rows[0][1], Value::Text("ada".to_string()));
         assert_eq!(result.rows[1][0], Value::Int(2));
+    }
+
+    #[tokio::test]
+    async fn introspect_reads_indexes_keys_and_triggers() {
+        let conn = SqliteConnection::open_in_memory().await.unwrap();
+        for statement in [
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users (id),
+                 CONSTRAINT again FOREIGN KEY (user_id) REFERENCES users)",
+            "CREATE INDEX orders_user ON orders (user_id)",
+            "CREATE TRIGGER stamp AFTER UPDATE OF user_id ON orders BEGIN SELECT 1; END",
+        ] {
+            conn.execute(statement).await.unwrap();
+        }
+        let catalog = conn.introspect().await.unwrap();
+        let tables = &catalog.schemas[0].tables;
+        let orders = tables.iter().find(|t| t.name == "orders").unwrap();
+
+        assert_eq!(orders.indexes.len(), 1);
+        assert_eq!(orders.indexes[0].detail(), "(user_id)");
+        assert_eq!(
+            orders.foreign_keys[0].detail(),
+            "(user_id) → main.users(id)"
+        );
+        // A key that names no target column reads the target's primary
+        // key, and a second key over the same column gets a name of its own.
+        let keys: Vec<(String, String)> = (orders.foreign_keys.iter())
+            .map(|k| (k.name.clone(), k.detail()))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                (
+                    "orders_user_id_fkey".to_string(),
+                    "(user_id) → main.users(id)".to_string()
+                ),
+                (
+                    "orders_user_id_fkey1".to_string(),
+                    "(user_id) → main.users(id)".to_string()
+                ),
+            ]
+        );
+        assert_eq!(orders.triggers[0].timing, "after update of user_id");
+
+        // The unique constraint is the index SQLite made for it.
+        let users = tables.iter().find(|t| t.name == "users").unwrap();
+        assert_eq!(users.indexes.len(), 1);
+        assert!(users.indexes[0].unique);
+        assert_eq!(users.indexes[0].definition, "(email)");
+    }
+
+    #[test]
+    fn a_trigger_reads_its_timing_off_its_own_statement() {
+        assert_eq!(
+            trigger_timing("CREATE TRIGGER IF NOT EXISTS t BEFORE DELETE ON x BEGIN END"),
+            "before delete"
+        );
+        // No timing word means before.
+        assert_eq!(
+            trigger_timing("CREATE TRIGGER t INSERT ON x BEGIN END"),
+            "before insert"
+        );
+        assert_eq!(trigger_timing("not a trigger"), "");
     }
 
     /// The count off the completion tag, on the engine that needs no

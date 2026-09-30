@@ -237,21 +237,47 @@ instead of leaving them waiting for ever.
 
 ### The sidebar
 
-The tree is schema → `TABLES` and `VIEWS` → the relations. The catalog is
-read into `Group`s (a schema) holding `Section`s (its tables, its views),
-and flattened into `CatalogRow`s again whenever what the sidebar shows
-changes.
+The tree is schema → `TABLES`, `VIEWS`, `SEQUENCES`, `ROUTINES` and
+`TYPES` → the names under them. A relation folds out under its own
+chevron into its columns — straight away, with no folder of their own,
+because they are what a relation is opened to read — and then
+`INDEXES`, `FOREIGN KEYS`, `CONSTRAINTS` and `TRIGGERS`. The catalog is
+read into `Group`s (a schema) holding `Section`s holding `Entry`s — a
+relation with its `Parts`, or a `Leaf` — and flattened into `CatalogRow`s
+again whenever what the sidebar shows changes. An empty section or folder
+is left out rather than drawn empty.
 
-**The two levels remember themselves the other way round.** A schema is
-closed until `open_schemas` holds it, because a database of 3,000
-relations is a wall of names when every schema is expanded; a section is
-open until `closed_sections` holds it, because a schema the user just
-opened was opened to see what is in it — one click, not three. Both sets
-are keyed by name, so they survive an introspection replacing the cached
-catalog.
+**A relation is folded out lazily.** Its `Parts` are built the first
+time it is unfolded, from the `Rc<Catalog>` its `Group` holds: a catalog
+of three thousand tables carries some eighty thousand columns and
+indexes, and a leaf apiece on the GPUI thread every time a catalog lands
+would pay for rows almost nobody opens. "reveal in schema tree" unfolds
+the relation it reveals, because what changed may be one of its indexes.
+
+**A leaf opens nothing.** A column, an index or a routine says what it is
+— its type, its key, its signature, in the faint ink after its name — and
+a click on it does nothing, because there is no tab for it to open into.
+It is not a stop for ↑↓ either: ⏎ on the filter line means "open this
+relation". The chevron on a relation stops its press before the row can
+hear it, so folding a relation out never also opens a tab on it.
+
+**One rule places every row.** A row at level n has its chevron slot at
+`chevron_at(n)` and what follows at `content_at(n)`, one `TREE_STEP`
+apart, so a relation's glyph sits under its section's label and a
+column's under its relation's name however deep the tree goes.
+
+**The levels remember themselves in two ways.** A schema is closed until
+`open_schemas` holds it, because a database of 3,000 relations is a wall
+of names when every schema is expanded; a section is open until
+`closed_sections` holds it, because a schema the user just opened was
+opened to see what is in it — one click, not three. A relation is closed
+until `open_relations` holds it, for the schema's reason, and its folders
+are sections, open until closed. Every set is keyed by name, so they
+survive an introspection replacing the cached catalog.
 
 The filter line over the list narrows the names the session already
-holds — no query goes out — by the palette's own rule, through
+holds — relations, sequences, routines and types alike, never a relation's
+columns — and no query goes out — by the palette's own rule, through
 `palette::path_rank`: the `fuzzy` crate's word-start rule, and **a dot
 names a path**. So `address` finds every `address`, `addr_ln` finds
 `address_line`, `dev.addr` finds the one in `sample_dev_sample`, and a
@@ -1050,19 +1076,30 @@ tokio task.
 Once a shape-changing statement lands, `Shell::report_schema` reads the
 catalog again and `introspect::diff` compares it with the one the shell
 had: tables that came or went, and for a table that stayed, columns that
-came, went, or changed type, nullability or default. `SchemaReport` on the
+came, went, or changed type, nullability or default. Everything else the
+catalog carries is an *object* — an index, a key, a constraint or a
+trigger of a table that stayed, and a sequence, a routine or a type of a
+schema — and `Delta::objects` lists the ones that came, went, or read
+differently, compared by the same `detail()` line the sidebar paints. The
+objects of a table that came or went are not listed: a `CREATE TABLE`
+with a key makes an index, and saying so beside the table would say one
+event twice. **An object is never data lost**: `drops_anything` and
+`dropped_names` count tables and columns only, so a committed `DROP
+INDEX` is not painted as something that cannot be recovered. `SchemaReport` on the
 tab holds the result, and `Shell::schema_strip` paints it as the comp's
 SCHEMA CHANGED panel, first under the editor: a `+` row on the green wash,
 a `−` row on the clay wash with the name struck through, a `~` row saying
 `text → integer`, and `reveal in schema tree`, which opens the sidebar on
 the relation. When the run held exactly one shape-changing statement the
 report is its doing, and `ddl_meta` rewrites its statistic to
-`altered · +2 −1 columns · 12 ms`.
+`altered · +2 −1 columns · 12 ms` — or, when no column moved and no
+table came or went, to `created · +1 index · 12 ms`, naming the object's
+own sort when they are all of one.
 
 **It reads on the tab's own session, because that is the only place the
 change exists yet.** Inside an open transaction a new table is visible to
 the connection that made it and to nobody else; a pooled read would report
-nothing changed. So `Session::introspect` runs the same three catalog
+nothing changed. So `Session::introspect` runs the same catalog
 queries `Connection::introspect` runs — one `read_catalog` in the driver,
 so the two cannot drift — down the pinned connection. `SchemaReport::held`
 says the change is in that state, and it is what keeps the new catalog
@@ -1077,8 +1114,8 @@ next ⌘⏎, being news about the last run.
 The line under the rows is the one sentence a shape change is owed, and
 `schema_note` is pure: held, it says rollback puts the dropped column
 back; committed, it names what is gone and cannot be recovered from here.
-An empty delta says so rather than painting nothing — an index, a
-function or a grant is a shape change the model does not carry, and the
+An empty delta says so rather than painting nothing — a grant, a comment
+or a function's body is a shape change the model does not carry, and the
 panel says which those are.
 
 ### Marking what will not parse
@@ -1781,6 +1818,46 @@ and the connections list carries it in its MODE column.
 columns, because it also carries the `reltuples` estimate and `format_type`
 renders type names the way `psql` does. Primary keys come from
 `information_schema`, which reports key column order.
+
+**The rest of the catalog is its own reads, not one join.** Indexes,
+constraints, triggers, sequences, routines and types each come from their
+own system catalog, rendered by the server's own `pg_get_*` functions so a
+definition reads the way `\d` prints it; a join of them all would
+multiply the rows. `build_catalog` puts the tree together, and lists a
+schema that holds anything at all — a schema of nothing but functions has
+a place too. Every list is grouped by its table once, so a catalog of
+thousands of tables is one pass per list rather than one per table.
+
+What something made for itself is left out, because it is not the
+user's and the schema report would name it beside the thing that made
+it: routines and types an extension installed (`pg_depend.deptype =
+'e'`) — `CREATE EXTENSION pgcrypto` puts forty functions into `public` —
+a range type's constructors (`'i'`), a sequence a `serial` or an
+identity column owns, a foreign key's enforcement triggers
+(`tgisinternal`), and the clone of a key Postgres makes for every
+partition of a partitioned table it references. A trigger's timing is
+read off `tgtype`'s bits by `trigger_timing`.
+
+**The relations are the catalog; the objects are extra.** Tables,
+columns and keys fail the introspection when they fail, as they always
+did. Every read after them is best-effort and answers with an empty list
+on an error, so a Postgres-compatible server that refuses one does not
+cost the sidebar its tables. What needs a catalog newer than
+PostgreSQL 10 — `pg_sequence`, `prokind`, `conparentid` — is gated on
+`server_version_num` and never sent to an older server, which matters
+on a session: a refused read inside the user's transaction would abort
+it.
+
+SQLite has no sequences, routines or types. Its indexes and foreign keys
+come from the `pragma_index_list` and `pragma_foreign_key_list` table
+functions, and it names no foreign key, so each is named the way Postgres
+would have, with a number after a name already taken. A key that names
+no target column reads the target's primary key. It keeps a check only in the `CREATE TABLE` text, and the
+driver does not parse SQL to find one.
+
+Every field the model gained after its first cut is `#[serde(default)]`,
+because the cached catalog is JSON an older build may have written, and a
+row that no longer parsed would cost the first paint.
 
 Decode result columns by matching on `type_info().name()` — `try_get::<String>`
 fails on non-text Postgres types. An unknown type must never error: a viewer
