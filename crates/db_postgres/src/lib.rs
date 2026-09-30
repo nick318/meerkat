@@ -1007,12 +1007,21 @@ fn is_cancelled(error: &sqlx::Error) -> bool {
 /// into two catalogs: a session reads it to see its own uncommitted DDL,
 /// and must see exactly what the sidebar would see once that commits.
 ///
-/// Nine statements, each over one system catalog. A join of all of them
+/// Ten statements, each over one system catalog. A join of all of them
 /// would multiply the rows — every column by every index by every
 /// trigger — so the tree is put together here instead, by `build_catalog`.
 /// Every read skips the system schemas the same way, and the routines and
 /// types skip what an extension installed: `CREATE EXTENSION pgcrypto`
 /// puts forty functions into `public`, and none of them is the user's.
+///
+/// **The relations are the catalog; everything else is extra.** The
+/// tables, their columns and their keys fail the read when they fail, as
+/// they always have. The objects after them are read *best-effort*: a
+/// server that refuses one of those reads — a fork, a server older than
+/// the catalog column asked for — answers with an empty list rather than
+/// costing the sidebar its tables. The two reads that need a column newer
+/// than PostgreSQL 10 are not sent to an older server at all, so they
+/// cannot abort a transaction the session read is running inside.
 async fn read_catalog(conn: &mut sqlx::PgConnection) -> Result<Catalog> {
     let tables: Vec<TableRow> = sqlx::query_as(
         "SELECT n.nspname, c.relname, c.relkind::text, c.reltuples::bigint \
@@ -1063,6 +1072,11 @@ async fn read_catalog(conn: &mut sqlx::PgConnection) -> Result<Catalog> {
     .await
     .context("failed to list primary keys")?;
 
+    let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(&mut *conn)
+        .await
+        .context("failed to read the server version")?;
+
     // `pg_get_indexdef` writes the whole `CREATE INDEX`; the part after
     // `USING` is the method and the key, which is what differs between
     // two indexes of one table.
@@ -1083,13 +1097,26 @@ async fn read_catalog(conn: &mut sqlx::PgConnection) -> Result<Catalog> {
     )
     .fetch_all(&mut *conn)
     .await
-    .context("failed to list indexes")?;
+    .unwrap_or_default();
 
     // Foreign keys, unique, check and exclusion constraints in one read.
     // The primary key is left out — `keys` has it in key order — and so
     // is a domain's check, which belongs to no table. The column arrays
     // are walked `WITH ORDINALITY` so a two-column key keeps its order.
-    let constraints: Vec<ConstraintRow> = sqlx::query_as(
+    //
+    // A key that references a partitioned table is cloned once for every
+    // partition it reaches, on the same referencing table; those clones
+    // carry a parent on that same table, and `\d` hides them too.
+    // `conparentid` is PostgreSQL 11's, and a server before it has no
+    // clones to hide.
+    let clones = if version >= 110_000 {
+        "AND NOT EXISTS (SELECT 1 FROM pg_constraint parent \
+                          WHERE parent.oid = con.conparentid \
+                            AND parent.conrelid = con.conrelid)"
+    } else {
+        ""
+    };
+    let constraints: Vec<ConstraintRow> = sqlx::query_as(&format!(
         "SELECT n.nspname, c.relname, con.conname, con.contype::text, \
                 pg_get_constraintdef(con.oid, true), \
                 ARRAY(SELECT a.attname::text \
@@ -1106,15 +1133,15 @@ async fn read_catalog(conn: &mut sqlx::PgConnection) -> Result<Catalog> {
          JOIN pg_namespace n ON n.oid = c.relnamespace \
          LEFT JOIN pg_class fc ON fc.oid = con.confrelid \
          LEFT JOIN pg_namespace fn ON fn.oid = fc.relnamespace \
-         WHERE con.contype IN ('f', 'u', 'c', 'x') \
+         WHERE con.contype IN ('f', 'u', 'c', 'x') {clones} \
            AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
            AND n.nspname NOT LIKE 'pg_toast%' \
            AND n.nspname NOT LIKE 'pg_temp%' \
          ORDER BY n.nspname, c.relname, con.conname",
-    )
+    ))
     .fetch_all(&mut *conn)
     .await
-    .context("failed to list constraints")?;
+    .unwrap_or_default();
 
     // `tgisinternal` is what a foreign key's own enforcement triggers
     // carry; they are the key, not something the user wrote.
@@ -1131,24 +1158,42 @@ async fn read_catalog(conn: &mut sqlx::PgConnection) -> Result<Catalog> {
     )
     .fetch_all(&mut *conn)
     .await
-    .context("failed to list triggers")?;
+    .unwrap_or_default();
 
-    let sequences: Vec<SequenceRow> = sqlx::query_as(
-        "SELECT n.nspname, c.relname, format_type(s.seqtypid, NULL) \
-         FROM pg_sequence s \
-         JOIN pg_class c ON c.oid = s.seqrelid \
-         JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
-           AND n.nspname NOT LIKE 'pg_toast%' \
-           AND n.nspname NOT LIKE 'pg_temp%' \
-         ORDER BY n.nspname, c.relname",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .context("failed to list sequences")?;
+    // A sequence a column owns — a `serial`'s, an identity's — is how that
+    // column counts, not something the user made beside it. Listing it
+    // would also have every `CREATE TABLE … (id serial)` report a new
+    // sequence beside its new table. `pg_sequence` is PostgreSQL 10's.
+    let sequences: Vec<SequenceRow> = if version >= 100_000 {
+        sqlx::query_as(
+            "SELECT n.nspname, c.relname, format_type(s.seqtypid, NULL) \
+             FROM pg_sequence s \
+             JOIN pg_class c ON c.oid = s.seqrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+               AND n.nspname NOT LIKE 'pg_toast%' \
+               AND n.nspname NOT LIKE 'pg_temp%' \
+               AND NOT EXISTS (SELECT 1 FROM pg_depend d \
+                                WHERE d.classid = 'pg_class'::regclass \
+                                  AND d.objid = c.oid AND d.refobjsubid > 0 \
+                                  AND d.deptype IN ('a', 'i')) \
+             ORDER BY n.nspname, c.relname",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
-    let routines: Vec<RoutineRow> = sqlx::query_as(
-        "SELECT n.nspname, p.proname, p.prokind::text, \
+    // `prokind` is PostgreSQL 11's. The routines a `CREATE TYPE … AS RANGE`
+    // makes for itself depend on the type (`deptype = 'i'`) and are the
+    // type's, not the user's, so they are skipped with the extensions'.
+    let routines: Vec<RoutineRow> = if version < 110_000 {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT n.nspname, p.proname, p.prokind::text, \
                 pg_get_function_identity_arguments(p.oid), \
                 CASE WHEN p.prokind = 'p' THEN NULL ELSE pg_get_function_result(p.oid) END \
          FROM pg_proc p \
@@ -1158,12 +1203,13 @@ async fn read_catalog(conn: &mut sqlx::PgConnection) -> Result<Catalog> {
            AND n.nspname NOT LIKE 'pg_temp%' \
            AND NOT EXISTS (SELECT 1 FROM pg_depend d \
                             WHERE d.classid = 'pg_proc'::regclass \
-                              AND d.objid = p.oid AND d.deptype = 'e') \
+                              AND d.objid = p.oid AND d.deptype IN ('e', 'i')) \
          ORDER BY n.nspname, p.proname, 4",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .context("failed to list routines")?;
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap_or_default()
+    };
 
     // Every table has a composite type of its own; only a composite made
     // with `CREATE TYPE … AS (…)` has a `pg_class` row of kind `c`.
@@ -1197,7 +1243,7 @@ async fn read_catalog(conn: &mut sqlx::PgConnection) -> Result<Catalog> {
     )
     .fetch_all(&mut *conn)
     .await
-    .context("failed to list types")?;
+    .unwrap_or_default();
 
     Ok(build_catalog(CatalogRows {
         tables,
@@ -1229,6 +1275,10 @@ struct CatalogRows {
 /// sits in it, so a schema of nothing but functions has a place in the
 /// tree too. Every read is ordered by schema name, and a `BTreeMap` keeps
 /// that order: `name` compares bytewise, as a Rust string does.
+///
+/// Every per-table list is grouped by its table once, up front, so a
+/// catalog of thousands of tables is put together in one pass over each
+/// list rather than one pass per table.
 fn build_catalog(rows: CatalogRows) -> Catalog {
     let mut schemas: BTreeMap<String, Schema> = BTreeMap::new();
     fn schema<'a>(schemas: &'a mut BTreeMap<String, Schema>, name: &str) -> &'a mut Schema {
@@ -1237,81 +1287,97 @@ fn build_catalog(rows: CatalogRows) -> Catalog {
             ..Default::default()
         })
     }
-    let of =
-        |s: &str, t: &str, schema_name: &str, table_name: &str| s == schema_name && t == table_name;
 
-    for (schema_name, table_name, relkind, reltuples) in &rows.tables {
+    let mut columns = by_table(
+        rows.columns,
+        |(s, t, name, data_type, nullable, default)| {
+            (
+                (s, t),
+                Column {
+                    name,
+                    data_type,
+                    nullable,
+                    default,
+                },
+            )
+        },
+    );
+    let mut keys = by_table(rows.keys, |(s, t, column)| ((s, t), column));
+    let mut indexes = by_table(rows.indexes, |(s, t, name, definition, unique, primary)| {
+        (
+            (s, t),
+            Index {
+                name,
+                definition,
+                unique,
+                primary,
+            },
+        )
+    });
+    let mut foreign_keys = HashMap::new();
+    let mut constraints = HashMap::new();
+    for (s, t, name, kind, definition, key, target_schema, target_table, target_key) in
+        rows.constraints
+    {
+        let kind = match kind.as_str() {
+            "f" => {
+                foreign_keys
+                    .entry((s, t))
+                    .or_insert_with(Vec::new)
+                    .push(ForeignKey {
+                        name,
+                        columns: key,
+                        target_schema: target_schema.unwrap_or_default(),
+                        target_table: target_table.unwrap_or_default(),
+                        target_columns: target_key,
+                    });
+                continue;
+            }
+            "u" => ConstraintKind::Unique,
+            "c" => ConstraintKind::Check,
+            "x" => ConstraintKind::Exclusion,
+            _ => continue,
+        };
+        constraints
+            .entry((s, t))
+            .or_insert_with(Vec::new)
+            .push(Constraint {
+                name,
+                kind,
+                definition,
+            });
+    }
+    let mut triggers = by_table(rows.triggers, |(s, t, name, tgtype, function)| {
+        (
+            (s, t),
+            Trigger {
+                name,
+                timing: trigger_timing(tgtype),
+                function: format!("{function}()"),
+            },
+        )
+    });
+
+    for (schema_name, table_name, relkind, reltuples) in rows.tables {
+        let key = (schema_name, table_name);
         let table = Table {
-            name: table_name.clone(),
+            name: key.1.clone(),
             kind: match relkind.as_str() {
                 // Views and materialized views read the same to a viewer.
                 "v" | "m" => TableKind::View,
                 _ => TableKind::Table,
             },
-            columns: (rows.columns.iter())
-                .filter(|(s, t, ..)| of(s, t, schema_name, table_name))
-                .map(|(_, _, name, data_type, nullable, default)| Column {
-                    name: name.clone(),
-                    data_type: data_type.clone(),
-                    nullable: *nullable,
-                    default: default.clone(),
-                })
-                .collect(),
-            primary_key: (rows.keys.iter())
-                .filter(|(s, t, _)| of(s, t, schema_name, table_name))
-                .map(|(_, _, column)| column.clone())
-                .collect(),
+            columns: columns.remove(&key).unwrap_or_default(),
+            primary_key: keys.remove(&key).unwrap_or_default(),
             // `reltuples` is -1 when the table was never analyzed. Report
             // nothing rather than a zero the user would read as "empty".
             approx_rows: reltuples.filter(|n| *n >= 0).map(|n| n as u64),
-            indexes: (rows.indexes.iter())
-                .filter(|(s, t, ..)| of(s, t, schema_name, table_name))
-                .map(|(_, _, name, definition, unique, primary)| Index {
-                    name: name.clone(),
-                    definition: definition.clone(),
-                    unique: *unique,
-                    primary: *primary,
-                })
-                .collect(),
-            foreign_keys: (rows.constraints.iter())
-                .filter(|(s, t, _, kind, ..)| kind == "f" && of(s, t, schema_name, table_name))
-                .map(
-                    |(_, _, name, _, _, columns, target_schema, target_table, target_columns)| {
-                        ForeignKey {
-                            name: name.clone(),
-                            columns: columns.clone(),
-                            target_schema: target_schema.clone().unwrap_or_default(),
-                            target_table: target_table.clone().unwrap_or_default(),
-                            target_columns: target_columns.clone(),
-                        }
-                    },
-                )
-                .collect(),
-            constraints: (rows.constraints.iter())
-                .filter(|(s, t, ..)| of(s, t, schema_name, table_name))
-                .filter_map(|(_, _, name, kind, definition, ..)| {
-                    Some(Constraint {
-                        name: name.clone(),
-                        kind: match kind.as_str() {
-                            "u" => ConstraintKind::Unique,
-                            "c" => ConstraintKind::Check,
-                            "x" => ConstraintKind::Exclusion,
-                            _ => return None,
-                        },
-                        definition: definition.clone(),
-                    })
-                })
-                .collect(),
-            triggers: (rows.triggers.iter())
-                .filter(|(s, t, ..)| of(s, t, schema_name, table_name))
-                .map(|(_, _, name, tgtype, function)| Trigger {
-                    name: name.clone(),
-                    timing: trigger_timing(*tgtype),
-                    function: format!("{function}()"),
-                })
-                .collect(),
+            indexes: indexes.remove(&key).unwrap_or_default(),
+            foreign_keys: foreign_keys.remove(&key).unwrap_or_default(),
+            constraints: constraints.remove(&key).unwrap_or_default(),
+            triggers: triggers.remove(&key).unwrap_or_default(),
         };
-        schema(&mut schemas, schema_name).tables.push(table);
+        schema(&mut schemas, &key.0).tables.push(table);
     }
     for (schema_name, name, data_type) in rows.sequences {
         schema(&mut schemas, &schema_name)
@@ -1347,6 +1413,21 @@ fn build_catalog(rows: CatalogRows) -> Catalog {
     Catalog {
         schemas: schemas.into_values().collect(),
     }
+}
+
+/// Group one listing by the table each row belongs to, keeping the order
+/// the listing had within each table. `split` names the table and makes
+/// the model value out of the rest of the row.
+fn by_table<R, T>(
+    rows: Vec<R>,
+    split: impl Fn(R) -> ((String, String), T),
+) -> HashMap<(String, String), Vec<T>> {
+    let mut grouped: HashMap<(String, String), Vec<T>> = HashMap::new();
+    for row in rows {
+        let (key, value) = split(row);
+        grouped.entry(key).or_default().push(value);
+    }
+    grouped
 }
 
 /// When a trigger fires, read off `pg_trigger.tgtype`, whose bits are
@@ -2223,8 +2304,8 @@ mod tests {
 
     /// Everything beside the columns: the indexes, keys, constraints and
     /// triggers of a table, and the sequences, routines and types of the
-    /// schema — and nothing an extension or a key's own enforcement put
-    /// there.
+    /// schema — and nothing a key's own enforcement, a `serial` or a range
+    /// type made for itself.
     #[tokio::test]
     async fn introspect_reads_every_object() {
         let Some(url) = test_url() else { return };
@@ -2239,6 +2320,14 @@ mod tests {
             "CREATE DOMAIN meerkat_objects.price AS numeric(10, 2) CHECK (VALUE >= 0)",
             "CREATE TYPE meerkat_objects.pair AS (a integer, b text)",
             "CREATE SEQUENCE meerkat_objects.ticket AS integer",
+            "CREATE TYPE meerkat_objects.span AS RANGE (subtype = integer)",
+            "CREATE TABLE meerkat_objects.events (id serial PRIMARY KEY)",
+            "CREATE TABLE meerkat_objects.parted (id integer PRIMARY KEY) PARTITION BY RANGE (id)",
+            "CREATE TABLE meerkat_objects.parted_a PARTITION OF meerkat_objects.parted
+                 FOR VALUES FROM (0) TO (10)",
+            "CREATE TABLE meerkat_objects.parted_b PARTITION OF meerkat_objects.parted
+                 FOR VALUES FROM (10) TO (20)",
+            "CREATE TABLE meerkat_objects.pointer (id integer REFERENCES meerkat_objects.parted)",
             "CREATE TABLE meerkat_objects.users (id bigint PRIMARY KEY, email text UNIQUE)",
             "CREATE TABLE meerkat_objects.orders (
                  id bigint PRIMARY KEY,
@@ -2289,14 +2378,24 @@ mod tests {
         assert_eq!(orders.constraints[0].definition, "CHECK (id > 0)");
 
         // The foreign key's enforcement triggers are internal and left out.
+        // The range type's constructors are not listed as routines either.
         assert_eq!(orders.triggers.len(), 1);
         assert_eq!(orders.triggers[0].timing, "before insert or update");
         assert_eq!(orders.triggers[0].function, "meerkat_objects.touch()");
 
+        // A key into a partitioned table is one key, not one per partition.
+        let pointer = schema.tables.iter().find(|t| t.name == "pointer").unwrap();
+        let keys: Vec<&str> = (pointer.foreign_keys.iter())
+            .map(|k| k.name.as_str())
+            .collect();
+        assert_eq!(keys, ["pointer_id_fkey"]);
+
         let users = schema.tables.iter().find(|t| t.name == "users").unwrap();
         assert_eq!(users.constraints[0].kind, ConstraintKind::Unique);
 
-        assert_eq!(schema.sequences.len(), 1);
+        // The `serial` column's own sequence is the column's, not listed.
+        let sequences: Vec<&str> = schema.sequences.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(sequences, ["ticket"]);
         assert_eq!(schema.sequences[0].data_type, "integer");
 
         let routines: Vec<String> = schema.routines.iter().map(|r| r.detail()).collect();
@@ -2312,6 +2411,7 @@ mod tests {
                 "enum · sad, ok, happy",
                 "composite · a integer, b text",
                 "domain · numeric(10,2)",
+                "range · integer",
             ]
         );
 

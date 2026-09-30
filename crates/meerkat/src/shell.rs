@@ -31,6 +31,7 @@ use results_grid::{
     Cell, Extent, Grid, GridData, GridState, Hit, Selection, Step, clipboard_text, find_columns,
 };
 use sql_editor::{Diagnostic, Kind, Name, SqlEditor, SqlEditorEvent, StatementStatus, Vocabulary};
+use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
@@ -451,7 +452,7 @@ pub struct Shell {
     grid_focus: FocusHandle,
     status: Status,
     connection: Option<Arc<dyn Connection>>,
-    catalog: Option<Catalog>,
+    catalog: Option<Rc<Catalog>>,
     /// True while the introspection runs. It is a second round trip after
     /// the connect, so a session is connected — and can run a query —
     /// before there is a catalog to paint.
@@ -1416,12 +1417,7 @@ impl Shell {
     /// into the flattened list. A header is not among them — it opens and
     /// closes, and ⏎ on this line means "open this relation".
     fn catalog_stops(&self) -> Vec<usize> {
-        self.catalog_rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| matches!(row, CatalogRow::Relation { .. }))
-            .map(|(ix, _)| ix)
-            .collect()
+        catalog_stops(&self.catalog_rows)
     }
 
     /// Move the cursor one relation on, and scroll it into view.
@@ -1563,8 +1559,9 @@ impl Shell {
     /// and every open query tab is handed the new words — a tab built
     /// before the catalog landed carries an empty vocabulary otherwise.
     fn apply_catalog(&mut self, catalog: Catalog, cx: &mut Context<Self>) {
+        let catalog = Rc::new(catalog);
         self.vocabulary = Arc::new(vocabulary_of(&catalog));
-        self.catalog_groups = catalog_groups(&catalog);
+        self.catalog_groups = catalog_groups(catalog.clone());
         // A group the user opened keeps its name across an introspection,
         // so the sidebar does not close under them when the real catalog
         // replaces the cached one.
@@ -1978,9 +1975,9 @@ impl Shell {
 
     /// Open the sidebar on a relation the schema report names, so "what
     /// did that do" and "where is it now" are one click apart. The filter
-    /// is emptied — a filtered tree may not hold the row — and the schema
-    /// and its section are opened, because a row under a closed header is
-    /// not revealed.
+    /// is emptied — a filtered tree may not hold the row — the schema and
+    /// its section are opened, because a row under a closed header is not
+    /// revealed, and the relation is unfolded to show what changed in it.
     fn reveal_relation(
         &mut self,
         schema: SharedString,
@@ -1989,8 +1986,14 @@ impl Shell {
     ) {
         self.catalog_filter.update(cx, |field, cx| field.clear(cx));
         self.open_schemas.insert(schema.clone());
+        // Only the schema's own sections: a folder the user closed inside
+        // one of its relations has a third part, and stays as they left it.
         let prefix = format!("{schema}\t");
-        self.closed_sections.retain(|key| !key.starts_with(&prefix));
+        self.closed_sections
+            .retain(|key| !(key.starts_with(&prefix) && !key[prefix.len()..].contains('\t')));
+        // Unfolded, because what changed may be an index or a column, and
+        // a relation revealed shut would hide exactly that.
+        self.open_relations.insert(relation_key(&schema, &name));
         self.rebuild_catalog_rows(cx);
         let found = self.catalog_rows.iter().position(|row| {
             matches!(row, CatalogRow::Relation { schema: s, name: n, .. } if *s == schema && *n == name)
@@ -3090,7 +3093,7 @@ impl Shell {
         let typed = palette.query.read(cx).text().to_string();
         let (scope, needle) = palette::parse(&typed, palette.chip);
         let found = palette::build(
-            self.catalog.as_ref(),
+            self.catalog.as_deref(),
             &palette.runs,
             scope,
             needle,
@@ -4814,6 +4817,11 @@ fn ddl_meta(delta: &Delta, verb: DdlVerb, ms: u128) -> Option<String> {
         parts.push(format!("~{changed}"));
     }
     if parts.is_empty() {
+        // A table that came or went is the header's news; whatever came
+        // or went with it is not the statement's either.
+        if !delta.relations.is_empty() {
+            return None;
+        }
         return object_meta(&delta.objects, verb, ms);
     }
     let noun = if added + dropped + changed == 1 {
@@ -8194,6 +8202,10 @@ struct Group {
     label: SharedString,
     schema: SharedString,
     sections: Vec<Section>,
+    /// The catalog the group was read from, and where its schema sits in
+    /// it, so a relation's columns can be read when it is first unfolded.
+    catalog: Rc<Catalog>,
+    schema_ix: usize,
 }
 
 /// One folder of a schema: its tables, its views, its sequences, its
@@ -8215,7 +8227,14 @@ enum Entry {
         kind: TableKind,
         /// Identity of the relation in the open set: `schema\trelation`.
         key: SharedString,
-        parts: Rc<Parts>,
+        /// Where the relation sits in its schema's `tables`.
+        table_ix: usize,
+        /// What it folds out into, built the first time it is unfolded.
+        /// A catalog of three thousand tables holds some eighty thousand
+        /// columns and indexes, and building a leaf for each on the GPUI
+        /// thread every time a catalog lands — after every committed DDL —
+        /// would pay for rows almost nobody opens.
+        parts: OnceCell<Parts>,
     },
     Object(Leaf),
 }
@@ -8272,19 +8291,18 @@ struct Folder {
 /// sections under it — `TABLES`, `VIEWS`, `SEQUENCES`, `ROUTINES`,
 /// `TYPES` — then the names under those. A section with nothing in it is
 /// left out rather than drawn empty, and so is a schema.
-fn catalog_groups(catalog: &Catalog) -> Rc<Vec<Group>> {
+fn catalog_groups(catalog: Rc<Catalog>) -> Rc<Vec<Group>> {
     let mut groups = Vec::new();
-    for schema in &catalog.schemas {
+    for (schema_ix, schema) in catalog.schemas.iter().enumerate() {
         let relations = |kind: TableKind| -> Vec<Entry> {
-            schema
-                .tables
-                .iter()
-                .filter(|table| table.kind == kind)
-                .map(|table| Entry::Relation {
+            (schema.tables.iter().enumerate())
+                .filter(|(_, table)| table.kind == kind)
+                .map(|(table_ix, table)| Entry::Relation {
                     name: table.name.clone().into(),
                     kind,
                     key: relation_key(&schema.name, &table.name),
-                    parts: Rc::new(relation_parts(table)),
+                    table_ix,
+                    parts: OnceCell::new(),
                 })
                 .collect()
         };
@@ -8334,9 +8352,21 @@ fn catalog_groups(catalog: &Catalog) -> Rc<Vec<Group>> {
             label: schema.name.to_ascii_uppercase().into(),
             schema: schema.name.clone().into(),
             sections,
+            catalog: catalog.clone(),
+            schema_ix,
         });
     }
     Rc::new(groups)
+}
+
+/// The rows ↑↓ stop on: the relations, by their index into the list. A
+/// header opens and closes and a leaf opens nothing, so neither is a stop.
+fn catalog_stops(rows: &[CatalogRow]) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| matches!(row, CatalogRow::Relation { .. }))
+        .map(|(ix, _)| ix)
+        .collect()
 }
 
 /// Identity of a relation in the open set. A schema name cannot hold a
@@ -8489,6 +8519,7 @@ fn catalog_rows(
                         name,
                         kind,
                         key,
+                        table_ix,
                         parts,
                     } => {
                         let open = open_relations.contains(key);
@@ -8499,6 +8530,11 @@ fn catalog_rows(
                             open,
                         });
                         if open {
+                            let parts = parts.get_or_init(|| {
+                                relation_parts(
+                                    &group.catalog.schemas[group.schema_ix].tables[*table_ix],
+                                )
+                            });
                             rows.extend(parts.columns.iter().map(|leaf| leaf.row(3)));
                             for folder in &parts.folders {
                                 let key: SharedString = format!("{key}\t{}", folder.label).into();
@@ -10703,7 +10739,7 @@ mod tests {
 
     #[test]
     fn a_schema_holds_a_tables_section_and_a_views_section() {
-        let groups = catalog_groups(&sample());
+        let groups = catalog_groups(Rc::new(sample()));
         let read: Vec<String> = groups.iter().map(|group| group.label.to_string()).collect();
         assert_eq!(read, ["PUBLIC", "REPORTING"]);
 
@@ -10723,14 +10759,14 @@ mod tests {
 
     #[test]
     fn every_schema_starts_closed() {
-        let groups = catalog_groups(&sample());
+        let groups = catalog_groups(Rc::new(sample()));
         // The schemas and their totals, and nothing under them.
         assert_eq!(read(&rows(&groups, "")), ["[PUBLIC 3]", "[REPORTING 1]"]);
     }
 
     #[test]
     fn an_open_schema_shows_its_sections_and_their_relations() {
-        let groups = catalog_groups(&sample());
+        let groups = catalog_groups(Rc::new(sample()));
         let open = HashSet::from([groups[0].key.clone()]);
         // A section is open until it is closed: opening the schema is one
         // click, not three.
@@ -10769,7 +10805,7 @@ mod tests {
 
     #[test]
     fn the_filter_opens_what_it_matched() {
-        let groups = catalog_groups(&sample());
+        let groups = catalog_groups(Rc::new(sample()));
         // A relation name: only what holds a hit survives, open however
         // the two sets stand, and the counts are of the hits.
         assert_eq!(
@@ -10805,7 +10841,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let groups = catalog_groups(&catalog);
+        let groups = catalog_groups(Rc::new(catalog));
         // Alphabetical order buries the name the query says outright, so
         // the filtered section is ranked instead: the whole word first,
         // then the names it starts, shortest first, then the name that
@@ -10842,7 +10878,7 @@ mod tests {
 
     #[test]
     fn a_dot_in_the_filter_names_a_path() {
-        let groups = catalog_groups(&sample());
+        let groups = catalog_groups(Rc::new(sample()));
         // Both parts must hit: the schema, then the relation under it.
         assert_eq!(
             read(&rows(&groups, "public.orders")),
@@ -11105,7 +11141,7 @@ mod tests {
 
     #[test]
     fn a_schema_lists_its_sequences_routines_and_types_after_its_relations() {
-        let groups = catalog_groups(&furnished());
+        let groups = catalog_groups(Rc::new(furnished()));
         let open = HashSet::from([groups[0].key.clone()]);
         assert_eq!(
             read(&catalog_rows(
@@ -11131,7 +11167,7 @@ mod tests {
 
     #[test]
     fn a_relation_folds_out_into_its_columns_and_its_objects() {
-        let groups = catalog_groups(&furnished());
+        let groups = catalog_groups(Rc::new(furnished()));
         let open = HashSet::from([groups[0].key.clone()]);
         let folded = HashSet::from([relation_key("public", "orders")]);
         let rows = catalog_rows(&groups, &open, &HashSet::new(), &folded, "");
@@ -11175,7 +11211,7 @@ mod tests {
 
     #[test]
     fn the_filter_finds_a_routine_but_does_not_fold_a_relation_out() {
-        let groups = catalog_groups(&furnished());
+        let groups = catalog_groups(Rc::new(furnished()));
         assert_eq!(
             read(&rows(&groups, "total")),
             [
@@ -11192,12 +11228,16 @@ mod tests {
         );
         // A leaf is not somewhere ⏎ can go, so the cursor never lands on
         // one: the only stop is still the relation.
-        let found = rows(&groups, "public.");
-        let stops: Vec<usize> = (found.iter().enumerate())
-            .filter(|(_, row)| matches!(row, CatalogRow::Relation { .. }))
-            .map(|(ix, _)| ix)
-            .collect();
-        assert_eq!(stops, [2]);
+        let folded = HashSet::from([relation_key("public", "orders")]);
+        let found = catalog_rows(
+            &groups,
+            &HashSet::new(),
+            &HashSet::new(),
+            &folded,
+            "public.",
+        );
+        assert!(found.len() > 10, "the relation is folded out");
+        assert_eq!(catalog_stops(&found), [2]);
     }
 
     fn an_object(kind: ObjectKind, name: &str, change: ObjectChange) -> ObjectDelta {
@@ -11252,6 +11292,18 @@ mod tests {
             ddl_meta(&mixed, DdlVerb::Alter, 7),
             Some("altered · +1 −1 objects · 7 ms".to_string())
         );
+        // What came with a new table is the table's, and not counted.
+        let mut created = Delta {
+            relations: vec![RelationDelta {
+                schema: "public".into(),
+                name: "t".into(),
+                kind: TableKind::Table,
+                change: RelationChange::Added { columns: vec![] },
+            }],
+            ..Default::default()
+        };
+        created.objects = one.objects.clone();
+        assert_eq!(ddl_meta(&created, DdlVerb::Create, 7), None);
     }
 
     #[test]

@@ -40,7 +40,9 @@ impl Delta {
 
     /// Whether anything in the delta is a removal — a table or a column
     /// that is not there any more. It is what decides whether "cannot be
-    /// recovered" is worth saying.
+    /// recovered" is worth saying, so an object does not count: a dropped
+    /// index or function held no rows, and a renamed one reads as a drop
+    /// and an add.
     pub fn drops_anything(&self) -> bool {
         self.relations
             .iter()
@@ -51,14 +53,11 @@ impl Delta {
                     .iter()
                     .any(|column| matches!(column, ColumnDelta::Dropped(_))),
             })
-            || self
-                .objects
-                .iter()
-                .any(|object| matches!(object.change, ObjectChange::Dropped { .. }))
     }
 
     /// The names of every column and table the delta removes, qualified
     /// the way the sidebar shows them. Empty when nothing was dropped.
+    /// Objects are left out, for the reason `drops_anything` leaves them.
     pub fn dropped_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         for relation in &self.relations {
@@ -74,11 +73,6 @@ impl Delta {
                         }
                     }
                 }
-            }
-        }
-        for object in &self.objects {
-            if matches!(object.change, ObjectChange::Dropped { .. }) {
-                names.push(object.qualified());
             }
         }
         names
@@ -582,10 +576,16 @@ mod tests {
                 if before == "btree (a)" && after == "btree (a, b)"
         ));
 
-        // And going away is a drop, named under its table.
+        // And going away is a drop, named under its table — but not data
+        // lost: an index held no rows.
         let delta = diff(&after, &before);
-        assert!(delta.drops_anything());
-        assert_eq!(delta.dropped_names(), vec!["t.t_a_idx"]);
+        assert!(matches!(
+            delta.objects[0].change,
+            ObjectChange::Dropped { .. }
+        ));
+        assert_eq!(delta.objects[0].qualified(), "t.t_a_idx");
+        assert!(!delta.drops_anything());
+        assert!(delta.dropped_names().is_empty());
     }
 
     #[test]
@@ -625,6 +625,7 @@ mod tests {
             data_type: "bigint".into(),
         });
         let delta = diff(&before, &Catalog { schemas: vec![] });
-        assert_eq!(delta.dropped_names(), vec!["public.order_seq"]);
+        assert_eq!(delta.objects.len(), 1);
+        assert_eq!(delta.objects[0].qualified(), "public.order_seq");
     }
 }

@@ -191,7 +191,9 @@ impl SqliteConnection {
     }
 
     /// A table's foreign keys. SQLite names none of them, so each is
-    /// named the way Postgres would have named it: `orders_user_id_fkey`.
+    /// named the way Postgres would have named it: `orders_user_id_fkey`,
+    /// and `orders_user_id_fkey1` for a second key over the same columns,
+    /// which Postgres would have named that way too.
     async fn foreign_keys(&self, table: &str) -> Result<Vec<ForeignKey>> {
         let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
             "SELECT id, \"table\", \"from\", \"to\" FROM pragma_foreign_key_list(?1) \
@@ -216,16 +218,34 @@ impl SqliteConnection {
             }
             let (_, key) = keys.last_mut().expect("pushed above");
             key.columns.push(from);
-            // No `to` means the key names the target's primary key.
-            key.target_columns.push(to.unwrap_or_default());
+            if let Some(to) = to {
+                key.target_columns.push(to);
+            }
         }
-        Ok(keys
-            .into_iter()
-            .map(|(_, mut key)| {
-                key.name = format!("{table}_{}_fkey", key.columns.join("_"));
-                key
-            })
-            .collect())
+        let mut named: Vec<ForeignKey> = Vec::with_capacity(keys.len());
+        for (_, mut key) in keys {
+            // No `to` means the key names the target's primary key, which
+            // is where the columns have to be read from.
+            if key.target_columns.len() != key.columns.len() {
+                let primary: Vec<(String,)> = sqlx::query_as(
+                    "SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk",
+                )
+                .bind(&key.target_table)
+                .fetch_all(&self.pool)
+                .await?;
+                key.target_columns = primary.into_iter().map(|(name,)| name).collect();
+            }
+            let base = format!("{table}_{}_fkey", key.columns.join("_"));
+            let mut name = base.clone();
+            let mut n = 0;
+            while named.iter().any(|other| other.name == name) {
+                n += 1;
+                name = format!("{base}{n}");
+            }
+            key.name = name;
+            named.push(key);
+        }
+        Ok(named)
     }
 
     async fn triggers(&self, table: &str) -> Result<Vec<Trigger>> {
@@ -467,7 +487,8 @@ mod tests {
         let conn = SqliteConnection::open_in_memory().await.unwrap();
         for statement in [
             "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
-            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users (id))",
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users (id),
+                 CONSTRAINT again FOREIGN KEY (user_id) REFERENCES users)",
             "CREATE INDEX orders_user ON orders (user_id)",
             "CREATE TRIGGER stamp AFTER UPDATE OF user_id ON orders BEGIN SELECT 1; END",
         ] {
@@ -483,7 +504,24 @@ mod tests {
             orders.foreign_keys[0].detail(),
             "(user_id) → main.users(id)"
         );
-        assert_eq!(orders.foreign_keys[0].name, "orders_user_id_fkey");
+        // A key that names no target column reads the target's primary
+        // key, and a second key over the same column gets a name of its own.
+        let keys: Vec<(String, String)> = (orders.foreign_keys.iter())
+            .map(|k| (k.name.clone(), k.detail()))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                (
+                    "orders_user_id_fkey".to_string(),
+                    "(user_id) → main.users(id)".to_string()
+                ),
+                (
+                    "orders_user_id_fkey1".to_string(),
+                    "(user_id) → main.users(id)".to_string()
+                ),
+            ]
+        );
         assert_eq!(orders.triggers[0].timing, "after update of user_id");
 
         // The unique constraint is the index SQLite made for it.

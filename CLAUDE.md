@@ -247,6 +247,13 @@ relation with its `Parts`, or a `Leaf` — and flattened into `CatalogRow`s
 again whenever what the sidebar shows changes. An empty section or folder
 is left out rather than drawn empty.
 
+**A relation is folded out lazily.** Its `Parts` are built the first
+time it is unfolded, from the `Rc<Catalog>` its `Group` holds: a catalog
+of three thousand tables carries some eighty thousand columns and
+indexes, and a leaf apiece on the GPUI thread every time a catalog lands
+would pay for rows almost nobody opens. "reveal in schema tree" unfolds
+the relation it reveals, because what changed may be one of its indexes.
+
 **A leaf opens nothing.** A column, an index or a routine says what it is
 — its type, its key, its signature, in the faint ink after its name — and
 a click on it does nothing, because there is no tab for it to open into.
@@ -1076,16 +1083,18 @@ schema — and `Delta::objects` lists the ones that came, went, or read
 differently, compared by the same `detail()` line the sidebar paints. The
 objects of a table that came or went are not listed: a `CREATE TABLE`
 with a key makes an index, and saying so beside the table would say one
-event twice. `SchemaReport` on the
+event twice. **An object is never data lost**: `drops_anything` and
+`dropped_names` count tables and columns only, so a committed `DROP
+INDEX` is not painted as something that cannot be recovered. `SchemaReport` on the
 tab holds the result, and `Shell::schema_strip` paints it as the comp's
 SCHEMA CHANGED panel, first under the editor: a `+` row on the green wash,
 a `−` row on the clay wash with the name struck through, a `~` row saying
 `text → integer`, and `reveal in schema tree`, which opens the sidebar on
 the relation. When the run held exactly one shape-changing statement the
 report is its doing, and `ddl_meta` rewrites its statistic to
-`altered · +2 −1 columns · 12 ms` — or, when no column moved, to
-`created · +1 index · 12 ms`, naming the object's own sort when they are
-all of one.
+`altered · +2 −1 columns · 12 ms` — or, when no column moved and no
+table came or went, to `created · +1 index · 12 ms`, naming the object's
+own sort when they are all of one.
 
 **It reads on the tab's own session, because that is the only place the
 change exists yet.** Inside an open transaction a new table is visible to
@@ -1810,22 +1819,40 @@ columns, because it also carries the `reltuples` estimate and `format_type`
 renders type names the way `psql` does. Primary keys come from
 `information_schema`, which reports key column order.
 
-**The rest of the catalog is nine reads, not one join.** Indexes,
+**The rest of the catalog is its own reads, not one join.** Indexes,
 constraints, triggers, sequences, routines and types each come from their
 own system catalog, rendered by the server's own `pg_get_*` functions so a
 definition reads the way `\d` prints it; a join of them all would
 multiply the rows. `build_catalog` puts the tree together, and lists a
 schema that holds anything at all — a schema of nothing but functions has
-a place too. Routines and types skip what an extension installed
-(`pg_depend.deptype = 'e'`), because `CREATE EXTENSION pgcrypto` puts
-forty functions into `public` and none of them is the user's, and
-triggers skip `tgisinternal`, which is a foreign key's own enforcement.
-A trigger's timing is read off `tgtype`'s bits by `trigger_timing`.
+a place too. Every list is grouped by its table once, so a catalog of
+thousands of tables is one pass per list rather than one per table.
+
+What something made for itself is left out, because it is not the
+user's and the schema report would name it beside the thing that made
+it: routines and types an extension installed (`pg_depend.deptype =
+'e'`) — `CREATE EXTENSION pgcrypto` puts forty functions into `public` —
+a range type's constructors (`'i'`), a sequence a `serial` or an
+identity column owns, a foreign key's enforcement triggers
+(`tgisinternal`), and the clone of a key Postgres makes for every
+partition of a partitioned table it references. A trigger's timing is
+read off `tgtype`'s bits by `trigger_timing`.
+
+**The relations are the catalog; the objects are extra.** Tables,
+columns and keys fail the introspection when they fail, as they always
+did. Every read after them is best-effort and answers with an empty list
+on an error, so a Postgres-compatible server that refuses one does not
+cost the sidebar its tables. The two reads that need a column newer than
+PostgreSQL 10 — `pg_sequence`, `prokind`, `conparentid` — are gated on
+`server_version_num` and never sent to an older server, which matters
+on a session: a refused read inside the user's transaction would abort
+it.
 
 SQLite has no sequences, routines or types. Its indexes and foreign keys
 come from the `pragma_index_list` and `pragma_foreign_key_list` table
 functions, and it names no foreign key, so each is named the way Postgres
-would have. It keeps a check only in the `CREATE TABLE` text, and the
+would have, with a number after a name already taken. A key that names
+no target column reads the target's primary key. It keeps a check only in the `CREATE TABLE` text, and the
 driver does not parse SQL to find one.
 
 Every field the model gained after its first cut is `#[serde(default)]`,
