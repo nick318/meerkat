@@ -1990,7 +1990,7 @@ impl Shell {
         // one of its relations has a third part, and stays as they left it.
         let prefix = format!("{schema}\t");
         self.closed_sections
-            .retain(|key| !(key.starts_with(&prefix) && !key[prefix.len()..].contains('\t')));
+            .retain(|key| !key.starts_with(&prefix) || key[prefix.len()..].contains('\t'));
         // Unfolded, because what changed may be an index or a column, and
         // a relation revealed shut would hide exactly that.
         self.open_relations.insert(relation_key(&schema, &name));

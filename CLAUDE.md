@@ -1842,8 +1842,8 @@ read off `tgtype`'s bits by `trigger_timing`.
 columns and keys fail the introspection when they fail, as they always
 did. Every read after them is best-effort and answers with an empty list
 on an error, so a Postgres-compatible server that refuses one does not
-cost the sidebar its tables. The two reads that need a column newer than
-PostgreSQL 10 — `pg_sequence`, `prokind`, `conparentid` — are gated on
+cost the sidebar its tables. What needs a catalog newer than
+PostgreSQL 10 — `pg_sequence`, `prokind`, `conparentid` — is gated on
 `server_version_num` and never sent to an older server, which matters
 on a session: a refused read inside the user's transaction would abort
 it.

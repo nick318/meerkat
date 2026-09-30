@@ -1019,9 +1019,9 @@ fn is_cancelled(error: &sqlx::Error) -> bool {
 /// they always have. The objects after them are read *best-effort*: a
 /// server that refuses one of those reads — a fork, a server older than
 /// the catalog column asked for — answers with an empty list rather than
-/// costing the sidebar its tables. The two reads that need a column newer
-/// than PostgreSQL 10 are not sent to an older server at all, so they
-/// cannot abort a transaction the session read is running inside.
+/// costing the sidebar its tables. What needs a catalog newer than
+/// PostgreSQL 10 is not sent to an older server at all, so it cannot
+/// abort a transaction the session read is running inside.
 async fn read_catalog(conn: &mut sqlx::PgConnection) -> Result<Catalog> {
     let tables: Vec<TableRow> = sqlx::query_as(
         "SELECT n.nspname, c.relname, c.relkind::text, c.reltuples::bigint \
