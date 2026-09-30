@@ -12,6 +12,13 @@
 //! the caret. Colouring comes from a one-pass tokenizer that also knows
 //! the names in the connected database. There is no soft wrap.
 //!
+//! ⌘F opens a find strip over the buffer: every hit washed, the one the
+//! walk stands on selected, ⏎ and ⇧⏎ (or ⌘G and ⇧⌘G) stepping between
+//! them. The strip is `ui::find_bar`, the one the results grid wears, and
+//! it is painted **beside** the editor's key context rather than inside it
+//! — `enter` there is a line break, and would be taken from the search
+//! line.
+//!
 //! Offsets are byte offsets into the buffer and always sit on a character
 //! boundary.
 
@@ -27,15 +34,18 @@ use gpui::{
     Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
     FontWeight, GlobalElementId, Hsla, IntoElement, KeyContext, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollHandle,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
-    fill, point, prelude::*, px, relative, size,
+    ShapedLine, SharedString, Style, Subscription, TextRun, UTF16Selection, UnderlineStyle, Window,
+    actions, div, fill, point, prelude::*, px, relative, size,
 };
 use highlight::Token;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 use theme::{ThemeColors, theme};
 use ui::blink::{Blink, Blinking};
+use ui::find_bar::{self, FindCount};
 use ui::scrollbar::{self, DragState, Scrollbar};
+use ui::{TextField, TextFieldEvent};
 
 actions!(
     sql_editor,
@@ -50,6 +60,9 @@ actions!(
         DeleteToEndOfLine,
         DeleteToNextWordEnd,
         DeleteToPreviousWordStart,
+        Find,
+        FindNext,
+        FindPrevious,
         Indent,
         MoveDown,
         MoveLeft,
@@ -91,6 +104,11 @@ pub fn key_bindings() -> Vec<gpui::KeyBinding> {
     macro_rules! bind {
         ($keystroke:expr, $action:expr) => {
             gpui::KeyBinding::new($keystroke, $action, Some(KEY_CONTEXT))
+        };
+    }
+    macro_rules! finding {
+        ($keystroke:expr, $action:expr) => {
+            gpui::KeyBinding::new($keystroke, $action, Some(FIND_KEY_CONTEXT))
         };
     }
     macro_rules! completing {
@@ -141,6 +159,18 @@ pub fn key_bindings() -> Vec<gpui::KeyBinding> {
         bind!("cmd-c", Copy),
         bind!("cmd-x", Cut),
         bind!("ctrl-space", OpenCompletion),
+        // Finding text. ⌘G and ⇧⌘G step with the strip closed as well, over
+        // what it last searched for — the macOS habit, and the way back to
+        // a hit after ⎋ put the keys back in the buffer.
+        bind!("cmd-f", Find),
+        bind!("cmd-g", FindNext),
+        bind!("cmd-shift-g", FindPrevious),
+        // The strip's own keys. ⏎ and ⎋ are the search line's `Submit` and
+        // `Cancel`, as they are for every other search line in the app.
+        finding!("cmd-f", Find),
+        finding!("cmd-g", FindNext),
+        finding!("cmd-shift-g", FindPrevious),
+        finding!("shift-enter", FindPrevious),
         // Registered last, and scoped to the completing context, so they
         // outrank the caret bindings above only while the panel is open.
         completing!("down", NextCompletion),
@@ -157,6 +187,9 @@ const KEY_CONTEXT: &str = "SqlEditor";
 /// Only true while the completion panel is open, so ↑↓/enter/tab keep
 /// their ordinary meaning the rest of the time.
 const COMPLETING_CONTEXT: &str = "SqlEditor && completing";
+/// The find strip's own context. It is not inside `KEY_CONTEXT`, so none of
+/// the editor's keys reach the search line.
+const FIND_KEY_CONTEXT: &str = "SqlEditorFind";
 /// The completion popup keeps a readable width without stretching to fit
 /// a long column name.
 const MENU_MIN_WIDTH: f32 = 220.;
@@ -332,6 +365,33 @@ pub struct SqlEditor {
     diagnostics: Vec<Diagnostic>,
     /// Where the caret is in its blink.
     blink: Blink,
+    /// The find strip, while it is open.
+    find: Option<FindStrip>,
+    /// What the strip last searched for, kept when it closes so ⌘G can go
+    /// on stepping and ⌘F can open on it again.
+    last_needle: String,
+    /// Every hit of the open strip, worked out in `render` from the buffer
+    /// and the line as they are this frame, for the element to paint.
+    /// Never kept past a frame: an edit moves the text under them.
+    hits: Vec<Range<usize>>,
+    /// The strip stopped counting at `find_bar::MAX_HITS`.
+    hits_capped: bool,
+    /// The selection the find walk put there, while it is still the
+    /// selection.
+    ///
+    /// **A hit is selected, and a run over a selection runs the selection**
+    /// — so without this, ⌘F `delete from orders` and then ⌘⏎ would send
+    /// `DELETE FROM orders` with the `WHERE` after it left behind. A
+    /// selection the user did not make is not a request to run part of the
+    /// buffer, so [`SqlEditor::run_source`] and [`SqlEditor::selected_text`]
+    /// read past it. Any edit or motion clears it, through `touched`.
+    found: Option<Range<usize>>,
+}
+
+/// The open find strip. What it found is not kept here — see `hits`.
+struct FindStrip {
+    query: Entity<TextField>,
+    _subscription: Subscription,
 }
 
 impl gpui::EventEmitter<SqlEditorEvent> for SqlEditor {}
@@ -403,6 +463,11 @@ impl SqlEditor {
             statements: Vec::new(),
             diagnostics: Vec::new(),
             blink: Blink::default(),
+            find: None,
+            last_needle: String::new(),
+            hits: Vec::new(),
+            hits_capped: false,
+            found: None,
         }
     }
 
@@ -413,7 +478,7 @@ impl SqlEditor {
     /// The selected text, when there is a selection. The query tab runs
     /// this in place of the whole buffer.
     pub fn selected_text(&self) -> Option<String> {
-        let range = clamp_range(&self.content, self.selected_range.clone());
+        let range = clamp_range(&self.content, self.chosen_range());
         let selected = self.content[range].trim().to_string();
         (!selected.is_empty()).then_some(selected)
     }
@@ -426,7 +491,7 @@ impl SqlEditor {
     /// statements of *this* buffer — a mark on the first of them belongs
     /// on the line the selection starts on, not on line one.
     pub fn run_source(&self) -> (String, usize) {
-        let range = clamp_range(&self.content, self.selected_range.clone());
+        let range = clamp_range(&self.content, self.chosen_range());
         let slice = &self.content[range.clone()];
         let trimmed = slice.trim();
         if trimmed.is_empty() {
@@ -434,6 +499,16 @@ impl SqlEditor {
         }
         let start = range.start + (slice.len() - slice.trim_start().len());
         (trimmed.to_string(), start)
+    }
+
+    /// The selection the user made, if any: a hit the find walk selected
+    /// counts as none. See `found`.
+    fn chosen_range(&self) -> Range<usize> {
+        if self.found.as_ref() == Some(&self.selected_range) {
+            let at = self.selected_range.start;
+            return at..at;
+        }
+        self.selected_range.clone()
     }
 
     /// Take the statements a run is about to send, all of them queued.
@@ -668,6 +743,7 @@ impl SqlEditor {
     /// both name byte ranges the edit has just shifted — and whoever owns
     /// the editor is told, so the check can run again.
     fn edited(&mut self, cx: &mut Context<Self>) {
+        self.found = None;
         self.statements.clear();
         self.diagnostics.clear();
         cx.emit(SqlEditorEvent::Changed);
@@ -676,6 +752,7 @@ impl SqlEditor {
     /// Redraw, and put the caret back on show. Every edit and every
     /// motion goes through here rather than calling `cx.notify()` itself.
     fn touched(&mut self, cx: &mut Context<Self>) {
+        self.found = None;
         self.restart_blink(cx);
         cx.notify();
     }
@@ -756,6 +833,7 @@ impl SqlEditor {
                 snapshot.selection_reversed,
             ),
         };
+        self.found = None;
         self.marked_range = None;
         self.last_edit = EditKind::None;
         self.pending_autoscroll = true;
@@ -879,6 +957,178 @@ impl SqlEditor {
         let line = &layout.lines[row];
         let local = line.closest_index_for_x(position.x - bounds.left());
         layout.line_starts[row] + local
+    }
+
+    // --- finding text ----------------------------------------------------
+
+    /// ⌘F: open the strip, or put the keys back in it. A selection on one
+    /// line is what the user wants to find more of, so it becomes the line;
+    /// otherwise the line opens on what was last searched for. Either way
+    /// it is marked, so the next character typed replaces it.
+    pub fn find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A hit the last search left selected is not a new needle: ⎋ then
+        // ⌘F goes back to that search rather than to one spelled the way
+        // the hit happens to be.
+        let selected = &self.content[clamp_range(&self.content, self.chosen_range())];
+        let seed = (!selected.is_empty() && !selected.contains('\n')).then(|| selected.to_string());
+        let query = match &self.find {
+            Some(find) => find.query.clone(),
+            None => {
+                let query = cx.new(|cx| TextField::new("find", cx).bare(find_bar::FONT_SIZE));
+                let subscription = cx.subscribe_in(&query, window, Self::on_find_event);
+                self.find = Some(FindStrip {
+                    query: query.clone(),
+                    _subscription: subscription,
+                });
+                if seed.is_none() && !self.last_needle.is_empty() {
+                    let needle = self.last_needle.clone();
+                    query.update(cx, |field, cx| field.set_text(needle, cx));
+                }
+                query
+            }
+        };
+        if let Some(seed) = seed {
+            query.update(cx, |field, cx| field.set_text(seed, cx));
+        }
+        query.update(cx, |field, cx| field.select_everything(cx));
+        window.focus(&query.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn find_action(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        self.find(window, cx);
+    }
+
+    /// ⎋ in the line: close the strip and give the keys back to the buffer,
+    /// with the hit the walk stood on still selected.
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(find) = self.find.take() {
+            self.last_needle = find.query.read(cx).text().to_string();
+        }
+        self.hits.clear();
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// What the strip is searching for: the open line's text, or what the
+    /// closed one last held.
+    fn needle(&self, cx: &App) -> String {
+        match &self.find {
+            Some(find) => find.query.read(cx).text().to_string(),
+            None => self.last_needle.clone(),
+        }
+    }
+
+    fn search(&self, needle: &str) -> Vec<Range<usize>> {
+        self.search_capped(needle).0
+    }
+
+    fn search_capped(&self, needle: &str) -> (Vec<Range<usize>>, bool) {
+        fuzzy::Needle::new(needle).find_capped(&self.content, find_bar::MAX_HITS)
+    }
+
+    /// A keystroke in the line lands on the first hit from where the
+    /// selection starts — so a hit already under the user stays put as the
+    /// needle grows, and the search moves on from where they were rather
+    /// than from the top of the buffer.
+    fn land(&mut self, cx: &mut Context<Self>) {
+        let hits = self.search(&self.needle(cx));
+        let starts: Vec<usize> = hits.iter().map(|hit| hit.start).collect();
+        if let Some(ix) = find_bar::first_from(&starts, &self.selected_range.start) {
+            self.select_hit(hits[ix].clone(), cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// ⏎ and ⇧⏎ in the line, ⌘G and ⇧⌘G anywhere: the next hit or the one
+    /// before, wrapping at both ends.
+    fn step_find(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let hits = self.search(&self.needle(cx));
+        let starts: Vec<usize> = hits.iter().map(|hit| hit.start).collect();
+        let at = self.selected_range.start;
+        // A bare caret sitting right in front of a hit stands before it, so
+        // a step forward lands there rather than skipping it.
+        let ix = if forward && self.selected_range.is_empty() {
+            find_bar::first_from(&starts, &at)
+        } else {
+            find_bar::step(&starts, Some(&at), forward)
+        };
+        if let Some(ix) = ix {
+            self.select_hit(hits[ix].clone(), cx);
+        }
+    }
+
+    fn find_next(&mut self, _: &FindNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_find(true, cx);
+    }
+
+    fn find_previous(&mut self, _: &FindPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_find(false, cx);
+    }
+
+    /// Select one hit and bring it into view. The hit is the selection, so
+    /// ⎋ leaves it marked and ⌘C copies it.
+    fn select_hit(&mut self, hit: Range<usize>, cx: &mut Context<Self>) {
+        self.close_completions();
+        self.selected_range = clamp_range(&self.content, hit);
+        self.selection_reversed = false;
+        self.last_edit = EditKind::None;
+        self.pending_autoscroll = true;
+        self.touched(cx);
+        self.found = Some(self.selected_range.clone());
+    }
+
+    fn on_find_event(
+        &mut self,
+        _field: &Entity<TextField>,
+        event: &TextFieldEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TextFieldEvent::Changed => self.land(cx),
+            TextFieldEvent::Submit => self.step_find(true, cx),
+            TextFieldEvent::Cancel => self.close_find(window, cx),
+            // The strip has one field and nothing to finish.
+            TextFieldEvent::NextField => {}
+        }
+    }
+
+    /// The strip, in a key context of its own.
+    fn find_strip(&self, find: &FindStrip, cx: &mut Context<Self>) -> Div {
+        let count = FindCount {
+            typed: !find.query.read(cx).text().is_empty(),
+            total: self.hits.len(),
+            current: self.hits.iter().position(|hit| *hit == self.selected_range),
+            capped: self.hits_capped,
+        };
+        let editor = cx.entity().downgrade();
+        let on_step: find_bar::OnStep = Rc::new(move |forward, _window, cx| {
+            editor
+                .update(cx, |editor, cx| editor.step_find(forward, cx))
+                .ok();
+        });
+        let editor = cx.entity().downgrade();
+        let on_close: find_bar::OnClose = Rc::new(move |window, cx| {
+            editor
+                .update(cx, |editor, cx| editor.close_find(window, cx))
+                .ok();
+        });
+        div()
+            .flex_none()
+            .key_context(FIND_KEY_CONTEXT)
+            .on_action(cx.listener(Self::find_action))
+            .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::find_previous))
+            .child(find_bar::find_bar(
+                "sql-editor-find",
+                find.query.clone(),
+                count,
+                on_step,
+                on_close,
+                cx,
+            ))
     }
 
     // --- completions -----------------------------------------------------
@@ -1458,6 +1708,13 @@ impl Render for SqlEditor {
         // element inside fills this box; the box is what the scroll
         // container measures.
         let text_width = TEXT_PADDING_X * 2. + self.widest_line() as f32 * CHAR_WIDTH;
+        // The hits are read off the buffer and the line as they are now, so
+        // an edit under an open strip is searched again on the next frame.
+        (self.hits, self.hits_capped) = match &self.find {
+            Some(find) => self.search_capped(find.query.read(cx).text()),
+            None => (Vec::new(), false),
+        };
+        let find_strip = self.find.as_ref().map(|find| self.find_strip(find, cx));
 
         // The `completing` entry is what lets the completion bindings
         // outrank the caret bindings, and only while the panel is open.
@@ -1467,7 +1724,7 @@ impl Render for SqlEditor {
             key_context.add("completing");
         }
 
-        div()
+        let editor = div()
             .id("sql-editor")
             .key_context(key_context)
             .track_focus(&self.focus_handle(cx))
@@ -1511,11 +1768,16 @@ impl Render for SqlEditor {
             .on_action(cx.listener(Self::next_completion))
             .on_action(cx.listener(Self::previous_completion))
             .on_action(cx.listener(Self::dismiss_completion))
+            .on_action(cx.listener(Self::find_action))
+            .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::find_previous))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .size_full()
+            .w_full()
+            .flex_1()
+            .min_h(px(0.))
             .relative()
             .flex()
             .text_size(px(FONT_SIZE))
@@ -1721,7 +1983,16 @@ impl Render for SqlEditor {
                         .h(px(scrollbar::THICKNESS))
                         .child(bar)
                 }),
-            )
+            );
+
+        // The strip sits over the editor and beside its key context, never
+        // inside it: see the module docs.
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .children(find_strip)
+            .child(editor)
     }
 }
 
@@ -2210,6 +2481,17 @@ impl Element for EditorElement {
                 .unwrap_or_default();
             let mut quads = wash_quads(editor, &layout, bounds, &colors);
             quads.extend(selection_quads(editor, &layout, bounds, colors.selection));
+            // Over the selection, because the hit the walk stands on *is*
+            // the selection, and it has to read as the current hit rather
+            // than as text the user happened to mark.
+            for hit in &editor.hits {
+                let color = if *hit == editor.selected_range {
+                    colors.find_current
+                } else {
+                    colors.find_hit
+                };
+                quads.extend(range_quads(hit, &layout, bounds, color));
+            }
             (
                 quads,
                 cursor_quad(editor, &layout, bounds, colors.accent),
@@ -2572,19 +2854,34 @@ fn selection_quads(
     bounds: Bounds<Pixels>,
     color: Hsla,
 ) -> Vec<PaintQuad> {
-    if editor.selected_range.is_empty() {
+    range_quads(&editor.selected_range, layout, bounds, color)
+}
+
+/// The blocks behind one range of the buffer, a block per line it covers.
+fn range_quads(
+    range: &Range<usize>,
+    layout: &EditorLayout,
+    bounds: Bounds<Pixels>,
+    color: Hsla,
+) -> Vec<PaintQuad> {
+    if range.is_empty() {
         return Vec::new();
     }
+    // Only the lines the range reaches: a buffer can carry thousands of
+    // hits, and a walk over every line for each of them is a frame nobody
+    // gets to see.
+    let first = row_for_offset(&layout.line_starts, range.start);
+    let last = row_for_offset(&layout.line_starts, range.end);
     let mut quads = Vec::new();
-    for (row, line) in layout.lines.iter().enumerate() {
+    for (row, line) in layout.lines.iter().enumerate().take(last + 1).skip(first) {
         let start = layout.line_starts[row];
         let end = start + line.len();
-        let from = editor.selected_range.start.clamp(start, end);
-        let to = editor.selected_range.end.clamp(start, end);
+        let from = range.start.clamp(start, end);
+        let to = range.end.clamp(start, end);
         // A line whose break is inside the selection gets a sliver of
         // trailing highlight, so a multi-line selection reads as one block
         // instead of ragged stripes.
-        let trailing = if editor.selected_range.start <= end && editor.selected_range.end > end {
+        let trailing = if range.start <= end && range.end > end {
             px(4.)
         } else {
             px(0.)

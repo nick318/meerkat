@@ -72,7 +72,17 @@
 //! those ranges into the label it builds, so a range that fell inside a
 //! character would panic on the slice.
 //!
+//! ## Finding text
+//!
+//! A find line over a buffer or a result asks a different question —
+//! where is this text, not which name was meant — and [`text`] answers it
+//! with a plain substring under the same case rule.
+//!
 //! [fzf's]: https://github.com/junegunn/fzf/blob/master/src/algo/algo.go
+
+pub mod text;
+
+pub use text::Needle;
 
 use std::ops::Range;
 

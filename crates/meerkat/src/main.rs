@@ -74,6 +74,7 @@ fn main() {
         cx.bind_keys(palette::key_bindings());
         cx.bind_keys(shell::confirm_key_bindings());
         cx.bind_keys(shell::column_find_key_bindings());
+        cx.bind_keys(shell::result_find_key_bindings());
         cx.bind_keys(shell::catalog_filter_key_bindings());
         cx.bind_keys(shell::peek_key_bindings());
         // The workspace's keys are scoped to the workspace, not bound

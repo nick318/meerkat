@@ -153,10 +153,10 @@ UI crates may depend on data crates; the reverse is forbidden. `db_postgres`,
 | `db_postgres`, `db_sqlite` | sqlx drivers behind that trait |
 | `introspect` | Schema model (`Catalog` → `Schema` → `Table` → `Column`) that drivers fill |
 | `query` | `statements()`: split a buffer into statements, quote- and comment-aware |
-| `fuzzy` | `Pattern::score`: one matcher for every search line over names |
+| `fuzzy` | `Pattern::score`: one matcher for every search line over names; `Needle`: the ⌘F substring over text |
 | `sql_editor` | Multi-line SQL buffer: motion, undo, colouring, completion |
 | `results_grid` | Virtualized grid |
-| `ui`, `theme` | Component kit (incl. `TextField` and the overlay `scrollbar`) and color tokens |
+| `ui`, `theme` | Component kit (incl. `TextField`, the overlay `scrollbar` and the ⌘F `find_bar`) and color tokens |
 | `storage` | Local SQLite: profiles, cached probe counts, layout, history, cached catalogs |
 | `secrets` | OS keychain wrapper for passwords |
 | `release_channel` | Which channel this build is (`local`/`dev`/`public`), its version and commit — baked in at compile time |
@@ -592,7 +592,8 @@ word starting with one, while `EMAIL` still finds `email`.
 by substring, because it is prose rather than a path of words — see the
 palette section. And SQL keywords in the completion panel are matched by
 prefix: a keyword is one word with nothing to walk, and matching inside
-one would answer `em` with `temp`.
+one would answer `em` with `temp`. And the ⌘F line over the editor and
+the result is a plain substring, `fuzzy::Needle` — see "Finding text".
 
 ### Finding a column of a result
 
@@ -645,6 +646,81 @@ is why every path that changes the active tab now hands the focus on
 through `focus_active_tab`, or the focus would be left on a control the
 switch took off the screen. `guard_close` and `open_palette` drop it for
 the reason they close the palette: one thing takes keys at a time.
+
+### Finding text
+
+**⌘F means "find in what I am looking at"**, so it is bound three times
+and the deepest context answers. In the SQL editor it searches the buffer;
+in the grid it searches the result's values; anywhere else in the shell
+`Shell::find_in_tab` picks by the tab — a query tab's editor, a table
+tab's result. ⏎ and ⇧⏎ step inside the line, ⌘G and ⇧⌘G step from the
+editor or the grid as well, over what the line last held — so ⎋ puts the
+keys back and the walk still goes on. The walk **wraps**, and the count
+says where it is: `3 of 12`.
+
+**One strip, two owners.** `ui::find_bar` paints the line, the count and
+the two steps, and decides nothing: it is handed a `FindCount` and two
+callbacks. A hit in the editor is a byte range and a hit in the grid is a
+cell, and each owner keeps its own. `find_bar::step` and `first_from` are
+the walk, plain functions over sorted hits, argued with in a test.
+
+**It is a strip, not a popover.** A popover over the editor covers the
+lines being searched, and one over the grid covers the header that says
+which column a hit is in. The strip pushes the pane down by one row.
+
+**The strip never sits inside its owner's key context.** The grid binds
+a bare `space` to ticking a row and the editor binds `enter` to a line
+break, and an ancestor binding takes the key before the search line can
+type it. So each strip is a sibling of its owner's context, with a
+context of its own — `SqlEditorFind` and `RESULT_FIND_KEY_CONTEXT`.
+
+**The needle is a substring, not the name matcher.** `fuzzy::Needle`
+reads the line as text: the word-start rule over a statement full of
+word starts would light half the buffer. Case follows the crate's own
+rule — ignored until the line is written in both cases — so one habit
+serves every search line in the app.
+
+**A keystroke lands from where the user is.** `first_from` puts the walk
+on the first hit at or after the caret or the cursor, so a hit already
+under the user stays put as the needle grows, and a search does not jump
+back to the top.
+
+In the editor **the hit is the selection**: ⎋ leaves it marked and ⌘C
+copies it. The hits are worked out in `render` from the buffer and the
+line as they are this frame, so an edit under an open strip is searched
+again; a buffer is small enough for that. Every hit wears `find_hit`,
+and the one the selection covers wears `find_current`, painted over the
+selection so it reads as the current hit.
+
+In the grid **the hit is the cursor**: a step moves `Selection`'s cursor
+and `GridState::reveal` scrolls to it, as ⌘J does. What is searched is
+the **value**, not what the cell paints, so a hit past the lane's cut is
+still found — ⏎ opens it whole. `results_grid::find_cells` reads every
+value in a result, which is too much to pay per frame, so `ResultFind`
+memoises the answer on the result it came from — held by a `Weak`, which
+also stops the next result reusing the address — and on the line's text.
+A run, a page turn or a keystroke is a miss — but a needle that only
+grew is `refine_cells` over the hits it had, since every hit of `abc` is a
+hit of `ab`, so a word costs one full read rather than one per letter.
+The search stops at `find_bar::MAX_HITS`, and the count says `10,000+`;
+it counts from the first row, so a capped search is one to narrow, not
+to step through. The editor caps its hits the same way.
+
+**The selection the find walk made is not the user's.** A hit is
+selected, and ⌘⏎ over a selection runs the selection — so ⌘F `delete
+from orders` and ⌘⏎ would send the statement without its `WHERE`.
+`SqlEditor::found` remembers the range the walk selected, and
+`run_source` and `selected_text` read past it; any edit or motion clears
+it. ⌘F after ⎋ reads past it too, and opens on the last needle rather
+than on the hit's own spelling.
+The hits are painted only while the strip is open; a wash nobody asked
+for would be one the user cannot put away.
+
+The find family is butter yellow, `find_hit` and `find_current`, and not
+a fourth tan: the grid already carries the cursor, the range and a
+ticked row in the ochre family, and a hit has to read apart from all
+three. A strip is a control on one result, so `Shell::activate` drops the
+grid's, as it drops the column find.
 
 ### Reading a whole value
 

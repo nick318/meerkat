@@ -75,6 +75,14 @@ pub struct ThemeColors {
     /// The same wash inside a palette row for a run that failed, so the
     /// mark stays warm against `error_surface`.
     pub match_error: Hsla,
+    /// What the ⌘F line found, in the SQL editor and in the results grid.
+    /// A butter yellow rather than another warm tan: the grid already
+    /// carries three marks in the ochre family — the cursor, the range and
+    /// a ticked row — and a hit has to read apart from all three at a
+    /// glance. `find_hit` is every hit; `find_current` is the one the walk
+    /// stands on, deep enough to be found again after a scroll.
+    pub find_hit: Hsla,
+    pub find_current: Hsla,
     /// The scrim the ⌘K palette lays over the workspace. Carries alpha:
     /// the screen behind it must stay readable.
     pub overlay: Hsla,
@@ -206,6 +214,8 @@ impl Theme {
                 match_wash: rgb(0xEFE3CC).into(),
                 match_strong: rgb(0xE7CFA3).into(),
                 match_error: rgb(0xF2DDD1).into(),
+                find_hit: rgb(0xF6E8B1).into(),
+                find_current: rgb(0xEBCB67).into(),
                 overlay: rgba(0x34302A38).into(),
                 shadow: rgba(0x211F1B66).into(),
                 env_prod: rgb(0xB4552A).into(),
