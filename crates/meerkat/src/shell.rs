@@ -536,6 +536,11 @@ pub struct Shell {
     /// the same reason the grid keeps its hovered row on `GridState`. One
     /// button is on screen at a time, so one flag covers it.
     run_pressed: bool,
+    /// The error strip whose message was last put on the clipboard: its
+    /// tab and the message itself. The strip's link says `copied` while
+    /// both still match, so the press has an answer on screen; a new
+    /// error in that tab is a different message and reads `copy` again.
+    copied_error: Option<(u64, String)>,
     /// The divider drag in flight, if any. Mouse state between frames,
     /// like `run_pressed`, and one at a time: there is one pointer.
     pane_drag: Option<PaneDrag>,
@@ -1214,6 +1219,7 @@ impl Shell {
             sweeping: false,
             timing: false,
             run_pressed: false,
+            copied_error: None,
             pane_drag: None,
             sidebar_width,
             editor_height,
@@ -3609,6 +3615,17 @@ impl Shell {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
+    /// The error strip's `copy`: the server's message, whole and bare.
+    ///
+    /// Whole, because the line the user needs to paste is often the
+    /// `LINE 1:` under the first; bare, because it is going into a ticket
+    /// or a search box, not a grid.
+    fn copy_error(&mut self, tab_id: u64, message: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(message.clone()));
+        self.copied_error = Some((tab_id, message));
+        cx.notify();
+    }
+
     // --- walking the tabs -------------------------------------------------
 
     /// ⌃⇥ moves to the next tab, ⌃⇧⇥ to the one before it, in the order
@@ -5972,7 +5989,11 @@ impl Shell {
         match self.tabs.get(self.active) {
             Some(Tab::Table(tab)) => pane
                 .child(self.table_toolbar(tab, colors, cx))
-                .children(tab.error.clone().map(|error| error_strip(error, colors)))
+                .children(
+                    tab.error
+                        .clone()
+                        .map(|error| self.error_strip(tab.id, error, colors, cx)),
+                )
                 .child(self.result_body(tab.id, colors, cx)),
             Some(Tab::Query(tab)) => self.query_pane(pane, tab, colors, cx),
             Some(Tab::History(tab)) => self.history_pane(pane, tab, colors, cx),
@@ -6636,6 +6657,49 @@ impl Shell {
         )
     }
 
+    /// What the server said when it refused a run, with a `copy` link on
+    /// the right. The text of a GPUI element cannot be marked with the
+    /// pointer, and an error is the one message on screen most often
+    /// wanted somewhere else — a ticket, a search, a colleague.
+    fn error_strip(
+        &self,
+        tab_id: u64,
+        message: String,
+        colors: &ThemeColors,
+        cx: &Context<Self>,
+    ) -> Div {
+        let copied = self
+            .copied_error
+            .as_ref()
+            .is_some_and(|(id, text)| *id == tab_id && *text == message);
+        div()
+            .flex_none()
+            .flex()
+            .items_start()
+            .gap(px(12.))
+            .px(px(14.))
+            .py(px(9.))
+            .border_b_1()
+            .border_color(colors.error_border)
+            .bg(colors.error_surface)
+            .text_size(px(11.))
+            .text_color(colors.error)
+            .child(div().flex_1().min_w(px(0.)).child(message.clone()))
+            .child(
+                div()
+                    .id(ElementId::NamedInteger("copy-error".into(), tab_id))
+                    .flex_none()
+                    .cursor_pointer()
+                    .text_size(px(10.))
+                    .text_color(colors.error_secondary)
+                    .hover(|s| s.text_color(colors.error))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.copy_error(tab_id, message.clone(), cx)
+                    }))
+                    .child(if copied { "copied" } else { "copy" }),
+            )
+    }
+
     fn tx_bar(&self, tab: &QueryTab, colors: &ThemeColors, cx: &Context<Self>) -> Option<Div> {
         let state = TxState {
             mode: tab.tx_mode,
@@ -7177,7 +7241,11 @@ impl Shell {
         // and above the run's own error strip, which is about a statement
         // that was actually sent.
         .children(syntax_strip(tab, colors, cx))
-        .children(tab.error.clone().map(|error| error_strip(error, colors)))
+        .children(
+            tab.error
+                .clone()
+                .map(|error| self.error_strip(tab.id, error, colors, cx)),
+        )
         // Directly over the result, because it is about what the runs have
         // done rather than about the statement above them.
         .children(self.tx_bar(tab, colors, cx))
@@ -7264,7 +7332,11 @@ impl Shell {
                         })),
                 ),
         )
-        .children(tab.error.clone().map(|error| error_strip(error, colors)))
+        .children(
+            tab.error
+                .clone()
+                .map(|error| self.error_strip(tab.id, error, colors, cx)),
+        )
         .child(self.history_list(tab, colors, cx))
     }
 
@@ -9283,7 +9355,7 @@ fn cap_note(tab: &QueryTab, colors: &ThemeColors) -> Option<Div> {
 /// is spoken for, and the count on the right says how many there are —
 /// otherwise a buffer with three faults would read as a buffer with one.
 ///
-/// It is **not** [`error_strip`]. That one answers a run: the server was
+/// It is **not** [`Shell::error_strip`]. That one answers a run: the server was
 /// sent a statement and refused it. This one is about a statement nobody
 /// has sent, so it takes the panel's own ground and says its piece in the
 /// error ink rather than lighting a whole strip up like a failure.
@@ -9329,19 +9401,6 @@ fn spoken_for(diagnostics: &[Diagnostic], cursor: usize) -> usize {
         .iter()
         .position(|diagnostic| diagnostic.range.start <= cursor && cursor <= diagnostic.range.end)
         .unwrap_or(0)
-}
-
-fn error_strip(message: String, colors: &ThemeColors) -> Div {
-    div()
-        .flex_none()
-        .px(px(14.))
-        .py(px(9.))
-        .border_b_1()
-        .border_color(colors.error_border)
-        .bg(colors.error_surface)
-        .text_size(px(11.))
-        .text_color(colors.error)
-        .child(message)
 }
 
 /// Never paint a password, not even in the "could not connect" card.
