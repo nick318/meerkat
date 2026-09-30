@@ -998,7 +998,9 @@ mod tests {
                     columns: Vec::new(),
                     primary_key: vec!["id".into()],
                     approx_rows: Some(12),
+                    ..Default::default()
                 }],
+                ..Default::default()
             }],
         };
 

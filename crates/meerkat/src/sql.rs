@@ -90,6 +90,7 @@ mod tests {
                 .collect(),
             primary_key: primary_key.iter().map(|c| c.to_string()).collect(),
             approx_rows: None,
+            ..Default::default()
         }
     }
 

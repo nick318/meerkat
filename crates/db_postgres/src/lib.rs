@@ -9,6 +9,9 @@
 //! carries the `reltuples` row estimate and `format_type` renders the type
 //! names the way `psql` shows them. Primary keys come from
 //! `information_schema`, which already reports the key column order.
+//! Indexes, constraints, triggers, sequences, routines and types come
+//! from `pg_catalog` too, each rendered by the server's own `pg_get_*`
+//! function so a definition reads the way `\d` prints it.
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -17,13 +20,16 @@ use db_client::{
     RunId, ServerTiming, Session, Stop, TxEnd, Value, Wire,
 };
 use futures::TryStreamExt as _;
-use introspect::{Catalog, Column, Schema, Table, TableKind};
+use introspect::{
+    Catalog, Column, Constraint, ConstraintKind, ForeignKey, Index, Routine, RoutineKind, Schema,
+    Sequence, Table, TableKind, Trigger, TypeKind, UserType,
+};
 use sqlx::postgres::{
     PgConnectOptions, PgDatabaseError, PgErrorPosition, PgPool, PgPoolOptions, PgQueryResult,
     PgRow, PgTypeInfo, PgTypeKind, PgValueFormat, PgValueRef,
 };
 use sqlx::{Column as _, Either, Executor as _, Row as _, TypeInfo as _, ValueRef as _};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -399,6 +405,29 @@ type TableRow = (String, String, String, Option<i64>);
 type ColumnRow = (String, String, String, String, bool, Option<String>);
 /// One row of the primary-key listing: schema, table, column.
 type KeyRow = (String, String, String);
+/// One index: schema, table, index, method and key, unique, primary.
+type IndexRow = (String, String, String, String, bool, bool);
+/// One constraint: schema, table, name, `contype`, definition, columns,
+/// and for a foreign key the referenced schema, table and columns.
+type ConstraintRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Vec<String>,
+    Option<String>,
+    Option<String>,
+    Vec<String>,
+);
+/// One trigger: schema, table, name, `tgtype`, the function it runs.
+type TriggerRow = (String, String, String, i32, String);
+/// One sequence: schema, name, type.
+type SequenceRow = (String, String, String);
+/// One routine: schema, name, `prokind`, identity arguments, result.
+type RoutineRow = (String, String, String, String, Option<String>);
+/// One type: schema, name, `typtype`, what it is made of.
+type TypeRow = (String, String, String, Option<String>);
 
 #[async_trait]
 impl Connection for PostgresConnection {
@@ -972,11 +1001,18 @@ fn is_cancelled(error: &sqlx::Error) -> bool {
     matches!(error, sqlx::Error::Database(db) if db.code().as_deref() == Some(QUERY_CANCELED))
 }
 
-/// The three catalog reads, on whichever connection is handed in.
+/// The catalog reads, on whichever connection is handed in.
 ///
 /// One function for the pool and for a session, so the two cannot drift
 /// into two catalogs: a session reads it to see its own uncommitted DDL,
 /// and must see exactly what the sidebar would see once that commits.
+///
+/// Nine statements, each over one system catalog. A join of all of them
+/// would multiply the rows — every column by every index by every
+/// trigger — so the tree is put together here instead, by `build_catalog`.
+/// Every read skips the system schemas the same way, and the routines and
+/// types skip what an extension installed: `CREATE EXTENSION pgcrypto`
+/// puts forty functions into `public`, and none of them is the user's.
 async fn read_catalog(conn: &mut sqlx::PgConnection) -> Result<Catalog> {
     let tables: Vec<TableRow> = sqlx::query_as(
         "SELECT n.nspname, c.relname, c.relkind::text, c.reltuples::bigint \
@@ -1027,12 +1063,184 @@ async fn read_catalog(conn: &mut sqlx::PgConnection) -> Result<Catalog> {
     .await
     .context("failed to list primary keys")?;
 
-    Ok(build_catalog(tables, columns, keys))
+    // `pg_get_indexdef` writes the whole `CREATE INDEX`; the part after
+    // `USING` is the method and the key, which is what differs between
+    // two indexes of one table.
+    let indexes: Vec<IndexRow> = sqlx::query_as(
+        "SELECT n.nspname, c.relname, ic.relname, \
+                coalesce(substring(pg_get_indexdef(i.indexrelid) FROM ' USING (.*)$'), \
+                         pg_get_indexdef(i.indexrelid)), \
+                i.indisunique, i.indisprimary \
+         FROM pg_index i \
+         JOIN pg_class c ON c.oid = i.indrelid \
+         JOIN pg_class ic ON ic.oid = i.indexrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind IN ('r', 'p', 'm', 'f') \
+           AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND n.nspname NOT LIKE 'pg_toast%' \
+           AND n.nspname NOT LIKE 'pg_temp%' \
+         ORDER BY n.nspname, c.relname, ic.relname",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to list indexes")?;
+
+    // Foreign keys, unique, check and exclusion constraints in one read.
+    // The primary key is left out — `keys` has it in key order — and so
+    // is a domain's check, which belongs to no table. The column arrays
+    // are walked `WITH ORDINALITY` so a two-column key keeps its order.
+    let constraints: Vec<ConstraintRow> = sqlx::query_as(
+        "SELECT n.nspname, c.relname, con.conname, con.contype::text, \
+                pg_get_constraintdef(con.oid, true), \
+                ARRAY(SELECT a.attname::text \
+                        FROM unnest(con.conkey) WITH ORDINALITY AS k(num, ord) \
+                        JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.num \
+                       ORDER BY k.ord), \
+                fn.nspname::text, fc.relname::text, \
+                ARRAY(SELECT a.attname::text \
+                        FROM unnest(con.confkey) WITH ORDINALITY AS k(num, ord) \
+                        JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.num \
+                       ORDER BY k.ord) \
+         FROM pg_constraint con \
+         JOIN pg_class c ON c.oid = con.conrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_class fc ON fc.oid = con.confrelid \
+         LEFT JOIN pg_namespace fn ON fn.oid = fc.relnamespace \
+         WHERE con.contype IN ('f', 'u', 'c', 'x') \
+           AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND n.nspname NOT LIKE 'pg_toast%' \
+           AND n.nspname NOT LIKE 'pg_temp%' \
+         ORDER BY n.nspname, c.relname, con.conname",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to list constraints")?;
+
+    // `tgisinternal` is what a foreign key's own enforcement triggers
+    // carry; they are the key, not something the user wrote.
+    let triggers: Vec<TriggerRow> = sqlx::query_as(
+        "SELECT n.nspname, c.relname, t.tgname, t.tgtype::int, t.tgfoid::regproc::text \
+         FROM pg_trigger t \
+         JOIN pg_class c ON c.oid = t.tgrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE NOT t.tgisinternal \
+           AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND n.nspname NOT LIKE 'pg_toast%' \
+           AND n.nspname NOT LIKE 'pg_temp%' \
+         ORDER BY n.nspname, c.relname, t.tgname",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to list triggers")?;
+
+    let sequences: Vec<SequenceRow> = sqlx::query_as(
+        "SELECT n.nspname, c.relname, format_type(s.seqtypid, NULL) \
+         FROM pg_sequence s \
+         JOIN pg_class c ON c.oid = s.seqrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND n.nspname NOT LIKE 'pg_toast%' \
+           AND n.nspname NOT LIKE 'pg_temp%' \
+         ORDER BY n.nspname, c.relname",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to list sequences")?;
+
+    let routines: Vec<RoutineRow> = sqlx::query_as(
+        "SELECT n.nspname, p.proname, p.prokind::text, \
+                pg_get_function_identity_arguments(p.oid), \
+                CASE WHEN p.prokind = 'p' THEN NULL ELSE pg_get_function_result(p.oid) END \
+         FROM pg_proc p \
+         JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND n.nspname NOT LIKE 'pg_toast%' \
+           AND n.nspname NOT LIKE 'pg_temp%' \
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d \
+                            WHERE d.classid = 'pg_proc'::regclass \
+                              AND d.objid = p.oid AND d.deptype = 'e') \
+         ORDER BY n.nspname, p.proname, 4",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to list routines")?;
+
+    // Every table has a composite type of its own; only a composite made
+    // with `CREATE TYPE … AS (…)` has a `pg_class` row of kind `c`.
+    let types: Vec<TypeRow> = sqlx::query_as(
+        "SELECT n.nspname, t.typname, t.typtype::text, \
+                CASE t.typtype \
+                  WHEN 'e' THEN (SELECT string_agg(e.enumlabel, ', ' ORDER BY e.enumsortorder) \
+                                   FROM pg_enum e WHERE e.enumtypid = t.oid) \
+                  WHEN 'd' THEN format_type(t.typbasetype, t.typtypmod) \
+                  WHEN 'r' THEN (SELECT format_type(r.rngsubtype, NULL) \
+                                   FROM pg_range r WHERE r.rngtypid = t.oid) \
+                  WHEN 'c' THEN (SELECT string_agg(a.attname || ' ' \
+                                                   || format_type(a.atttypid, a.atttypmod), \
+                                                   ', ' ORDER BY a.attnum) \
+                                   FROM pg_attribute a \
+                                  WHERE a.attrelid = t.typrelid \
+                                    AND a.attnum > 0 AND NOT a.attisdropped) \
+                END \
+         FROM pg_type t \
+         JOIN pg_namespace n ON n.oid = t.typnamespace \
+         WHERE t.typtype IN ('e', 'd', 'r', 'c') \
+           AND (t.typtype <> 'c' \
+                OR (SELECT c.relkind FROM pg_class c WHERE c.oid = t.typrelid) = 'c') \
+           AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND n.nspname NOT LIKE 'pg_toast%' \
+           AND n.nspname NOT LIKE 'pg_temp%' \
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d \
+                            WHERE d.classid = 'pg_type'::regclass \
+                              AND d.objid = t.oid AND d.deptype = 'e') \
+         ORDER BY n.nspname, t.typname",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to list types")?;
+
+    Ok(build_catalog(CatalogRows {
+        tables,
+        columns,
+        keys,
+        indexes,
+        constraints,
+        triggers,
+        sequences,
+        routines,
+        types,
+    }))
 }
 
-fn build_catalog(tables: Vec<TableRow>, columns: Vec<ColumnRow>, keys: Vec<KeyRow>) -> Catalog {
-    let mut schemas: Vec<Schema> = Vec::new();
-    for (schema_name, table_name, relkind, reltuples) in tables {
+/// Everything `read_catalog` read, before it is put into a tree.
+struct CatalogRows {
+    tables: Vec<TableRow>,
+    columns: Vec<ColumnRow>,
+    keys: Vec<KeyRow>,
+    indexes: Vec<IndexRow>,
+    constraints: Vec<ConstraintRow>,
+    triggers: Vec<TriggerRow>,
+    sequences: Vec<SequenceRow>,
+    routines: Vec<RoutineRow>,
+    types: Vec<TypeRow>,
+}
+
+/// Put the rows into schemas. A schema is listed when anything at all
+/// sits in it, so a schema of nothing but functions has a place in the
+/// tree too. Every read is ordered by schema name, and a `BTreeMap` keeps
+/// that order: `name` compares bytewise, as a Rust string does.
+fn build_catalog(rows: CatalogRows) -> Catalog {
+    let mut schemas: BTreeMap<String, Schema> = BTreeMap::new();
+    fn schema<'a>(schemas: &'a mut BTreeMap<String, Schema>, name: &str) -> &'a mut Schema {
+        schemas.entry(name.to_string()).or_insert_with(|| Schema {
+            name: name.to_string(),
+            ..Default::default()
+        })
+    }
+    let of =
+        |s: &str, t: &str, schema_name: &str, table_name: &str| s == schema_name && t == table_name;
+
+    for (schema_name, table_name, relkind, reltuples) in &rows.tables {
         let table = Table {
             name: table_name.clone(),
             kind: match relkind.as_str() {
@@ -1040,9 +1248,8 @@ fn build_catalog(tables: Vec<TableRow>, columns: Vec<ColumnRow>, keys: Vec<KeyRo
                 "v" | "m" => TableKind::View,
                 _ => TableKind::Table,
             },
-            columns: columns
-                .iter()
-                .filter(|(s, t, ..)| *s == schema_name && *t == table_name)
+            columns: (rows.columns.iter())
+                .filter(|(s, t, ..)| of(s, t, schema_name, table_name))
                 .map(|(_, _, name, data_type, nullable, default)| Column {
                     name: name.clone(),
                     data_type: data_type.clone(),
@@ -1050,24 +1257,132 @@ fn build_catalog(tables: Vec<TableRow>, columns: Vec<ColumnRow>, keys: Vec<KeyRo
                     default: default.clone(),
                 })
                 .collect(),
-            primary_key: keys
-                .iter()
-                .filter(|(s, t, _)| *s == schema_name && *t == table_name)
+            primary_key: (rows.keys.iter())
+                .filter(|(s, t, _)| of(s, t, schema_name, table_name))
                 .map(|(_, _, column)| column.clone())
                 .collect(),
             // `reltuples` is -1 when the table was never analyzed. Report
             // nothing rather than a zero the user would read as "empty".
             approx_rows: reltuples.filter(|n| *n >= 0).map(|n| n as u64),
+            indexes: (rows.indexes.iter())
+                .filter(|(s, t, ..)| of(s, t, schema_name, table_name))
+                .map(|(_, _, name, definition, unique, primary)| Index {
+                    name: name.clone(),
+                    definition: definition.clone(),
+                    unique: *unique,
+                    primary: *primary,
+                })
+                .collect(),
+            foreign_keys: (rows.constraints.iter())
+                .filter(|(s, t, _, kind, ..)| kind == "f" && of(s, t, schema_name, table_name))
+                .map(
+                    |(_, _, name, _, _, columns, target_schema, target_table, target_columns)| {
+                        ForeignKey {
+                            name: name.clone(),
+                            columns: columns.clone(),
+                            target_schema: target_schema.clone().unwrap_or_default(),
+                            target_table: target_table.clone().unwrap_or_default(),
+                            target_columns: target_columns.clone(),
+                        }
+                    },
+                )
+                .collect(),
+            constraints: (rows.constraints.iter())
+                .filter(|(s, t, ..)| of(s, t, schema_name, table_name))
+                .filter_map(|(_, _, name, kind, definition, ..)| {
+                    Some(Constraint {
+                        name: name.clone(),
+                        kind: match kind.as_str() {
+                            "u" => ConstraintKind::Unique,
+                            "c" => ConstraintKind::Check,
+                            "x" => ConstraintKind::Exclusion,
+                            _ => return None,
+                        },
+                        definition: definition.clone(),
+                    })
+                })
+                .collect(),
+            triggers: (rows.triggers.iter())
+                .filter(|(s, t, ..)| of(s, t, schema_name, table_name))
+                .map(|(_, _, name, tgtype, function)| Trigger {
+                    name: name.clone(),
+                    timing: trigger_timing(*tgtype),
+                    function: format!("{function}()"),
+                })
+                .collect(),
         };
-        match schemas.last_mut() {
-            Some(schema) if schema.name == schema_name => schema.tables.push(table),
-            _ => schemas.push(Schema {
-                name: schema_name,
-                tables: vec![table],
-            }),
-        }
+        schema(&mut schemas, schema_name).tables.push(table);
     }
-    Catalog { schemas }
+    for (schema_name, name, data_type) in rows.sequences {
+        schema(&mut schemas, &schema_name)
+            .sequences
+            .push(Sequence { name, data_type });
+    }
+    for (schema_name, name, kind, arguments, returns) in rows.routines {
+        schema(&mut schemas, &schema_name).routines.push(Routine {
+            name,
+            kind: match kind.as_str() {
+                "p" => RoutineKind::Procedure,
+                "a" => RoutineKind::Aggregate,
+                "w" => RoutineKind::Window,
+                _ => RoutineKind::Function,
+            },
+            arguments,
+            returns,
+        });
+    }
+    for (schema_name, name, kind, definition) in rows.types {
+        let kind = match kind.as_str() {
+            "e" => TypeKind::Enum,
+            "d" => TypeKind::Domain,
+            "r" => TypeKind::Range,
+            _ => TypeKind::Composite,
+        };
+        schema(&mut schemas, &schema_name).types.push(UserType {
+            name,
+            kind,
+            definition: definition.unwrap_or_default(),
+        });
+    }
+    Catalog {
+        schemas: schemas.into_values().collect(),
+    }
+}
+
+/// When a trigger fires, read off `pg_trigger.tgtype`, whose bits are
+/// fixed in `pg_trigger.h`: `before insert or update`, and `· statement`
+/// for one that fires once per statement rather than once per row.
+fn trigger_timing(tgtype: i32) -> String {
+    const ROW: i32 = 1 << 0;
+    const BEFORE: i32 = 1 << 1;
+    const INSERT: i32 = 1 << 2;
+    const DELETE: i32 = 1 << 3;
+    const UPDATE: i32 = 1 << 4;
+    const TRUNCATE: i32 = 1 << 5;
+    const INSTEAD: i32 = 1 << 6;
+
+    let when = if tgtype & INSTEAD != 0 {
+        "instead of"
+    } else if tgtype & BEFORE != 0 {
+        "before"
+    } else {
+        "after"
+    };
+    let events: Vec<&str> = [
+        (INSERT, "insert"),
+        (UPDATE, "update"),
+        (DELETE, "delete"),
+        (TRUNCATE, "truncate"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| tgtype & bit != 0)
+    .map(|(_, event)| event)
+    .collect();
+    let mut timing = format!("{when} {}", events.join(" or "));
+    if tgtype & ROW == 0 {
+        timing.push_str(" · statement");
+    }
+    timing
 }
 
 fn decode(row: &PgRow, i: usize) -> Result<Value> {
@@ -1904,6 +2219,115 @@ mod tests {
         conn.execute("DROP SCHEMA meerkat_test CASCADE")
             .await
             .unwrap();
+    }
+
+    /// Everything beside the columns: the indexes, keys, constraints and
+    /// triggers of a table, and the sequences, routines and types of the
+    /// schema — and nothing an extension or a key's own enforcement put
+    /// there.
+    #[tokio::test]
+    async fn introspect_reads_every_object() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect_url(&url, false).await.unwrap();
+
+        conn.execute("DROP SCHEMA IF EXISTS meerkat_objects CASCADE")
+            .await
+            .unwrap();
+        for statement in [
+            "CREATE SCHEMA meerkat_objects",
+            "CREATE TYPE meerkat_objects.mood AS ENUM ('sad', 'ok', 'happy')",
+            "CREATE DOMAIN meerkat_objects.price AS numeric(10, 2) CHECK (VALUE >= 0)",
+            "CREATE TYPE meerkat_objects.pair AS (a integer, b text)",
+            "CREATE SEQUENCE meerkat_objects.ticket AS integer",
+            "CREATE TABLE meerkat_objects.users (id bigint PRIMARY KEY, email text UNIQUE)",
+            "CREATE TABLE meerkat_objects.orders (
+                 id bigint PRIMARY KEY,
+                 user_id bigint REFERENCES meerkat_objects.users (id),
+                 total meerkat_objects.price,
+                 CONSTRAINT positive CHECK (id > 0)
+             )",
+            "CREATE INDEX orders_user ON meerkat_objects.orders (user_id)",
+            "CREATE FUNCTION meerkat_objects.touch() RETURNS trigger LANGUAGE plpgsql
+                 AS $$ BEGIN RETURN NEW; END $$",
+            "CREATE FUNCTION meerkat_objects.double(x integer) RETURNS integer
+                 LANGUAGE sql AS 'SELECT x * 2'",
+            "CREATE PROCEDURE meerkat_objects.noop() LANGUAGE sql AS 'SELECT 1'",
+            "CREATE TRIGGER touch BEFORE INSERT OR UPDATE ON meerkat_objects.orders
+                 FOR EACH ROW EXECUTE FUNCTION meerkat_objects.touch()",
+        ] {
+            conn.execute(statement).await.unwrap();
+        }
+
+        let catalog = conn.introspect().await.unwrap();
+        let schema = catalog
+            .schemas
+            .iter()
+            .find(|s| s.name == "meerkat_objects")
+            .expect("test schema is missing from the catalog");
+        let orders = schema.tables.iter().find(|t| t.name == "orders").unwrap();
+
+        let indexes: Vec<(&str, &str, bool)> = (orders.indexes.iter())
+            .map(|i| (i.name.as_str(), i.definition.as_str(), i.primary))
+            .collect();
+        assert_eq!(
+            indexes,
+            [
+                ("orders_pkey", "btree (id)", true),
+                ("orders_user", "btree (user_id)", false),
+            ]
+        );
+
+        assert_eq!(orders.foreign_keys.len(), 1);
+        assert_eq!(
+            orders.foreign_keys[0].detail(),
+            "(user_id) → meerkat_objects.users(id)"
+        );
+        // The check is a constraint; the key and the primary key are not
+        // listed a second time.
+        assert_eq!(orders.constraints.len(), 1);
+        assert_eq!(orders.constraints[0].kind, ConstraintKind::Check);
+        assert_eq!(orders.constraints[0].definition, "CHECK (id > 0)");
+
+        // The foreign key's enforcement triggers are internal and left out.
+        assert_eq!(orders.triggers.len(), 1);
+        assert_eq!(orders.triggers[0].timing, "before insert or update");
+        assert_eq!(orders.triggers[0].function, "meerkat_objects.touch()");
+
+        let users = schema.tables.iter().find(|t| t.name == "users").unwrap();
+        assert_eq!(users.constraints[0].kind, ConstraintKind::Unique);
+
+        assert_eq!(schema.sequences.len(), 1);
+        assert_eq!(schema.sequences[0].data_type, "integer");
+
+        let routines: Vec<String> = schema.routines.iter().map(|r| r.detail()).collect();
+        assert_eq!(
+            routines,
+            ["(x integer) → integer", "procedure · ()", "() → trigger"]
+        );
+
+        let types: Vec<String> = schema.types.iter().map(|t| t.detail()).collect();
+        assert_eq!(
+            types,
+            [
+                "enum · sad, ok, happy",
+                "composite · a integer, b text",
+                "domain · numeric(10,2)",
+            ]
+        );
+
+        conn.execute("DROP SCHEMA meerkat_objects CASCADE")
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn a_trigger_says_when_it_fires() {
+        // ROW | BEFORE | INSERT | UPDATE
+        assert_eq!(trigger_timing(1 | 2 | 4 | 16), "before insert or update");
+        // AFTER DELETE, once per statement.
+        assert_eq!(trigger_timing(8), "after delete · statement");
+        // INSTEAD OF INSERT on a view, per row.
+        assert_eq!(trigger_timing(1 | 4 | 64), "instead of insert");
     }
 
     #[tokio::test]

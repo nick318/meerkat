@@ -24,8 +24,10 @@ packet, rather than the app reading the user's SQL.
 
 Open a connection and you get:
 
-- **A sidebar** of the real schemas, tables and views, painted from a
-  cached catalog before the connection has even landed. ⌘E puts the keys
+- **A sidebar** of the real schemas, tables and views — and their
+  sequences, routines and types — painted from a cached catalog before
+  the connection has even landed. A table folds out into its columns,
+  indexes, foreign keys, constraints and triggers. ⌘E puts the keys
   on its filter line; ↑↓ walk the matches and ⏎ opens one.
 - **Query tabs.** ⌘⏎ runs the buffer, ⌘. stops it. Each tab pins its own
   connection from its first run, so `BEGIN`, `SET` and temp tables mean
@@ -95,7 +97,7 @@ UI crates may depend on data crates; the reverse is forbidden.
 | `db_client` | Engine-agnostic `Connection` and `Session` traits, `Profile`, `Value`, `QueryResult`, result caps |
 | `db_postgres` | PostgreSQL driver (sqlx): introspection, runs, cancels, server timing |
 | `db_sqlite` | SQLite driver (sqlx). Written and tested; the app does not offer it yet |
-| `introspect` | Schema model: catalog, schemas, tables, columns, keys |
+| `introspect` | Schema model: schemas, tables, columns, keys, indexes, constraints, triggers, sequences, routines, types |
 | `query` | Splitting a buffer into statements, and reading a statement's verb |
 | `fuzzy` | One name matcher for the sidebar, the palette, the column search and completion |
 | `sql_editor` | Multi-line SQL buffer: motion, undo, colouring, completion, gutter marks |

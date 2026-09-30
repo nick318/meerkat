@@ -14,19 +14,28 @@
 //! **A table with a different kind is a drop and a create**, not an
 //! alteration: nothing in SQL turns a table into a view in place, and a
 //! view that replaced a table of the same name is two events.
+//!
+//! **Everything else the catalog carries is an object**: an index, a key,
+//! a constraint or a trigger of a relation, and a sequence, a routine or a
+//! type of a schema. They are compared by name and by `detail()` — the
+//! line the sidebar paints beside them — and listed apart from the
+//! relations in `Delta::objects`. The objects of a relation that came or
+//! went are *not* listed: a `CREATE TABLE` with a key makes an index, and
+//! reporting it beside the table would say one event twice.
 
-use crate::{Catalog, Column, Table, TableKind};
+use crate::{Catalog, Column, Schema, Table, TableKind};
 
-/// Everything that differs between two catalogs, relation by relation.
-/// Empty means the two describe the same tables and columns.
+/// Everything that differs between two catalogs, relation by relation,
+/// then object by object. Empty means the two describe the same shape.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Delta {
     pub relations: Vec<RelationDelta>,
+    pub objects: Vec<ObjectDelta>,
 }
 
 impl Delta {
     pub fn is_empty(&self) -> bool {
-        self.relations.is_empty()
+        self.relations.is_empty() && self.objects.is_empty()
     }
 
     /// Whether anything in the delta is a removal — a table or a column
@@ -42,6 +51,10 @@ impl Delta {
                     .iter()
                     .any(|column| matches!(column, ColumnDelta::Dropped(_))),
             })
+            || self
+                .objects
+                .iter()
+                .any(|object| matches!(object.change, ObjectChange::Dropped { .. }))
     }
 
     /// The names of every column and table the delta removes, qualified
@@ -61,6 +74,11 @@ impl Delta {
                         }
                     }
                 }
+            }
+        }
+        for object in &self.objects {
+            if matches!(object.change, ObjectChange::Dropped { .. }) {
+                names.push(object.qualified());
             }
         }
         names
@@ -101,9 +119,88 @@ pub enum ColumnDelta {
     },
 }
 
+/// What sort of thing an object is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    Index,
+    ForeignKey,
+    Constraint,
+    Trigger,
+    Sequence,
+    Routine,
+    Type,
+}
+
+impl ObjectKind {
+    pub fn noun(self) -> &'static str {
+        match self {
+            ObjectKind::Index => "index",
+            ObjectKind::ForeignKey => "foreign key",
+            ObjectKind::Constraint => "constraint",
+            ObjectKind::Trigger => "trigger",
+            ObjectKind::Sequence => "sequence",
+            ObjectKind::Routine => "routine",
+            ObjectKind::Type => "type",
+        }
+    }
+
+    pub fn plural(self) -> &'static str {
+        match self {
+            ObjectKind::Index => "indexes",
+            ObjectKind::ForeignKey => "foreign keys",
+            ObjectKind::Constraint => "constraints",
+            ObjectKind::Trigger => "triggers",
+            ObjectKind::Sequence => "sequences",
+            ObjectKind::Routine => "routines",
+            ObjectKind::Type => "types",
+        }
+    }
+}
+
+/// One object that came, went, or reads differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectDelta {
+    pub schema: String,
+    /// The relation the object belongs to; `None` for one that sits in
+    /// the schema itself.
+    pub relation: Option<String>,
+    pub kind: ObjectKind,
+    /// Its name — a routine's signature, because overloads share a name
+    /// and are two objects.
+    pub name: String,
+    pub change: ObjectChange,
+}
+
+impl ObjectDelta {
+    /// The name qualified by what it sits in, the way `dropped_names`
+    /// writes a column: `orders.orders_user_id_fkey`, `public.order_seq`.
+    pub fn qualified(&self) -> String {
+        match &self.relation {
+            Some(relation) => format!("{relation}.{}", self.name),
+            None => format!("{}.{}", self.schema, self.name),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectChange {
+    Added {
+        detail: String,
+    },
+    Dropped {
+        detail: String,
+    },
+    /// The same name, another definition: `btree (a)` became `btree (a, b)`.
+    Changed {
+        before: String,
+        after: String,
+    },
+}
+
 /// Compare two readings of one database.
 pub fn diff(before: &Catalog, after: &Catalog) -> Delta {
     let mut relations = Vec::new();
+    let mut objects = Vec::new();
 
     // What exists now: new, or altered.
     for schema in &after.schemas {
@@ -125,6 +222,13 @@ pub fn diff(before: &Catalog, after: &Catalog) -> Delta {
                     },
                 }),
                 Some(was) => {
+                    diff_objects(
+                        &schema.name,
+                        Some(&table.name),
+                        &table_objects(was),
+                        &table_objects(table),
+                        &mut objects,
+                    );
                     let columns = diff_columns(was, table);
                     if !columns.is_empty() {
                         relations.push(RelationDelta {
@@ -136,6 +240,35 @@ pub fn diff(before: &Catalog, after: &Catalog) -> Delta {
                     }
                 }
             }
+        }
+    }
+
+    // What sits in the schemas themselves, for every schema that is there
+    // now, and then for every one that went.
+    for schema in &after.schemas {
+        let was = before
+            .schemas
+            .iter()
+            .find(|s| s.name == schema.name)
+            .map(schema_objects)
+            .unwrap_or_default();
+        diff_objects(
+            &schema.name,
+            None,
+            &was,
+            &schema_objects(schema),
+            &mut objects,
+        );
+    }
+    for schema in &before.schemas {
+        if !after.schemas.iter().any(|s| s.name == schema.name) {
+            diff_objects(
+                &schema.name,
+                None,
+                &schema_objects(schema),
+                &[],
+                &mut objects,
+            );
         }
     }
 
@@ -162,7 +295,86 @@ pub fn diff(before: &Catalog, after: &Catalog) -> Delta {
         }
     }
 
-    Delta { relations }
+    Delta { relations, objects }
+}
+
+/// An object as the diff compares it: what it is, its name, its detail.
+type Object = (ObjectKind, String, String);
+
+/// Everything a relation carries beside its columns.
+fn table_objects(table: &Table) -> Vec<Object> {
+    let mut objects = Vec::new();
+    objects.extend((table.indexes.iter()).map(|i| (ObjectKind::Index, i.name.clone(), i.detail())));
+    objects.extend(
+        (table.foreign_keys.iter()).map(|k| (ObjectKind::ForeignKey, k.name.clone(), k.detail())),
+    );
+    objects.extend(
+        (table.constraints.iter()).map(|c| (ObjectKind::Constraint, c.name.clone(), c.detail())),
+    );
+    objects
+        .extend((table.triggers.iter()).map(|t| (ObjectKind::Trigger, t.name.clone(), t.detail())));
+    objects
+}
+
+/// Everything a schema holds beside its relations.
+fn schema_objects(schema: &Schema) -> Vec<Object> {
+    let mut objects = Vec::new();
+    objects.extend(
+        (schema.sequences.iter()).map(|s| (ObjectKind::Sequence, s.name.clone(), s.detail())),
+    );
+    objects
+        .extend((schema.routines.iter()).map(|r| (ObjectKind::Routine, r.signature(), r.detail())));
+    objects.extend((schema.types.iter()).map(|t| (ObjectKind::Type, t.name.clone(), t.detail())));
+    objects
+}
+
+/// The objects of one relation or one schema that differ, in the order
+/// they have now — dropped ones last, in the order they had.
+fn diff_objects(
+    schema: &str,
+    relation: Option<&str>,
+    before: &[Object],
+    after: &[Object],
+    out: &mut Vec<ObjectDelta>,
+) {
+    let delta = |kind: ObjectKind, name: &str, change: ObjectChange| ObjectDelta {
+        schema: schema.to_string(),
+        relation: relation.map(str::to_string),
+        kind,
+        name: name.to_string(),
+        change,
+    };
+    for (kind, name, detail) in after {
+        match before.iter().find(|(k, n, _)| k == kind && n == name) {
+            None => out.push(delta(
+                *kind,
+                name,
+                ObjectChange::Added {
+                    detail: detail.clone(),
+                },
+            )),
+            Some((_, _, was)) if was != detail => out.push(delta(
+                *kind,
+                name,
+                ObjectChange::Changed {
+                    before: was.clone(),
+                    after: detail.clone(),
+                },
+            )),
+            Some(_) => {}
+        }
+    }
+    for (kind, name, detail) in before {
+        if !after.iter().any(|(k, n, _)| k == kind && n == name) {
+            out.push(delta(
+                *kind,
+                name,
+                ObjectChange::Dropped {
+                    detail: detail.clone(),
+                },
+            ));
+        }
+    }
 }
 
 /// The columns of one relation that differ between two readings, in the
@@ -196,7 +408,7 @@ fn same_shape(a: &Column, b: &Column) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Schema;
+    use crate::{Index, Routine, RoutineKind, Sequence};
 
     fn column(name: &str, data_type: &str) -> Column {
         Column {
@@ -210,10 +422,8 @@ mod tests {
     fn table(name: &str, columns: Vec<Column>) -> Table {
         Table {
             name: name.into(),
-            kind: TableKind::Table,
             columns,
-            primary_key: Vec::new(),
-            approx_rows: None,
+            ..Default::default()
         }
     }
 
@@ -222,7 +432,17 @@ mod tests {
             schemas: vec![Schema {
                 name: "public".into(),
                 tables,
+                ..Default::default()
             }],
+        }
+    }
+
+    fn index(name: &str, definition: &str) -> Index {
+        Index {
+            name: name.into(),
+            definition: definition.into(),
+            unique: false,
+            primary: false,
         }
     }
 
@@ -327,10 +547,84 @@ mod tests {
             schemas: vec![Schema {
                 name: "scratch".into(),
                 tables: vec![table("t", vec![])],
+                ..Default::default()
             }],
         };
         let after = Catalog { schemas: vec![] };
         let delta = diff(&before, &after);
         assert_eq!(delta.dropped_names(), vec!["scratch.t"]);
+    }
+
+    #[test]
+    fn an_index_on_a_table_that_stayed_is_an_object() {
+        let before = catalog(vec![table("t", vec![])]);
+        let mut with_index = table("t", vec![]);
+        with_index.indexes.push(index("t_a_idx", "btree (a)"));
+        let after = catalog(vec![with_index.clone()]);
+
+        let delta = diff(&before, &after);
+        // The table itself did not change, so it is not a relation delta.
+        assert!(delta.relations.is_empty());
+        assert_eq!(delta.objects.len(), 1);
+        let object = &delta.objects[0];
+        assert_eq!(object.kind, ObjectKind::Index);
+        assert_eq!(object.relation.as_deref(), Some("t"));
+        assert!(matches!(&object.change, ObjectChange::Added { detail } if detail == "btree (a)"));
+        assert!(!delta.drops_anything());
+
+        // The same name over another key reads as a change.
+        let mut widened = with_index.clone();
+        widened.indexes[0].definition = "btree (a, b)".into();
+        let delta = diff(&after, &catalog(vec![widened]));
+        assert!(matches!(
+            &delta.objects[0].change,
+            ObjectChange::Changed { before, after }
+                if before == "btree (a)" && after == "btree (a, b)"
+        ));
+
+        // And going away is a drop, named under its table.
+        let delta = diff(&after, &before);
+        assert!(delta.drops_anything());
+        assert_eq!(delta.dropped_names(), vec!["t.t_a_idx"]);
+    }
+
+    #[test]
+    fn a_new_table_does_not_list_its_own_indexes() {
+        let mut with_key = table("t", vec![column("id", "integer")]);
+        with_key.indexes.push(index("t_pkey", "btree (id)"));
+        let delta = diff(&catalog(vec![]), &catalog(vec![with_key]));
+        assert_eq!(delta.relations.len(), 1);
+        assert!(delta.objects.is_empty());
+    }
+
+    #[test]
+    fn overloads_of_a_routine_are_two_objects() {
+        let routine = |arguments: &str| Routine {
+            name: "total".into(),
+            kind: RoutineKind::Function,
+            arguments: arguments.into(),
+            returns: Some("bigint".into()),
+        };
+        let mut before = catalog(vec![]);
+        before.schemas[0].routines.push(routine("integer"));
+        let mut after = before.clone();
+        after.schemas[0].routines.push(routine("integer, integer"));
+
+        let delta = diff(&before, &after);
+        assert_eq!(delta.objects.len(), 1);
+        assert_eq!(delta.objects[0].name, "total(integer, integer)");
+        assert_eq!(delta.objects[0].relation, None);
+        assert!(!delta.is_empty());
+    }
+
+    #[test]
+    fn a_schema_that_went_takes_its_sequences_with_it() {
+        let mut before = catalog(vec![]);
+        before.schemas[0].sequences.push(Sequence {
+            name: "order_seq".into(),
+            data_type: "bigint".into(),
+        });
+        let delta = diff(&before, &Catalog { schemas: vec![] });
+        assert_eq!(delta.dropped_names(), vec!["public.order_seq"]);
     }
 }

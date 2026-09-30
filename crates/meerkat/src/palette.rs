@@ -958,6 +958,7 @@ mod tests {
             columns,
             primary_key: Vec::new(),
             approx_rows: Some(18_412),
+            ..Default::default()
         }
     }
 
@@ -972,6 +973,7 @@ mod tests {
                     table("active_users_7d", TableKind::View, Vec::new()),
                     table("orders", TableKind::Table, vec![column("user_id", "int8")]),
                 ],
+                ..Default::default()
             }],
         }
     }
@@ -985,6 +987,7 @@ mod tests {
                 table("task", TableKind::Table, vec![column("name", "text")]),
                 table("task_run", TableKind::Table, Vec::new()),
             ],
+            ..Default::default()
         };
         Catalog {
             schemas: vec![
@@ -1158,10 +1161,12 @@ mod tests {
                 Schema {
                     name: "task_archive".to_string(),
                     tables: vec![table("orders", TableKind::Table, Vec::new())],
+                    ..Default::default()
                 },
                 Schema {
                     name: "public".to_string(),
                     tables: vec![table("task", TableKind::Table, Vec::new())],
+                    ..Default::default()
                 },
             ],
         };
@@ -1272,6 +1277,7 @@ mod tests {
         let mut schema = Schema {
             name: "public".to_string(),
             tables: Vec::new(),
+            ..Default::default()
         };
         for ix in 0..9 {
             schema

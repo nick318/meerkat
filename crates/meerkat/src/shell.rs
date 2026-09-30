@@ -21,7 +21,10 @@ use gpui::{
     SharedString, Size, Stateful, StyledText, Subscription, TextLayout, UniformListScrollHandle,
     Window, actions, canvas, deferred, div, prelude::*, px, uniform_list,
 };
-use introspect::diff::{self as schema_diff, ColumnDelta, Delta, RelationChange, RelationDelta};
+use introspect::diff::{
+    self as schema_diff, ColumnDelta, Delta, ObjectChange, ObjectDelta, RelationChange,
+    RelationDelta,
+};
 use introspect::{Catalog, Column, Table, TableKind};
 use query::{CommandVerb, DdlVerb, TxVerb};
 use results_grid::{
@@ -471,6 +474,9 @@ pub struct Shell {
     /// what is in it: sections start open, and closing one is the choice
     /// worth remembering.
     closed_sections: HashSet<SharedString>,
+    /// Relations folded out to show their columns and objects, keyed by
+    /// `schema\trelation`. Closed until opened, as a schema is.
+    open_relations: HashSet<SharedString>,
     /// The sidebar's filter line. It narrows the rows already in hand — no
     /// query goes out for it.
     catalog_filter: Entity<TextField>,
@@ -1188,6 +1194,7 @@ impl Shell {
             catalog_rows: Rc::new(Vec::new()),
             open_schemas: HashSet::new(),
             closed_sections: HashSet::new(),
+            open_relations: HashSet::new(),
             catalog_filter,
             catalog_selected: None,
             catalog_scroll: UniformListScrollHandle::new(),
@@ -1371,6 +1378,7 @@ impl Shell {
             &self.catalog_groups,
             &self.open_schemas,
             &self.closed_sections,
+            &self.open_relations,
             &needle,
         );
         // The cursor is an index into the rows that have just been
@@ -1398,7 +1406,9 @@ impl Shell {
         };
         match row {
             CatalogRow::Relation { schema, name, .. } => Some((schema.clone(), name.clone())),
-            CatalogRow::Schema { .. } | CatalogRow::Section { .. } => None,
+            CatalogRow::Schema { .. } | CatalogRow::Section { .. } | CatalogRow::Leaf { .. } => {
+                None
+            }
         }
     }
 
@@ -1502,6 +1512,15 @@ impl Shell {
     fn toggle_section(&mut self, key: SharedString, cx: &mut Context<Self>) {
         if !self.closed_sections.remove(&key) {
             self.closed_sections.insert(key);
+        }
+        self.rebuild_catalog_rows(cx);
+    }
+
+    /// Fold a relation out to show its columns and objects, or fold it
+    /// back. Closed until opened, as a schema is.
+    fn toggle_relation(&mut self, key: SharedString, cx: &mut Context<Self>) {
+        if !self.open_relations.remove(&key) {
+            self.open_relations.insert(key);
         }
         self.rebuild_catalog_rows(cx);
     }
@@ -4350,7 +4369,7 @@ struct Changed {
 struct SchemaReport {
     /// What differs, once the catalog has been read back. Empty until
     /// then, and empty afterwards for a change the model does not carry —
-    /// an index, a function, a grant.
+    /// a grant, a comment, a function's body.
     delta: Delta,
     /// The shape-changing statements of the run: their index in the run,
     /// for the statistic beside them, and their verb, for the wording.
@@ -4795,12 +4814,50 @@ fn ddl_meta(delta: &Delta, verb: DdlVerb, ms: u128) -> Option<String> {
         parts.push(format!("~{changed}"));
     }
     if parts.is_empty() {
-        return None;
+        return object_meta(&delta.objects, verb, ms);
     }
     let noun = if added + dropped + changed == 1 {
         "column"
     } else {
         "columns"
+    };
+    Some(format!(
+        "{} · {} {noun} · {}",
+        verb.past(),
+        parts.join(" "),
+        format_millis(ms)
+    ))
+}
+
+/// The statistic for a statement that moved no column but did make or
+/// drop something else: `created · +1 index · 12 ms`. The noun is the
+/// object's own when they are all of one sort, which a `CREATE INDEX` or a
+/// `DROP FUNCTION` always is, and `objects` when a script mixed them.
+fn object_meta(objects: &[ObjectDelta], verb: DdlVerb, ms: u128) -> Option<String> {
+    let first = objects.first()?;
+    let (mut added, mut dropped, mut changed) = (0, 0, 0);
+    for object in objects {
+        match object.change {
+            ObjectChange::Added { .. } => added += 1,
+            ObjectChange::Dropped { .. } => dropped += 1,
+            ObjectChange::Changed { .. } => changed += 1,
+        }
+    }
+    let mut parts = Vec::new();
+    if added > 0 {
+        parts.push(format!("+{added}"));
+    }
+    if dropped > 0 {
+        parts.push(format!("−{dropped}"));
+    }
+    if changed > 0 {
+        parts.push(format!("~{changed}"));
+    }
+    let one_kind = objects.iter().all(|object| object.kind == first.kind);
+    let noun = match (one_kind, objects.len()) {
+        (true, 1) => first.kind.noun(),
+        (true, _) => first.kind.plural(),
+        (false, _) => "objects",
     };
     Some(format!(
         "{} · {} {noun} · {}",
@@ -6549,7 +6606,7 @@ impl Shell {
             (None, true) => (String::new(), colors.ddl_muted),
             (None, false) if report.delta.is_empty() => (
                 format!(
-                    "{} · nothing the sidebar lists changed — indexes, functions and grants are not compared",
+                    "{} · nothing the sidebar lists changed — grants, comments and function bodies are not compared",
                     schema_note(report.held, &[])
                 ),
                 colors.ddl_muted,
@@ -8054,33 +8111,81 @@ impl Shell {
     }
 }
 
-/// The sidebar tree, flattened into rows of one height. Headers and
-/// relations share the list so `uniform_list` can measure once and lay
-/// out only what is on screen.
+/// The sidebar tree, flattened into rows of one height. Headers,
+/// relations and leaves share the list so `uniform_list` can measure once
+/// and lay out only what is on screen.
+///
+/// Every row sits at a `level` of the tree, and one rule places them all:
+/// the chevron slot of a row at level n starts at `chevron_at(n)`, and
+/// what follows it at `content_at(n)`. So a relation's glyph sits under
+/// its section's label, and a column's under the relation's name — the
+/// tree reads off the left edge however deep it goes.
 #[derive(Clone)]
 enum CatalogRow {
-    /// A schema, and how many relations it holds.
+    /// A schema, and how many things it holds.
     Schema {
         key: SharedString,
         label: SharedString,
         count: usize,
         open: bool,
     },
-    /// `TABLES` or `VIEWS` inside the schema above it.
+    /// A folder: `TABLES`, `VIEWS`, `SEQUENCES`, `ROUTINES` or `TYPES`
+    /// inside a schema at level 1, or `INDEXES`, `FOREIGN KEYS`,
+    /// `CONSTRAINTS` or `TRIGGERS` inside an open relation at level 3.
     Section {
         key: SharedString,
         label: SharedString,
         count: usize,
         open: bool,
+        level: usize,
     },
     Relation {
         schema: SharedString,
         name: SharedString,
         kind: TableKind,
+        /// Whether its columns and folders are drawn under it.
+        open: bool,
+    },
+    /// Something the tree lists and does not open: a column, an index, a
+    /// routine. It says what it is and nothing happens on a click — there
+    /// is no tab for a column to open into.
+    Leaf {
+        name: SharedString,
+        detail: SharedString,
+        mark: Mark,
+        level: usize,
     },
 }
 
-/// One schema of the sidebar tree, with its relations split into the two
+/// What a leaf is, which is what its glyph says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mark {
+    Column,
+    /// A column of the primary key.
+    Key,
+    Index,
+    ForeignKey,
+    Constraint,
+    Trigger,
+    Sequence,
+    Routine,
+    Type,
+}
+
+/// How far one level of the tree steps in: a chevron and the gap after it.
+const TREE_STEP: f32 = 13.;
+
+/// Where the chevron of a row at `level` starts.
+fn chevron_at(level: usize) -> f32 {
+    6. + TREE_STEP * level as f32
+}
+
+/// Where what follows that chevron starts — a label, or a leaf's glyph.
+fn content_at(level: usize) -> f32 {
+    chevron_at(level) + TREE_STEP
+}
+
+/// One schema of the sidebar tree, with what it holds split into the
 /// sections under it. Built once per catalog, and flattened into rows
 /// again whenever something opens or the filter changes.
 struct Group {
@@ -8091,40 +8196,136 @@ struct Group {
     sections: Vec<Section>,
 }
 
-/// A schema's tables, or the same schema's views.
+/// One folder of a schema: its tables, its views, its sequences, its
+/// routines or its types.
 struct Section {
     /// Identity of the section in the closed set. A schema name cannot
     /// hold a tab, so the two parts cannot run together into another
     /// section's key.
     key: SharedString,
     label: SharedString,
-    kind: TableKind,
-    relations: Vec<SharedString>,
+    entries: Vec<Entry>,
 }
 
-/// Read the catalog the way the sidebar reads it: a schema, then `TABLES`
-/// and `VIEWS` under it, then the relations under those. A section with
-/// nothing in it is left out rather than drawn empty.
+/// One name a section lists, which is what the filter matches.
+enum Entry {
+    /// A relation opens a tab on a click and folds out under its chevron.
+    Relation {
+        name: SharedString,
+        kind: TableKind,
+        /// Identity of the relation in the open set: `schema\trelation`.
+        key: SharedString,
+        parts: Rc<Parts>,
+    },
+    Object(Leaf),
+}
+
+impl Entry {
+    fn name(&self) -> &SharedString {
+        match self {
+            Entry::Relation { name, .. } => name,
+            Entry::Object(leaf) => &leaf.name,
+        }
+    }
+}
+
+/// A name the tree lists and does not open, before it has a level.
+#[derive(Clone)]
+struct Leaf {
+    name: SharedString,
+    detail: SharedString,
+    mark: Mark,
+}
+
+impl Leaf {
+    fn new(name: impl Into<SharedString>, detail: impl Into<SharedString>, mark: Mark) -> Self {
+        Leaf {
+            name: name.into(),
+            detail: detail.into(),
+            mark,
+        }
+    }
+
+    fn row(&self, level: usize) -> CatalogRow {
+        CatalogRow::Leaf {
+            name: self.name.clone(),
+            detail: self.detail.clone(),
+            mark: self.mark,
+            level,
+        }
+    }
+}
+
+/// What an open relation shows under it: its columns, straight away, and
+/// then a folder for each sort of object it carries.
+struct Parts {
+    columns: Vec<Leaf>,
+    folders: Vec<Folder>,
+}
+
+struct Folder {
+    label: &'static str,
+    leaves: Vec<Leaf>,
+}
+
+/// Read the catalog the way the sidebar reads it: a schema, then its
+/// sections under it — `TABLES`, `VIEWS`, `SEQUENCES`, `ROUTINES`,
+/// `TYPES` — then the names under those. A section with nothing in it is
+/// left out rather than drawn empty, and so is a schema.
 fn catalog_groups(catalog: &Catalog) -> Rc<Vec<Group>> {
     let mut groups = Vec::new();
     for schema in &catalog.schemas {
-        let sections: Vec<Section> = [(TableKind::Table, "TABLES"), (TableKind::View, "VIEWS")]
-            .into_iter()
-            .filter_map(|(kind, label)| {
-                let relations: Vec<SharedString> = schema
-                    .tables
-                    .iter()
-                    .filter(|table| table.kind == kind)
-                    .map(|table| table.name.clone().into())
-                    .collect();
-                (!relations.is_empty()).then(|| Section {
-                    key: format!("{}\t{label}", schema.name).into(),
-                    label: label.into(),
+        let relations = |kind: TableKind| -> Vec<Entry> {
+            schema
+                .tables
+                .iter()
+                .filter(|table| table.kind == kind)
+                .map(|table| Entry::Relation {
+                    name: table.name.clone().into(),
                     kind,
-                    relations,
+                    key: relation_key(&schema.name, &table.name),
+                    parts: Rc::new(relation_parts(table)),
                 })
+                .collect()
+        };
+        let objects = |leaves: Vec<Leaf>| leaves.into_iter().map(Entry::Object).collect();
+        let sections: Vec<Section> = [
+            ("TABLES", relations(TableKind::Table)),
+            ("VIEWS", relations(TableKind::View)),
+            (
+                "SEQUENCES",
+                objects(
+                    (schema.sequences.iter())
+                        .map(|s| Leaf::new(s.name.clone(), s.detail(), Mark::Sequence))
+                        .collect(),
+                ),
+            ),
+            (
+                "ROUTINES",
+                objects(
+                    (schema.routines.iter())
+                        .map(|r| Leaf::new(r.name.clone(), r.detail(), Mark::Routine))
+                        .collect(),
+                ),
+            ),
+            (
+                "TYPES",
+                objects(
+                    (schema.types.iter())
+                        .map(|t| Leaf::new(t.name.clone(), t.detail(), Mark::Type))
+                        .collect(),
+                ),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(label, entries)| {
+            (!entries.is_empty()).then(|| Section {
+                key: format!("{}\t{label}", schema.name).into(),
+                label: label.into(),
+                entries,
             })
-            .collect();
+        })
+        .collect();
         if sections.is_empty() {
             continue;
         }
@@ -8138,23 +8339,80 @@ fn catalog_groups(catalog: &Catalog) -> Rc<Vec<Group>> {
     Rc::new(groups)
 }
 
+/// Identity of a relation in the open set. A schema name cannot hold a
+/// tab, so no two relations share one.
+fn relation_key(schema: &str, name: &str) -> SharedString {
+    format!("{schema}\t{name}").into()
+}
+
+/// The columns and folders a relation folds out into. A folder with
+/// nothing in it is left out, as an empty section is.
+fn relation_parts(table: &Table) -> Parts {
+    let columns = (table.columns.iter())
+        .map(|column| {
+            let mark = if table.is_key(&column.name) {
+                Mark::Key
+            } else {
+                Mark::Column
+            };
+            Leaf::new(column.name.clone(), column.data_type.clone(), mark)
+        })
+        .collect();
+    let folders = [
+        (
+            "INDEXES",
+            (table.indexes.iter())
+                .map(|i| Leaf::new(i.name.clone(), i.detail(), Mark::Index))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "FOREIGN KEYS",
+            (table.foreign_keys.iter())
+                .map(|k| Leaf::new(k.name.clone(), k.detail(), Mark::ForeignKey))
+                .collect(),
+        ),
+        (
+            "CONSTRAINTS",
+            (table.constraints.iter())
+                .map(|c| Leaf::new(c.name.clone(), c.detail(), Mark::Constraint))
+                .collect(),
+        ),
+        (
+            "TRIGGERS",
+            (table.triggers.iter())
+                .map(|t| Leaf::new(t.name.clone(), t.detail(), Mark::Trigger))
+                .collect(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, leaves)| !leaves.is_empty())
+    .map(|(label, leaves)| Folder { label, leaves })
+    .collect();
+    Parts { columns, folders }
+}
+
 /// Flatten the tree for `uniform_list`: a schema row, its section rows
-/// while it is open, and their relations while they are.
+/// while it is open, and their entries while they are — and under a
+/// relation the user folded out, its columns and its folders.
 ///
-/// The two levels remember themselves the other way round. A schema is
-/// closed until `open_schemas` holds it, because a catalog of thousands of
-/// relations is a wall of names otherwise; a section is open until
-/// `closed_sections` holds it, because a schema the user just opened was
-/// opened to see what is in it.
+/// The levels remember themselves in two ways. A schema is closed until
+/// `open_schemas` holds it, because a catalog of thousands of relations is
+/// a wall of names otherwise; a section is open until `closed_sections`
+/// holds it, because a schema the user just opened was opened to see what
+/// is in it. A relation is closed until `open_relations` holds it, for the
+/// schema's reason: a schema of forty tables folded out would be a
+/// schema of four hundred columns. A relation's folders are sections, and
+/// open until closed like the rest.
 ///
-/// A `needle` narrows the list to the relations it matches, by the same
-/// rule the palette uses: the word-start rule, and **a dot names a path**.
-/// So `address` finds every `address`, `dev.addr` finds the one in
+/// A `needle` narrows the list to the names it matches, by the same rule
+/// the palette uses: the word-start rule, and **a dot names a path**. So
+/// `address` finds every `address`, `dev.addr` finds the one in
 /// `sample_dev_sample`, and a bare schema name answers with everything
 /// under it. Whatever is left with nothing under it is dropped, header and
-/// all. While the filter is on, everything that survived is drawn open
-/// whatever the two sets say — a search that needs a second click to show
-/// its hits is not a search.
+/// all. While the filter is on, every schema and section that survived is
+/// drawn open whatever the sets say — a search that needs a second click
+/// to show its hits is not a search. A relation is not: the hit is its
+/// name, and folding every hit out would bury the next one.
 ///
 /// **The hits are ranked, and only while the filter is on.** The catalog's
 /// own order is alphabetical, which puts `master` in the middle of the
@@ -8169,30 +8427,31 @@ fn catalog_rows(
     groups: &[Group],
     open_schemas: &HashSet<SharedString>,
     closed_sections: &HashSet<SharedString>,
+    open_relations: &HashSet<SharedString>,
     needle: &str,
 ) -> Rc<Vec<CatalogRow>> {
     let filtering = !needle.is_empty();
     let mut rows = Vec::new();
     for group in groups {
-        let found: Vec<(&Section, Vec<&SharedString>)> = group
+        let found: Vec<(&Section, Vec<&Entry>)> = group
             .sections
             .iter()
             .filter_map(|section| {
-                let matches: Vec<&SharedString> = if !filtering {
-                    section.relations.iter().collect()
+                let matches: Vec<&Entry> = if !filtering {
+                    section.entries.iter().collect()
                 } else {
-                    let mut ranked: Vec<((usize, i32, usize), &SharedString)> = section
-                        .relations
+                    let mut ranked: Vec<((usize, i32, usize), &Entry)> = section
+                        .entries
                         .iter()
-                        .filter_map(|name| {
-                            let path = [group.schema.to_string(), name.to_string()];
-                            Some((palette::path_rank(&path, needle)?, name))
+                        .filter_map(|entry| {
+                            let path = [group.schema.to_string(), entry.name().to_string()];
+                            Some((palette::path_rank(&path, needle)?, entry))
                         })
                         .collect();
                     // A stable sort, so two names the query cannot tell
                     // apart stay in the catalog's own order.
                     ranked.sort_by(|(a, _), (b, _)| a.cmp(b));
-                    ranked.into_iter().map(|(_, name)| name).collect()
+                    ranked.into_iter().map(|(_, entry)| entry).collect()
                 };
                 (!matches.is_empty()).then_some((section, matches))
             })
@@ -8219,13 +8478,46 @@ fn catalog_rows(
                 label: section.label.clone(),
                 count: matches.len(),
                 open,
+                level: 1,
             });
-            if open {
-                rows.extend(matches.into_iter().map(|name| CatalogRow::Relation {
-                    schema: group.schema.clone(),
-                    name: name.clone(),
-                    kind: section.kind,
-                }));
+            if !open {
+                continue;
+            }
+            for entry in matches {
+                match entry {
+                    Entry::Relation {
+                        name,
+                        kind,
+                        key,
+                        parts,
+                    } => {
+                        let open = open_relations.contains(key);
+                        rows.push(CatalogRow::Relation {
+                            schema: group.schema.clone(),
+                            name: name.clone(),
+                            kind: *kind,
+                            open,
+                        });
+                        if open {
+                            rows.extend(parts.columns.iter().map(|leaf| leaf.row(3)));
+                            for folder in &parts.folders {
+                                let key: SharedString = format!("{key}\t{}", folder.label).into();
+                                let open = !closed_sections.contains(&key);
+                                rows.push(CatalogRow::Section {
+                                    key,
+                                    label: folder.label.into(),
+                                    count: folder.leaves.len(),
+                                    open,
+                                    level: 3,
+                                });
+                                if open {
+                                    rows.extend(folder.leaves.iter().map(|leaf| leaf.row(4)));
+                                }
+                            }
+                        }
+                    }
+                    Entry::Object(leaf) => rows.push(leaf.row(2)),
+                }
             }
         }
     }
@@ -8255,23 +8547,60 @@ fn header_row(
         .hover(move |s| s.bg(hover))
         // The chevron is the whole affordance: a closed row shows nothing
         // else that says it can be opened.
-        .child(
-            div()
-                .flex_none()
-                .w(px(8.))
-                .text_size(px(8.))
-                .text_color(colors.text_faint)
-                .child(if open { "▾" } else { "▸" }),
-        )
+        .child(chevron(open, colors))
 }
 
-/// How many relations sit under a header, at its right edge.
+/// The mark that says a row folds out, and which way it is.
+fn chevron(open: bool, colors: &ThemeColors) -> Div {
+    div()
+        .flex_none()
+        .w(px(8.))
+        .text_size(px(8.))
+        .text_color(colors.text_faint)
+        .child(if open { "▾" } else { "▸" })
+}
+
+/// How many entries sit under a header, at its right edge.
 fn count_label(count: usize, colors: &ThemeColors) -> Div {
     div()
         .flex_none()
         .text_size(px(9.))
         .text_color(colors.text_faint)
         .child(format_count(count as u64))
+}
+
+/// A leaf's glyph, as wide as a relation's so the names after both line
+/// up. A column is a dot, the key's own columns in the accent — the one
+/// thing about a column worth seeing before reading it. Everything else
+/// is one character in the faint ink, because the folder above it has
+/// already said what it is and the glyph only has to tell the kinds apart
+/// in a schema's own sections.
+fn leaf_mark(mark: Mark, colors: &ThemeColors) -> Div {
+    let dot = |ink| div().size(px(4.)).rounded_full().bg(ink);
+    let glyph = |text: &'static str| {
+        div()
+            .text_size(px(9.))
+            .text_color(colors.text_faint)
+            .child(text)
+    };
+    let inner = match mark {
+        Mark::Column => dot(colors.text_faint),
+        Mark::Key => dot(colors.accent),
+        Mark::Index => glyph("≡"),
+        Mark::ForeignKey => glyph("→"),
+        Mark::Constraint => glyph("✓"),
+        Mark::Trigger => glyph("↯"),
+        Mark::Sequence => glyph("#"),
+        Mark::Routine => glyph("ƒ"),
+        Mark::Type => glyph("τ"),
+    };
+    div()
+        .flex_none()
+        .w(px(5.))
+        .flex()
+        .justify_center()
+        .items_center()
+        .child(inner)
 }
 
 /// One row of the flattened list. Free-standing because the list's render
@@ -8296,7 +8625,7 @@ fn catalog_row(
             open,
         } => {
             let (key, shell) = (key.clone(), shell.clone());
-            header_row(ix, "schema", 6., *open, colors)
+            header_row(ix, "schema", chevron_at(0), *open, colors)
                 .on_click(move |_event, _window, cx| {
                     shell
                         .update(cx, |shell, cx| shell.toggle_schema(key.clone(), cx))
@@ -8320,9 +8649,10 @@ fn catalog_row(
             label,
             count,
             open,
+            level,
         } => {
             let (key, shell) = (key.clone(), shell.clone());
-            header_row(ix, "section", 19., *open, colors)
+            header_row(ix, "section", chevron_at(*level), *open, colors)
                 .on_click(move |_event, _window, cx| {
                     shell
                         .update(cx, |shell, cx| shell.toggle_section(key.clone(), cx))
@@ -8337,36 +8667,99 @@ fn catalog_row(
                 .child(count_label(*count, colors))
                 .into_any_element()
         }
-        CatalogRow::Relation { schema, name, kind } => {
+        CatalogRow::Leaf {
+            name,
+            detail,
+            mark,
+            level,
+        } => div()
+            .h(px(CATALOG_ROW_HEIGHT))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .pl(px(content_at(*level)))
+            .pr(px(8.))
+            .child(leaf_mark(*mark, colors))
+            // The name gives way before the detail does, but not all the
+            // way: a column's type is worth reading, and so is its name.
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(gpui::relative(0.6))
+                    .min_w(px(0.))
+                    .text_size(px(11.))
+                    .text_color(colors.text_secondary)
+                    .truncate()
+                    .child(name.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_size(px(10.))
+                    .text_color(colors.text_faint)
+                    .truncate()
+                    .child(detail.clone()),
+            )
+            .into_any_element(),
+        CatalogRow::Relation {
+            schema,
+            name,
+            kind,
+            open,
+        } => {
             let is_active = active.is_some_and(|(s, t)| s == schema && t == name);
             // Two rows read loud, and for the same reason: this is the one
             // being pointed at. The tab's row says where the result on
             // screen came from, the cursor's says what ⏎ would open.
             let lit = is_active || cursor;
+            let (key, fold) = (relation_key(schema, name), shell.clone());
             let shell = shell.clone();
             let (schema_name, table_name) = (schema.to_string(), name.to_string());
 
-            let item =
-                div()
-                    .id(ElementId::NamedInteger("relation".into(), ix as u64))
-                    .h(px(CATALOG_ROW_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    // Indented under its section's chevron, so the schema and
-                    // the section a relation sits in read off the left edge.
-                    .pl(px(32.))
-                    .pr(px(8.))
-                    .rounded(px(5.))
-                    .cursor_pointer()
-                    .on_click(move |_event, window, cx| {
-                        shell
-                            .update(cx, |shell, cx| {
-                                shell.browse_table(&schema_name, &table_name, window, cx)
-                            })
-                            .ok();
-                    })
-                    .child(match kind {
+            let item = div()
+                .id(ElementId::NamedInteger("relation".into(), ix as u64))
+                .h(px(CATALOG_ROW_HEIGHT))
+                .flex()
+                .items_center()
+                // Indented under its section's label, so the schema and
+                // the section a relation sits in read off the left edge.
+                .pl(px(chevron_at(2)))
+                .pr(px(8.))
+                .rounded(px(5.))
+                .cursor_pointer()
+                .on_click(move |_event, window, cx| {
+                    shell
+                        .update(cx, |shell, cx| {
+                            shell.browse_table(&schema_name, &table_name, window, cx)
+                        })
+                        .ok();
+                })
+                // The chevron folds the relation out, and must not also
+                // open a tab on it: the press is stopped here, before the
+                // row's own click can hear it. It takes the whole step and
+                // the row's height, because an 8px target is one the
+                // pointer misses.
+                .child(
+                    div()
+                        .id(ElementId::NamedInteger("relation-fold".into(), ix as u64))
+                        .flex_none()
+                        .w(px(TREE_STEP))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                            cx.stop_propagation()
+                        })
+                        .on_click(move |_event, _window, cx| {
+                            cx.stop_propagation();
+                            fold.update(cx, |shell, cx| shell.toggle_relation(key.clone(), cx))
+                                .ok();
+                        })
+                        .child(chevron(*open, colors)),
+                )
+                .child(
+                    match kind {
                         TableKind::Table => table_glyph(lit, cx),
                         TableKind::View => div()
                             .size(px(5.))
@@ -8377,25 +8770,28 @@ fn catalog_row(
                             } else {
                                 colors.text_faint
                             }),
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .text_size(px(12.))
-                            .font_weight(if lit {
-                                FontWeight::MEDIUM
-                            } else {
-                                FontWeight::NORMAL
-                            })
-                            .text_color(if lit {
-                                colors.text
-                            } else {
-                                colors.text_secondary
-                            })
-                            .truncate()
-                            .child(name.clone()),
-                    );
+                    }
+                    .flex_none()
+                    .mr(px(8.)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_size(px(12.))
+                        .font_weight(if lit {
+                            FontWeight::MEDIUM
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .text_color(if lit {
+                            colors.text
+                        } else {
+                            colors.text_secondary
+                        })
+                        .truncate()
+                        .child(name.clone()),
+                );
 
             match (cursor, is_active) {
                 // The cursor's mark is the deeper of the two, and it has
@@ -9010,21 +9406,28 @@ fn report_verbs(statements: &[(usize, DdlVerb)]) -> String {
 /// What the report is about, in the header — one relation by name, or a
 /// count — and the relation "reveal in schema tree" opens, which is the
 /// first one that is still there. `None` for both with nothing changed.
+///
+/// An object of a relation reveals the relation it belongs to, which is
+/// always still there: the objects of a dropped relation are not listed.
 fn report_subject(delta: &Delta) -> (Option<String>, Option<(SharedString, SharedString)>) {
     let reveal = delta
         .relations
         .iter()
         .find(|relation| !matches!(relation.change, RelationChange::Dropped { .. }))
-        .map(|relation| {
-            (
-                SharedString::from(relation.schema.clone()),
-                SharedString::from(relation.name.clone()),
-            )
-        });
-    let subject = match delta.relations.as_slice() {
-        [] => None,
-        [one] => Some(format!("{}.{}", one.schema, one.name)),
-        many => Some(format!("{} relations", many.len())),
+        .map(|relation| (relation.schema.clone(), relation.name.clone()))
+        .or_else(|| {
+            (delta.objects.iter()).find_map(|object| {
+                let relation = object.relation.clone()?;
+                Some((object.schema.clone(), relation))
+            })
+        })
+        .map(|(schema, name)| (SharedString::from(schema), SharedString::from(name)));
+    let subject = match (delta.relations.as_slice(), delta.objects.as_slice()) {
+        ([], []) => None,
+        ([one], []) => Some(format!("{}.{}", one.schema, one.name)),
+        ([], [one]) => Some(format!("{} {}", one.kind.noun(), one.qualified())),
+        (many, []) => Some(format!("{} relations", many.len())),
+        (relations, objects) => Some(format!("{} changes", relations.len() + objects.len())),
     };
     (subject, reveal)
 }
@@ -9116,6 +9519,26 @@ fn delta_rows(delta: &Delta, colors: &ThemeColors) -> Vec<Div> {
                 }
             }
         }
+    }
+    // Then what else changed: an index, a key, a routine. Named with what
+    // it sits in, because a bare `orders_user` could be anybody's.
+    for object in &delta.objects {
+        total += 1;
+        if rows.len() >= DELTA_ROWS {
+            continue;
+        }
+        let (sign, note) = match &object.change {
+            ObjectChange::Added { detail } => (Sign::Plus, detail.clone()),
+            ObjectChange::Dropped { detail } => (Sign::Minus, detail.clone()),
+            ObjectChange::Changed { before, after } => (Sign::Tilde, format!("{before} → {after}")),
+        };
+        rows.push(delta_row(
+            sign,
+            object.qualified(),
+            object.kind.noun().to_string(),
+            note,
+            colors,
+        ));
     }
     if total > rows.len() {
         rows.push(
@@ -9443,6 +9866,7 @@ fn redact(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use introspect::diff::ObjectKind;
 
     /// A connection that knows no names at all, which is what a tab has
     /// before the catalog lands.
@@ -10038,6 +10462,7 @@ mod tests {
             columns: Vec::new(),
             primary_key: Vec::new(),
             approx_rows: None,
+            ..Default::default()
         }
     }
 
@@ -10234,14 +10659,23 @@ mod tests {
                 } => {
                     format!("({label} {})", shown(count, open))
                 }
-                CatalogRow::Relation { name, .. } => name.to_string(),
+                CatalogRow::Relation { name, open, .. } => {
+                    format!("{name}{}", if *open { " ▾" } else { "" })
+                }
+                CatalogRow::Leaf { name, detail, .. } => format!("- {name}: {detail}"),
             })
             .collect()
     }
 
-    /// `catalog_rows` with both sets at their starting state.
+    /// `catalog_rows` with every set at its starting state.
     fn rows(groups: &[Group], needle: &str) -> Rc<Vec<CatalogRow>> {
-        catalog_rows(groups, &HashSet::new(), &HashSet::new(), needle)
+        catalog_rows(
+            groups,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            needle,
+        )
     }
 
     fn sample() -> Catalog {
@@ -10254,12 +10688,14 @@ mod tests {
                         relation("active_users", TableKind::View),
                         relation("orders", TableKind::Table),
                     ],
+                    ..Default::default()
                 },
                 // A schema of views only gets a `VIEWS` section, not an
                 // empty `TABLES` one above it.
                 Schema {
                     name: "reporting".to_string(),
                     tables: vec![relation("daily", TableKind::View)],
+                    ..Default::default()
                 },
             ],
         }
@@ -10277,7 +10713,10 @@ mod tests {
             .map(|section| section.label.to_string())
             .collect();
         assert_eq!(sections, ["TABLES", "VIEWS"]);
-        assert_eq!(groups[0].sections[0].relations, ["users", "orders"]);
+        let names: Vec<&str> = (groups[0].sections[0].entries.iter())
+            .map(|entry| entry.name().as_ref())
+            .collect();
+        assert_eq!(names, ["users", "orders"]);
         // A schema of views only carries the one section.
         assert_eq!(groups[1].sections.len(), 1);
     }
@@ -10296,7 +10735,13 @@ mod tests {
         // A section is open until it is closed: opening the schema is one
         // click, not three.
         assert_eq!(
-            read(&catalog_rows(&groups, &open, &HashSet::new(), "")),
+            read(&catalog_rows(
+                &groups,
+                &open,
+                &HashSet::new(),
+                &HashSet::new(),
+                ""
+            )),
             [
                 "[PUBLIC 3 open]",
                 "(TABLES 2 open)",
@@ -10311,7 +10756,7 @@ mod tests {
         // Closing a section leaves its header and takes its relations.
         let closed = HashSet::from([groups[0].sections[0].key.clone()]);
         assert_eq!(
-            read(&catalog_rows(&groups, &open, &closed, "")),
+            read(&catalog_rows(&groups, &open, &closed, &HashSet::new(), "")),
             [
                 "[PUBLIC 3 open]",
                 "(TABLES 2)",
@@ -10357,6 +10802,7 @@ mod tests {
                     relation("master", TableKind::Table),
                     relation("master_rate", TableKind::Table),
                 ],
+                ..Default::default()
             }],
         };
         let groups = catalog_groups(&catalog);
@@ -10378,7 +10824,13 @@ mod tests {
         // With no filter the catalog's own order stands.
         let open = HashSet::from([groups[0].key.clone()]);
         assert_eq!(
-            read(&catalog_rows(&groups, &open, &HashSet::new(), ""))[2..],
+            read(&catalog_rows(
+                &groups,
+                &open,
+                &HashSet::new(),
+                &HashSet::new(),
+                ""
+            ))[2..],
             [
                 "correspondence_master",
                 "master_assignment",
@@ -10519,6 +10971,7 @@ mod tests {
                 kind: TableKind::Table,
                 change: RelationChange::Altered { columns },
             }],
+            ..Default::default()
         }
     }
 
@@ -10594,8 +11047,235 @@ mod tests {
                 kind: TableKind::Table,
                 change: RelationChange::Dropped { columns: vec![] },
             }],
+            ..Default::default()
         };
         assert_eq!(report_subject(&gone).1, None);
         assert_eq!(report_subject(&Delta::default()), (None, None));
+    }
+
+    /// A schema with a table that carries one of everything, and a
+    /// sequence, a routine and a type beside it.
+    fn furnished() -> Catalog {
+        let mut orders = relation("orders", TableKind::Table);
+        orders.columns = vec![
+            Column {
+                name: "id".into(),
+                data_type: "bigint".into(),
+                nullable: false,
+                default: None,
+            },
+            a_column("user_id"),
+        ];
+        orders.primary_key = vec!["id".into()];
+        orders.indexes = vec![introspect::Index {
+            name: "orders_pkey".into(),
+            definition: "btree (id)".into(),
+            unique: true,
+            primary: true,
+        }];
+        orders.foreign_keys = vec![introspect::ForeignKey {
+            name: "orders_user_id_fkey".into(),
+            columns: vec!["user_id".into()],
+            target_schema: "public".into(),
+            target_table: "users".into(),
+            target_columns: vec!["id".into()],
+        }];
+        Catalog {
+            schemas: vec![Schema {
+                name: "public".into(),
+                tables: vec![orders],
+                sequences: vec![introspect::Sequence {
+                    name: "ticket".into(),
+                    data_type: "integer".into(),
+                }],
+                routines: vec![introspect::Routine {
+                    name: "total".into(),
+                    kind: introspect::RoutineKind::Function,
+                    arguments: "integer".into(),
+                    returns: Some("bigint".into()),
+                }],
+                types: vec![introspect::UserType {
+                    name: "mood".into(),
+                    kind: introspect::TypeKind::Enum,
+                    definition: "sad, ok".into(),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn a_schema_lists_its_sequences_routines_and_types_after_its_relations() {
+        let groups = catalog_groups(&furnished());
+        let open = HashSet::from([groups[0].key.clone()]);
+        assert_eq!(
+            read(&catalog_rows(
+                &groups,
+                &open,
+                &HashSet::new(),
+                &HashSet::new(),
+                ""
+            )),
+            [
+                "[PUBLIC 4 open]",
+                "(TABLES 1 open)",
+                "orders",
+                "(SEQUENCES 1 open)",
+                "- ticket: integer",
+                "(ROUTINES 1 open)",
+                "- total: (integer) → bigint",
+                "(TYPES 1 open)",
+                "- mood: enum · sad, ok",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_relation_folds_out_into_its_columns_and_its_objects() {
+        let groups = catalog_groups(&furnished());
+        let open = HashSet::from([groups[0].key.clone()]);
+        let folded = HashSet::from([relation_key("public", "orders")]);
+        let rows = catalog_rows(&groups, &open, &HashSet::new(), &folded, "");
+        assert_eq!(
+            read(&rows)[..8],
+            [
+                "[PUBLIC 4 open]",
+                "(TABLES 1 open)",
+                "orders ▾",
+                // The columns come straight away, with no folder of their
+                // own: they are what a relation is opened to read.
+                "- id: bigint",
+                "- user_id: text",
+                "(INDEXES 1 open)",
+                "- orders_pkey: primary · btree (id)",
+                "(FOREIGN KEYS 1 open)",
+            ]
+        );
+        // The key's own column carries the key's mark.
+        assert!(matches!(
+            &rows[3],
+            CatalogRow::Leaf {
+                mark: Mark::Key,
+                level: 3,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &rows[4],
+            CatalogRow::Leaf {
+                mark: Mark::Column,
+                ..
+            }
+        ));
+
+        // A relation's folder closes like any section, by its own key.
+        let closed = HashSet::from([SharedString::from("public\torders\tINDEXES")]);
+        let rows = catalog_rows(&groups, &open, &closed, &folded, "");
+        assert_eq!(read(&rows)[5..7], ["(INDEXES 1)", "(FOREIGN KEYS 1 open)"]);
+    }
+
+    #[test]
+    fn the_filter_finds_a_routine_but_does_not_fold_a_relation_out() {
+        let groups = catalog_groups(&furnished());
+        assert_eq!(
+            read(&rows(&groups, "total")),
+            [
+                "[PUBLIC 1 open]",
+                "(ROUTINES 1 open)",
+                "- total: (integer) → bigint"
+            ]
+        );
+        // A relation the filter found is listed, not folded out: the hit
+        // is its name.
+        assert_eq!(
+            read(&rows(&groups, "orders")),
+            ["[PUBLIC 1 open]", "(TABLES 1 open)", "orders"]
+        );
+        // A leaf is not somewhere ⏎ can go, so the cursor never lands on
+        // one: the only stop is still the relation.
+        let found = rows(&groups, "public.");
+        let stops: Vec<usize> = (found.iter().enumerate())
+            .filter(|(_, row)| matches!(row, CatalogRow::Relation { .. }))
+            .map(|(ix, _)| ix)
+            .collect();
+        assert_eq!(stops, [2]);
+    }
+
+    fn an_object(kind: ObjectKind, name: &str, change: ObjectChange) -> ObjectDelta {
+        ObjectDelta {
+            schema: "public".into(),
+            relation: Some("t".into()),
+            kind,
+            name: name.into(),
+            change,
+        }
+    }
+
+    #[test]
+    fn a_statement_that_moved_no_column_counts_its_objects() {
+        let added = || ObjectChange::Added {
+            detail: "btree (a)".into(),
+        };
+        let one = Delta {
+            objects: vec![an_object(ObjectKind::Index, "t_a_idx", added())],
+            ..Default::default()
+        };
+        assert_eq!(
+            ddl_meta(&one, DdlVerb::Create, 7),
+            Some("created · +1 index · 7 ms".to_string())
+        );
+        let two = Delta {
+            objects: vec![
+                an_object(ObjectKind::Index, "t_a_idx", added()),
+                an_object(ObjectKind::Index, "t_b_idx", added()),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            ddl_meta(&two, DdlVerb::Create, 7),
+            Some("created · +2 indexes · 7 ms".to_string())
+        );
+        // A script that mixed them says objects.
+        let mixed = Delta {
+            objects: vec![
+                an_object(ObjectKind::Index, "t_a_idx", added()),
+                an_object(
+                    ObjectKind::Trigger,
+                    "audit",
+                    ObjectChange::Dropped {
+                        detail: String::new(),
+                    },
+                ),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            ddl_meta(&mixed, DdlVerb::Alter, 7),
+            Some("altered · +1 −1 objects · 7 ms".to_string())
+        );
+    }
+
+    #[test]
+    fn the_report_header_names_one_object_and_reveals_its_relation() {
+        let delta = Delta {
+            objects: vec![an_object(
+                ObjectKind::Index,
+                "t_a_idx",
+                ObjectChange::Added {
+                    detail: "btree (a)".into(),
+                },
+            )],
+            ..Default::default()
+        };
+        let (subject, reveal) = report_subject(&delta);
+        assert_eq!(subject.as_deref(), Some("index t.t_a_idx"));
+        assert_eq!(
+            reveal,
+            Some((SharedString::from("public"), SharedString::from("t")))
+        );
+
+        // A table and its index together are two changes.
+        let mut both = altered(vec![ColumnDelta::Added(a_column("a"))]);
+        both.objects = delta.objects.clone();
+        assert_eq!(report_subject(&both).0.as_deref(), Some("2 changes"));
     }
 }
