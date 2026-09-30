@@ -40,17 +40,15 @@ const DATA_FONT_SIZE: f32 = 12.;
 /// advances 0.6em, so 7.2px at 12px; round up so a full-width value keeps
 /// a hair of slack instead of tripping the ellipsis.
 const CHAR_WIDTH: f32 = DATA_FONT_SIZE * 0.62;
+/// The advance itself, unrounded. Sizing a lane rounds up so a value fits;
+/// counting what a lane can show must not, or the cut would land short of
+/// the lane's edge.
+const CHAR_ADVANCE: f32 = DATA_FONT_SIZE * 0.6;
 /// The 12px of padding on each side of a cell.
 const CELL_PADDING: f32 = 24.;
 const MIN_COLUMN_WIDTH: f32 = 56.;
 /// Past this a column steals the pane; the rest of the value truncates.
 const MAX_COLUMN_WIDTH: f32 = 320.;
-/// The most characters a cell ever shapes. A lane is `MAX_COLUMN_WIDTH`
-/// wide, so about fifty characters is all that can be on screen; the rest
-/// is shaped, measured and thrown away by the ellipsis. `MAX_CELL_BYTES`
-/// lets a megabyte of text into one value, and shaping a megabyte of it
-/// per visible cell per frame would freeze the window.
-const CELL_CHARS: usize = 64;
 /// Rows sampled to size the lanes. The first screens decide the widths;
 /// scanning a whole 500-row page for a few pixels is not worth it.
 const WIDTH_SAMPLE: usize = 200;
@@ -245,10 +243,19 @@ fn reveal_offset(left: f32, width: f32, visible_left: f32, viewport: f32) -> f32
 /// So the cut is made here rather than left to the ellipsis, and the
 /// first line is cut the way a long single-line value already is.
 ///
+/// **The line is cut to `chars`, what the lane can show**, which
+/// [`lane_chars`] works out from the lane's width. `MAX_CELL_BYTES` lets a
+/// megabyte of text into one value, and shaping a megabyte of it per
+/// visible cell per frame would freeze the window — but the cut is the
+/// lane's and not one number for every lane, because the last lane takes
+/// the slack. A fixed cap sized for a 320-pixel lane painted a one-column
+/// result, an `EXPLAIN ANALYZE` plan, as a pane-wide lane of lines that
+/// all stopped at the same character with room to spare after them.
+///
 /// `…` says the cut was made, in the character `Value::display` already
 /// uses for a shortened `bytea`. Nothing else is dropped: ⏎ over the cell
 /// or a double click opens the value whole, and ⌘C copies it whole.
-pub fn cell_text(value: &Value) -> String {
+pub fn cell_text(value: &Value, chars: usize) -> String {
     let text = value.display();
     // A value that merely ends in a newline has nothing after it worth
     // marking, and a `text` column full of them would wear an ellipsis on
@@ -258,11 +265,33 @@ pub fn cell_text(value: &Value) -> String {
     // A CRLF buffer would otherwise leave the carriage return on the end
     // of every line, which shapes as a box or as nothing at all.
     let first = first.strip_suffix('\r').unwrap_or(first);
-    let mut out: String = first.chars().take(CELL_CHARS).collect();
+    let mut out: String = first.chars().take(chars).collect();
     if out.len() < body.len() {
         out.push('…');
     }
     out
+}
+
+/// How many characters a lane `width` pixels wide can show, and one more.
+///
+/// The one more is what leaves the ellipsis to the text system: a value
+/// cut short of the edge would end in `…` with room left after it, while
+/// one cut a character past the edge overflows and is truncated at the
+/// edge, where every other long value in the grid is.
+fn lane_chars(width: f32) -> usize {
+    ((width - CELL_PADDING).max(0.) / CHAR_ADVANCE).ceil() as usize + 1
+}
+
+/// The characters a cell may shape, from its lane's measured width.
+///
+/// The last lane is laid out with its width as a floor and takes whatever
+/// the pane has left, so its measured width says nothing about how much of
+/// a value is on screen. The window is the bound instead: the pane is never
+/// wider than the window it is in, so a cut to the window's width is never
+/// short, and it is still a bound — a few hundred characters, not the
+/// megabyte a value may hold.
+fn cell_chars(width: f32, last: bool, window_width: f32) -> usize {
+    lane_chars(if last { width.max(window_width) } else { width })
 }
 
 /// Size each lane to the widest value it actually holds, header included.
@@ -275,7 +304,11 @@ pub fn column_widths(columns: &[String], rows: &[Vec<Value>]) -> Vec<f32> {
                 .iter()
                 .take(WIDTH_SAMPLE)
                 .filter_map(|row| row.get(ix))
-                .map(|value| cell_text(value).chars().count())
+                .map(|value| {
+                    cell_text(value, lane_chars(MAX_COLUMN_WIDTH))
+                        .chars()
+                        .count()
+                })
                 .max()
                 .unwrap_or(0)
                 .max(name.chars().count());
@@ -704,12 +737,14 @@ fn row_list(
                 pointer: pointer.clone(),
                 view: window.current_view(),
             };
+            let window_width = f32::from(window.viewport_size().width);
             range
                 .map(|ix| {
                     data_row(
                         ix,
                         &data.rows[ix],
                         &data.widths,
+                        window_width,
                         &marks,
                         first_row,
                         &frame,
@@ -845,6 +880,7 @@ fn data_row(
     ix: usize,
     values: &[Value],
     widths: &[f32],
+    window_width: f32,
     marks: &Selection,
     first_row: usize,
     frame: &PointerFrame,
@@ -947,7 +983,10 @@ fn data_row(
             .overflow_hidden()
             .truncate()
             .text_color(value_color(value, colors))
-            .child(cell_text(value));
+            .child(cell_text(
+                value,
+                cell_chars(*width, column == last, window_width),
+            ));
         // The cursor's cell is the strongest mark on screen, the rest of
         // the range a wash under it. Neither carries a border: a border
         // would take a pixel out of the cell's content box and shift the
@@ -1005,25 +1044,60 @@ mod tests {
         Value::Text(value.to_string())
     }
 
+    /// Room enough for anything these tests paint, so the line rule is
+    /// argued with apart from the cut.
+    const WIDE: usize = 1_000;
+
     #[test]
     fn a_cell_paints_the_first_line_of_a_value() {
-        assert_eq!(cell_text(&text("one\ntwo\nthree")), "one…");
-        assert_eq!(cell_text(&text("one\r\ntwo")), "one…");
+        assert_eq!(cell_text(&text("one\ntwo\nthree"), WIDE), "one…");
+        assert_eq!(cell_text(&text("one\r\ntwo"), WIDE), "one…");
     }
 
     #[test]
     fn a_value_short_enough_to_fit_is_painted_whole() {
-        assert_eq!(cell_text(&text("ada@example.com")), "ada@example.com");
-        assert_eq!(cell_text(&Value::Null), "NULL");
+        assert_eq!(cell_text(&text("ada@example.com"), WIDE), "ada@example.com");
+        assert_eq!(cell_text(&Value::Null, WIDE), "NULL");
         // A trailing newline drops nothing anybody can read.
-        assert_eq!(cell_text(&text("one\n")), "one");
+        assert_eq!(cell_text(&text("one\n"), WIDE), "one");
     }
 
     #[test]
     fn a_long_line_is_cut_to_what_a_lane_can_hold() {
-        let cut = cell_text(&text(&"x".repeat(CELL_CHARS * 4)));
-        assert_eq!(cut.chars().count(), CELL_CHARS + 1);
+        let chars = lane_chars(MAX_COLUMN_WIDTH);
+        let cut = cell_text(&text(&"x".repeat(chars * 4)), chars);
+        assert_eq!(cut.chars().count(), chars + 1);
         assert!(cut.ends_with('…'));
+    }
+
+    /// The cut must never land inside the lane: a value that reaches the
+    /// edge has to go on past it, so the text system truncates it there.
+    #[test]
+    fn a_lane_is_cut_past_its_own_edge() {
+        for width in [MIN_COLUMN_WIDTH, 100., MAX_COLUMN_WIDTH, 1_400.] {
+            let shown = lane_chars(width) as f32 * CHAR_ADVANCE;
+            assert!(shown > width - CELL_PADDING, "{width}px lane");
+        }
+    }
+
+    /// The case this was written for. `EXPLAIN ANALYZE` answers with one
+    /// column, a plan line per row, and the one lane of a one-column result
+    /// is the last lane — it spans the pane, whatever it measured.
+    #[test]
+    fn the_last_lane_is_cut_to_the_window_not_to_its_measure() {
+        let line = format!(
+            "  ->  Seq Scan on orders  (cost=0.00..1834.00 rows=100000 width=8){}",
+            " (actual time=0.011..9.874 rows=100000 loops=1)"
+        );
+        let data = GridData::new(vec!["QUERY PLAN".to_string()], vec![vec![text(&line)]]);
+        assert_eq!(data.widths[0], MAX_COLUMN_WIDTH);
+        let chars = cell_chars(data.widths[0], true, 1_400.);
+        assert_eq!(cell_text(&text(&line), chars), line);
+        // Any other lane is laid out at its measure, so it is cut there.
+        let chars = cell_chars(data.widths[0], false, 1_400.);
+        assert_eq!(chars, lane_chars(MAX_COLUMN_WIDTH));
+        // A window narrower than the lane cannot shrink the cut below it.
+        assert_eq!(cell_chars(MAX_COLUMN_WIDTH, true, 0.), chars);
     }
 
     #[test]

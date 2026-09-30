@@ -636,10 +636,22 @@ row is `ROW_HEIGHT` tall and GPUI lays a shaped text out line by line
 whatever `truncate` says, so a value with a newline in it does not merely
 overflow its lane — a pretty-printed `jsonb` pushes every row under it
 out of line. So the first line is taken and cut the way a long
-single-line value already is, at `CELL_CHARS`, and `…` says a cut was
-made. The cap on characters is not tidiness: `MAX_CELL_BYTES` lets a
-megabyte into one value, and shaping a megabyte per visible cell per
-frame would freeze the window. A value that merely *ends* in a newline is
+single-line value already is, and `…` says a cut was made. The cap on
+characters is not tidiness: `MAX_CELL_BYTES` lets a megabyte into one
+value, and shaping a megabyte per visible cell per frame would freeze the
+window.
+
+**The cut is the lane's, not one number for the grid.** `lane_chars` is
+what a lane that wide can show, and one character more, so a value that
+reaches the edge goes past it and GPUI truncates it there, the way it
+truncates every other long value. The last lane takes the slack of the
+pane, so its measured width says nothing about what is on screen, and
+`cell_chars` cuts it to the **window's** width instead. The pane is never
+wider than its window, so that cut is never short, and it is still a
+bound. A fixed cap sized for a 320px lane cut every line of an `EXPLAIN
+ANALYZE` plan at the same character, in a lane as wide as the pane.
+
+A value that merely *ends* in a newline is
 painted whole — there is nothing after it to read. Nothing else is
 shortened: the card opens the value whole and ⌘C copies it whole, so the
 grid is the only place a value is cut.
