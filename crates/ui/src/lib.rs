@@ -3,6 +3,7 @@
 //! pills, one ochre accent. Grows as Meerkat needs more controls.
 
 pub mod blink;
+pub mod find_bar;
 pub mod scrollbar;
 mod text_field;
 

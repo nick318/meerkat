@@ -13,10 +13,12 @@
 //! matches on rather than five callbacks that can disagree.
 
 pub mod columns;
+pub mod find;
 pub mod selection;
 
 pub use columns::find_columns;
 use db_client::Value;
+pub use find::{find_cells, refine_cells};
 use gpui::{
     App, Bounds, Div, Element, ElementId, EntityId, FontWeight, GlobalElementId, Hsla, LayoutId,
     MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, ScrollStrategy,
@@ -326,6 +328,7 @@ pub struct Grid<'a> {
     selection: &'a Selection,
     first_row: usize,
     on_hit: Option<OnHit>,
+    hits: Rc<Vec<Cell>>,
 }
 
 impl<'a> Grid<'a> {
@@ -342,6 +345,7 @@ impl<'a> Grid<'a> {
             selection,
             first_row: 1,
             on_hit: None,
+            hits: Rc::default(),
         }
     }
 
@@ -358,6 +362,15 @@ impl<'a> Grid<'a> {
         self
     }
 
+    /// The cells the ⌘F line found, in reading order — what
+    /// [`find_cells`] answers. Each wears `find_hit`, and the one under the
+    /// cursor `find_current`: the walk moves the cursor, so the cursor is
+    /// where the walk stands.
+    pub fn hits(mut self, hits: Rc<Vec<Cell>>) -> Self {
+        self.hits = hits;
+        self
+    }
+
     pub fn render(self, cx: &App) -> Div {
         let Self {
             id,
@@ -366,6 +379,7 @@ impl<'a> Grid<'a> {
             selection,
             first_row,
             on_hit,
+            hits,
         } = self;
         let colors = theme(cx).colors.clone();
         // The content can be wider than the pane; the whole grid scrolls
@@ -383,6 +397,7 @@ impl<'a> Grid<'a> {
             data.clone(),
             state,
             marks.clone(),
+            hits,
             first_row,
             on_hit.clone(),
         );
@@ -722,6 +737,7 @@ fn row_list(
     data: Rc<GridData>,
     state: &GridState,
     marks: Rc<Selection>,
+    hits: Rc<Vec<Cell>>,
     first_row: usize,
     on_hit: Option<OnHit>,
 ) -> impl IntoElement {
@@ -746,6 +762,7 @@ fn row_list(
                         &data.widths,
                         window_width,
                         &marks,
+                        &hits,
                         first_row,
                         &frame,
                         on_hit.clone(),
@@ -882,6 +899,7 @@ fn data_row(
     widths: &[f32],
     window_width: f32,
     marks: &Selection,
+    hits: &[Cell],
     first_row: usize,
     frame: &PointerFrame,
     on_hit: Option<OnHit>,
@@ -975,6 +993,7 @@ fn data_row(
             break;
         };
         let cursor = marks.is_cursor(ix, column);
+        let hit = hits.binary_search(&Cell::new(ix, column)).is_ok();
         let mut cell = lane(div().id(column), *width, column == last)
             .px(px(12.))
             .h_full()
@@ -991,8 +1010,18 @@ fn data_row(
         // the range a wash under it. Neither carries a border: a border
         // would take a pixel out of the cell's content box and shift the
         // value inside it every time the cursor moved.
-        if cursor {
+        //
+        // A find hit sits between the two. The walk moves the cursor from
+        // hit to hit, so the cursor on a hit is the one the count names and
+        // takes the find family's deep tone; every other hit is washed
+        // over the range, because while the line is open the hits are what
+        // the user is reading.
+        if cursor && hit {
+            cell = cell.bg(colors.find_current).text_color(colors.text);
+        } else if cursor {
             cell = cell.bg(colors.match_strong).text_color(colors.text);
+        } else if hit {
+            cell = cell.bg(colors.find_hit);
         } else if marks.contains(ix, column) {
             cell = cell.bg(colors.range_surface);
         } else if !picked && !row_hovered {

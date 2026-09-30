@@ -31,14 +31,15 @@ use results_grid::{
     Cell, Extent, Grid, GridData, GridState, Hit, Selection, Step, clipboard_text, find_columns,
 };
 use sql_editor::{Diagnostic, Kind, Name, SqlEditor, SqlEditorEvent, StatementStatus, Vocabulary};
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashSet;
 use std::ops::Range;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use storage::{HistoryFilter, NewRun, QueryRun, RunSource, SavedTab, SavedTabs, Store};
 use theme::{FONT_FAMILY, ThemeColors, theme};
+use ui::find_bar::{self, FindCount};
 use ui::scrollbar::{self, DragState, Scrollbar};
 use ui::{
     TextField, TextFieldEvent, card, format_count, format_millis, format_millis_frac,
@@ -86,6 +87,10 @@ actions!(
         FindColumn,
         ColumnPrev,
         ColumnNext,
+        FindInTab,
+        FindInResult,
+        ResultFindNext,
+        ResultFindPrev,
         FilterCatalog,
         CatalogPrev,
         CatalogNext,
@@ -129,6 +134,32 @@ pub fn column_find_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("cmd-j", FindColumn, Some("Shell")),
         gpui::KeyBinding::new("up", ColumnPrev, Some(COLUMN_FIND_KEY_CONTEXT)),
         gpui::KeyBinding::new("down", ColumnNext, Some(COLUMN_FIND_KEY_CONTEXT)),
+    ]
+}
+
+/// The result find strip's own key context. It sits beside the grid's
+/// rather than inside it: the grid binds a bare `space` to ticking a row,
+/// and an ancestor binding would take the spaces out of the search line.
+pub const RESULT_FIND_KEY_CONTEXT: &str = "ResultFind";
+
+/// Key bindings for finding a value in the result on screen.
+///
+/// ⌘F means "find in what I am looking at", so it is bound three times and
+/// the deepest context answers: in the SQL editor it is the editor's own
+/// find, in the grid it is this one, and anywhere else in the shell it
+/// picks by the tab — a query tab's editor, a table tab's result. ⌘G and
+/// ⇧⌘G step, in the grid as in the strip, over what the strip last
+/// searched for. ⏎ and ⎋ are the search line's own `Submit` and `Cancel`.
+pub fn result_find_key_bindings() -> Vec<gpui::KeyBinding> {
+    vec![
+        gpui::KeyBinding::new("cmd-f", FindInTab, Some("Shell")),
+        gpui::KeyBinding::new("cmd-f", FindInResult, Some(GRID_KEY_CONTEXT)),
+        gpui::KeyBinding::new("cmd-g", ResultFindNext, Some(GRID_KEY_CONTEXT)),
+        gpui::KeyBinding::new("cmd-shift-g", ResultFindPrev, Some(GRID_KEY_CONTEXT)),
+        gpui::KeyBinding::new("cmd-f", FindInResult, Some(RESULT_FIND_KEY_CONTEXT)),
+        gpui::KeyBinding::new("cmd-g", ResultFindNext, Some(RESULT_FIND_KEY_CONTEXT)),
+        gpui::KeyBinding::new("cmd-shift-g", ResultFindPrev, Some(RESULT_FIND_KEY_CONTEXT)),
+        gpui::KeyBinding::new("shift-enter", ResultFindPrev, Some(RESULT_FIND_KEY_CONTEXT)),
     ]
 }
 
@@ -530,6 +561,13 @@ pub struct Shell {
     /// active tab holds, so it lives beside the palette rather than on a
     /// tab: one is open at a time, over whichever result is on screen.
     column_find: Option<ColumnFind>,
+    /// The ⌘F strip over the result, while it is open. Like the column
+    /// find it is a control on one result, so it lives here and names its
+    /// tab rather than living on the tab.
+    result_find: Option<ResultFind>,
+    /// What the result strip last searched for, kept when it closes so ⌘G
+    /// in the grid goes on stepping and ⌘F opens on it again.
+    result_needle: String,
     /// The cell whose whole value is being read, while the card is up.
     peek: Option<Peek>,
     /// The close the user is being asked about, while the dialog is up.
@@ -617,6 +655,34 @@ struct ColumnFind {
     selected: usize,
     scroll: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The open ⌘F strip over a result: one line searched against the values
+/// the result holds.
+///
+/// **What it found is remembered, not kept.** A run or a page turn replaces
+/// the result under the strip, so a list of cells taken from the result
+/// before would point at cells that are not there. But the search reads
+/// every value in the result, which is too much to pay per frame, so the
+/// answer is memoised on the result it was worked out from — held by a
+/// `Weak`, which also keeps the allocation from being reused by the next
+/// result — and on the line's text. A new result or a keystroke is a miss.
+struct ResultFind {
+    /// The tab whose result is being searched. Switching tabs closes the
+    /// strip rather than carrying it over to a result it was never opened
+    /// on.
+    tab: u64,
+    query: Entity<TextField>,
+    found: RefCell<Option<FoundCells>>,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// One search over one result, and the two things it was worked out from.
+struct FoundCells {
+    data: Weak<GridData>,
+    needle: String,
+    cells: Rc<Vec<Cell>>,
+    capped: bool,
 }
 
 /// The cell whose whole value is on screen.
@@ -1217,6 +1283,8 @@ impl Shell {
             env,
             palette: None,
             column_find: None,
+            result_find: None,
+            result_needle: String::new(),
             peek: None,
             confirm: None,
             sweeping: false,
@@ -3427,6 +3495,284 @@ impl Shell {
         }
     }
 
+    // --- finding a value -----------------------------------------------------
+
+    /// ⌘F outside the editor and the grid: find in whatever the tab is
+    /// about. A query tab is about its statement, so the editor's own find
+    /// opens; a table tab is a result and nothing else.
+    fn find_in_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() || self.confirm.is_some() {
+            return;
+        }
+        // The strip takes the keys, and one thing takes keys at a time: a
+        // popover or a card left open would sit there holding none.
+        self.column_find = None;
+        self.peek = None;
+        match self.tabs.get(self.active) {
+            Some(Tab::Query(tab)) => {
+                let editor = tab.editor.clone();
+                editor.update(cx, |editor, cx| editor.find(window, cx));
+            }
+            Some(Tab::Table(_)) => self.open_result_find(window, cx),
+            _ => {}
+        }
+    }
+
+    /// ⌘F in the grid: open the strip over the result, or put the keys back
+    /// in it. It opens on what was last searched for, marked, so the next
+    /// character replaces it.
+    fn open_result_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Each of these is already the thing taking keys while it is up.
+        if self.palette.is_some() || self.confirm.is_some() {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active).map(Tab::id) else {
+            return;
+        };
+        // A result with no columns has no value to find.
+        if self.result_columns().is_empty() {
+            return;
+        }
+        // One search line at a time, and the column find is a popover the
+        // strip would open under. A value card is dropped for the same
+        // reason: it would stay up holding no keys.
+        self.column_find = None;
+        self.peek = None;
+        let query = match &self.result_find {
+            Some(find) if find.tab == tab => find.query.clone(),
+            _ => {
+                let query =
+                    cx.new(|cx| TextField::new("find in result", cx).bare(find_bar::FONT_SIZE));
+                if !self.result_needle.is_empty() {
+                    let needle = self.result_needle.clone();
+                    query.update(cx, |field, cx| field.set_text(needle, cx));
+                }
+                let subscriptions =
+                    vec![cx.subscribe_in(&query, window, Self::on_result_find_event)];
+                self.result_find = Some(ResultFind {
+                    tab,
+                    query: query.clone(),
+                    found: RefCell::new(None),
+                    _subscriptions: subscriptions,
+                });
+                query
+            }
+        };
+        query.update(cx, |field, cx| field.select_everything(cx));
+        window.focus(&query.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// ⎋ in the line: close the strip and give the keys to the grid, whose
+    /// cursor is on the hit the walk stood on.
+    fn close_result_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(find) = self.result_find.take() {
+            self.result_needle = find.query.read(cx).text().to_string();
+        }
+        window.focus(&self.grid_focus, cx);
+        cx.notify();
+    }
+
+    /// The result the active tab holds, when it holds one.
+    fn result_data(&self) -> Option<&Rc<GridData>> {
+        match self.tabs.get(self.active) {
+            Some(Tab::Table(tab)) => Some(&tab.data),
+            Some(Tab::Query(tab)) => Some(&tab.data),
+            Some(Tab::History(_)) | None => None,
+        }
+    }
+
+    /// What the strip is searching for: the open line's text, or what the
+    /// closed one last held.
+    fn result_needle(&self, cx: &App) -> String {
+        match &self.result_find {
+            Some(find) => find.query.read(cx).text().to_string(),
+            None => self.result_needle.clone(),
+        }
+    }
+
+    /// The cells of the active result that hold the needle, in reading
+    /// order, and whether the search stopped short of the end. Worked out
+    /// again only when the result or the needle changed — see
+    /// [`ResultFind`].
+    fn result_hits(&self, cx: &App) -> (Rc<Vec<Cell>>, bool) {
+        let needle = self.result_needle(cx);
+        let Some(data) = self.result_data() else {
+            return (Rc::default(), false);
+        };
+        let search = || {
+            let (cells, capped) =
+                results_grid::find_cells(data, &fuzzy::Needle::new(&needle), find_bar::MAX_HITS);
+            FoundCells {
+                data: Rc::downgrade(data),
+                needle: needle.clone(),
+                cells: Rc::new(cells),
+                capped,
+            }
+        };
+        // A closed strip keeps no memo: ⌘G in the grid is one search per
+        // press, which is what it costs anyway.
+        let Some(find) = &self.result_find else {
+            let found = search();
+            return (found.cells, found.capped);
+        };
+        let mut memo = find.found.borrow_mut();
+        let same_data = memo
+            .as_ref()
+            .is_some_and(|found| Weak::ptr_eq(&found.data, &Rc::downgrade(data)));
+        let fresh = same_data && memo.as_ref().is_some_and(|found| found.needle == needle);
+        // A needle that only grew is looked for among the hits it already
+        // has, so typing a word reads the whole result once rather than
+        // once per letter. A capped answer left cells out and cannot be.
+        let refined = same_data
+            .then(|| memo.as_ref())
+            .flatten()
+            .filter(|found| {
+                !found.capped && !found.needle.is_empty() && needle.starts_with(&found.needle)
+            })
+            .map(|found| {
+                let cells =
+                    results_grid::refine_cells(data, &found.cells, &fuzzy::Needle::new(&needle));
+                FoundCells {
+                    data: Rc::downgrade(data),
+                    needle: needle.clone(),
+                    cells: Rc::new(cells),
+                    capped: false,
+                }
+            });
+        if !fresh {
+            *memo = Some(refined.unwrap_or_else(search));
+        }
+        let found = memo.as_ref().expect("the memo was just filled");
+        (found.cells.clone(), found.capped)
+    }
+
+    /// A keystroke in the line lands on the first hit from the cursor, so a
+    /// hit already under it stays put as the needle grows, and the search
+    /// moves on from where the user was rather than from the first row.
+    fn land_result_find(&mut self, cx: &mut Context<Self>) {
+        let (hits, _) = self.result_hits(cx);
+        let at = self
+            .tabs
+            .get(self.active)
+            .and_then(Tab::selection)
+            .and_then(Selection::cursor)
+            .unwrap_or(Cell::new(0, 0));
+        match find_bar::first_from(&hits, &at) {
+            Some(ix) => self.jump_to_hit(hits[ix], cx),
+            None => cx.notify(),
+        }
+    }
+
+    /// ⏎ and ⇧⏎ in the line, ⌘G and ⇧⌘G in the grid: the next hit or the
+    /// one before, wrapping at both ends.
+    fn step_result_find(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let (hits, _) = self.result_hits(cx);
+        let at = self
+            .tabs
+            .get(self.active)
+            .and_then(Tab::selection)
+            .and_then(Selection::cursor);
+        if let Some(ix) = find_bar::step(&hits, at.as_ref(), forward) {
+            self.jump_to_hit(hits[ix], cx);
+        }
+    }
+
+    /// Put the cursor on a hit and bring it into view. The focus stays
+    /// where it is: in the line, the user is still typing or stepping, and
+    /// in the grid, ⌘G was pressed there.
+    fn jump_to_hit(&mut self, cell: Cell, cx: &mut Context<Self>) {
+        let Some(marked) = self.tabs.get_mut(self.active).and_then(Tab::marked) else {
+            return;
+        };
+        let extent = Extent::of(marked.data);
+        // The hits were worked out from the result in hand, but the check
+        // is cheap and a cursor past the end is not.
+        if cell.row >= extent.rows || cell.column >= extent.columns {
+            return;
+        }
+        marked.selection.focus(cell);
+        marked.scroll.reveal(cell, marked.data);
+        cx.notify();
+    }
+
+    fn on_result_find_event(
+        &mut self,
+        _field: &Entity<TextField>,
+        event: &TextFieldEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TextFieldEvent::Changed => self.land_result_find(cx),
+            TextFieldEvent::Submit => self.step_result_find(true, cx),
+            TextFieldEvent::Cancel => self.close_result_find(window, cx),
+            // One field, and nothing to finish.
+            TextFieldEvent::NextField => {}
+        }
+    }
+
+    /// The strip over the result, when it is open on this tab.
+    fn result_find_strip(&self, tab_id: u64, cx: &Context<Self>) -> Option<Div> {
+        let find = self
+            .result_find
+            .as_ref()
+            .filter(|find| find.tab == tab_id)?;
+        let (hits, capped) = self.result_hits(cx);
+        let cursor = self
+            .tabs
+            .get(self.active)
+            .and_then(Tab::selection)
+            .and_then(Selection::cursor);
+        let count = FindCount {
+            typed: !find.query.read(cx).text().is_empty(),
+            total: hits.len(),
+            current: cursor.and_then(|cursor| hits.binary_search(&cursor).ok()),
+            capped,
+        };
+        let shell = cx.entity().downgrade();
+        let on_step: find_bar::OnStep = Rc::new(move |forward, _window, cx| {
+            shell
+                .update(cx, |shell, cx| shell.step_result_find(forward, cx))
+                .ok();
+        });
+        let shell = cx.entity().downgrade();
+        let on_close: find_bar::OnClose = Rc::new(move |window, cx| {
+            shell
+                .update(cx, |shell, cx| shell.close_result_find(window, cx))
+                .ok();
+        });
+        Some(
+            div()
+                .flex_none()
+                .key_context(RESULT_FIND_KEY_CONTEXT)
+                .child(find_bar::find_bar(
+                    "result-find",
+                    find.query.clone(),
+                    count,
+                    on_step,
+                    on_close,
+                    cx,
+                )),
+        )
+    }
+
+    fn on_find_in_tab(&mut self, _: &FindInTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_in_tab(window, cx);
+    }
+
+    fn on_find_in_result(&mut self, _: &FindInResult, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_result_find(window, cx);
+    }
+
+    fn on_result_find_next(&mut self, _: &ResultFindNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_result_find(true, cx);
+    }
+
+    fn on_result_find_prev(&mut self, _: &ResultFindPrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_result_find(false, cx);
+    }
+
     // --- reading a whole value ---------------------------------------------
 
     /// ⏎ over the cursor's cell, and a double click on any cell: show the
@@ -3890,6 +4236,11 @@ impl Shell {
         // activated, so they go rather than being carried to a result they
         // were never opened on.
         self.column_find = None;
+        // Its needle outlives it, so ⌘G on the next tab steps over what
+        // was typed here, as it would after ⎋.
+        if let Some(find) = self.result_find.take() {
+            self.result_needle = find.query.read(cx).text().to_string();
+        }
         self.peek = None;
         self.active = ix;
         self.remember_tabs(cx);
@@ -5162,6 +5513,10 @@ impl Render for Shell {
             .on_action(cx.listener(Self::on_next_page))
             .on_action(cx.listener(Self::on_show_history))
             .on_action(cx.listener(Self::on_find_column))
+            .on_action(cx.listener(Self::on_find_in_tab))
+            .on_action(cx.listener(Self::on_find_in_result))
+            .on_action(cx.listener(Self::on_result_find_next))
+            .on_action(cx.listener(Self::on_result_find_prev))
             .on_action(cx.listener(Self::on_filter_catalog))
             .on_action(cx.listener(Self::on_peek_value))
             .on_action(cx.listener(Self::on_toggle_palette))
@@ -6079,9 +6434,15 @@ impl Shell {
             Tab::History(_) => 0,
         };
         if columns == 0 {
+            // An open strip stays on screen over a result with nothing in
+            // it — an `UPDATE`, a failed run — because it holds the focus,
+            // and a line taken off the screen would take ⎋ with it.
             return div()
                 .flex_1()
                 .min_h(px(0.))
+                .flex()
+                .flex_col()
+                .children(self.result_find_strip(tab_id, cx))
                 .children(no_result_note(tab, colors));
         }
         let (data, selection, scroll, first_row) = match tab {
@@ -6097,7 +6458,15 @@ impl Shell {
             Tab::History(_) => return div(),
         };
 
-        div()
+        let strip = self.result_find_strip(tab_id, cx);
+        // Only an open strip paints its hits. `result_hits` answers for a
+        // closed one too, because ⌘G steps without it, but a wash nobody
+        // asked for would be one the user cannot put away.
+        let hits = match strip {
+            Some(_) => self.result_hits(cx).0,
+            None => Rc::default(),
+        };
+        let grid = div()
             .key_context(GRID_KEY_CONTEXT)
             .track_focus(&self.grid_focus)
             .flex()
@@ -6108,8 +6477,19 @@ impl Shell {
                 Grid::new(format!("tab-{tab_id}"), data.clone(), scroll, selection)
                     .first_row(first_row)
                     .on_hit(self.hit_handler(tab_id, cx))
+                    .hits(hits)
                     .render(cx),
-            )
+            );
+        // The strip is a sibling of the grid's key context, never a child:
+        // see `RESULT_FIND_KEY_CONTEXT`.
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .min_w(px(0.))
+            .children(strip)
+            .child(grid)
     }
 
     /// Everything a click in the grid can mean, in one place.

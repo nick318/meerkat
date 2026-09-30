@@ -17,7 +17,11 @@ use std::collections::BTreeSet;
 /// One cell, by row and column index into the result on screen. Both are
 /// indices into what the grid holds, never absolute row numbers in the
 /// table: paging replaces the rows, and a selection does not survive it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// Cells order **row by row**, left to right within a row — the order the
+/// fields are declared in, which is what the derive compares. It is the
+/// order a result is read in, and so the order ⌘F walks its hits.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Cell {
     pub row: usize,
     pub column: usize,
