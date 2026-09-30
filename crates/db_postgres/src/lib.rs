@@ -20,7 +20,7 @@ use futures::TryStreamExt as _;
 use introspect::{Catalog, Column, Schema, Table, TableKind};
 use sqlx::postgres::{
     PgConnectOptions, PgDatabaseError, PgErrorPosition, PgPool, PgPoolOptions, PgQueryResult,
-    PgRow, PgValueFormat, PgValueRef,
+    PgRow, PgTypeInfo, PgTypeKind, PgValueFormat, PgValueRef,
 };
 use sqlx::{Column as _, Either, Executor as _, Row as _, TypeInfo as _, ValueRef as _};
 use std::collections::HashMap;
@@ -1125,11 +1125,30 @@ fn decode(row: &PgRow, i: usize) -> Result<Value> {
 /// where each type is its own layout and nothing generic can be said, so
 /// the ones worth reading are decoded by hand and the rest keep the type
 /// name they had.
+///
+/// An **array** is one of those. sqlx decodes `text[]` into a `Vec`, but
+/// only of one dimension and only of a Rust type named up front, so every
+/// array went to the placeholder and a `text[]` column painted `<TEXT[]>`
+/// in every cell. See [`array`].
 fn off_the_wire(raw: PgValueRef<'_>, type_name: &str) -> Result<Value> {
     let format = raw.format();
+    let type_info = raw.type_info();
     let bytes = raw.as_bytes().map_err(|error| anyhow::anyhow!("{error}"))?;
     if let PgValueFormat::Text = format {
         return Ok(Value::Text(String::from_utf8_lossy(bytes).into_owned()));
+    }
+    // A domain over an array is sent as the array it is.
+    let mut array_type = type_info.as_ref();
+    while let PgTypeKind::Domain(base) = array_type.kind() {
+        array_type = base;
+    }
+    if let PgTypeKind::Array(element_type) = array_type.kind() {
+        let items = array_wire(bytes)?;
+        return Ok(Value::Text(if is_vector(array_type.name()) {
+            vector(&items, element_type)
+        } else {
+            array(&items, element_type)
+        }));
     }
     // The name comes from the catalog, so it arrives as the server spells
     // it; the built-in names sqlx uses are upper case.
@@ -1139,6 +1158,432 @@ fn off_the_wire(raw: PgValueRef<'_>, type_name: &str) -> Result<Value> {
         "tsvector" => Value::Text(tsvector(bytes)?),
         _ => Value::Text(format!("<{type_name}>")),
     })
+}
+
+/// Postgres's own limit on an array's dimensions, `MAXDIM`. A header that
+/// claims more is not an array the server wrote.
+const MAX_ARRAY_DIMENSIONS: usize = 6;
+
+/// An array as it crossed the wire: the length and the lower bound of
+/// each dimension, and every element in row-major order, `None` for a
+/// NULL.
+struct ArrayWire<'a> {
+    lengths: Vec<usize>,
+    lowers: Vec<i32>,
+    items: Vec<Option<&'a [u8]>>,
+}
+
+/// Split an array's binary form, as `array_send` writes it, into its
+/// parts.
+///
+/// The wire form is a header — the number of dimensions, a has-nulls
+/// flag, the element's OID, then a length and a lower bound for each
+/// dimension — followed by every element, each a length (-1 for NULL)
+/// and that many bytes. An empty array has no dimensions at all, so a
+/// dimension of length zero is refused: the server never sends one, and
+/// `[i32::MAX, 0]` would otherwise be two billion brace pairs around
+/// nothing. Every element costs at least its four-byte length, which is
+/// what bounds the count by the bytes that are actually there.
+fn array_wire(bytes: &[u8]) -> Result<ArrayWire<'_>> {
+    let mut wire = WireBytes(bytes);
+    let dimensions = usize::try_from(wire.i32()?)
+        .ok()
+        .filter(|n| *n <= MAX_ARRAY_DIMENSIONS)
+        .ok_or_else(|| anyhow::anyhow!("array has an impossible number of dimensions"))?;
+    wire.take(4)?; // has nulls: every element says so itself
+    wire.take(4)?; // the element's OID: sqlx already resolved the type
+
+    let mut lengths = Vec::with_capacity(dimensions);
+    let mut lowers = Vec::with_capacity(dimensions);
+    for _ in 0..dimensions {
+        let length = usize::try_from(wire.i32()?)
+            .ok()
+            .filter(|length| *length > 0)
+            .ok_or_else(|| anyhow::anyhow!("array dimension has no length"))?;
+        lengths.push(length);
+        lowers.push(wire.i32()?);
+    }
+    let count = if dimensions == 0 {
+        0
+    } else {
+        lengths
+            .iter()
+            .try_fold(1usize, |count, length| count.checked_mul(*length))
+            .filter(|count| *count <= wire.0.len() / 4)
+            .ok_or_else(|| anyhow::anyhow!("array promises more elements than it holds"))?
+    };
+
+    let mut items = Vec::with_capacity(count);
+    for _ in 0..count {
+        let length = wire.i32()?;
+        items.push(if length == -1 {
+            None
+        } else {
+            let length = usize::try_from(length)
+                .map_err(|_| anyhow::anyhow!("array element has a negative length"))?;
+            Some(wire.take(length)?)
+        });
+    }
+    if !wire.0.is_empty() {
+        anyhow::bail!("array has bytes past its last element");
+    }
+    Ok(ArrayWire {
+        lengths,
+        lowers,
+        items,
+    })
+}
+
+/// An array rendered the way `array_out` renders it: `{a,"b c",NULL}`,
+/// `{{1,2},{3,4}}`, and `[0:1]={1,2}` when a dimension does not start
+/// at 1.
+///
+/// The text form is the target because it is what the same statement
+/// paints when it comes back unprepared, and a cell must not read two
+/// ways depending on how the statement was sent. So a `bool[]` reads
+/// `{t,f}`, as `psql` shows it, and not the way the scalar `true` does.
+///
+/// Each element is read by the type sqlx resolved for the column, through
+/// [`element`]. One it cannot read keeps the type's name, so an array of
+/// an exotic type still shows its shape — and a value this reader gets
+/// wrong costs its own element, not the whole result: an error here would
+/// fail every row of the run.
+fn array(array: &ArrayWire<'_>, element_type: &PgTypeInfo) -> String {
+    let mut out = String::new();
+    if array.lowers.iter().any(|lower| *lower != 1) {
+        for (lower, length) in array.lowers.iter().zip(&array.lengths) {
+            let upper = i64::from(*lower) + *length as i64 - 1;
+            out.push_str(&format!("[{lower}:{upper}]"));
+        }
+        out.push('=');
+    }
+    if array.lengths.is_empty() {
+        out.push_str("{}");
+    } else {
+        array_level(
+            &mut out,
+            &array.lengths,
+            &mut array.items.iter(),
+            element_type,
+        );
+    }
+    out
+}
+
+/// One level of braces: the elements themselves at the innermost
+/// dimension, and a brace group per entry of every dimension outside it.
+fn array_level<'a>(
+    out: &mut String,
+    lengths: &[usize],
+    items: &mut impl Iterator<Item = &'a Option<&'a [u8]>>,
+    element_type: &PgTypeInfo,
+) {
+    out.push('{');
+    for n in 0..lengths[0] {
+        if n > 0 {
+            out.push(',');
+        }
+        if lengths.len() > 1 {
+            array_level(out, &lengths[1..], items, element_type);
+            continue;
+        }
+        match items.next() {
+            Some(Some(bytes)) => array_item(out, &element_or_name(bytes, element_type)),
+            _ => out.push_str("NULL"),
+        }
+    }
+    out.push('}');
+}
+
+/// `int2vector` and `oidvector` are arrays on the wire — the catalog
+/// files them as such, so sqlx calls them one — but their own output
+/// functions print them space-separated with no braces: `1 2`, as
+/// `pg_index.indkey` reads in `psql`.
+fn is_vector(type_name: &str) -> bool {
+    type_name.eq_ignore_ascii_case("int2vector") || type_name.eq_ignore_ascii_case("oidvector")
+}
+
+fn vector(array: &ArrayWire<'_>, element_type: &PgTypeInfo) -> String {
+    array
+        .items
+        .iter()
+        .map(|item| match item {
+            Some(bytes) => element_or_name(bytes, element_type),
+            None => "NULL".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One element, quoted by `array_out`'s rule: an empty string, the word
+/// `NULL` in any case, and anything holding a brace, a comma, a quote, a
+/// backslash or white space goes in quotes, with a quote or a backslash
+/// inside it escaped by a backslash. Otherwise `{"a,b"}` would read as
+/// two elements and `{"NULL"}` as none.
+fn array_item(out: &mut String, item: &str) {
+    let quoted = item.is_empty()
+        || item.eq_ignore_ascii_case("null")
+        || item.chars().any(|character| {
+            matches!(
+                character,
+                '{' | '}' | ',' | '"' | '\\' | ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'
+            )
+        });
+    if !quoted {
+        out.push_str(item);
+        return;
+    }
+    out.push('"');
+    for character in item.chars() {
+        if character == '"' || character == '\\' {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+    out.push('"');
+}
+
+fn element_or_name(bytes: &[u8], type_info: &PgTypeInfo) -> String {
+    element(bytes, type_info).unwrap_or_else(|_| format!("<{}>", type_info.name()))
+}
+
+/// One element of an array, from its binary form, as its type's own
+/// output function prints it.
+///
+/// The scalar path has sqlx to decode a value, but an element has no
+/// `PgValueRef` of its own to hand sqlx, so the common types are read by
+/// hand here. The name is matched the way [`decode`] matches it — sqlx's
+/// upper-case names for the built-ins — and the kind covers what has no
+/// fixed name: an enum's element is its label, and a domain is its base
+/// type.
+fn element(bytes: &[u8], type_info: &PgTypeInfo) -> Result<String> {
+    match type_info.kind() {
+        PgTypeKind::Enum(_) => return Ok(String::from_utf8_lossy(bytes).into_owned()),
+        PgTypeKind::Domain(base) => return element(bytes, base),
+        _ => {}
+    }
+    let name = type_info.name();
+    Ok(match name.to_ascii_uppercase().as_str() {
+        "BOOL" => match bytes {
+            [0] => "f".to_string(),
+            [_] => "t".to_string(),
+            _ => anyhow::bail!("expected 1 byte on the wire, got {}", bytes.len()),
+        },
+        "INT2" => i16::from_be_bytes(fixed(bytes)?).to_string(),
+        "INT4" => i32::from_be_bytes(fixed(bytes)?).to_string(),
+        "INT8" => i64::from_be_bytes(fixed(bytes)?).to_string(),
+        "OID" | "XID" => u32::from_be_bytes(fixed(bytes)?).to_string(),
+        "XID8" => u64::from_be_bytes(fixed(bytes)?).to_string(),
+        "FLOAT4" => {
+            let value = f32::from_be_bytes(fixed(bytes)?);
+            float(value.into(), format!("{value:e}"), value.to_string(), 6)
+        }
+        "FLOAT8" => {
+            let value = f64::from_be_bytes(fixed(bytes)?);
+            float(value, format!("{value:e}"), value.to_string(), 15)
+        }
+        "NUMERIC" => numeric(bytes)?,
+        // `"char"`, the one-byte type, is the name sqlx spells with its
+        // quotes; `CHAR` is `bpchar`.
+        "TEXT" | "VARCHAR" | "BPCHAR" | "CHAR" | "\"CHAR\"" | "NAME" | "CITEXT" | "UNKNOWN"
+        | "JSON" | "XML" => String::from_utf8_lossy(bytes).into_owned(),
+        // `jsonb` leads with a format version, which is 1.
+        "JSONB" => match bytes.split_first() {
+            Some((1, json)) => String::from_utf8_lossy(json).into_owned(),
+            _ => anyhow::bail!("unknown jsonb format"),
+        },
+        "UUID" => sqlx::types::Uuid::from_slice(bytes)?.to_string(),
+        "BYTEA" => {
+            let mut hex = String::from("\\x");
+            for byte in bytes {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            hex
+        }
+        "DATE" => match i32::from_be_bytes(fixed(bytes)?) {
+            i32::MAX => "infinity".to_string(),
+            i32::MIN => "-infinity".to_string(),
+            days => {
+                let (date, era) = calendar_date(days.into());
+                format!("{date}{era}")
+            }
+        },
+        "TIME" => clock(i64::from_be_bytes(fixed(bytes)?))?,
+        // `timestamptz` is stored in UTC and sqlx decodes the scalar as
+        // UTC, so the element reads the same way, offset and all.
+        "TIMESTAMP" | "TIMESTAMPTZ" => match i64::from_be_bytes(fixed(bytes)?) {
+            i64::MAX => "infinity".to_string(),
+            i64::MIN => "-infinity".to_string(),
+            micros => {
+                let (date, era) = calendar_date(micros.div_euclid(MICROS_PER_DAY));
+                let time = clock(micros.rem_euclid(MICROS_PER_DAY))?;
+                let offset = if name.eq_ignore_ascii_case("TIMESTAMPTZ") {
+                    " +00:00"
+                } else {
+                    ""
+                };
+                format!("{date} {time}{offset}{era}")
+            }
+        },
+        _ => format!("<{name}>"),
+    })
+}
+
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+/// The date `days` after 2000-01-01 — day zero of every Postgres date and
+/// timestamp on the wire — as Postgres prints it: the year in at least
+/// four digits, and the era apart, because there is no year zero and a
+/// year before 1 AD prints as `0001 … BC`.
+///
+/// The arithmetic is Howard Hinnant's `civil_from_days`, by hand rather
+/// than through `time`: Postgres dates run to 5874897 AD and `time`
+/// stops at 9999, so a date the server is happy to hold would come back
+/// as an error.
+fn calendar_date(days: i64) -> (String, &'static str) {
+    // Days from 0000-03-01, the start of the proleptic cycle.
+    let z = days + 10_957 + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    if year <= 0 {
+        (format!("{:04}-{month:02}-{day:02}", 1 - year), " BC")
+    } else {
+        (format!("{year:04}-{month:02}-{day:02}"), "")
+    }
+}
+
+/// The time of day `micros` after midnight, the way `format_time` writes
+/// the scalar: seconds, and the microseconds only when there are some.
+/// `24:00:00` is a time Postgres accepts, so the end of the day is one.
+fn clock(micros: i64) -> Result<String> {
+    if !(0..=MICROS_PER_DAY).contains(&micros) {
+        anyhow::bail!("time of day out of range");
+    }
+    let seconds = micros / 1_000_000;
+    let (hour, minute, second) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    Ok(match micros % 1_000_000 {
+        0 => format!("{hour:02}:{minute:02}:{second:02}"),
+        micro => format!("{hour:02}:{minute:02}:{second:02}.{micro:06}"),
+    })
+}
+
+/// A float the way Postgres prints it: the shortest digits that read
+/// back as the same value, plain while the exponent is from -4 to one
+/// below the type's digits (6 for `float4`, 15 for `float8`) and written
+/// as `1e+15` outside that. `plain` and `scientific` are Rust's own
+/// shortest renderings, taken from the value's own type, since a
+/// `float4` widened to `f64` first would print as `0.10000000149011612`.
+fn float(value: f64, scientific: String, plain: String, digits: i32) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    let Some((mantissa, exponent)) = scientific.split_once('e') else {
+        return plain;
+    };
+    let Ok(exponent) = exponent.parse::<i32>() else {
+        return plain;
+    };
+    if (-4..digits).contains(&exponent) {
+        plain
+    } else {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exponent.abs())
+    }
+}
+
+/// `numeric`'s binary form, rendered the way `numeric_out` renders it.
+///
+/// The wire form is a digit count, a weight, a sign and a display scale,
+/// then the digits in base 10000, the first one standing for
+/// 10000^weight. A digit past the ones sent is zero. The display scale is
+/// what keeps `1280.00` from reading as `1280`: the scalar path loses it
+/// to `BigDecimal`, but an element has no need to.
+fn numeric(bytes: &[u8]) -> Result<String> {
+    let mut wire = WireBytes(bytes);
+    let count = wire.u16()? as usize;
+    let weight = i32::from(wire.u16()? as i16);
+    let sign = wire.u16()?;
+    let scale = wire.u16()? as usize;
+    let digits = (0..count).map(|_| wire.u16()).collect::<Result<Vec<_>>>()?;
+    if !wire.0.is_empty() {
+        anyhow::bail!("numeric has bytes past its last digit");
+    }
+    let negative = match sign {
+        0x0000 => false,
+        0x4000 => true,
+        0xC000 => return Ok("NaN".to_string()),
+        0xD000 => return Ok("Infinity".to_string()),
+        0xF000 => return Ok("-Infinity".to_string()),
+        _ => anyhow::bail!("numeric has an unknown sign"),
+    };
+    let digit = |k: i32| {
+        usize::try_from(k)
+            .ok()
+            .and_then(|k| digits.get(k).copied())
+            .unwrap_or(0)
+    };
+
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    if weight < 0 {
+        out.push('0');
+    } else {
+        out.push_str(&digit(0).to_string());
+        for k in 1..=weight {
+            out.push_str(&format!("{:04}", digit(k)));
+        }
+    }
+    if scale > 0 {
+        let mut fraction = String::new();
+        let mut k = weight + 1;
+        while fraction.len() < scale {
+            fraction.push_str(&format!("{:04}", digit(k)));
+            k += 1;
+        }
+        fraction.truncate(scale);
+        out.push('.');
+        out.push_str(&fraction);
+    }
+    Ok(out)
+}
+
+/// A cursor over the bytes of one value that fails, rather than panics,
+/// when a count promises more than is there.
+struct WireBytes<'a>(&'a [u8]);
+
+impl<'a> WireBytes<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        if self.0.len() < n {
+            anyhow::bail!("value ended early on the wire");
+        }
+        let (head, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Ok(head)
+    }
+
+    fn i32(&mut self) -> Result<i32> {
+        Ok(i32::from_be_bytes(fixed(self.take(4)?)?))
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_be_bytes(fixed(self.take(2)?)?))
+    }
 }
 
 fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
@@ -1507,6 +1952,105 @@ mod tests {
             Value::Text("'fox':2A 'quick':1A".to_string())
         );
         assert_eq!(result.rows[0][4], Value::Text("'a''b'".to_string()));
+    }
+
+    /// An array comes back in binary on a prepared run, and sqlx has no
+    /// reading of it that fits every array, so it used to paint
+    /// `<TEXT[]>`. Each cell here must read the way `psql` prints it —
+    /// braces, quotes and all — except that a date or a time inside one
+    /// reads the way the same value reads in a cell of its own.
+    #[tokio::test]
+    async fn arrays_read_as_postgres_prints_them() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect(&url).await.unwrap();
+
+        let result = conn
+            .execute(
+                r#"SELECT ARRAY['a', 'b c', NULL, '', 'NULL', 'x,y', 'q"q', 'b\s']::text[],
+                          '{}'::text[],
+                          '{{1,2},{3,4}}'::int4[],
+                          '[0:1]={7,8}'::int8[],
+                          ARRAY[true, false],
+                          ARRAY[1.50, -0.001, 12345678.9, 0]::numeric[],
+                          ARRAY['NaN', 'Infinity']::float8[],
+                          ARRAY['2024-02-29', 'infinity']::date[],
+                          ARRAY['1999-12-31 23:59:59.5']::timestamp[],
+                          ARRAY['2024-01-01 00:00:00+00']::timestamptz[],
+                          ARRAY['24:00:00', '08:30:00']::time[],
+                          ARRAY['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11']::uuid[],
+                          ARRAY['{"k": 1}']::jsonb[],
+                          ARRAY['\x0102']::bytea[],
+                          ARRAY['abc']::varchar[],
+                          ARRAY[point(1, 2)],
+                          ARRAY['10000-01-01', '0001-01-01 BC']::date[],
+                          ARRAY['0001-01-01 00:00:00 BC']::timestamp[],
+                          ARRAY[0.1, 1234567]::float4[],
+                          ARRAY[1e300, 1e-05]::float8[],
+                          '1 3'::int2vector"#,
+            )
+            .await
+            .unwrap();
+        let cells: Vec<Value> = [
+            r#"{a,"b c",NULL,"","NULL","x,y","q\"q","b\\s"}"#,
+            "{}",
+            "{{1,2},{3,4}}",
+            "[0:1]={7,8}",
+            "{t,f}",
+            "{1.50,-0.001,12345678.9,0}",
+            "{NaN,Infinity}",
+            "{2024-02-29,infinity}",
+            r#"{"1999-12-31 23:59:59.500000"}"#,
+            r#"{"2024-01-01 00:00:00 +00:00"}"#,
+            "{24:00:00,08:30:00}",
+            "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}",
+            r#"{"{\"k\": 1}"}"#,
+            r#"{"\\x0102"}"#,
+            "{abc}",
+            "{<POINT>}",
+            r#"{10000-01-01,"0001-01-01 BC"}"#,
+            r#"{"0001-01-01 00:00:00 BC"}"#,
+            "{0.1,1.234567e+06}",
+            "{1e+300,1e-05}",
+            "1 3",
+        ]
+        .into_iter()
+        .map(|cell| Value::Text(cell.to_string()))
+        .collect();
+        assert_eq!(result.rows[0], cells);
+    }
+
+    /// An enum has no fixed name to match on, and a domain is its base
+    /// type, so an array of either — and a domain over an array — is read
+    /// through the type's kind.
+    #[tokio::test]
+    async fn arrays_of_enums_and_domains_read_their_elements() {
+        let Some(url) = test_url() else { return };
+        let conn = PostgresConnection::connect_url(&url, false).await.unwrap();
+        let session = conn.open_session().await.unwrap();
+        for statement in [
+            "CREATE TYPE pg_temp.mood AS ENUM ('ok', 'not ok')",
+            "CREATE DOMAIN pg_temp.small AS int4 CHECK (VALUE < 100)",
+            "CREATE DOMAIN pg_temp.tags AS text[]",
+        ] {
+            session.execute(statement).await.unwrap();
+        }
+
+        let result = session
+            .execute(
+                "SELECT ARRAY['ok', 'not ok']::pg_temp.mood[],
+                        ARRAY[1, 2]::pg_temp.small[],
+                        ARRAY['a', 'b']::pg_temp.tags",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.rows[0],
+            vec![
+                Value::Text(r#"{ok,"not ok"}"#.to_string()),
+                Value::Text("{1,2}".to_string()),
+                Value::Text("{a,b}".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2452,6 +2996,188 @@ mod tests {
         assert!(tsvector(&[0, 0, 0, 1, b'a']).is_err());
         // A position count with no positions behind it.
         assert!(tsvector(&[0, 0, 0, 1, b'a', 0, 0, 1]).is_err());
+    }
+
+    /// The bytes `array_send` writes for a one-dimensional `int4[]`, so
+    /// the reader can be argued with without a server.
+    fn int4_array_bytes(lower: i32, items: &[Option<i32>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(1i32.to_be_bytes());
+        bytes.extend(0i32.to_be_bytes());
+        bytes.extend(23u32.to_be_bytes());
+        bytes.extend((items.len() as i32).to_be_bytes());
+        bytes.extend(lower.to_be_bytes());
+        for item in items {
+            match item {
+                Some(n) => {
+                    bytes.extend(4i32.to_be_bytes());
+                    bytes.extend(n.to_be_bytes());
+                }
+                None => bytes.extend((-1i32).to_be_bytes()),
+            }
+        }
+        bytes
+    }
+
+    fn int4_array(bytes: &[u8]) -> Result<String> {
+        let int4 = <i32 as sqlx::Type<sqlx::Postgres>>::type_info();
+        array_wire(bytes).map(|items| array(&items, &int4))
+    }
+
+    #[test]
+    fn an_array_reads_as_postgres_prints_it() {
+        let bytes = int4_array_bytes(1, &[Some(1), None, Some(-3)]);
+        assert_eq!(int4_array(&bytes).unwrap(), "{1,NULL,-3}");
+        // A dimension that does not start at 1 says where it starts.
+        let bytes = int4_array_bytes(-1, &[Some(5)]);
+        assert_eq!(int4_array(&bytes).unwrap(), "[-1:-1]={5}");
+        // No dimensions at all is the empty array.
+        let empty = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23];
+        assert_eq!(int4_array(&empty).unwrap(), "{}");
+    }
+
+    #[test]
+    fn a_malformed_array_is_an_error_not_a_panic() {
+        let bytes = int4_array_bytes(1, &[Some(1), Some(2)]);
+        // Cut short anywhere, in the header or in an element.
+        for end in 0..bytes.len() {
+            assert!(int4_array(&bytes[..end]).is_err(), "cut at {end}");
+        }
+        // Bytes past the last element.
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(int4_array(&long).is_err());
+        // More dimensions than Postgres allows, and a negative length.
+        let mut deep = bytes.clone();
+        deep[..4].copy_from_slice(&7i32.to_be_bytes());
+        assert!(int4_array(&deep).is_err());
+        let mut negative = bytes.clone();
+        negative[12..16].copy_from_slice(&(-2i32).to_be_bytes());
+        assert!(int4_array(&negative).is_err());
+    }
+
+    /// A header is a promise about the bytes behind it, and one that
+    /// promises billions of elements must be refused before anything is
+    /// built for them.
+    #[test]
+    fn an_array_header_cannot_promise_more_than_its_bytes() {
+        let header = |lengths: &[i32]| {
+            let mut bytes = Vec::new();
+            bytes.extend((lengths.len() as i32).to_be_bytes());
+            bytes.extend(0i32.to_be_bytes());
+            bytes.extend(23u32.to_be_bytes());
+            for length in lengths {
+                bytes.extend(length.to_be_bytes());
+                bytes.extend(1i32.to_be_bytes());
+            }
+            bytes
+        };
+        // A zero length inside a dimension would be braces around nothing,
+        // two billion times over; the server sends no dimensions instead.
+        assert!(int4_array(&header(&[i32::MAX, 0])).is_err());
+        assert!(int4_array(&header(&[i32::MAX; 6])).is_err());
+        let mut short = header(&[3]);
+        short.extend(4i32.to_be_bytes());
+        short.extend(1i32.to_be_bytes());
+        assert!(int4_array(&short).is_err());
+    }
+
+    #[test]
+    fn a_catalog_vector_reads_space_separated() {
+        let int2 = <i16 as sqlx::Type<sqlx::Postgres>>::type_info();
+        let mut bytes = Vec::new();
+        for word in [1i32, 0, 21, 2, 0] {
+            bytes.extend(word.to_be_bytes());
+        }
+        for n in [1i16, 3] {
+            bytes.extend(2i32.to_be_bytes());
+            bytes.extend(n.to_be_bytes());
+        }
+        assert_eq!(vector(&array_wire(&bytes).unwrap(), &int2), "1 3");
+        assert!(is_vector("int2vector"));
+        assert!(is_vector("oidvector"));
+        assert!(!is_vector("INT2[]"));
+    }
+
+    #[test]
+    fn a_date_reads_across_the_whole_postgres_range() {
+        assert_eq!(calendar_date(0), ("2000-01-01".to_string(), ""));
+        assert_eq!(calendar_date(-1), ("1999-12-31".to_string(), ""));
+        assert_eq!(calendar_date(59), ("2000-02-29".to_string(), ""));
+        // Past the year 9999, where `time` stops.
+        assert_eq!(calendar_date(2_914_635), ("9980-01-01".to_string(), ""));
+        assert_eq!(calendar_date(2_921_940), ("10000-01-01".to_string(), ""));
+        // There is no year zero: the day before 0001-01-01 is 1 BC.
+        assert_eq!(calendar_date(-730_119), ("0001-01-01".to_string(), ""));
+        assert_eq!(calendar_date(-730_120), ("0001-12-31".to_string(), " BC"));
+    }
+
+    #[test]
+    fn a_float_reads_as_postgres_prints_it() {
+        let float8 = |value: f64| float(value, format!("{value:e}"), value.to_string(), 15);
+        let float4 = |value: f32| float(value.into(), format!("{value:e}"), value.to_string(), 6);
+        assert_eq!(float4(0.1), "0.1");
+        assert_eq!(float4(123456.0), "123456");
+        assert_eq!(float4(1234567.0), "1.234567e+06");
+        assert_eq!(float8(1e14), "100000000000000");
+        assert_eq!(float8(1e15), "1e+15");
+        assert_eq!(float8(-2.5e300), "-2.5e+300");
+        assert_eq!(float8(0.0001), "0.0001");
+        assert_eq!(float8(0.00001), "1e-05");
+        assert_eq!(float8(-0.0), "-0");
+        assert_eq!(float8(f64::NEG_INFINITY), "-Infinity");
+    }
+
+    #[test]
+    fn an_array_element_is_quoted_when_it_would_misread() {
+        let quoted = |item: &str| {
+            let mut out = String::new();
+            array_item(&mut out, item);
+            out
+        };
+        assert_eq!(quoted("plain"), "plain");
+        assert_eq!(quoted(""), r#""""#);
+        assert_eq!(quoted("null"), r#""null""#);
+        assert_eq!(quoted("a b"), r#""a b""#);
+        assert_eq!(quoted("{x}"), r#""{x}""#);
+        assert_eq!(quoted(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(quoted(r"a\b"), r#""a\\b""#);
+    }
+
+    /// The bytes `numeric_send` writes: a digit count, a weight, a sign, a
+    /// display scale, then the base-10000 digits.
+    fn numeric_bytes(weight: i16, sign: u16, scale: u16, digits: &[u16]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend((digits.len() as u16).to_be_bytes());
+        bytes.extend(weight.to_be_bytes());
+        bytes.extend(sign.to_be_bytes());
+        bytes.extend(scale.to_be_bytes());
+        for digit in digits {
+            bytes.extend(digit.to_be_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_numeric_keeps_its_scale() {
+        assert_eq!(
+            numeric(&numeric_bytes(0, 0, 2, &[1280])).unwrap(),
+            "1280.00"
+        );
+        assert_eq!(
+            numeric(&numeric_bytes(1, 0, 1, &[1234, 5678, 9000])).unwrap(),
+            "12345678.9"
+        );
+        assert_eq!(
+            numeric(&numeric_bytes(-1, 0x4000, 3, &[10])).unwrap(),
+            "-0.001"
+        );
+        // Digits past the ones sent are zero, on either side of the point.
+        assert_eq!(numeric(&numeric_bytes(2, 0, 0, &[7])).unwrap(), "700000000");
+        assert_eq!(numeric(&numeric_bytes(0, 0, 0, &[])).unwrap(), "0");
+        assert_eq!(numeric(&numeric_bytes(0, 0xC000, 0, &[])).unwrap(), "NaN");
+        assert!(numeric(&numeric_bytes(0, 0x1234, 0, &[])).is_err());
+        assert!(numeric(&[0, 1, 0, 0, 0, 0, 0, 0]).is_err());
     }
 
     #[test]
