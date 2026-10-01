@@ -4,17 +4,130 @@
 
 pub mod blink;
 pub mod find_bar;
+pub mod icon;
 pub mod scrollbar;
 mod text_field;
 
 pub use blink::{Blink, Blinking};
+pub use icon::{Icon, icon};
 pub use text_field::{TextField, TextFieldEvent, text_field_key_bindings};
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui::{
-    App, Div, FontWeight, InteractiveElement as _, ParentElement as _, SharedString, Styled as _,
-    div, px,
+    App, Div, ElementId, FontWeight, InteractiveElement as _, MouseButton, MouseDownEvent,
+    ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _,
+    Window, WindowControlArea, div, px,
 };
-use theme::theme;
+use theme::{MONO_FONT_FAMILY, theme};
+
+/// The height of the bar each screen draws where the system's title bar
+/// was. The traffic lights sit in its left end, so it has to be tall
+/// enough to centre them: `main` places them 15px down.
+pub const TITLE_BAR_HEIGHT: f32 = 44.;
+
+/// The room the traffic lights take at the bar's left end.
+pub const TRAFFIC_LIGHTS_WIDTH: f32 = 78.;
+
+/// Whether a press on the title bar is a press on the bar itself, and so
+/// may still become a window drag.
+///
+/// The window is created with `app_owns_titlebar_drag`, because the tabs
+/// live in the bar and AppKit would otherwise take every press on them
+/// for a drag. So the bar moves the window itself, the way Zed's does:
+/// a press arms the drag and the first move after it starts it.
+///
+/// A press on a *control* in the bar must not arm it, or pressing a tab
+/// and wobbling the pointer would carry the window off. GPUI bubbles a
+/// mouse-down from the deepest hitbox outwards, so a control hears the
+/// press before the bar does: `claim` is the listener a control hangs on
+/// itself, and the bar reads the claim and clears it. Nothing is stopped,
+/// so the control's own click still arrives.
+#[derive(Clone, Default)]
+pub struct TitleDrag {
+    armed: Rc<Cell<bool>>,
+    claimed: Rc<Cell<bool>>,
+    on_bar: Rc<Cell<bool>>,
+}
+
+impl TitleDrag {
+    /// The listener a control in the bar hangs on its own mouse-down.
+    pub fn claim(&self) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+        let claimed = self.claimed.clone();
+        move |_event, _window, _cx| claimed.set(true)
+    }
+}
+
+/// The bar at the top of a screen, which is also the window's title bar:
+/// a press on it and a move drags the window, a double click zooms it.
+/// The caller lays out what is in it; the traffic lights are painted over
+/// its first `TRAFFIC_LIGHTS_WIDTH` pixels by the system.
+pub fn title_bar(id: impl Into<ElementId>, drag: &TitleDrag) -> Stateful<Div> {
+    let (armed, claimed, on_bar) = (
+        drag.armed.clone(),
+        drag.claimed.clone(),
+        drag.on_bar.clone(),
+    );
+    let (up, out, moving) = (drag.armed.clone(), drag.armed.clone(), drag.armed.clone());
+    let clicked = drag.on_bar.clone();
+    div()
+        .id(id)
+        .window_control_area(WindowControlArea::Drag)
+        .h(px(TITLE_BAR_HEIGHT))
+        .flex_none()
+        .flex()
+        .items_center()
+        .pl(px(TRAFFIC_LIGHTS_WIDTH))
+        .on_mouse_down(MouseButton::Left, move |_event, _window, _cx| {
+            let bare = !claimed.replace(false);
+            armed.set(bare);
+            on_bar.set(bare);
+        })
+        .on_mouse_up(MouseButton::Left, move |_event, _window, _cx| up.set(false))
+        .on_mouse_down_out(move |_event, _window, _cx| out.set(false))
+        .on_mouse_move(move |_event, window, _cx| {
+            if moving.replace(false) {
+                window.start_window_move();
+            }
+        })
+        .on_click(move |event, window, _cx| {
+            if event.click_count() == 2 && clicked.get() {
+                window.titlebar_double_click();
+            }
+        })
+}
+
+/// A key written on a cap: the way every shortcut in the app is named, in
+/// a button, a footer or a hint. It sits on `raised` with a deeper bottom
+/// edge, so it reads as a key and not as a chip.
+pub fn keycap(key: impl Into<SharedString>, cx: &App) -> Div {
+    let colors = &theme(cx).colors;
+    div()
+        .flex_none()
+        .px(px(5.))
+        .border_1()
+        .border_b_2()
+        .border_color(colors.border)
+        .rounded(px(4.))
+        .bg(colors.raised)
+        .font_family(MONO_FONT_FAMILY)
+        .text_size(px(10.5))
+        .line_height(px(15.))
+        .text_color(colors.text_secondary)
+        .child(key.into())
+}
+
+/// A key and what it does, for a footer or a status strip: `⏎ open`.
+pub fn key_hint(key: impl Into<SharedString>, label: impl Into<SharedString>, cx: &App) -> Div {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .child(keycap(key, cx))
+        .child(label.into())
+}
 
 /// A bordered card surface sitting on a panel (connection card, inputs).
 pub fn card(cx: &App) -> Div {
@@ -38,41 +151,74 @@ pub fn toolbar_button(text: impl Into<SharedString>, cx: &App) -> Div {
 pub fn toolbar_button_bare(cx: &App) -> Div {
     let colors = &theme(cx).colors;
     div()
-        .px(px(9.))
-        .py(px(5.))
+        .h(px(28.))
+        .flex()
+        .items_center()
+        .gap(px(7.))
+        .px(px(10.))
         .border_1()
-        .border_color(colors.border_strong)
-        .rounded(px(6.))
-        .bg(colors.elevated)
-        .text_size(px(11.))
+        .border_color(colors.border)
+        .rounded(px(7.))
+        .bg(colors.window)
+        .text_size(px(12.))
         .text_color(colors.text_secondary)
         .cursor_pointer()
-        .hover(|s| s.border_color(colors.text_faint))
+        .hover(|s| s.bg(colors.panel).border_color(colors.border_strong))
 }
 
-/// The single filled accent button ("run", "commit").
+/// The one filled button in a view ("Connect", "Save", "Restart now").
+/// The fill is `accent_fill`, not `accent`: white on the accent itself is
+/// 3.8:1, under what a label needs.
 pub fn accent_button(text: impl Into<SharedString>, cx: &App) -> Div {
+    accent_button_bare(cx).child(text.into())
+}
+
+/// The same button with nothing in it, for one that carries a keycap.
+pub fn accent_button_bare(cx: &App) -> Div {
     let colors = &theme(cx).colors;
     div()
-        .px(px(10.))
-        .py(px(5.))
-        .rounded(px(6.))
-        .bg(colors.accent)
-        .text_size(px(11.))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(colors.window)
+        .h(px(28.))
+        .flex()
+        .items_center()
+        .gap(px(7.))
+        .px(px(11.))
+        .rounded(px(7.))
+        .bg(colors.accent_fill)
+        .text_size(px(12.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(colors.on_accent)
         .cursor_pointer()
         .hover(|s| s.bg(colors.accent_deep))
-        .child(text.into())
 }
 
-/// An uppercase micro section label ("SCHEMA · PUBLIC", "CONNECTIONS").
+/// A keycap that sits *inside* a filled button: the cap has to read over
+/// the fill, so it is a veil of the ink rather than a tone of its own.
+pub fn keycap_on_fill(key: impl Into<SharedString>, cx: &App) -> Div {
+    let colors = &theme(cx).colors;
+    div()
+        .flex_none()
+        .px(px(5.))
+        .border_1()
+        .border_b_2()
+        .border_color(colors.key_on_fill_border)
+        .rounded(px(4.))
+        .bg(colors.key_on_fill_surface)
+        .font_family(MONO_FONT_FAMILY)
+        .text_size(px(10.5))
+        .line_height(px(15.))
+        .font_weight(FontWeight::MEDIUM)
+        .child(key.into())
+}
+
+/// A section's name ("Saved connections", "Tables"). Sentence case, in
+/// the chrome's font: the first edition wrote these in 9px capitals in
+/// the faintest grey, which is a label nobody can read.
 pub fn section_label(text: impl Into<SharedString>, cx: &App) -> Div {
     let colors = &theme(cx).colors;
     div()
-        .text_size(px(9.))
+        .text_size(px(11.5))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(colors.text_faint)
+        .text_color(colors.text_muted)
         .child(text.into())
 }
 
@@ -321,11 +467,11 @@ pub fn switch(on: bool, cx: &App) -> Div {
         .rounded_full()
         .p(px(2.))
         .bg(if on {
-            colors.accent
+            colors.accent_fill
         } else {
             colors.border_strong
         })
-        .child(div().size(px(13.)).rounded_full().bg(colors.elevated));
+        .child(div().size(px(13.)).rounded_full().bg(colors.raised));
     if on {
         track = track.justify_end();
     }

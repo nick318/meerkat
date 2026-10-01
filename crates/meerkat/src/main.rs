@@ -26,7 +26,7 @@ mod update;
 
 use gpui::{
     App, Bounds, Focusable as _, Global, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
-    actions, prelude::*, px, size,
+    actions, point, prelude::*, px, size,
 };
 use gpui_platform::application;
 use root::Root;
@@ -62,6 +62,9 @@ fn main() {
                 Cow::Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf")),
                 Cow::Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-Medium.ttf")),
                 Cow::Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-SemiBold.ttf")),
+                Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf")),
+                Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Medium.ttf")),
+                Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf")),
             ])
             .expect("failed to load bundled fonts");
 
@@ -212,10 +215,16 @@ fn open_window(target: Option<Target>, cx: &mut App) {
         .open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // The screens draw their own title bar, so the tab strip can
+                // sit where the system's empty one was: three bars of chrome
+                // became one. `ui::title_bar` moves the window, which is why
+                // AppKit is told it does not own the drag.
                 titlebar: Some(TitlebarOptions {
                     title: Some("Meerkat".into()),
-                    ..Default::default()
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(14.), px(15.))),
                 }),
+                app_owns_titlebar_drag: true,
                 ..Default::default()
             },
             |window, cx| cx.new(|cx| Root::new(target, window, cx)),

@@ -19,7 +19,7 @@ use gpui::{
     ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy,
     SharedString, Size, Stateful, StyledText, Subscription, TextLayout, UniformListScrollHandle,
-    Window, actions, canvas, deferred, div, prelude::*, px, uniform_list,
+    Window, actions, canvas, deferred, div, point, prelude::*, px, transparent_black, uniform_list,
 };
 use introspect::diff::{
     self as schema_diff, ColumnDelta, Delta, ObjectChange, ObjectDelta, RelationChange,
@@ -38,13 +38,13 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use storage::{HistoryFilter, NewRun, QueryRun, RunSource, SavedTab, SavedTabs, Store};
-use theme::{FONT_FAMILY, ThemeColors, theme};
+use theme::{MONO_FONT_FAMILY, ThemeColors, UI_FONT_FAMILY, theme};
 use ui::find_bar::{self, FindCount};
 use ui::scrollbar::{self, DragState, Scrollbar};
 use ui::{
-    TextField, TextFieldEvent, card, format_count, format_millis, format_millis_frac,
-    format_seconds, lock_glyph, meerkat_mark, play_glyph, search_glyph, section_label, status_dot,
-    stop_glyph, table_glyph,
+    Icon, TRAFFIC_LIGHTS_WIDTH, TextField, TextFieldEvent, TitleDrag, format_count, format_millis,
+    format_millis_frac, format_seconds, icon, key_hint, keycap as cap, lock_glyph, meerkat_mark,
+    play_glyph, search_glyph, section_label, status_dot, stop_glyph, title_bar,
 };
 
 use crate::connections::unix_now;
@@ -263,9 +263,9 @@ const HANDLE_LINE: f32 = 2.;
 /// Every sidebar row is this tall, headers included: `uniform_list` needs
 /// one height to measure, and the design's rows are already within a
 /// pixel of each other.
-const CATALOG_ROW_HEIGHT: f32 = 24.;
+const CATALOG_ROW_HEIGHT: f32 = 26.;
 /// The sidebar's filter line, a size under the relation names it filters.
-const FILTER_FONT_SIZE: f32 = 11.;
+const FILTER_FONT_SIZE: f32 = 12.;
 /// How far back the history screen looks, in days. The comp's header says
 /// "last 7 days", and that is the window the list actually reads.
 const HISTORY_DAYS: i64 = 7;
@@ -356,8 +356,8 @@ const RUN_PRESS_DEPTH: f32 = 0.08;
 /// that fits "run" clips the "p" off "stop" — the button's own label is the
 /// one thing on it that must never be cut, because the word *is* what the
 /// button is offering to do. The couple of pixels over are the rounding.
-const RUN_LABEL_WIDTH: f32 = 28.;
-const TERMINATE_LABEL_WIDTH: f32 = 62.;
+const RUN_LABEL_WIDTH: f32 = 30.;
+const TERMINATE_LABEL_WIDTH: f32 = 64.;
 /// How long a tab's session may sit unused before it is handed back, and
 /// how often the sweep looks. Ten minutes is long enough that a session is
 /// still there when the user comes back from a meeting having left a tab
@@ -385,13 +385,14 @@ const PEEK_CHARS: usize = 4_000;
 /// straight under the button that opens it, with a list that grows to about
 /// nine rows and then scrolls.
 const COLUMN_FIND_WIDTH: f32 = 290.;
-const COLUMN_FIND_TOP: f32 = 32.;
+const COLUMN_FIND_TOP: f32 = 34.;
 const COLUMN_ROW_HEIGHT: f32 = 24.;
 const COLUMN_LIST_MAX_HEIGHT: f32 = 236.;
 /// The search line inside it, a size up from the list it filters.
 const COLUMN_FIND_FONT_SIZE: f32 = 12.;
-/// The tab strip is one row tall, as the comp draws it.
-const TAB_STRIP_HEIGHT: f32 = 34.;
+/// A tab's height inside the title bar: a pill, with the bar's own
+/// padding above and below it.
+const TAB_HEIGHT: f32 = 30.;
 /// A tab is never squeezed below this, so the strip reads as a row of
 /// tabs rather than a row of words of different lengths.
 const TAB_MIN_WIDTH: f32 = 116.;
@@ -501,7 +502,7 @@ pub struct Shell {
     /// relations is a wall of names when every schema is expanded, so the
     /// sidebar opens closed and the user opens what they want.
     open_schemas: HashSet<SharedString>,
-    /// Which `TABLES` / `VIEWS` sections are closed. This one is the other
+    /// Which `Tables` / `Views` sections are closed. This one is the other
     /// way round because a schema the user just opened was opened to see
     /// what is in it: sections start open, and closing one is the choice
     /// worth remembering.
@@ -581,6 +582,10 @@ pub struct Shell {
     /// the same reason the grid keeps its hovered row on `GridState`. One
     /// button is on screen at a time, so one flag covers it.
     run_pressed: bool,
+    /// The title bar's own mouse state: whether a press on it may still
+    /// become a window drag. Mouse state between frames, like
+    /// `run_pressed`.
+    title_drag: TitleDrag,
     /// The error strip whose message was last put on the clipboard: its
     /// tab and the message itself. The strip's link says `copied` while
     /// both still match, so the press has an answer on screen; a new
@@ -1053,6 +1058,15 @@ impl Timing {
     /// The strip's line. `~` marks a server figure that is an estimate or a
     /// mean rather than this run's own measured time — an unmarked number
     /// claims more than the app knows.
+    /// How much of the wait was the server's, from 0 to 1 — the width of
+    /// the server's part of the bar beside the summary. `None` when the
+    /// summary has no split to draw.
+    fn server_share(&self) -> Option<f32> {
+        let (server, _) = self.server_ms()?;
+        self.lag_ms()?;
+        (self.total_ms > 0).then(|| (server as f32 / self.total_ms as f32).clamp(0., 1.))
+    }
+
     fn summary(&self) -> String {
         let total = format_millis(self.total_ms);
         let Some(((server, exact), lag)) = self.server_ms().zip(self.lag_ms()) else {
@@ -1290,6 +1304,7 @@ impl Shell {
             sweeping: false,
             timing: false,
             run_pressed: false,
+            title_drag: TitleDrag::default(),
             copied_error: None,
             pane_drag: None,
             sidebar_width,
@@ -4640,7 +4655,7 @@ fn run_scope(tab: &QueryTab, cx: &App) -> Option<SharedString> {
     tab.editor
         .read(cx)
         .selected_text()
-        .map(|_| "runs the selection".into())
+        .map(|_| "Runs the selection".into())
 }
 
 /// Every schema, relation and column in the catalog, so the query editor
@@ -5460,7 +5475,7 @@ impl Render for Shell {
             .size_full()
             .flex()
             .flex_col()
-            .child(self.breadcrumb_bar(&colors, cx))
+            .child(self.title_row(&colors, cx))
             .child(
                 div()
                     .flex()
@@ -5478,7 +5493,6 @@ impl Render for Shell {
                             .flex_col()
                             .flex_1()
                             .min_w(px(0.))
-                            .child(self.tab_strip(&colors, cx))
                             .child(self.pane(&colors, window, cx))
                             .child(self.status_strip(&colors, cx)),
                     )
@@ -5543,7 +5557,7 @@ impl Render for Shell {
             .flex_col()
             .size_full()
             .bg(colors.window)
-            .font_family(FONT_FAMILY)
+            .font_family(UI_FONT_FAMILY)
             .text_color(colors.text_body);
         if self.env.is_some() {
             root = root.rounded_b(radius);
@@ -5573,96 +5587,269 @@ impl Render for Shell {
 }
 
 impl Shell {
-    fn breadcrumb_bar(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
-        let separator = || div().text_color(colors.text_faint).child("/");
-        let mut trail = div()
-            .flex_1()
-            .flex()
-            .justify_center()
-            .items_center()
-            .gap(px(7.))
-            .text_color(colors.text_muted)
-            .child(
-                div()
-                    .text_color(colors.text_secondary)
-                    .child(self.session_name()),
-            );
-        match self.tabs.get(self.active) {
-            Some(Tab::Table(tab)) => {
-                trail = trail
-                    .child(separator())
-                    .child(tab.schema.clone())
-                    .child(separator())
-                    .child(
-                        div()
-                            .text_color(colors.text)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(tab.table.clone()),
-                    );
-            }
-            Some(Tab::History(_)) => {
-                trail = trail.child(separator()).child(
-                    div()
-                        .text_color(colors.text)
-                        .font_weight(FontWeight::MEDIUM)
-                        .child("history"),
-                );
-            }
-            _ => {}
-        }
-
-        // A tagged session tints the whole bar with the environment's
-        // wash and rules it with the same family, the way the comp does.
+    /// The one bar over the workspace, which is also the window's title
+    /// bar. The first edition stacked three here — the system's empty title
+    /// bar, a breadcrumb bar and the tab strip, a hundred pixels before the
+    /// first line of SQL — and each said part of one thing: which database,
+    /// which tab. So the bar holds, left to right, the traffic lights, the
+    /// way back to the connections screen under the session's name, the
+    /// tabs, the palette, and the two marks that say what this window may
+    /// do to the database.
+    ///
+    /// The session's part is as wide as the sidebar under it, so the tabs
+    /// start over the pane they switch. A tagged session tints the whole
+    /// bar with the environment's wash, as the breadcrumb bar did: the
+    /// frame warns at the edges and the bar warns where the eye is.
+    fn title_row(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Stateful<Div> {
         let (bar_bg, bar_rule) = match self.env {
             Some(env) => (env.surface(colors), env.inner(colors)),
             None => (colors.panel, colors.border),
         };
-        div()
-            .h(px(38.))
-            .flex_none()
-            .flex()
-            .items_center()
-            .px(px(12.))
-            .gap(px(14.))
+        let dot = match self.status {
+            Status::Connected => colors.ok,
+            Status::Failed(_) => colors.error_mark,
+            Status::Connecting(_) => colors.idle,
+        };
+        let session_width = (self.sidebar_width - TRAFFIC_LIGHTS_WIDTH).max(96.);
+        let claim = || self.title_drag.claim();
+
+        title_bar("title-bar", &self.title_drag)
+            .gap(px(8.))
+            .pr(px(12.))
             .border_b_1()
             .border_color(bar_rule)
             .bg(bar_bg)
-            .text_size(px(11.))
-            // The way back to the connections screen, where the comp puts
-            // the window controls.
+            .text_size(px(13.))
             .child(
                 div()
-                    .id("connections")
+                    .w(px(session_width - 8.))
                     .flex_none()
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .id("connections")
+                            .h(px(TAB_HEIGHT))
+                            .max_w_full()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .px(px(8.))
+                            .rounded(px(7.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(colors.sunk))
+                            .on_mouse_down(MouseButton::Left, claim())
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                // Leaving drops every tab at once, so it asks
+                                // about all of them — `proceed_close` writes
+                                // the strip back before the shell goes.
+                                if this.guard_close(Close::Shell, window, cx) {
+                                    this.proceed_close(Close::Shell, window, cx);
+                                }
+                            }))
+                            .child(status_dot(dot).size(px(7.)).flex_none())
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(colors.text)
+                                    .truncate()
+                                    .child(self.session_name()),
+                            )
+                            .child(icon(Icon::ChevronDown, 11., colors.text_muted)),
+                    ),
+            )
+            .child(div().flex_none().w(px(1.)).h(px(20.)).bg(bar_rule))
+            .child(self.tabs(colors, cx))
+            .child(
+                div()
+                    .id("palette-button")
+                    .flex_none()
+                    .w(px(232.))
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .pl(px(10.))
+                    .pr(px(5.))
+                    .border_1()
+                    .border_color(colors.border)
+                    .rounded(px(7.))
+                    .bg(colors.window)
+                    .text_size(px(12.5))
                     .text_color(colors.text_muted)
                     .cursor_pointer()
-                    .hover(|s| s.text_color(colors.accent))
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        // Leaving drops every tab at once, so it asks about
-                        // all of them — `proceed_close` writes the strip
-                        // back before the shell goes.
-                        if this.guard_close(Close::Shell, window, cx) {
-                            this.proceed_close(Close::Shell, window, cx);
-                        }
-                    }))
-                    .child("‹ connections"),
+                    .hover(|s| s.border_color(colors.border_strong))
+                    .on_mouse_down(MouseButton::Left, claim())
+                    .on_click(
+                        cx.listener(|this, _event, window, cx| this.toggle_palette(window, cx)),
+                    )
+                    .child(icon(Icon::Search, 12., colors.text_muted))
+                    .child(div().flex_1().truncate().child("Search tables and history"))
+                    .child(cap("⌘K", cx)),
             )
             .children(self.env.map(|env| {
-                // The badge names the frame: PROD in the ring's own
-                // color, so the tint never has to be decoded from memory.
+                // The badge names the frame, so the tint never has to be
+                // decoded from memory. It sits on the paper with a ring of
+                // the frame's colour rather than filled with it: a sand or
+                // green fill under white text is too faint to read.
                 div()
                     .flex_none()
-                    .px(px(9.))
-                    .py(px(4.))
-                    .rounded(px(5.))
-                    .bg(env.ring(colors))
-                    .text_size(px(10.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .px(px(8.))
+                    .border_1()
+                    .border_color(env.ring(colors))
+                    .rounded(px(6.))
+                    .bg(colors.raised)
+                    .text_size(px(11.5))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(colors.window)
-                    .child(env.as_str().to_ascii_uppercase())
+                    .text_color(env.text(colors))
+                    .child(status_dot(env.ring(colors)))
+                    .child(env.as_str().to_string())
             }))
             .child(self.mode_mark(colors))
-            .child(trail)
+    }
+
+    /// The tabs, inside the title bar. They scroll inside their part of the
+    /// bar rather than pushing the palette off the end, and each keeps a
+    /// width between the two bounds: a long table name is truncated, and a
+    /// short one is not squeezed to its text.
+    fn tabs(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Stateful<Div> {
+        let mut tabs = div()
+            .id("tabs")
+            .flex()
+            .flex_1()
+            .min_w(px(0.))
+            .items_center()
+            .gap(px(4.))
+            .overflow_x_scroll();
+
+        for (ix, tab) in self.tabs.iter().enumerate() {
+            let is_active = ix == self.active;
+            let id = tab.id();
+            let glyph = match tab {
+                Tab::Table(tab) if tab.kind == TableKind::View => Icon::View,
+                Tab::Table(_) => Icon::Table,
+                Tab::Query(tab) if tab.relation.is_some() => Icon::Table,
+                Tab::Query(_) => Icon::Query,
+                Tab::History(_) => Icon::History,
+            };
+            let mut item = div()
+                .id(ElementId::Name(format!("tab-{id}").into()))
+                .h(px(TAB_HEIGHT))
+                .flex_none()
+                .min_w(px(TAB_MIN_WIDTH))
+                .max_w(px(TAB_MAX_WIDTH))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .pl(px(11.))
+                .pr(px(6.))
+                .border_1()
+                .rounded(px(7.))
+                .text_size(px(12.5))
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, self.title_drag.claim())
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.activate(ix, cx);
+                    // The tab that was clicked takes the focus, each kind the
+                    // way it takes it when it opens: a query tab into its
+                    // editor, a table tab into its grid. Leaving the focus
+                    // where it was would leave it on a control the click has
+                    // just taken off the screen.
+                    this.focus_active_tab(window, cx);
+                    cx.notify();
+                }))
+                .child(icon(
+                    glyph,
+                    13.,
+                    if is_active {
+                        colors.accent
+                    } else {
+                        colors.text_muted
+                    },
+                ))
+                .child(
+                    // The title is what gives way when the tab is at its
+                    // widest, so it takes the room the glyph and the ×
+                    // leave and truncates inside it.
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .font_weight(if is_active {
+                            FontWeight::MEDIUM
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .text_color(if is_active {
+                            colors.text
+                        } else {
+                            colors.text_secondary
+                        })
+                        .truncate()
+                        .child(tab.title()),
+                )
+                .child(
+                    div()
+                        .id(ElementId::Name(format!("close-{id}").into()))
+                        .flex_none()
+                        .size(px(18.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.))
+                        .text_size(px(14.))
+                        .text_color(if is_active {
+                            colors.text_muted
+                        } else {
+                            colors.text_faint
+                        })
+                        .cursor_pointer()
+                        .hover(|s| s.bg(colors.sunk).text_color(colors.error))
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            let what = close_intent(this.tabs.len(), id);
+                            if this.guard_close(what, window, cx) {
+                                this.proceed_close(what, window, cx);
+                            }
+                        }))
+                        .child("×"),
+                );
+            item = if is_active {
+                item.border_color(colors.border)
+                    .bg(colors.window)
+                    .shadow(vec![BoxShadow {
+                        color: colors.shadow_soft,
+                        offset: point(px(0.), px(1.)),
+                        blur_radius: px(2.),
+                        spread_radius: px(0.),
+                        inset: false,
+                    }])
+            } else {
+                let hover = colors.sunk;
+                item.border_color(transparent_black())
+                    .hover(move |s| s.bg(hover))
+            };
+            tabs = tabs.child(item);
+        }
+
+        tabs.child(
+            div()
+                .id("new-query")
+                .flex_none()
+                .size(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(7.))
+                .cursor_pointer()
+                .hover(|s| s.bg(colors.sunk))
+                .on_mouse_down(MouseButton::Left, self.title_drag.claim())
+                .on_click(cx.listener(|this, _event, window, cx| this.new_query(window, cx)))
+                .child(icon(Icon::Plus, 12., colors.text_muted)),
+        )
     }
 
     /// The comp's mode mark: a padlock and one word, in the top bar beside
@@ -5678,19 +5865,19 @@ impl Shell {
         let (label, surface, border, ink) = self.mode_tones(colors);
         div()
             .flex_none()
+            .h(px(22.))
             .flex()
             .items_center()
             .gap(px(6.))
             .px(px(8.))
-            .py(px(4.))
             .border_1()
             .border_color(border)
-            .rounded(px(5.))
+            .rounded(px(6.))
             .bg(surface)
             .child(lock_glyph(ink))
             .child(
                 div()
-                    .text_size(px(10.))
+                    .text_size(px(11.5))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(ink)
                     .child(label),
@@ -5702,38 +5889,23 @@ impl Shell {
     fn mode_tones(&self, colors: &ThemeColors) -> (&'static str, Hsla, Hsla, Hsla) {
         match (&self.status, self.read_only) {
             (Status::Failed(_), _) => (
-                "OFFLINE",
+                "Offline",
                 colors.mode_off_surface,
                 colors.mode_off_border,
                 colors.mode_off_text,
             ),
             (_, true) => (
-                "READ-ONLY",
+                "Read-only",
                 colors.env_dev_surface,
                 colors.env_dev_inner,
                 colors.env_dev_text,
             ),
             (_, false) => (
-                "READ-WRITE",
+                "Read-write",
                 colors.env_prod_surface,
                 colors.env_prod_inner,
                 colors.env_prod_text,
             ),
-        }
-    }
-
-    /// The mark's ink on its own, for the lines that say the mode in text.
-    fn mode_ink(&self, colors: &ThemeColors) -> Hsla {
-        self.mode_tones(colors).3
-    }
-
-    /// The same fact in a word, for the lines that carry it as text: the
-    /// sidebar's foot and the query toolbar.
-    fn mode_word(&self) -> &'static str {
-        if self.read_only {
-            "read-only"
-        } else {
-            "read-write"
         }
     }
 
@@ -5982,21 +6154,20 @@ impl Shell {
     }
 
     fn sidebar(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
-        // The card's second line carries whatever the first one does not.
-        // A named profile takes the title, so the database moves down here
+        // The title bar names the session; the foot says where it is. A
+        // named profile takes the title, so the database moves down here
         // rather than leaving the screen: the user still has to know which
         // database of that host is open.
-        let (host, dot) = match (&self.label, &self.status) {
+        let host = match (&self.label, &self.status) {
             (Some(label), Status::Connected) => {
-                let where_it_is = format!("{} · {}", label.host, label.port);
-                let line = match (&self.name, label.database.is_empty()) {
+                let where_it_is = format!("{}:{}", label.host, label.port);
+                match (&self.name, label.database.is_empty()) {
                     (Some(_), false) => format!("{} · {where_it_is}", label.database),
                     _ => where_it_is,
-                };
-                (line, colors.ok)
+                }
             }
-            (_, Status::Failed(_)) => ("not connected".to_string(), colors.error),
-            _ => ("connecting…".to_string(), colors.text_faint),
+            (_, Status::Failed(_)) => "not connected".to_string(),
+            _ => "connecting…".to_string(),
         };
 
         div()
@@ -6007,88 +6178,56 @@ impl Shell {
             .border_r_1()
             .border_color(colors.border)
             .bg(colors.panel)
-            .child(
-                div()
-                    .p(px(12.))
-                    .border_b_1()
-                    .border_color(colors.hairline)
-                    .child(
-                        card(cx)
-                            .flex()
-                            .items_center()
-                            .gap(px(9.))
-                            .px(px(8.))
-                            .py(px(7.))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.))
-                                    .child(
-                                        div()
-                                            .text_size(px(12.))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(colors.text)
-                                            .truncate()
-                                            .child(self.session_name()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(10.))
-                                            .text_color(colors.text_muted)
-                                            .truncate()
-                                            .child(host),
-                                    ),
-                            )
-                            .child(status_dot(dot)),
-                    ),
-            )
             .child(self.catalog_filter_row(colors, cx))
             .child(self.catalog_list(colors, cx))
             .child(
                 div()
                     .flex_none()
-                    .px(px(12.))
-                    .py(px(9.))
-                    .border_t_1()
-                    .border_color(colors.hairline)
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
-                    .text_size(px(10.))
+                    .gap(px(2.))
+                    .px(px(6.))
+                    .pt(px(6.))
+                    .pb(px(8.))
+                    .border_t_1()
+                    .border_color(colors.border)
+                    .text_size(px(12.))
                     .text_color(colors.text_muted)
-                    // The comp's way into the history, kept where it puts
-                    // it: the foot of the sidebar.
                     .child(
                         div()
                             .flex()
+                            .items_center()
                             .justify_between()
+                            .gap(px(8.))
+                            // The comp's way into the history, kept where it
+                            // puts it: the foot of the sidebar.
                             .child(
                                 div()
                                     .id("query-history")
+                                    .h(px(28.))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.))
+                                    .px(px(8.))
+                                    .rounded(px(7.))
+                                    .text_color(colors.text_secondary)
                                     .cursor_pointer()
-                                    .hover(|s| s.text_color(colors.accent))
+                                    .hover(|s| s.bg(colors.sunk))
                                     .on_click(cx.listener(|this, _event, _window, cx| {
                                         this.open_history(cx)
                                     }))
-                                    .child("query history"),
+                                    .child(icon(Icon::History, 13., colors.text_muted))
+                                    .child("Query history"),
                             )
-                            // The foot says the mode in words, where the
-                            // comp puts it, and in the mark's own ink: the
-                            // sidebar is where a session is read, and it
-                            // must not have to be read against the top bar.
-                            .child(
-                                div()
-                                    .text_color(self.mode_ink(colors))
-                                    .child(self.mode_word()),
-                            ),
+                            .child(div().pr(px(6.)).child(self.table_total())),
                     )
                     .child(
                         div()
-                            .text_color(colors.text_faint)
-                            .child(self.table_total()),
+                            .px(px(8.))
+                            .font_family(MONO_FONT_FAMILY)
+                            .text_size(px(11.))
+                            .truncate()
+                            .child(host),
                     ),
             )
     }
@@ -6114,24 +6253,20 @@ impl Shell {
             .on_action(cx.listener(Self::on_catalog_prev))
             .on_action(cx.listener(Self::on_catalog_next))
             .flex_none()
-            .px(px(12.))
-            .py(px(8.))
-            .border_b_1()
-            .border_color(colors.hairline)
+            .p(px(10.))
             .child(
-                card(cx)
+                div()
+                    .h(px(30.))
                     .flex()
                     .items_center()
-                    .gap(px(7.))
-                    .px(px(8.))
-                    .py(px(5.))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(10.))
-                            .text_color(colors.text_faint)
-                            .child("⌕"),
-                    )
+                    .gap(px(8.))
+                    .pl(px(9.))
+                    .pr(px(5.))
+                    .border_1()
+                    .border_color(colors.border)
+                    .rounded(px(7.))
+                    .bg(colors.window)
+                    .child(icon(Icon::Search, 12., colors.text_muted))
                     .child(
                         div()
                             .flex_1()
@@ -6142,28 +6277,27 @@ impl Shell {
                     // nothing on screen names is a gesture nobody finds.
                     // It gives way to the clear mark, which is about the
                     // line the user is already on.
-                    .children((!filtering).then(|| {
-                        div()
-                            .flex_none()
-                            .text_size(px(10.))
-                            .text_color(colors.text_faint)
-                            .child("⌘E")
-                    }))
+                    .children((!filtering).then(|| cap("⌘E", cx)))
                     // The way out of a filter for the mouse. It appears only
                     // when there is something to clear.
                     .children(filtering.then(|| {
                         div()
                             .id("clear-filter")
                             .flex_none()
-                            .text_size(px(10.))
-                            .text_color(colors.text_faint)
+                            .size(px(20.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.))
+                            .text_size(px(14.))
+                            .text_color(colors.text_muted)
                             .cursor_pointer()
-                            .hover(|s| s.text_color(colors.accent))
+                            .hover(|s| s.bg(colors.sunk).text_color(colors.text))
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.catalog_filter.update(cx, |field, cx| field.clear(cx));
                                 this.rebuild_catalog_rows(cx);
                             }))
-                            .child("✕")
+                            .child("×")
                     })),
             )
     }
@@ -6177,10 +6311,10 @@ impl Shell {
                 .id("catalog")
                 .flex_1()
                 .min_h(px(0.))
-                .px(px(14.))
-                .pt(px(10.))
-                .text_size(px(11.))
-                .text_color(colors.text_faint)
+                .px(px(16.))
+                .pt(px(6.))
+                .text_size(px(12.))
+                .text_color(colors.text_muted)
                 // The catalog is a request of its own, so a connected
                 // session can still be waiting for one. A filter that
                 // matched nothing empties the list as well, and says so
@@ -6237,7 +6371,7 @@ impl Shell {
         let list = list
             .track_scroll(&self.catalog_scroll)
             .size_full()
-            .px(px(8.));
+            .px(px(6.));
 
         // The bar sits outside the scrolling list, or it would scroll away
         // with it. `uniform_list` keeps a plain handle inside its own, and
@@ -6267,133 +6401,6 @@ impl Shell {
                 }),
             )
             .into_any_element()
-    }
-
-    fn tab_strip(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
-        // The tabs scroll inside the strip rather than pushing "+ new
-        // query" off the end, and each one keeps its height and a width
-        // between the two bounds: a long table name is truncated, and a
-        // short one is not squeezed to its text.
-        let mut tabs = div()
-            .id("tabs")
-            .flex()
-            .flex_1()
-            .min_w(px(0.))
-            .items_stretch()
-            .overflow_x_scroll();
-
-        for (ix, tab) in self.tabs.iter().enumerate() {
-            let is_active = ix == self.active;
-            let id = tab.id();
-            let mut item = div()
-                .id(ElementId::Name(format!("tab-{id}").into()))
-                .h_full()
-                .flex_none()
-                .min_w(px(TAB_MIN_WIDTH))
-                .max_w(px(TAB_MAX_WIDTH))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .px(px(14.))
-                .border_r_1()
-                .border_color(colors.border)
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _event, window, cx| {
-                    this.activate(ix, cx);
-                    // The tab that was clicked takes the focus, each kind the
-                    // way it takes it when it opens: a query tab into its
-                    // editor, a table tab into its grid. Leaving the focus
-                    // where it was would leave it on a control the click has
-                    // just taken off the screen.
-                    this.focus_active_tab(window, cx);
-                    cx.notify();
-                }))
-                .child(match tab {
-                    Tab::Table(tab) if tab.kind == TableKind::Table => {
-                        table_glyph(is_active, cx).flex_none()
-                    }
-                    // Views and query results are both "not a table": the
-                    // sidebar marks them with a ring, so tabs match.
-                    _ => div()
-                        .size(px(5.))
-                        .flex_none()
-                        .rounded_full()
-                        .border_1()
-                        .border_color(if is_active {
-                            colors.accent
-                        } else {
-                            colors.text_faint
-                        }),
-                })
-                .child(
-                    // The title is what gives way when the tab is at its
-                    // widest, so it takes the room the glyph and the ×
-                    // leave and truncates inside it.
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .text_size(px(11.))
-                        .font_weight(if is_active {
-                            FontWeight::MEDIUM
-                        } else {
-                            FontWeight::NORMAL
-                        })
-                        .text_color(if is_active {
-                            colors.text
-                        } else {
-                            colors.text_muted
-                        })
-                        .truncate()
-                        .child(tab.title()),
-                )
-                .child(
-                    div()
-                        .id(ElementId::Name(format!("close-{id}").into()))
-                        .flex_none()
-                        .text_size(px(12.))
-                        .text_color(colors.text_faint)
-                        .cursor_pointer()
-                        .hover(|s| s.text_color(colors.error))
-                        .on_click(cx.listener(move |this, _event, window, cx| {
-                            let what = close_intent(this.tabs.len(), id);
-                            if this.guard_close(what, window, cx) {
-                                this.proceed_close(what, window, cx);
-                            }
-                        }))
-                        .child("×"),
-                );
-            item = if is_active {
-                item.bg(colors.window)
-            } else {
-                let hover = colors.hairline;
-                item.hover(move |s| s.bg(hover))
-            };
-            tabs = tabs.child(item);
-        }
-
-        div()
-            .h(px(TAB_STRIP_HEIGHT))
-            .flex_none()
-            .flex()
-            .items_stretch()
-            .border_b_1()
-            .border_color(colors.border)
-            .bg(colors.panel)
-            .child(tabs)
-            .child(
-                div()
-                    .id("new-query")
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .px(px(12.))
-                    .text_size(px(11.))
-                    .text_color(colors.accent)
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(colors.accent_deep))
-                    .on_click(cx.listener(|this, _event, window, cx| this.new_query(window, cx)))
-                    .child("+ new query"),
-            )
     }
 
     fn pane(&self, colors: &ThemeColors, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -6650,7 +6657,7 @@ impl Shell {
         // live" reading, in the accent's family rather than a warning's.
         let (border, fill) = match open {
             Some(_) => (colors.running_border, colors.running_surface),
-            None => (colors.border_strong, colors.elevated),
+            None => (colors.border, colors.window),
         };
 
         Some(
@@ -6660,25 +6667,25 @@ impl Shell {
                 .child(
                     div()
                         .id("find-column")
+                        .h(px(28.))
                         .flex()
                         .items_center()
                         .gap(px(7.))
-                        .pl(px(9.))
+                        .pl(px(10.))
                         .pr(px(5.))
-                        .py(px(4.))
                         .border_1()
                         .border_color(border)
-                        .rounded(px(6.))
+                        .rounded(px(7.))
                         .bg(fill)
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(colors.text_secondary)
                         .cursor_pointer()
-                        .hover(|s| s.border_color(colors.text_faint))
+                        .hover(|s| s.border_color(colors.border_strong))
                         .on_click(cx.listener(|this, _event, window, cx| {
                             this.toggle_column_find(window, cx)
                         }))
-                        .child(search_glyph(colors.accent))
-                        .child("column")
+                        .child(icon(Icon::Search, 12., colors.text_muted))
+                        .child("Column")
                         .child(key_badge("⌘J", colors)),
                 )
                 .children(open.map(|find| {
@@ -6849,16 +6856,17 @@ impl Shell {
         Some(
             div()
                 .flex_none()
+                .h(px(28.))
                 .flex()
                 .items_center()
                 .gap(px(7.))
-                .px(px(9.))
-                .py(px(5.))
+                .px(px(10.))
                 .border_1()
                 .border_color(colors.running_border)
-                .rounded(px(6.))
+                .rounded(px(7.))
                 .bg(colors.running_surface)
-                .text_size(px(11.))
+                .font_family(MONO_FONT_FAMILY)
+                .text_size(px(12.))
                 .text_color(colors.accent_deep)
                 .child(status_dot(colors.running_mark))
                 .child(format_seconds(waited.as_millis())),
@@ -6881,24 +6889,42 @@ impl Shell {
         let chip = |mode: TxMode, lit: bool, faint: bool, cx: &Context<Self>| {
             let mut chip = div()
                 .id(SharedString::from(format!("tx-{}", mode.as_str())))
+                .h(px(24.))
                 .flex()
                 .items_center()
-                .gap(px(5.))
-                .px(px(7.))
-                .py(px(4.))
-                .rounded(px(4.))
-                .text_size(px(10.))
-                .font_weight(FontWeight::MEDIUM)
+                .gap(px(6.))
+                .px(px(10.))
+                .rounded(px(5.))
+                .text_size(px(12.5))
+                .font_weight(if lit {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                })
                 .text_color(if lit {
-                    colors.accent_deep
+                    colors.text
                 } else if faint {
                     colors.text_faint
                 } else {
-                    colors.text_muted
+                    colors.text_secondary
                 })
-                .child(mode.as_str());
+                .child(match mode {
+                    TxMode::Auto => "Auto",
+                    TxMode::Manual => "Manual",
+                });
             if lit {
-                chip = chip.bg(colors.selection);
+                // The lit chip is lifted out of the track, the way a
+                // segmented control says which segment is chosen.
+                chip = chip.bg(colors.raised).shadow(vec![BoxShadow {
+                    color: colors.shadow_soft,
+                    offset: point(px(0.), px(1.)),
+                    blur_radius: px(2.),
+                    spread_radius: px(0.),
+                    inset: false,
+                }]);
+            } else if !faint {
+                let hover = colors.text;
+                chip = chip.hover(move |s| s.text_color(hover));
             }
             if !faint {
                 chip = chip.cursor_pointer().on_click(
@@ -6909,28 +6935,34 @@ impl Shell {
         };
         div()
             .flex_none()
+            .h(px(30.))
             .flex()
             .items_center()
-            .gap(px(3.))
-            .p(px(3.))
+            .gap(px(2.))
+            .p(px(2.))
             .border_1()
             .border_color(if manual {
                 colors.running_border
             } else {
-                colors.border_strong
+                colors.sunk
             })
-            .rounded(px(6.))
+            .rounded(px(7.))
             .bg(if manual {
                 colors.running_surface
             } else {
-                colors.panel
+                colors.sunk
             })
             .child(
                 div()
-                    .px(px(4.))
-                    .text_size(px(9.))
-                    .text_color(colors.mode_off_text)
-                    .child("tx"),
+                    .pl(px(6.))
+                    .pr(px(4.))
+                    .text_size(px(12.))
+                    .text_color(if manual {
+                        colors.accent_muted
+                    } else {
+                        colors.text_muted
+                    })
+                    .child("Transaction"),
             )
             .child(chip(TxMode::Auto, !manual, locked, cx))
             .child(
@@ -7312,9 +7344,9 @@ impl Shell {
     fn run_button(&self, tab: &QueryTab, colors: &ThemeColors, cx: &Context<Self>) -> AnyElement {
         let phase = tab.run.phase();
         let (verb, keys) = match phase {
-            RunPhase::Ready => ("run", "⌘⏎"),
-            RunPhase::Stop => ("stop", "⌘."),
-            RunPhase::Terminate => ("terminate", "⌘."),
+            RunPhase::Ready => ("Run", "⌘⏎"),
+            RunPhase::Stop => ("Stop", "⌘."),
+            RunPhase::Terminate => ("Terminate", "⌘."),
         };
         let pressed = self.run_pressed;
         // Paper under clay for "stop": the one state where the button is
@@ -7322,9 +7354,9 @@ impl Shell {
         // question rather than as a command already given.
         let (border, resting, ink, cap_surface, cap_border) = match phase {
             RunPhase::Ready => (
-                colors.accent,
-                colors.accent,
-                colors.window,
+                colors.accent_fill,
+                colors.accent_fill,
+                colors.on_accent,
                 colors.key_on_fill_surface,
                 colors.key_on_fill_border,
             ),
@@ -7338,7 +7370,7 @@ impl Shell {
             RunPhase::Terminate => (
                 colors.env_prod,
                 colors.env_prod,
-                colors.window,
+                colors.on_accent,
                 colors.key_on_fill_surface,
                 colors.key_on_fill_border,
             ),
@@ -7361,15 +7393,15 @@ impl Shell {
         let button = div()
             .id("run-query")
             .flex_none()
+            .h(px(30.))
             .flex()
             .items_center()
             .gap(px(8.))
-            .pl(px(10.))
+            .pl(px(12.))
             .pr(px(5.))
-            .py(px(4.))
             .border_1()
             .border_color(border)
-            .rounded(px(6.))
+            .rounded(px(7.))
             .bg(fill)
             .cursor_pointer()
             // **The press is the click here, and `on_click` is not used.**
@@ -7420,15 +7452,15 @@ impl Shell {
                     } else {
                         RUN_LABEL_WIDTH
                     }))
-                    .text_size(px(11.))
-                    .font_weight(FontWeight::MEDIUM)
+                    .text_size(px(12.5))
+                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(ink)
                     .child(verb),
             )
             // The keycap does not move on a press: the tone says the press
             // landed, and a keycap sinking a pixel is the one thing on this
             // button that would still read as a mechanism.
-            .child(keycap(keys, 11., cap_surface, cap_border, ink));
+            .child(keycap(keys, 10.5, cap_surface, cap_border, ink));
 
         // A press holds the button still at its pressed tone: what is under
         // the pointer must not also be breathing.
@@ -7509,17 +7541,17 @@ impl Shell {
             // With no backend the tab's session is still opening, and the
             // line must not claim the server has anything: it does not.
             Run::Running(live) if live.backend.is_none() => (
-                "RUNNING",
+                "Running",
                 "opening this tab's session · ⌘. calls it off".to_string(),
                 colors.accent_deep,
             ),
             Run::Running(_) => (
-                "RUNNING",
+                "Running",
                 "the server has the statement · ⌘. stops it".to_string(),
                 colors.accent_deep,
             ),
             Run::Cancelling(live) => (
-                "CANCELLING",
+                "Cancelling",
                 match live.backend {
                     None => "the run was called off before it left".to_string(),
                     Some(RunId(pid)) => format!(
@@ -7530,7 +7562,7 @@ impl Shell {
                 colors.accent_deep,
             ),
             Run::Cancelled { elapsed } => (
-                "CANCELLED",
+                "Cancelled",
                 format!("stopped after {} · no rows kept", format_seconds(*elapsed)),
                 colors.error,
             ),
@@ -7548,7 +7580,7 @@ impl Shell {
                     .map(|c| format!("{} · ", changed_copy(c)))
                     .unwrap_or_default();
                 (
-                    "RESULT",
+                    "Result",
                     format!(
                         "{statements}{} rows · {} columns · {changed}{}",
                         tab.data.rows.len(),
@@ -7575,7 +7607,7 @@ impl Shell {
                 };
                 let changed = tab.changed.map(changed_copy).unwrap_or_default();
                 (
-                    "DONE",
+                    "Done",
                     format!(
                         "{statements}{changed} · {}",
                         tab.timing
@@ -7585,61 +7617,41 @@ impl Shell {
                     colors.text_muted,
                 )
             }
-            Run::Idle => ("RESULT", "not run yet".to_string(), colors.text_muted),
+            Run::Idle => ("Result", "not run yet".to_string(), colors.text_muted),
         };
 
         pane.child(
-            // Query toolbar
+            // Query toolbar. The run button leads, because it is what the
+            // toolbar is for; the tab's name and the session's mode used to
+            // lead, and both now live in the title bar over it.
             div()
+                .h(px(46.))
                 .flex_none()
                 .flex()
                 .items_center()
                 .gap(px(10.))
                 .px(px(14.))
-                .py(px(9.))
                 .border_b_1()
                 .border_color(colors.hairline)
+                .child(self.run_button(tab, colors, cx))
+                .child(self.tx_switch(tab, colors, cx))
+                .children(self.run_timer(tab, colors))
                 .child(
-                    // **Everything on the left gives up room before any
-                    // control on the right does.** The run button must not
-                    // move because a tab has a long name, and it must not
-                    // be the thing that falls off the edge: it is
-                    // `flex_none`, so a row that overflows pushes it past
-                    // the pane and clips it.
-                    //
-                    // `min_w(0)` on each child is what makes that possible.
-                    // A text element's automatic minimum is its own text,
-                    // so without it these four cannot shrink at all,
-                    // whatever the flex factors say — and the row overflows
-                    // rather than truncating. It is the same pairing every
-                    // cell in the grid needs.
-                    //
-                    // This group also *is* the spacer: it takes the slack
-                    // when there is any, so the controls sit right however
-                    // little there is to say on the left.
+                    // **Everything after the controls gives up room before
+                    // any of them does.** `min_w(0)` on each child is what
+                    // makes that possible: a text element's automatic
+                    // minimum is its own text, so without it these cannot
+                    // shrink at all, and the row overflows rather than
+                    // truncating. It is the same pairing every cell in the
+                    // grid needs.
                     div()
                         .flex()
                         .flex_1()
                         .min_w(px(0.))
                         .items_center()
+                        .justify_end()
                         .gap(px(10.))
-                        .child(
-                            div()
-                                .min_w(px(0.))
-                                .text_size(px(12.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(colors.text)
-                                .truncate()
-                                .child(tab.title.clone()),
-                        )
-                        .child(
-                            div()
-                                .min_w(px(0.))
-                                .text_size(px(11.))
-                                .text_color(colors.text_muted)
-                                .truncate()
-                                .child(format!("{} · {}", self.session_name(), self.mode_word())),
-                        )
+                        .text_size(px(12.))
                         .children(session_mark(tab, colors))
                         // With several statements in the buffer, say which
                         // one a run would send, so ⌘⏎ never comes as a
@@ -7647,15 +7659,11 @@ impl Shell {
                         .children(run_scope(tab, cx).map(|scope| {
                             div()
                                 .min_w(px(0.))
-                                .text_size(px(11.))
-                                .text_color(colors.text_faint)
+                                .text_color(colors.text_muted)
                                 .truncate()
                                 .child(scope)
                         })),
-                )
-                .child(self.tx_switch(tab, colors, cx))
-                .children(self.run_timer(tab, colors))
-                .child(self.run_button(tab, colors, cx)),
+                ),
         )
         .child(
             div()
@@ -7689,24 +7697,38 @@ impl Shell {
         .child(
             // Result header
             div()
+                .h(px(40.))
                 .flex_none()
                 .flex()
                 .items_center()
-                .gap(px(12.))
+                .gap(px(10.))
                 .px(px(14.))
-                .py(px(8.))
                 .border_b_1()
-                .border_color(colors.hairline)
+                .border_color(colors.border)
                 .bg(colors.panel)
-                .text_size(px(10.))
-                .text_color(ink)
                 .child(
                     div()
+                        .flex_none()
+                        .text_size(px(13.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(ink)
+                        // A plain result is named in ink; a run that is out
+                        // or was stopped names itself in its own tone.
+                        .text_color(if ink == colors.text_muted {
+                            colors.text
+                        } else {
+                            ink
+                        })
                         .child(label),
                 )
-                .child(summary)
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .font_family(MONO_FONT_FAMILY)
+                        .text_size(px(11.5))
+                        .text_color(ink)
+                        .truncate()
+                        .child(summary),
+                )
                 .children(cap_note(tab, colors))
                 .child(div().flex_1())
                 // The way to a column of the result, on the line that
@@ -7865,7 +7887,7 @@ impl Shell {
     }
 
     fn status_strip(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Div {
-        let divider = || div().text_color(colors.text_faint).child("|");
+        let divider = || div().flex_none().w(px(1.)).h(px(14.)).bg(colors.border);
         let (range, timing) = match self.tabs.get(self.active) {
             Some(Tab::Table(tab)) => {
                 let first = tab.page * PAGE_SIZE + 1;
@@ -7916,8 +7938,23 @@ impl Shell {
             .and_then(|selection| selection.summary());
         // Only over a result there is something to do to. A tab still
         // waiting on its first run has no columns and no keys worth listing.
-        let keys = (!self.result_columns().is_empty())
-            .then_some("↑↓←→ move · ⌘J column · ⏎ value · space picks · ⌘C copies");
+        let keys = !self.result_columns().is_empty();
+
+        // The split of the wait, drawn: the server's part in the accent,
+        // the lag in the track. A number pair says the same thing, but the
+        // question is usually "was it the database?", and a bar answers it
+        // before the numbers are read.
+        let split = timing.and_then(|t| t.server_share()).map(|share| {
+            div()
+                .flex_none()
+                .w(px(56.))
+                .h(px(6.))
+                .flex()
+                .rounded(px(3.))
+                .overflow_hidden()
+                .bg(colors.sunk)
+                .child(div().h_full().w(gpui::relative(share)).bg(colors.accent))
+        });
 
         div()
             .h(px(30.))
@@ -7927,34 +7964,87 @@ impl Shell {
             .gap(px(12.))
             .px(px(14.))
             .border_t_1()
-            .border_color(colors.border_strong)
+            .border_color(colors.border)
             .bg(colors.panel)
-            .text_size(px(10.))
+            .text_size(px(12.))
             .text_color(colors.text_muted)
-            .child(range)
+            .whitespace_nowrap()
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(MONO_FONT_FAMILY)
+                    .text_size(px(11.5))
+                    .text_color(colors.text_secondary)
+                    .child(range),
+            )
             .children(paging.then(|| divider()))
-            .children(paging.then(|| self.page_link("prev", false, colors, cx)))
-            .children(paging.then(|| self.page_link("next", true, colors, cx)))
+            .children(paging.then(|| self.page_link("Previous", false, colors, cx)))
+            .children(paging.then(|| self.page_link("Next", true, colors, cx)))
             .children(marks.as_ref().map(|_| divider()))
-            .children(marks.map(|marks| div().text_color(colors.accent_deep).child(marks)))
+            .children(marks.map(|marks| {
+                div()
+                    .flex_none()
+                    .text_color(colors.accent_deep)
+                    .child(marks)
+            }))
             // The keys the result answers to, as the comp's own footer lists
             // them. It is the only place ⏎ and ⌘J are written down, and a
             // gesture nothing on screen names is a gesture nobody finds.
-            .children(keys.map(|_| divider()))
-            .children(keys.map(|keys| div().text_color(colors.text_faint).truncate().child(keys)))
-            .child(div().flex_1())
-            .children(timing.map(|timing| div().child(timing.summary())))
-            .child(divider())
-            .child(match self.status {
-                Status::Connected => "on lookout",
-                Status::Connecting(_) => "connecting",
-                Status::Failed(_) => "off duty",
-            })
-            .child(status_dot(match self.status {
-                Status::Connected => colors.ok,
-                Status::Connecting(_) => colors.text_faint,
-                Status::Failed(_) => colors.error,
+            .children(keys.then(|| divider()))
+            .children(keys.then(|| {
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .items_center()
+                    .gap(px(12.))
+                    .children(
+                        [
+                            ("↑↓←→", "move"),
+                            ("⌘J", "column"),
+                            ("⏎", "value"),
+                            ("space", "pick"),
+                            ("⌘C", "copy"),
+                        ]
+                        .map(|(key, label)| key_hint(key, label, cx)),
+                    )
             }))
+            .children((!keys).then(|| div().flex_1()))
+            .children(timing.map(|timing| {
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .font_family(MONO_FONT_FAMILY)
+                    .text_size(px(11.5))
+                    .children(split)
+                    .child(timing.summary())
+            }))
+            .child(divider())
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_color(match self.status {
+                        Status::Connected => colors.env_dev_text,
+                        Status::Connecting(_) => colors.text_muted,
+                        Status::Failed(_) => colors.error,
+                    })
+                    .child(status_dot(match self.status {
+                        Status::Connected => colors.ok,
+                        Status::Connecting(_) => colors.idle,
+                        Status::Failed(_) => colors.error_mark,
+                    }))
+                    .child(match self.status {
+                        Status::Connected => "On lookout",
+                        Status::Connecting(_) => "Connecting",
+                        Status::Failed(_) => "Off duty",
+                    }),
+            )
     }
 
     /// The palette, over everything. It is an absolutely positioned child
@@ -8487,9 +8577,11 @@ impl Shell {
         colors: &ThemeColors,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
-        let accent = colors.accent;
+        let accent = colors.accent_deep;
         div()
             .id(ElementId::Name(label.into()))
+            .flex_none()
+            .text_color(colors.text_secondary)
             .cursor_pointer()
             .hover(move |s| s.text_color(accent))
             .on_click(cx.listener(move |this, _event, _window, cx| {
@@ -8517,9 +8609,9 @@ enum CatalogRow {
         count: usize,
         open: bool,
     },
-    /// A folder: `TABLES`, `VIEWS`, `SEQUENCES`, `ROUTINES` or `TYPES`
-    /// inside a schema at level 1, or `INDEXES`, `FOREIGN KEYS`,
-    /// `CONSTRAINTS` or `TRIGGERS` inside an open relation at level 3.
+    /// A folder: `Tables`, `Views`, `Sequences`, `Routines` or `Types`
+    /// inside a schema at level 1, or `Indexes`, `Foreign keys`,
+    /// `Constraints` or `Triggers` inside an open relation at level 3.
     Section {
         key: SharedString,
         label: SharedString,
@@ -8560,8 +8652,15 @@ enum Mark {
     Type,
 }
 
-/// How far one level of the tree steps in: a chevron and the gap after it.
-const TREE_STEP: f32 = 13.;
+/// How far one level of the tree steps in: a chevron and the gap after it,
+/// which is also a glyph and the gap after *it* — `TREE_GLYPH` and
+/// `TREE_GAP` add up to this, or a column's glyph would not sit under its
+/// relation's name.
+const TREE_STEP: f32 = 16.;
+/// A row's glyph (a chevron, a relation's icon, a leaf's mark) is this wide.
+const TREE_GLYPH: f32 = 11.;
+/// ...and this far from what follows it.
+const TREE_GAP: f32 = TREE_STEP - TREE_GLYPH;
 
 /// Where the chevron of a row at `level` starts.
 fn chevron_at(level: usize) -> f32 {
@@ -8668,8 +8767,8 @@ struct Folder {
 }
 
 /// Read the catalog the way the sidebar reads it: a schema, then its
-/// sections under it — `TABLES`, `VIEWS`, `SEQUENCES`, `ROUTINES`,
-/// `TYPES` — then the names under those. A section with nothing in it is
+/// sections under it — `Tables`, `Views`, `Sequences`, `Routines`,
+/// `Types` — then the names under those. A section with nothing in it is
 /// left out rather than drawn empty, and so is a schema.
 fn catalog_groups(catalog: Rc<Catalog>) -> Rc<Vec<Group>> {
     let mut groups = Vec::new();
@@ -8688,10 +8787,10 @@ fn catalog_groups(catalog: Rc<Catalog>) -> Rc<Vec<Group>> {
         };
         let objects = |leaves: Vec<Leaf>| leaves.into_iter().map(Entry::Object).collect();
         let sections: Vec<Section> = [
-            ("TABLES", relations(TableKind::Table)),
-            ("VIEWS", relations(TableKind::View)),
+            ("Tables", relations(TableKind::Table)),
+            ("Views", relations(TableKind::View)),
             (
-                "SEQUENCES",
+                "Sequences",
                 objects(
                     (schema.sequences.iter())
                         .map(|s| Leaf::new(s.name.clone(), s.detail(), Mark::Sequence))
@@ -8699,7 +8798,7 @@ fn catalog_groups(catalog: Rc<Catalog>) -> Rc<Vec<Group>> {
                 ),
             ),
             (
-                "ROUTINES",
+                "Routines",
                 objects(
                     (schema.routines.iter())
                         .map(|r| Leaf::new(r.name.clone(), r.detail(), Mark::Routine))
@@ -8707,7 +8806,7 @@ fn catalog_groups(catalog: Rc<Catalog>) -> Rc<Vec<Group>> {
                 ),
             ),
             (
-                "TYPES",
+                "Types",
                 objects(
                     (schema.types.iter())
                         .map(|t| Leaf::new(t.name.clone(), t.detail(), Mark::Type))
@@ -8729,7 +8828,7 @@ fn catalog_groups(catalog: Rc<Catalog>) -> Rc<Vec<Group>> {
         }
         groups.push(Group {
             key: schema.name.clone().into(),
-            label: schema.name.to_ascii_uppercase().into(),
+            label: schema.name.clone().into(),
             schema: schema.name.clone().into(),
             sections,
             catalog: catalog.clone(),
@@ -8770,25 +8869,25 @@ fn relation_parts(table: &Table) -> Parts {
         .collect();
     let folders = [
         (
-            "INDEXES",
+            "Indexes",
             (table.indexes.iter())
                 .map(|i| Leaf::new(i.name.clone(), i.detail(), Mark::Index))
                 .collect::<Vec<_>>(),
         ),
         (
-            "FOREIGN KEYS",
+            "Foreign keys",
             (table.foreign_keys.iter())
                 .map(|k| Leaf::new(k.name.clone(), k.detail(), Mark::ForeignKey))
                 .collect(),
         ),
         (
-            "CONSTRAINTS",
+            "Constraints",
             (table.constraints.iter())
                 .map(|c| Leaf::new(c.name.clone(), c.detail(), Mark::Constraint))
                 .collect(),
         ),
         (
-            "TRIGGERS",
+            "Triggers",
             (table.triggers.iter())
                 .map(|t| Leaf::new(t.name.clone(), t.detail(), Mark::Trigger))
                 .collect(),
@@ -8949,16 +9048,16 @@ fn header_row(
     open: bool,
     colors: &ThemeColors,
 ) -> Stateful<Div> {
-    let hover = colors.hairline;
+    let hover = colors.sunk;
     div()
         .id(ElementId::NamedInteger(id.into(), ix as u64))
         .h(px(CATALOG_ROW_HEIGHT))
         .flex()
         .items_center()
-        .gap(px(5.))
+        .gap(px(TREE_GAP))
         .pl(px(indent))
         .pr(px(8.))
-        .rounded(px(5.))
+        .rounded(px(6.))
         .cursor_pointer()
         .hover(move |s| s.bg(hover))
         // The chevron is the whole affordance: a closed row shows nothing
@@ -8970,18 +9069,27 @@ fn header_row(
 fn chevron(open: bool, colors: &ThemeColors) -> Div {
     div()
         .flex_none()
-        .w(px(8.))
-        .text_size(px(8.))
-        .text_color(colors.text_faint)
-        .child(if open { "▾" } else { "▸" })
+        .w(px(TREE_GLYPH))
+        .flex()
+        .justify_center()
+        .child(icon(
+            if open {
+                Icon::ChevronDown
+            } else {
+                Icon::ChevronRight
+            },
+            TREE_GLYPH,
+            colors.text_muted,
+        ))
 }
 
 /// How many entries sit under a header, at its right edge.
 fn count_label(count: usize, colors: &ThemeColors) -> Div {
     div()
         .flex_none()
-        .text_size(px(9.))
-        .text_color(colors.text_faint)
+        .font_family(MONO_FONT_FAMILY)
+        .text_size(px(11.))
+        .text_color(colors.text_muted)
         .child(format_count(count as u64))
 }
 
@@ -8995,13 +9103,13 @@ fn leaf_mark(mark: Mark, colors: &ThemeColors) -> Div {
     let dot = |ink| div().size(px(4.)).rounded_full().bg(ink);
     let glyph = |text: &'static str| {
         div()
-            .text_size(px(9.))
-            .text_color(colors.text_faint)
+            .text_size(px(10.))
+            .text_color(colors.text_muted)
             .child(text)
     };
     let inner = match mark {
         Mark::Column => dot(colors.text_faint),
-        Mark::Key => dot(colors.accent),
+        Mark::Key => div().child(icon(Icon::Key, TREE_GLYPH, colors.accent)),
         Mark::Index => glyph("≡"),
         Mark::ForeignKey => glyph("→"),
         Mark::Constraint => glyph("✓"),
@@ -9012,7 +9120,7 @@ fn leaf_mark(mark: Mark, colors: &ThemeColors) -> Div {
     };
     div()
         .flex_none()
-        .w(px(5.))
+        .w(px(TREE_GLYPH))
         .flex()
         .justify_center()
         .items_center()
@@ -9047,13 +9155,15 @@ fn catalog_row(
                         .update(cx, |shell, cx| shell.toggle_schema(key.clone(), cx))
                         .ok();
                 })
+                .child(icon(Icon::Schema, TREE_GLYPH, colors.text_muted))
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.))
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(colors.text_secondary)
+                        .font_family(MONO_FONT_FAMILY)
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::NORMAL)
+                        .text_color(colors.text)
                         .truncate()
                         .child(label.clone()),
                 )
@@ -9078,7 +9188,7 @@ fn catalog_row(
                     div()
                         .flex_1()
                         .min_w(px(0.))
-                        .child(section_label(label.clone(), cx)),
+                        .child(section_label(label.clone(), cx).font_weight(FontWeight::NORMAL)),
                 )
                 .child(count_label(*count, colors))
                 .into_any_element()
@@ -9092,9 +9202,10 @@ fn catalog_row(
             .h(px(CATALOG_ROW_HEIGHT))
             .flex()
             .items_center()
-            .gap(px(8.))
+            .gap(px(TREE_GAP))
             .pl(px(content_at(*level)))
             .pr(px(8.))
+            .font_family(MONO_FONT_FAMILY)
             .child(leaf_mark(*mark, colors))
             // The name gives way before the detail does, but not all the
             // way: a column's type is worth reading, and so is its name.
@@ -9103,7 +9214,7 @@ fn catalog_row(
                     .flex_none()
                     .max_w(gpui::relative(0.6))
                     .min_w(px(0.))
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(colors.text_secondary)
                     .truncate()
                     .child(name.clone()),
@@ -9112,8 +9223,9 @@ fn catalog_row(
                 div()
                     .flex_1()
                     .min_w(px(0.))
-                    .text_size(px(10.))
-                    .text_color(colors.text_faint)
+                    .pl(px(3.))
+                    .text_size(px(11.))
+                    .text_color(colors.text_muted)
                     .truncate()
                     .child(detail.clone()),
             )
@@ -9142,7 +9254,7 @@ fn catalog_row(
                 // the section a relation sits in read off the left edge.
                 .pl(px(chevron_at(2)))
                 .pr(px(8.))
-                .rounded(px(5.))
+                .rounded(px(6.))
                 .cursor_pointer()
                 .on_click(move |_event, window, cx| {
                     shell
@@ -9174,27 +9286,24 @@ fn catalog_row(
                         })
                         .child(chevron(*open, colors)),
                 )
-                .child(
+                .child(div().flex_none().mr(px(TREE_GAP)).child(icon(
                     match kind {
-                        TableKind::Table => table_glyph(lit, cx),
-                        TableKind::View => div()
-                            .size(px(5.))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(if lit {
-                                colors.accent
-                            } else {
-                                colors.text_faint
-                            }),
-                    }
-                    .flex_none()
-                    .mr(px(8.)),
-                )
+                        TableKind::Table => Icon::Table,
+                        TableKind::View => Icon::View,
+                    },
+                    TREE_GLYPH,
+                    if lit {
+                        colors.accent
+                    } else {
+                        colors.text_muted
+                    },
+                )))
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.))
-                        .text_size(px(12.))
+                        .font_family(MONO_FONT_FAMILY)
+                        .text_size(px(12.5))
                         .font_weight(if lit {
                             FontWeight::MEDIUM
                         } else {
@@ -9218,7 +9327,7 @@ fn catalog_row(
                 (true, _) => item.bg(colors.match_strong).into_any_element(),
                 (false, true) => item.bg(colors.selection).into_any_element(),
                 (false, false) => {
-                    let hover = colors.hairline;
+                    let hover = colors.sunk;
                     item.hover(move |s| s.bg(hover)).into_any_element()
                 }
             }
@@ -9386,35 +9495,34 @@ fn line_at(text: &str, offset: usize) -> Range<usize> {
     start..end
 }
 
+/// A keycap in tones of the caller's choosing: the run button's and the
+/// transaction bar's caps sit on fills the plain `ui::keycap` cannot read
+/// on. Same shape as that one, so every key in the app looks like a key.
 fn keycap(keys: &'static str, size: f32, surface: Hsla, border: Hsla, ink: Hsla) -> Div {
     div()
         .flex_none()
-        .px(px(size * 6. / 11.))
-        .py(px(size * 4. / 11.))
+        .px(px(size * 5. / 10.5))
         .border_1()
         .border_b_2()
         .border_color(border)
-        .rounded(px(5.))
+        .rounded(px(4.))
         .bg(surface)
+        .font_family(MONO_FONT_FAMILY)
         .text_size(px(size))
+        .line_height(px(size + 4.5))
         .font_weight(FontWeight::MEDIUM)
         .text_color(ink)
         .child(keys)
 }
 
 fn key_badge(keys: &'static str, colors: &ThemeColors) -> Div {
-    div()
-        .flex_none()
-        .px(px(6.))
-        .py(px(4.))
-        .border_1()
-        .border_color(colors.border_strong)
-        .rounded(px(4.))
-        .bg(colors.window)
-        .text_size(px(10.))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(colors.text_muted)
-        .child(keys)
+    keycap(
+        keys,
+        10.5,
+        colors.raised,
+        colors.border,
+        colors.text_secondary,
+    )
 }
 
 /// What the close confirmation says: title, body, the keeping answer, the
@@ -10178,10 +10286,9 @@ fn session_mark(tab: &QueryTab, colors: &ThemeColors) -> Option<Div> {
         // must not be what pushes the run button off the edge.
         div()
             .min_w(px(0.))
-            .text_size(px(11.))
-            .text_color(colors.text_faint)
+            .text_color(colors.text_muted)
             .truncate()
-            .child("session ended · a run opens a new one"),
+            .child("Session ended · a run opens a new one"),
     )
 }
 
@@ -11106,8 +11213,8 @@ mod tests {
                     ],
                     ..Default::default()
                 },
-                // A schema of views only gets a `VIEWS` section, not an
-                // empty `TABLES` one above it.
+                // A schema of views only gets a `Views` section, not an
+                // empty `Tables` one above it.
                 Schema {
                     name: "reporting".to_string(),
                     tables: vec![relation("daily", TableKind::View)],
@@ -11121,14 +11228,14 @@ mod tests {
     fn a_schema_holds_a_tables_section_and_a_views_section() {
         let groups = catalog_groups(Rc::new(sample()));
         let read: Vec<String> = groups.iter().map(|group| group.label.to_string()).collect();
-        assert_eq!(read, ["PUBLIC", "REPORTING"]);
+        assert_eq!(read, ["public", "reporting"]);
 
         let sections: Vec<String> = groups[0]
             .sections
             .iter()
             .map(|section| section.label.to_string())
             .collect();
-        assert_eq!(sections, ["TABLES", "VIEWS"]);
+        assert_eq!(sections, ["Tables", "Views"]);
         let names: Vec<&str> = (groups[0].sections[0].entries.iter())
             .map(|entry| entry.name().as_ref())
             .collect();
@@ -11141,7 +11248,7 @@ mod tests {
     fn every_schema_starts_closed() {
         let groups = catalog_groups(Rc::new(sample()));
         // The schemas and their totals, and nothing under them.
-        assert_eq!(read(&rows(&groups, "")), ["[PUBLIC 3]", "[REPORTING 1]"]);
+        assert_eq!(read(&rows(&groups, "")), ["[public 3]", "[reporting 1]"]);
     }
 
     #[test]
@@ -11159,13 +11266,13 @@ mod tests {
                 ""
             )),
             [
-                "[PUBLIC 3 open]",
-                "(TABLES 2 open)",
+                "[public 3 open]",
+                "(Tables 2 open)",
                 "users",
                 "orders",
-                "(VIEWS 1 open)",
+                "(Views 1 open)",
                 "active_users",
-                "[REPORTING 1]",
+                "[reporting 1]",
             ]
         );
 
@@ -11174,11 +11281,11 @@ mod tests {
         assert_eq!(
             read(&catalog_rows(&groups, &open, &closed, &HashSet::new(), "")),
             [
-                "[PUBLIC 3 open]",
-                "(TABLES 2)",
-                "(VIEWS 1 open)",
+                "[public 3 open]",
+                "(Tables 2)",
+                "(Views 1 open)",
                 "active_users",
-                "[REPORTING 1]"
+                "[reporting 1]"
             ]
         );
     }
@@ -11191,17 +11298,17 @@ mod tests {
         assert_eq!(
             read(&rows(&groups, "user")),
             [
-                "[PUBLIC 2 open]",
-                "(TABLES 1 open)",
+                "[public 2 open]",
+                "(Tables 1 open)",
                 "users",
-                "(VIEWS 1 open)",
+                "(Views 1 open)",
                 "active_users"
             ]
         );
         // A schema's own name keeps everything under it.
         assert_eq!(
             read(&rows(&groups, "report")),
-            ["[REPORTING 1 open]", "(VIEWS 1 open)", "daily"]
+            ["[reporting 1 open]", "(Views 1 open)", "daily"]
         );
         // No hit anywhere is an empty list, not a list of empty headers.
         assert!(rows(&groups, "nothing").is_empty());
@@ -11229,8 +11336,8 @@ mod tests {
         assert_eq!(
             read(&rows(&groups, "master")),
             [
-                "[APP 4 open]",
-                "(TABLES 4 open)",
+                "[app 4 open]",
+                "(Tables 4 open)",
                 "master",
                 "master_rate",
                 "master_assignment",
@@ -11262,22 +11369,22 @@ mod tests {
         // Both parts must hit: the schema, then the relation under it.
         assert_eq!(
             read(&rows(&groups, "public.orders")),
-            ["[PUBLIC 1 open]", "(TABLES 1 open)", "orders"]
+            ["[public 1 open]", "(Tables 1 open)", "orders"]
         );
         // Part of each is enough, as in the palette.
         assert_eq!(
             read(&rows(&groups, "rep.dai")),
-            ["[REPORTING 1 open]", "(VIEWS 1 open)", "daily"]
+            ["[reporting 1 open]", "(Views 1 open)", "daily"]
         );
         // A trailing dot asks for everything the schema holds.
         assert_eq!(
             read(&rows(&groups, "public.")),
             [
-                "[PUBLIC 3 open]",
-                "(TABLES 2 open)",
+                "[public 3 open]",
+                "(Tables 2 open)",
                 "users",
                 "orders",
-                "(VIEWS 1 open)",
+                "(Views 1 open)",
                 "active_users",
             ]
         );
@@ -11287,7 +11394,7 @@ mod tests {
         // Case never matters, on either side of the dot.
         assert_eq!(
             read(&rows(&groups, "PUBLIC.Orders")),
-            ["[PUBLIC 1 open]", "(TABLES 1 open)", "orders"]
+            ["[public 1 open]", "(Tables 1 open)", "orders"]
         );
     }
 
@@ -11532,14 +11639,14 @@ mod tests {
                 ""
             )),
             [
-                "[PUBLIC 4 open]",
-                "(TABLES 1 open)",
+                "[public 4 open]",
+                "(Tables 1 open)",
                 "orders",
-                "(SEQUENCES 1 open)",
+                "(Sequences 1 open)",
                 "- ticket: integer",
-                "(ROUTINES 1 open)",
+                "(Routines 1 open)",
                 "- total: (integer) → bigint",
-                "(TYPES 1 open)",
+                "(Types 1 open)",
                 "- mood: enum · sad, ok",
             ]
         );
@@ -11554,16 +11661,16 @@ mod tests {
         assert_eq!(
             read(&rows)[..8],
             [
-                "[PUBLIC 4 open]",
-                "(TABLES 1 open)",
+                "[public 4 open]",
+                "(Tables 1 open)",
                 "orders ▾",
                 // The columns come straight away, with no folder of their
                 // own: they are what a relation is opened to read.
                 "- id: bigint",
                 "- user_id: text",
-                "(INDEXES 1 open)",
+                "(Indexes 1 open)",
                 "- orders_pkey: primary · btree (id)",
-                "(FOREIGN KEYS 1 open)",
+                "(Foreign keys 1 open)",
             ]
         );
         // The key's own column carries the key's mark.
@@ -11584,9 +11691,9 @@ mod tests {
         ));
 
         // A relation's folder closes like any section, by its own key.
-        let closed = HashSet::from([SharedString::from("public\torders\tINDEXES")]);
+        let closed = HashSet::from([SharedString::from("public\torders\tIndexes")]);
         let rows = catalog_rows(&groups, &open, &closed, &folded, "");
-        assert_eq!(read(&rows)[5..7], ["(INDEXES 1)", "(FOREIGN KEYS 1 open)"]);
+        assert_eq!(read(&rows)[5..7], ["(Indexes 1)", "(Foreign keys 1 open)"]);
     }
 
     #[test]
@@ -11595,8 +11702,8 @@ mod tests {
         assert_eq!(
             read(&rows(&groups, "total")),
             [
-                "[PUBLIC 1 open]",
-                "(ROUTINES 1 open)",
+                "[public 1 open]",
+                "(Routines 1 open)",
                 "- total: (integer) → bigint"
             ]
         );
@@ -11604,7 +11711,7 @@ mod tests {
         // is its name.
         assert_eq!(
             read(&rows(&groups, "orders")),
-            ["[PUBLIC 1 open]", "(TABLES 1 open)", "orders"]
+            ["[public 1 open]", "(Tables 1 open)", "orders"]
         );
         // A leaf is not somewhere ⏎ can go, so the cursor never lands on
         // one: the only stop is still the relation.

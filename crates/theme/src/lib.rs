@@ -1,8 +1,18 @@
 //! Color tokens for the whole app. Components take colors from here,
 //! never from literals, so themes stay swappable (Zed `theme` crate pattern).
 //!
-//! Default theme: "warm paper" light — JetBrains Mono throughout, hairline
-//! 1px rules, single ochre accent. From the Meerkat design comp.
+//! Default theme: "warm paper", second edition. IBM Plex Sans for the
+//! chrome, JetBrains Mono for everything the database said or the user
+//! typed, hairline rules, one ochre accent. The first edition was the comp
+//! at `docs/design/Meerkat.dc.html`; the second is the "Meerkat facelift"
+//! canvas, direction A.
+//!
+//! **Text must read at 4.5:1 or better against the paper.** The first
+//! edition's greys and its ochre carried row counts, captions and SQL
+//! keywords at 2–3.6:1. So ink that says something is `text_muted` or
+//! darker; `text_faint` is for marks that repeat what something else
+//! already says. The accent is two tokens for the same reason: `accent`
+//! fills and strokes, `accent_deep` is the accent as *text*.
 
 use gpui::{Hsla, rgb, rgba};
 
@@ -28,6 +38,13 @@ pub struct ThemeColors {
     pub panel: Hsla,
     /// Cards and inputs sitting on a panel.
     pub elevated: Hsla,
+    /// The one surface lifted off the paper: an active tab, a keycap, the
+    /// lit chip of a segmented control, a floating card. White, so a raised
+    /// thing reads as nearer than the paper under it.
+    pub raised: Hsla,
+    /// A recessed well: the track of a segmented control, the NULL chip in a
+    /// cell. Darker than `panel`, so a thing sitting in it reads as set in.
+    pub sunk: Hsla,
     /// Standard border.
     pub border: Hsla,
     /// Stronger border (grid header rules, window edge).
@@ -47,8 +64,14 @@ pub struct ThemeColors {
     /// Line numbers in the query editor gutter. Sits between `text_faint`
     /// and the rules, so the numbers recede behind the SQL.
     pub line_number: Hsla,
-    /// The single ochre accent.
+    /// The single ochre accent, for fills, strokes and icons. As text it is
+    /// 3.6:1 on the paper, which is why `accent_deep` exists.
     pub accent: Hsla,
+    /// The fill of the one primary button in a view (run, commit, connect,
+    /// save). Deeper than `accent`, so `on_accent` reads on it at 5.2:1.
+    pub accent_fill: Hsla,
+    /// Ink on `accent_fill`.
+    pub on_accent: Hsla,
     /// Deeper accent for emphasized values and hover. Also the SQL
     /// keyword colour in the query editor.
     pub accent_deep: Hsla,
@@ -87,8 +110,11 @@ pub struct ThemeColors {
     /// the screen behind it must stay readable.
     pub overlay: Hsla,
     /// The drop shadow under a floating surface (the palette). Carries
-    /// alpha; nothing else in the app is raised off the paper.
+    /// alpha.
     pub shadow: Hsla,
+    /// The shadow a raised thing *on* the paper casts — an active tab, the
+    /// lit chip of a segmented control. A pixel of it, not a float.
+    pub shadow_soft: Hsla,
     /// Environment tags: prod warns in clay, staging holds the middle in
     /// sand, dev rests in green. Each carries four tones from the comp:
     /// the ring (dots, badges, the window frame), the inner hairline just
@@ -165,6 +191,9 @@ pub struct ThemeColors {
     pub ok_muted: Hsla,
     /// Success / connected.
     pub ok: Hsla,
+    /// The wash under a statement's own statistic, and under a green note.
+    /// Its ink is `env_dev_text`.
+    pub ok_surface: Hsla,
     /// A connection that is saved but not open: the sand dot.
     pub idle: Hsla,
     /// Error text.
@@ -194,30 +223,35 @@ impl Theme {
             colors: ThemeColors {
                 canvas: rgb(0xEDEAE3).into(),
                 window: rgb(0xFBFAF7).into(),
-                panel: rgb(0xF7F5F0).into(),
+                panel: rgb(0xF5F3EE).into(),
                 elevated: rgb(0xFBFAF7).into(),
-                border: rgb(0xEAE6DC).into(),
-                border_strong: rgb(0xE5E1D8).into(),
-                hairline: rgb(0xF1EFE8).into(),
+                raised: rgb(0xFFFFFF).into(),
+                sunk: rgb(0xECE9E2).into(),
+                border: rgb(0xE3DED3).into(),
+                border_strong: rgb(0xD9D3C7).into(),
+                hairline: rgb(0xEEEAE2).into(),
                 text: rgb(0x211F1B).into(),
                 text_body: rgb(0x2E2B26).into(),
                 text_secondary: rgb(0x55514A).into(),
-                text_muted: rgb(0x8A857C).into(),
-                text_faint: rgb(0xB0AAA0).into(),
-                line_number: rgb(0xC6C0B4).into(),
+                text_muted: rgb(0x6F6A60).into(),
+                text_faint: rgb(0x958E82).into(),
+                line_number: rgb(0xB3AC9F).into(),
                 accent: rgb(0xB4762F).into(),
-                accent_deep: rgb(0x8E5A1E).into(),
+                accent_fill: rgb(0x9A5F1F).into(),
+                on_accent: rgb(0xFFFFFF).into(),
+                accent_deep: rgb(0x8A5519).into(),
                 syntax_literal: rgb(0x5C7A4E).into(),
                 syntax_identifier: rgb(0x3F5A6B).into(),
-                selection: rgb(0xF0E5D2).into(),
+                selection: rgb(0xF3E7D3).into(),
                 range_surface: rgb(0xF8F1E3).into(),
                 match_wash: rgb(0xEFE3CC).into(),
-                match_strong: rgb(0xE7CFA3).into(),
+                match_strong: rgb(0xEBD3A8).into(),
                 match_error: rgb(0xF2DDD1).into(),
                 find_hit: rgb(0xF6E8B1).into(),
                 find_current: rgb(0xEBCB67).into(),
                 overlay: rgba(0x34302A38).into(),
                 shadow: rgba(0x211F1B66).into(),
+                shadow_soft: rgba(0x211F1B1F).into(),
                 env_prod: rgb(0xB4552A).into(),
                 env_prod_inner: rgb(0xE8C6B2).into(),
                 env_prod_surface: rgb(0xFBEFE8).into(),
@@ -253,8 +287,9 @@ impl Theme {
                 delta_add_text: rgb(0x4E6152).into(),
                 delta_drop_surface: rgb(0xFAEDE5).into(),
                 delta_drop_type: rgb(0xA0765F).into(),
-                ok_muted: rgb(0x7C9A6B).into(),
-                ok: rgb(0x5C8A4E).into(),
+                ok_muted: rgb(0x4F7A40).into(),
+                ok: rgb(0x4F7A40).into(),
+                ok_surface: rgb(0xE8F1E3).into(),
                 idle: rgb(0xCFC8B8).into(),
                 error: rgb(0x8E4A2A).into(),
                 error_secondary: rgb(0xA9694A).into(),
@@ -271,8 +306,14 @@ impl Theme {
     }
 }
 
-/// UI font for the whole app; bundled in the `meerkat` crate assets.
-pub const FONT_FAMILY: &str = "JetBrains Mono";
+/// The chrome's font: labels, buttons, titles, captions. Bundled in the
+/// `meerkat` crate's assets.
+pub const UI_FONT_FAMILY: &str = "IBM Plex Sans";
+
+/// Everything the database said or the user typed: SQL, names, values,
+/// counts, timings. Also bundled. The SQL editor and the grid measure
+/// columns by a fixed advance, so they must set it themselves.
+pub const MONO_FONT_FAMILY: &str = "JetBrains Mono";
 
 impl gpui::Global for Theme {}
 

@@ -41,7 +41,7 @@ use highlight::Token;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
-use theme::{ThemeColors, theme};
+use theme::{MONO_FONT_FAMILY, ThemeColors, theme};
 use ui::blink::{Blink, Blinking};
 use ui::find_bar::{self, FindCount};
 use ui::scrollbar::{self, DragState, Scrollbar};
@@ -688,11 +688,21 @@ impl SqlEditor {
                         .filter(|meta| !meta.is_empty());
                     row.when(first_ddl, |row| row.child(ddl_chip(colors)))
                         .children(meta.map(|meta| {
+                            let landed =
+                                kind == StatementKind::Plain && status == StatementStatus::Done;
                             div()
                                 .flex_none()
                                 .whitespace_nowrap()
-                                .text_size(px(10.))
+                                .text_size(px(11.))
+                                .line_height(px(18.))
                                 .text_color(meta_color(kind, status, colors))
+                                // A statement that worked carries its number
+                                // on a green wash: it is the answer, and the
+                                // eye goes down the column looking for the
+                                // one that is not.
+                                .when(landed, |meta| {
+                                    meta.px(px(7.)).rounded(px(5.)).bg(colors.ok_surface)
+                                })
                                 .child(meta)
                         }))
                 })),
@@ -1780,6 +1790,9 @@ impl Render for SqlEditor {
             .min_h(px(0.))
             .relative()
             .flex()
+            // The caret and the columns are placed by a fixed advance, so
+            // the editor names its font rather than inheriting the chrome's.
+            .font_family(MONO_FONT_FAMILY)
             .text_size(px(FONT_SIZE))
             .line_height(px(LINE_HEIGHT))
             .child(
@@ -1833,9 +1846,10 @@ impl Render for SqlEditor {
                             .min_h(relative(1.))
                             .py(px(TEXT_PADDING_Y))
                             .pr(px(8.))
-                            .bg(colors.panel)
+                            .bg(colors.window)
                             .border_r_1()
-                            .border_color(colors.border)
+                            .border_color(colors.hairline)
+                            .text_size(px(11.5))
                             .text_color(colors.line_number)
                             .flex()
                             .flex_col()
@@ -2171,11 +2185,11 @@ fn wash_color(kind: StatementKind, status: StatementStatus, colors: &ThemeColors
 /// the rest is shared, because "failed" is failed whatever the statement.
 fn meta_color(kind: StatementKind, status: StatementStatus, colors: &ThemeColors) -> Hsla {
     match (kind, status) {
-        (_, StatementStatus::Queued) | (_, StatementStatus::Skipped) => colors.text_faint,
-        (_, StatementStatus::Failed) => colors.env_prod,
+        (_, StatementStatus::Queued) | (_, StatementStatus::Skipped) => colors.text_muted,
+        (_, StatementStatus::Failed) => colors.error,
         (StatementKind::Ddl, _) => colors.ddl_text,
-        (StatementKind::Plain, StatementStatus::Running) => colors.accent,
-        (StatementKind::Plain, StatementStatus::Done) => colors.ok_muted,
+        (StatementKind::Plain, StatementStatus::Running) => colors.accent_deep,
+        (StatementKind::Plain, StatementStatus::Done) => colors.env_dev_text,
     }
 }
 
@@ -2210,10 +2224,13 @@ fn statement_mark(line: usize, status: StatementStatus, colors: &ThemeColors) ->
             )
             .into_any_element(),
         StatementStatus::Done => div()
-            .text_size(px(14.))
-            .font_weight(FontWeight::BOLD)
-            .text_color(colors.ok)
-            .child("✓")
+            .size(px(MARK_SIZE + 1.))
+            .rounded_full()
+            .bg(colors.ok)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(ui::icon(ui::Icon::Check, 10., colors.on_accent))
             .into_any_element(),
         // The one mark that is filled and clay: a failure is the only
         // state here that stops the run, and it is read at a glance from
@@ -2227,7 +2244,7 @@ fn statement_mark(line: usize, status: StatementStatus, colors: &ThemeColors) ->
             .justify_center()
             .text_size(px(10.))
             .font_weight(FontWeight::BOLD)
-            .text_color(colors.window)
+            .text_color(colors.on_accent)
             .child("!")
             .into_any_element(),
         // A dash: nothing happened here, and nothing is what it draws.

@@ -56,10 +56,10 @@ use gpui::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage::{SavedConnection, Store};
-use theme::{FONT_FAMILY, ThemeColors, theme};
+use theme::{MONO_FONT_FAMILY, ThemeColors, UI_FONT_FAMILY, theme};
 use ui::{
-    TextField, TextFieldEvent, accent_button, meerkat_mark, section_label, status_dot, switch,
-    toolbar_button, toolbar_button_bare,
+    TextField, TextFieldEvent, TitleDrag, accent_button, meerkat_mark, section_label, status_dot,
+    switch, title_bar, toolbar_button, toolbar_button_bare,
 };
 
 /// The reading column: the list never stretches over a wide window. The
@@ -165,6 +165,9 @@ pub enum ConnectionsEvent {
 
 pub struct Connections {
     focus_handle: FocusHandle,
+    /// The title bar's mouse state: whether a press on it may still become
+    /// a window drag.
+    title_drag: TitleDrag,
     /// `None` when the profiles file could not be opened; the screen then
     /// says so instead of pretending there are no connections.
     store: Option<Store>,
@@ -277,6 +280,7 @@ impl Connections {
             .unwrap_or(true);
         let mut screen = Self {
             focus_handle: cx.focus_handle(),
+            title_drag: TitleDrag::default(),
             store,
             error,
             rows: Vec::new(),
@@ -852,13 +856,32 @@ impl Render for Connections {
             .on_action(cx.listener(Self::open_selected))
             .on_action(cx.listener(Self::edit_selected))
             .size_full()
+            .flex()
+            .flex_col()
             .bg(colors.window)
-            .font_family(FONT_FAMILY)
+            .font_family(UI_FONT_FAMILY)
+            .text_size(px(13.))
             .text_color(colors.text_body)
+            // The window has no system title bar, so this screen draws one:
+            // somewhere to grab the window by, and the screen's name.
+            .child(
+                title_bar("title-bar", &self.title_drag)
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .bg(colors.panel)
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.text)
+                            .child("Connections"),
+                    ),
+            )
             .child(
                 div()
                     .id("connections")
-                    .size_full()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .w_full()
                     .overflow_y_scroll()
                     .child(
                         div()

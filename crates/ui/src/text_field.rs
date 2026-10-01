@@ -20,7 +20,7 @@ use gpui::{
     relative, size,
 };
 use std::ops::Range;
-use theme::theme;
+use theme::{MONO_FONT_FAMILY, theme};
 
 actions!(
     text_field,
@@ -801,15 +801,22 @@ impl Render for TextField {
                     // The focused field is the one wearing the accent;
                     // every other border on the screen stays a hairline.
                     .border_color(if focused {
-                        colors.accent
+                        colors.accent_fill
                     } else {
-                        colors.border_strong
+                        colors.border
                     })
-                    .rounded(px(6.))
-                    .bg(colors.elevated)
+                    .rounded(px(7.))
+                    .bg(if focused {
+                        colors.raised
+                    } else {
+                        colors.elevated
+                    })
                     .text_size(px(FONT_SIZE))
                     .line_height(px(LINE_HEIGHT)),
             })
+            // What is typed here is a name, a URL or a query — the kind of
+            // text the app sets in monospace everywhere else.
+            .font_family(MONO_FONT_FAMILY)
             .text_color(colors.text_body)
             .child(FieldElement { field: cx.entity() })
     }

@@ -28,12 +28,12 @@ use gpui::{
 pub use selection::{Cell, Extent, Rect, Selection, Step, clipboard_text};
 use std::cell::Cell as StdCell;
 use std::rc::Rc;
-use theme::theme;
+use theme::{MONO_FONT_FAMILY, theme};
 use ui::scrollbar::{self, DragState, Scrollbar};
 
-/// Row height from the design comp. The header is 30px, data rows 28px.
+/// Row height from the design comp. The header is 32px, data rows 28px.
 pub const ROW_HEIGHT: f32 = 28.;
-pub const HEADER_HEIGHT: f32 = 30.;
+pub const HEADER_HEIGHT: f32 = 32.;
 
 /// Data text size, from the design comp.
 const DATA_FONT_SIZE: f32 = 12.;
@@ -447,6 +447,9 @@ impl<'a> Grid<'a> {
                             // the default here would render the data wider than
                             // its lane.
                             .text_size(px(DATA_FONT_SIZE))
+                            // Lanes are sized by a fixed advance per
+                            // character, which only a monospace honours.
+                            .font_family(MONO_FONT_FAMILY)
                             .child(header_row(&data, &marks, extent, on_hit, &colors))
                             .child(rows),
                     ),
@@ -792,11 +795,10 @@ fn header_row(
         .flex()
         .items_center()
         .border_b_1()
-        .border_color(colors.border_strong)
+        .border_color(colors.border)
         .bg(colors.panel)
-        .text_size(px(10.))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(colors.text_muted);
+        .text_color(colors.text_secondary);
 
     // The gutter's own head is the "all of them, or none" tick. It says
     // which state it is in rather than what a click would do, as every
@@ -813,10 +815,11 @@ fn header_row(
         .justify_center()
         .border_r_1()
         .border_color(colors.hairline)
+        .font_weight(FontWeight::NORMAL)
         .text_color(if all {
             colors.accent_deep
         } else {
-            colors.text_faint
+            colors.text_muted
         })
         .child(if all { TICK } else { "#" });
     if let Some(on_hit) = on_hit.clone() {
@@ -849,7 +852,10 @@ fn header_row(
             .items_center()
             .overflow_hidden()
             .truncate()
-            .child(name.to_ascii_uppercase());
+            // The name as the database spells it. The first edition set
+            // headers in capitals, which made `userId` and `userid` — two
+            // different columns to Postgres — read as the same one.
+            .child(name.clone());
         if ix > 0 {
             cell = cell.border_l_1().border_color(colors.hairline);
         }
@@ -1002,10 +1008,22 @@ fn data_row(
             .overflow_hidden()
             .truncate()
             .text_color(value_color(value, colors))
-            .child(cell_text(
-                value,
-                cell_chars(*width, column == last, window_width),
-            ));
+            .child(match value {
+                // Absence, set in a well so it cannot be read as the word
+                // somebody stored. Faint grey alone was 2.2:1 — it said
+                // "nothing here" by being nearly invisible.
+                Value::Null => div()
+                    .flex_none()
+                    .px(px(5.))
+                    .rounded(px(4.))
+                    .bg(colors.sunk)
+                    .text_size(px(10.5))
+                    .line_height(px(17.))
+                    .child("NULL")
+                    .into_any_element(),
+                _ => cell_text(value, cell_chars(*width, column == last, window_width))
+                    .into_any_element(),
+            });
         // The cursor's cell is the strongest mark on screen, the rest of
         // the range a wash under it. Neither carries a border: a border
         // would take a pixel out of the cell's content box and shift the
@@ -1059,7 +1077,7 @@ fn data_row(
 fn value_color(value: &Value, colors: &theme::ThemeColors) -> Hsla {
     match value {
         // NULL must read as absence, not as data.
-        Value::Null => colors.text_faint,
+        Value::Null => colors.text_muted,
         Value::Bytes(_) => colors.text_muted,
         _ => colors.text_body,
     }

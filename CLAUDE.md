@@ -173,6 +173,26 @@ connection pool, so a closed database keeps no sockets open.
 `Catalog`, the flattened sidebar rows, the completion vocabulary, and the
 open tabs (`Tab::Table`, `Tab::Query` or `Tab::History`).
 
+### The title bar
+
+**The window has no system title bar; each screen draws its own.** The
+window is opened with `appears_transparent` and `app_owns_titlebar_drag`,
+and `ui::title_bar` is the 44px bar under the traffic lights: a press on it
+and a move drags the window (`Window::start_window_move`, Zed's way), a
+double click zooms it. The first edition stacked the system's empty title
+bar, a breadcrumb bar and a tab strip — a hundred pixels of chrome before
+the first line of SQL — so the shell's bar now holds all three: the
+session's name (the way back to the connections screen), the tabs, the ⌘K
+button, the env badge and the mode mark. The session's part is as wide as
+the sidebar, so the tabs start over the pane they switch.
+
+**A control in the bar must claim its press.** GPUI bubbles a mouse-down
+from the deepest hitbox outward, so a tab hears it before the bar does;
+`TitleDrag::claim` is the listener each control hangs on itself, and the
+bar reads the claim and does not arm the drag. Nothing is stopped, so the
+control's own click still lands. A control that forgets it drags the
+window when the pointer wobbles.
+
 ### More than one window
 
 **⌘N opens a window, on the connections screen**, the way a browser's ⌘N
@@ -1882,11 +1902,10 @@ startup parameter fails the connect — which is the right way round, because
 a read-only session that cannot be asked for must not open at all.
 
 The mode is on screen at all times: `Shell::mode_mark` paints the comp's
-padlock badge in the top bar beside the environment badge, read-only in the
-dev family's green and read-write in the prod family's clay, so the two
+padlock badge in the title bar beside the environment badge, read-only in
+the dev family's green and read-write in the prod family's clay, so the two
 marks warn in the same tones. A session that never connected goes grey
-(`mode_off_*`). The sidebar's foot and the query toolbar say the same word,
-and the connections list carries it in its MODE column.
+(`mode_off_*`). The connections list carries it in its MODE column.
 
 ### Drivers
 
@@ -1962,8 +1981,18 @@ paging arithmetic that must be exact.
 
 - Every color comes from `theme::ThemeColors` tokens, never a literal in view
   code. If a token is missing, add it to `crates/theme` with a comment. The
-  visual language is the "warm paper" comp at `docs/design/Meerkat.dc.html`.
-- Font is bundled JetBrains Mono, loaded in `main.rs`.
+  visual language is "warm paper", second edition — the "Meerkat facelift"
+  design canvas, direction A; the first edition is the comp at
+  `docs/design/Meerkat.dc.html`. **Text reads at 4.5:1 or better**:
+  `text_faint` only repeats what something else says, and the accent as
+  text is `accent_deep`, never `accent`.
+- Two bundled fonts, loaded in `main.rs`: `UI_FONT_FAMILY` (IBM Plex Sans)
+  for the chrome, which the screens' roots set, and `MONO_FONT_FAMILY`
+  (JetBrains Mono) for SQL, names, values, counts and typed text. The SQL
+  editor, the grid and `TextField` set the mono themselves, because the
+  first two measure by a fixed advance. Labels are sentence case.
+- Icons are `ui::icon`: stroked paths in one 14-unit grid and one pen, so
+  the family reads as one hand. The app still carries no image assets.
 - `.hover()`, `.cursor_pointer()` and `.truncate()` come from
   `InteractiveElement` / `Styled` — `use gpui::prelude::*` in view files.
 - Every grid or table cell needs `.truncate()`, or a long value wraps and
