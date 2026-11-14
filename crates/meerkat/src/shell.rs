@@ -10,8 +10,8 @@
 //! away. Without that, a slow first page would overwrite a fast second one.
 
 use db_client::{
-    CheckError, Connection, Profile, QueryResult, Refusal, RunId, ServerTiming, Session, Stop,
-    TxEnd, TxMode, Wire,
+    CheckError, ConnectError, ConnectFailure, Connection, Profile, QueryResult, Refusal, RunId,
+    ServerTiming, Session, Stop, TxEnd, TxMode, Wire,
 };
 use db_postgres::{Label, PostgresConnection};
 use gpui::{
@@ -42,9 +42,10 @@ use theme::{MONO_FONT_FAMILY, ThemeColors, UI_FONT_FAMILY, theme};
 use ui::find_bar::{self, FindCount};
 use ui::scrollbar::{self, DragState, Scrollbar};
 use ui::{
-    Icon, TRAFFIC_LIGHTS_WIDTH, TextField, TextFieldEvent, TitleDrag, format_count, format_millis,
-    format_millis_frac, format_seconds, icon, key_hint, keycap as cap, lock_glyph, meerkat_mark,
-    play_glyph, search_glyph, section_label, status_dot, stop_glyph, title_bar,
+    Icon, TRAFFIC_LIGHTS_WIDTH, TextField, TextFieldEvent, TitleDrag, accent_button, format_count,
+    format_millis, format_millis_frac, format_seconds, icon, key_hint, keycap as cap, lock_glyph,
+    meerkat_mark, play_glyph, search_glyph, section_label, status_dot, stop_glyph, title_bar,
+    toolbar_button,
 };
 
 use crate::connections::unix_now;
@@ -273,6 +274,17 @@ const HISTORY_DAYS: i64 = 7;
 /// cached catalog lets a session open tabs while the connect is still in
 /// flight, so this is reachable on a first keystroke.
 const NOT_CONNECTED: &str = "not connected yet";
+/// The id the connect strip's `copy` link goes by in `copied_error`. Tab
+/// ids start at 1, so no tab's error strip can claim it.
+const CONNECT_COPY_ID: u64 = 0;
+/// How long a connect is out before the strip says so.
+///
+/// A connect to a server next door lands in a few milliseconds, and a
+/// strip that opened and shut inside them would shove the pane down and
+/// back on every session — a flicker that reports nothing. It is the run
+/// button's rule, `RUN_ARM`: the notice appears once the wait has proven
+/// itself one. A failure is never held back; it paints when it lands.
+const CONNECT_ARM: Duration = Duration::from_millis(400);
 /// How long the typing has to stop before the buffer is checked.
 ///
 /// A check is a round trip, and a round trip per keystroke would be a
@@ -484,6 +496,15 @@ pub struct Shell {
     grid_focus: FocusHandle,
     status: Status,
     connection: Option<Arc<dyn Connection>>,
+    /// What this shell was opened on, kept so a failed connect can be
+    /// asked again in place: the retry goes down the path the first
+    /// attempt took, with nothing rebuilt.
+    target: Target,
+    /// Counts the connects, as a tab counts its runs. A retry bumps it,
+    /// and a reply that carries an older number is dropped.
+    connect_generation: u64,
+    /// When the connect in flight left, for `CONNECT_ARM`.
+    connect_started: Instant,
     catalog: Option<Rc<Catalog>>,
     /// True while the introspection runs. It is a second round trip after
     /// the connect, so a session is connected — and can run a query —
@@ -805,9 +826,14 @@ pub enum ShellEvent {
 }
 
 enum Status {
+    /// The connect is out. The string is where it is going — `host:port`
+    /// — which is what the strip over the pane says while it waits.
     Connecting(String),
     Connected,
-    Failed(String),
+    /// The connect came back refused: its class, and the server's or the
+    /// system's own words. The strip over the pane paints it, and a run
+    /// asked for meanwhile repeats it.
+    Failed(ConnectError),
 }
 
 enum Tab {
@@ -1266,8 +1292,11 @@ impl Shell {
         let mut shell = Self {
             focus_handle: cx.focus_handle(),
             grid_focus: cx.focus_handle(),
-            status: Status::Connecting(describe(&target)),
+            status: Status::Connecting(endpoint(&target)),
             connection: None,
+            target: target.clone(),
+            connect_generation: 0,
+            connect_started: Instant::now(),
             catalog: None,
             catalog_loading: false,
             catalog_error: None,
@@ -1316,7 +1345,7 @@ impl Shell {
         if let Some(catalog) = cached {
             shell.apply_catalog(catalog, cx);
         }
-        shell.connect(target, cx);
+        shell.connect(cx);
         if saved.tabs.is_empty() {
             // A session opens on an empty query tab rather than on the
             // first table: it needs no catalog and no round trip, so the
@@ -1669,7 +1698,24 @@ impl Shell {
     /// database takes far longer than the connect itself, so it is a
     /// second request: the session says "connected" and runs queries as
     /// soon as there is a pool, and the sidebar fills in behind it.
-    fn connect(&mut self, target: Target, cx: &mut Context<Self>) {
+    ///
+    /// The first attempt and every retry come through here. Each bumps
+    /// `connect_generation`, so a reply to an attempt the user has since
+    /// asked again about is dropped rather than painted over the newer
+    /// one.
+    fn connect(&mut self, cx: &mut Context<Self>) {
+        self.connect_generation += 1;
+        let generation = self.connect_generation;
+        let target = self.target.clone();
+        self.status = Status::Connecting(endpoint(&target));
+        self.connect_started = Instant::now();
+        // Nothing repaints a window that is only waiting, so the strip
+        // asks for the frame it arms on.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CONNECT_ARM).await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
         let task = gpui_tokio::Tokio::spawn(cx, async move {
             let connection = match &target {
                 Target::Url(url) => PostgresConnection::connect(url).await?,
@@ -1684,8 +1730,22 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
             this.update(cx, |this, cx| {
-                match flatten(outcome) {
+                if this.connect_generation != generation {
+                    return;
+                }
+                match connect_outcome(outcome) {
                     Ok((connection, label)) => {
+                        // A run asked for while the connect was out was
+                        // told to wait. The wait is over; take the line
+                        // down rather than leave it over a live session.
+                        let waiting = not_connected_copy(&this.status);
+                        for tab in &mut this.tabs {
+                            if let Tab::Query(tab) = tab
+                                && tab.error.as_deref() == Some(waiting.as_str())
+                            {
+                                tab.error = None;
+                            }
+                        }
                         this.connection = Some(connection);
                         this.label = Some(label);
                         this.status = Status::Connected;
@@ -1697,6 +1757,7 @@ impl Shell {
                     }
                     Err(error) => {
                         this.status = Status::Failed(error);
+                        let reason = not_connected_copy(&this.status);
                         // Tabs opened from the cached catalog were waiting
                         // for this connection. Nothing is coming.
                         for tab in &mut this.tabs {
@@ -1704,7 +1765,7 @@ impl Shell {
                                 && tab.loading
                             {
                                 tab.loading = false;
-                                tab.error = Some(NOT_CONNECTED.to_string());
+                                tab.error = Some(reason.clone());
                             }
                         }
                     }
@@ -1714,6 +1775,33 @@ impl Shell {
             .ok();
         })
         .detach();
+        cx.notify();
+    }
+
+    /// Ask a failed connect again, in place. The strip's **Retry**.
+    ///
+    /// Only a failed connect is retried: one still out has its answer on
+    /// the way, and a second beside it would open a second pool. A session
+    /// that has failed never had a connection, so every error a tab holds
+    /// is the "not connected" line — they are taken down, and a table tab
+    /// goes back to waiting, which is the state `resume_pending_pages`
+    /// picks up when the connection lands.
+    fn retry_connect(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.status, Status::Failed(_)) {
+            return;
+        }
+        for tab in &mut self.tabs {
+            match tab {
+                Tab::Table(tab) if tab.error.is_some() => {
+                    tab.error = None;
+                    tab.loading = true;
+                }
+                Tab::Query(tab) => tab.error = None,
+                _ => {}
+            }
+        }
+        self.copied_error = None;
+        self.connect(cx);
     }
 
     /// Read the catalog behind the connection. A session that opened on a
@@ -1842,6 +1930,7 @@ impl Shell {
     fn load_page(&mut self, tab_id: u64, page: usize, cx: &mut Context<Self>) {
         let connection = self.connection.clone();
         let failed = matches!(self.status, Status::Failed(_));
+        let reason = not_connected_copy(&self.status);
         let Some(Tab::Table(tab)) = self.tab_mut(tab_id) else {
             return;
         };
@@ -1853,7 +1942,7 @@ impl Shell {
             tab.page = page;
             tab.selection.clear();
             tab.loading = !failed;
-            tab.error = failed.then(|| NOT_CONNECTED.to_string());
+            tab.error = failed.then_some(reason);
             self.remember_tabs(cx);
             cx.notify();
             return;
@@ -2270,6 +2359,7 @@ impl Shell {
 
     fn run_active_query(&mut self, cx: &mut Context<Self>) {
         let connection = self.connection.clone();
+        let reason = not_connected_copy(&self.status);
         let Some(Tab::Query(tab)) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -2282,9 +2372,11 @@ impl Shell {
             return;
         }
         // The tab opens before the connection does, so ⌘⏎ can arrive
-        // first. Say so rather than doing nothing.
+        // first. Say so rather than doing nothing — and say why: "not
+        // connected" under a connect that failed is the one line that
+        // leaves the user no better off than silence.
         let Some(connection) = connection else {
-            tab.error = Some(NOT_CONNECTED.to_string());
+            tab.error = Some(reason);
             cx.notify();
             return;
         };
@@ -5349,6 +5441,41 @@ fn flatten<T>(outcome: Result<anyhow::Result<T>, gpui_tokio::JoinError>) -> Resu
     }
 }
 
+/// The same collapse for the connect, which keeps its class: the strip
+/// paints the headline, the detail and the hint apart, so a sentence is
+/// not enough. A task that died is `Other`, with what the runtime said.
+fn connect_outcome<T>(
+    outcome: Result<anyhow::Result<T>, gpui_tokio::JoinError>,
+) -> Result<T, ConnectError> {
+    match outcome {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(ConnectError::of(&error)),
+        Err(join) => Err(ConnectError::new(
+            ConnectFailure::Other,
+            format!("the connect was interrupted: {join}"),
+        )),
+    }
+}
+
+/// What a tab says when it wanted the server and there was none.
+///
+/// **It repeats the reason.** A bare "not connected" under a connect that
+/// failed sends the user looking for what the strip over the pane already
+/// knows, so the line carries the class and the server's own words; while
+/// the connect is still out it says where it is going, because "yet" with
+/// no host is a wait with nothing to check.
+fn not_connected_copy(status: &Status) -> String {
+    match status {
+        Status::Failed(error) => format!(
+            "Not connected · {} · {}",
+            error.kind.headline(),
+            error.detail
+        ),
+        Status::Connecting(to) => format!("Not connected yet · still connecting to {to}"),
+        Status::Connected => NOT_CONNECTED.to_string(),
+    }
+}
+
 impl Focusable for Shell {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -5426,11 +5553,30 @@ fn frame_overlay(env: Env, radius: Pixels, colors: &ThemeColors) -> Div {
         )
 }
 
-/// What the connecting line says before there is a connection to describe.
-fn describe(target: &Target) -> String {
+/// Where the connect is going, as `host:port` — the two things a person
+/// checks first when it does not arrive. A profile with neither set means
+/// the driver's own defaults, so those are what is said. A URL is cut down
+/// to its authority, which also leaves the user and the password out.
+fn endpoint(target: &Target) -> String {
     match target {
-        Target::Url(url) => redact(url),
-        Target::Profile(profile) => profile.name.clone(),
+        Target::Profile(profile) => format!(
+            "{}:{}",
+            profile.host.as_deref().unwrap_or("localhost"),
+            profile.port.unwrap_or(5432)
+        ),
+        Target::Url(url) => {
+            let rest = url.split_once("://").map_or(url.as_str(), |(_, rest)| rest);
+            let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+            let host = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            match host {
+                "" => "localhost:5432".to_string(),
+                // A bracketed IPv6 address carries colons of its own.
+                host if host.ends_with(']') || !host.contains(':') => format!("{host}:5432"),
+                host => host.to_string(),
+            }
+        }
     }
 }
 
@@ -5493,6 +5639,7 @@ impl Render for Shell {
                             .flex_col()
                             .flex_1()
                             .min_w(px(0.))
+                            .children(self.connect_strip(&colors, cx))
                             .child(self.pane(&colors, window, cx))
                             .child(self.status_strip(&colors, cx)),
                     )
@@ -7126,6 +7273,163 @@ impl Shell {
         )
     }
 
+    /// The connect's own strip, over the pane: where the connect is going
+    /// while it is out, and what went wrong when it fails.
+    ///
+    /// A session opens on its tabs before the connection lands, so the
+    /// pane cannot be what reports the connect — it is busy being an
+    /// editor. The foot of the sidebar said "connecting…" and "not
+    /// connected" in the faint ink, which is where a host name belongs and
+    /// not where a failure does: a window that will never run a query has
+    /// to say so where the user is looking. So the strip sits over
+    /// whichever tab is open and pushes it down, as the ⌘F strip does,
+    /// rather than covering it: the SQL under it is still the user's.
+    ///
+    /// A failure is three lines and two ways out. The **headline** is the
+    /// class, the **detail** is the server's or the system's own words in
+    /// the mono — it is what gets pasted into a ticket, so it carries the
+    /// `copy` link the error strip has — and the **hint** is where to
+    /// look first. **Retry** asks again in place; **Back to connections**
+    /// is the title bar's own way out, through the same guard.
+    ///
+    /// Connected, there is no strip: a strip that said "connected" would
+    /// be one that is always there saying nothing.
+    fn connect_strip(&self, colors: &ThemeColors, cx: &Context<Self>) -> Option<Div> {
+        let error = match &self.status {
+            Status::Connected => return None,
+            Status::Connecting(_) if self.connect_started.elapsed() < CONNECT_ARM => return None,
+            Status::Connecting(to) => {
+                return Some(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .px(px(14.))
+                        .py(px(9.))
+                        .border_b_1()
+                        .border_color(colors.running_border)
+                        .bg(colors.running_surface)
+                        .child(status_dot(colors.running_mark))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(colors.accent_deep)
+                                .child("Connecting to"),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .font_family(MONO_FONT_FAMILY)
+                                .text_size(px(11.5))
+                                .text_color(colors.accent_deep)
+                                .child(format!("{to}…")),
+                        ),
+                );
+            }
+            Status::Failed(error) => error,
+        };
+        let detail = error.detail.clone();
+        let copied = self
+            .copied_error
+            .as_ref()
+            .is_some_and(|(id, text)| *id == CONNECT_COPY_ID && *text == detail);
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .items_start()
+                .gap(px(16.))
+                .px(px(14.))
+                .py(px(12.))
+                .border_b_1()
+                .border_color(colors.error_border)
+                .bg(colors.error_surface)
+                .child(
+                    div()
+                        .flex_none()
+                        .pt(px(5.))
+                        .child(status_dot(colors.error_mark)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(5.))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(colors.error)
+                                .child(error.kind.headline()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_start()
+                                .gap(px(10.))
+                                .child(
+                                    div()
+                                        .min_w(px(0.))
+                                        .font_family(MONO_FONT_FAMILY)
+                                        .text_size(px(11.5))
+                                        .text_color(colors.error)
+                                        .child(detail.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .id("copy-connect-error")
+                                        .flex_none()
+                                        .cursor_pointer()
+                                        .text_size(px(10.))
+                                        .text_color(colors.error_secondary)
+                                        .hover(|s| s.text_color(colors.error))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.copy_error(CONNECT_COPY_ID, detail.clone(), cx)
+                                        }))
+                                        .child(if copied { "copied" } else { "copy" }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(colors.text_secondary)
+                                .child(error.kind.hint()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            accent_button("Retry", cx)
+                                .id("retry-connect")
+                                .on_click(cx.listener(|this, _, _, cx| this.retry_connect(cx))),
+                        )
+                        .child(
+                            toolbar_button("Back to connections", cx)
+                                .id("back-to-connections")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    // The title bar's own way out, and its
+                                    // guard: nothing is running here, so it
+                                    // does not ask, but one path means the
+                                    // strip is written back either way.
+                                    if this.guard_close(Close::Shell, window, cx) {
+                                        this.proceed_close(Close::Shell, window, cx);
+                                    }
+                                })),
+                        ),
+                ),
+        )
+    }
+
     /// What the server said when it refused a run, with a `copy` link on
     /// the right. The text of a GPUI element cannot be marked with the
     /// pointer, and an error is the one message on screen most often
@@ -7851,7 +8155,7 @@ impl Shell {
     fn placeholder(&self, colors: &ThemeColors, _window: &mut Window) -> Div {
         let (heading, detail) = match &self.status {
             Status::Connecting(target) => ("connecting".to_string(), target.clone()),
-            Status::Failed(error) => ("could not connect".to_string(), error.clone()),
+            Status::Failed(error) => (error.kind.headline().to_string(), error.detail.clone()),
             Status::Connected => (
                 "nothing open".to_string(),
                 "pick a table on the left, or start a query".to_string(),
@@ -10390,6 +10694,51 @@ fn redact(url: &str) -> String {
 mod tests {
     use super::*;
     use introspect::diff::ObjectKind;
+
+    #[test]
+    fn the_endpoint_is_the_host_and_the_port_and_never_the_password() {
+        let url = |text: &str| endpoint(&Target::Url(text.to_string()));
+        assert_eq!(
+            url("postgres://app:secret@db.internal:6432/shop"),
+            "db.internal:6432"
+        );
+        assert_eq!(
+            url("postgres://app@db.internal/shop?sslmode=require"),
+            "db.internal:5432"
+        );
+        assert_eq!(
+            url("postgres://app:p@ss@db.internal/shop"),
+            "db.internal:5432"
+        );
+        assert_eq!(url("postgres://[::1]/shop"), "[::1]:5432");
+        assert_eq!(url("postgres:///shop"), "localhost:5432");
+    }
+
+    #[test]
+    fn a_tab_with_no_server_says_why() {
+        let failed = Status::Failed(ConnectError::new(
+            ConnectFailure::Refused,
+            "127.0.0.1:5433 · Connection refused (os error 61)",
+        ));
+        assert_eq!(
+            not_connected_copy(&failed),
+            "Not connected · The connection was refused · 127.0.0.1:5433 · Connection refused (os error 61)"
+        );
+        let waiting = Status::Connecting("db.internal:5432".to_string());
+        assert_eq!(
+            not_connected_copy(&waiting),
+            "Not connected yet · still connecting to db.internal:5432"
+        );
+    }
+
+    #[test]
+    fn a_connect_that_failed_keeps_its_class() {
+        let refused: anyhow::Result<()> =
+            Err(ConnectError::new(ConnectFailure::Auth, "password authentication failed").into());
+        let error = connect_outcome(Ok(refused)).unwrap_err();
+        assert_eq!(error.kind, ConnectFailure::Auth);
+        assert_eq!(error.detail, "password authentication failed");
+    }
 
     /// A connection that knows no names at all, which is what a tab has
     /// before the catalog lands.

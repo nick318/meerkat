@@ -16,8 +16,9 @@
 use anyhow::Context as _;
 use async_trait::async_trait;
 use db_client::{
-    CheckError, Connection, Limits, Profile, QueryResult, Refusal, Result, RowChange, RowSink,
-    RunId, ServerTiming, Session, Stop, TxEnd, Value, Wire,
+    CheckError, ConnectError, ConnectEvidence, ConnectFailure, Connection, Limits, Profile,
+    QueryResult, Refusal, Result, RowChange, RowSink, RunId, ServerTiming, Session, Stop, TxEnd,
+    Value, Wire,
 };
 use futures::TryStreamExt as _;
 use introspect::{
@@ -49,6 +50,103 @@ use std::time::{Duration, Instant};
 /// one shared pool would be a reserve until the day it was not.
 const APP_CONNECTIONS: u32 = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Knock on the server's port before the pool does.
+///
+/// **sqlx's pool hides the two failures a person most needs named.** Its
+/// connect loop reads "connection refused" as a server that is still
+/// starting up, and retries with a backoff until `acquire_timeout` runs
+/// out — so a wrong port, which the system reports in a millisecond, came
+/// back ten seconds later as "pool timed out while waiting for an open
+/// connection", in the same words as a host that never answered. One bare
+/// TCP connect tells them apart, and says "refused", "no route" or "no
+/// such host" at once.
+///
+/// It costs one TCP handshake — one round trip, with no TLS and no
+/// sign-in behind it — and the deadline is the pool's own, so a firewall
+/// that drops packets is given up on at `CONNECT_TIMEOUT` here rather
+/// than after it. A Unix socket is left to the pool: there is no network
+/// to ask about.
+async fn reach(options: &PgConnectOptions) -> Result<()> {
+    let host = options.get_host();
+    if options.get_socket().is_some() || host.starts_with('/') {
+        return Ok(());
+    }
+    let port = options.get_port();
+    let knock = tokio::net::TcpStream::connect((host, port));
+    let error = match tokio::time::timeout(CONNECT_TIMEOUT, knock).await {
+        Ok(Ok(_)) => return Ok(()),
+        Ok(Err(error)) => {
+            let message = format!("{host}:{port} · {error}");
+            ConnectError::from_evidence(&ConnectEvidence {
+                io: Some(error.kind()),
+                message: &message,
+                ..ConnectEvidence::default()
+            })
+        }
+        Err(_) => ConnectError::new(ConnectFailure::Timeout, no_answer(host, port)),
+    };
+    Err(error.into())
+}
+
+/// What a deadline that ran out is worded as: the driver's own sentence
+/// names a pool, which is nothing the person looking at it asked about.
+fn no_answer(host: &str, port: u16) -> String {
+    format!(
+        "{host}:{port} did not answer within {} s",
+        CONNECT_TIMEOUT.as_secs()
+    )
+}
+
+/// Turn what sqlx said about a failed connect into a class and a detail.
+/// The class is `db_client`'s to decide; this only reads the evidence out
+/// of the library's error.
+fn connect_error(error: &sqlx::Error, label: &Label) -> ConnectError {
+    match error {
+        sqlx::Error::Database(refused) => ConnectError::from_evidence(&ConnectEvidence {
+            sqlstate: refused.code().as_deref(),
+            message: refused.message(),
+            ..ConnectEvidence::default()
+        }),
+        sqlx::Error::Io(io) => {
+            let message = io.to_string();
+            ConnectError::from_evidence(&ConnectEvidence {
+                io: Some(io.kind()),
+                // rustls reports a handshake it gave up on as an I/O
+                // error of invalid data, with its own words inside.
+                tls: io.kind() == std::io::ErrorKind::InvalidData && names_tls(&message),
+                message: &message,
+                ..ConnectEvidence::default()
+            })
+        }
+        sqlx::Error::Tls(tls) => ConnectError::from_evidence(&ConnectEvidence {
+            tls: true,
+            message: &tls.to_string(),
+            ..ConnectEvidence::default()
+        }),
+        // The port answered the knock, so this is the server taking too
+        // long over the handshake — or one the pool kept retrying because
+        // it said it was starting up or out of connections.
+        sqlx::Error::PoolTimedOut => ConnectError::new(
+            ConnectFailure::Timeout,
+            format!(
+                "{} · the port is open, and the server did not finish the sign-in",
+                no_answer(&label.host, label.port)
+            ),
+        ),
+        other => ConnectError::from_evidence(&ConnectEvidence {
+            message: &other.to_string(),
+            ..ConnectEvidence::default()
+        }),
+    }
+}
+
+fn names_tls(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    ["certificate", "handshake", "tls"]
+        .iter()
+        .any(|word| lowered.contains(word))
+}
 
 /// SQLSTATE for `query_canceled`. The server answers a statement
 /// `pg_cancel_backend` reached with it — and a statement its own
@@ -204,7 +302,9 @@ impl PostgresConnection {
     /// writable session from a profile, where the user chose it.
     pub async fn connect_url(url: &str, read_only: bool) -> Result<Self> {
         let options = PgConnectOptions::from_str(url)
-            .with_context(|| format!("not a valid PostgreSQL URL: {url}"))?;
+            // The URL is left out of the message: it holds the password, and
+            // this text is painted on screen.
+            .context("not a valid PostgreSQL URL")?;
         Self::connect_with(options, read_only).await
     }
 
@@ -269,12 +369,13 @@ impl PostgresConnection {
         } else {
             options
         };
+        reach(&options).await?;
         let pool = PgPoolOptions::new()
             .max_connections(APP_CONNECTIONS)
             .acquire_timeout(CONNECT_TIMEOUT)
             .connect_with(options.clone())
             .await
-            .with_context(|| format!("failed to connect to {}", label.host))?;
+            .map_err(|error| connect_error(&error, &label))?;
         // The same options, so a session's startup packet is the app's:
         // one read-only flag, one set of parameters, no second story about
         // what this connection may do. Lazily connected — a session pool
@@ -341,7 +442,9 @@ pub enum Password<'a> {
 /// still looking at the form.
 pub fn profile_from_url(id: &str, name: &str, url: &str) -> Result<(Profile, Option<String>)> {
     let options = PgConnectOptions::from_str(url)
-        .with_context(|| format!("not a valid PostgreSQL URL: {url}"))?;
+        // The URL is left out of the message: it holds the password, and
+        // this text is painted on screen.
+        .context("not a valid PostgreSQL URL")?;
     let database = options
         .get_database()
         .filter(|database| !database.is_empty())
@@ -2199,6 +2302,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tracked.plan_ms, Some(0.5));
+    }
+
+    fn label() -> Label {
+        Label {
+            database: "shop".to_string(),
+            host: "db.internal".to_string(),
+            port: 5432,
+        }
+    }
+
+    #[test]
+    fn a_socket_error_is_classified_by_its_kind() {
+        let refused = sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert_eq!(
+            connect_error(&refused, &label()).kind,
+            ConnectFailure::Refused
+        );
+    }
+
+    #[test]
+    fn the_pools_deadline_is_a_timeout_that_names_the_server() {
+        let late = connect_error(&sqlx::Error::PoolTimedOut, &label());
+        assert_eq!(late.kind, ConnectFailure::Timeout);
+        assert!(
+            late.detail
+                .starts_with("db.internal:5432 did not answer within 10 s")
+        );
+        assert!(!late.detail.contains("pool"));
+    }
+
+    #[test]
+    fn a_tls_error_is_tls_from_either_layer() {
+        let outright = sqlx::Error::Tls("server does not support TLS".into());
+        assert_eq!(connect_error(&outright, &label()).kind, ConnectFailure::Tls);
+        let handshake = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid peer certificate: UnknownIssuer",
+        ));
+        assert_eq!(
+            connect_error(&handshake, &label()).kind,
+            ConnectFailure::Tls
+        );
+    }
+
+    /// No server needed: a port nothing listens on is refused by the
+    /// system itself. Before the knock this took the pool's whole ten
+    /// seconds and came back as a timeout.
+    #[tokio::test]
+    async fn a_closed_port_is_refused_at_once() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let started = Instant::now();
+        let url = format!("postgres://nobody@127.0.0.1:{port}/nothing");
+        let error = match PostgresConnection::connect(&url).await {
+            Ok(_) => panic!("nothing listens on that port"),
+            Err(error) => error,
+        };
+        let failure = ConnectError::of(&error);
+        assert_eq!(failure.kind, ConnectFailure::Refused);
+        assert!(failure.detail.contains(&format!("127.0.0.1:{port}")));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     /// These tests need a live server. Set `MEERKAT_TEST_PG_URL` to a

@@ -4,6 +4,12 @@
 //! The rest of the app talks only to this trait, so the UI never knows
 //! which engine is behind a tab.
 
+mod connect;
+
+pub use connect::{
+    ConnectError, ConnectFailure, Evidence as ConnectEvidence, classify as classify_connect,
+};
+
 use async_trait::async_trait;
 use introspect::Catalog;
 use serde::{Deserialize, Serialize};

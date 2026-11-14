@@ -20,6 +20,9 @@ sqlx = { workspace = true, features = [
     "time",
     "json",
 ] }
+# The connect's own probe: a bare TCP connect under a deadline. See
+# `reach` in `lib.rs`.
+tokio = { workspace = true, features = ["net"] }
 
 [dev-dependencies]
 tokio.workspace = true
