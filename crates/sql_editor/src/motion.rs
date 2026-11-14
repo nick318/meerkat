@@ -121,6 +121,134 @@ pub fn line_end(text: &str, offset: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+/// Where the line's own text starts: past the leading spaces and tabs.
+pub fn indent_end(text: &str, offset: usize) -> usize {
+    let start = line_start(text, offset);
+    start
+        + text[start..]
+            .bytes()
+            .take_while(|byte| *byte == b' ' || *byte == b'\t')
+            .count()
+}
+
+/// ⌘← and Home, the way Zed's `stop_at_indent` reads them: to the first
+/// character of the line's text, and from there to column zero. One key
+/// reaches both, and the first press lands where the typing starts.
+pub fn smart_line_start(text: &str, offset: usize) -> usize {
+    let indent = indent_end(text, offset);
+    if offset == indent {
+        line_start(text, offset)
+    } else {
+        indent
+    }
+}
+
+/// A subword ends where `_` or a step from lower to upper case cuts a
+/// name: `master_client` and `masterClient` are both two of them. SQL
+/// names are snake case, so this is the motion that walks one.
+fn is_subword_char(ch: char) -> bool {
+    is_word_char(ch) && ch != '_'
+}
+
+/// Start of the subword before `offset`, as ⌃⌥← gives in Zed.
+pub fn previous_subword_start(text: &str, offset: usize) -> usize {
+    let mut ix = offset;
+    if ix == 0 {
+        return 0;
+    }
+    if char_before(text, ix) == Some('\n') {
+        return previous_boundary(text, ix);
+    }
+    while let Some(ch) = char_before(text, ix) {
+        if ch == '\n' || is_subword_char(ch) {
+            break;
+        }
+        ix = previous_boundary(text, ix);
+    }
+    let mut taken: Option<char> = None;
+    while let Some(ch) = char_before(text, ix) {
+        if !is_subword_char(ch) {
+            break;
+        }
+        // `fooBar`, walking left: `B` is taken, `o` is the word before.
+        if taken.is_some_and(char::is_uppercase) && ch.is_lowercase() {
+            break;
+        }
+        ix = previous_boundary(text, ix);
+        taken = Some(ch);
+    }
+    ix
+}
+
+/// End of the subword after `offset`, as ⌃⌥→ gives in Zed.
+pub fn next_subword_end(text: &str, offset: usize) -> usize {
+    let mut ix = offset;
+    if ix >= text.len() {
+        return text.len();
+    }
+    if char_at(text, ix) == Some('\n') {
+        return next_boundary(text, ix);
+    }
+    while let Some(ch) = char_at(text, ix) {
+        if ch == '\n' || is_subword_char(ch) {
+            break;
+        }
+        ix = next_boundary(text, ix);
+    }
+    let mut taken: Option<char> = None;
+    while let Some(ch) = char_at(text, ix) {
+        if !is_subword_char(ch) {
+            break;
+        }
+        if taken.is_some_and(char::is_lowercase) && ch.is_uppercase() {
+            break;
+        }
+        ix = next_boundary(text, ix);
+        taken = Some(ch);
+    }
+    ix
+}
+
+fn is_blank(line: &str) -> bool {
+    line.chars().all(char::is_whitespace)
+}
+
+/// ⌃↑: the blank line that opens the paragraph the caret is in, or the
+/// top of the buffer. In a query buffer a paragraph is a statement.
+pub fn start_of_paragraph(text: &str, offset: usize) -> usize {
+    let mut start = line_start(text, offset);
+    let mut seen_text = false;
+    loop {
+        let blank = is_blank(&text[start..line_end(text, start)]);
+        if blank && seen_text {
+            return start;
+        }
+        seen_text |= !blank;
+        if start == 0 {
+            return 0;
+        }
+        start = line_start(text, start - 1);
+    }
+}
+
+/// ⌃↓: the blank line that closes the paragraph, or the end of the buffer.
+pub fn end_of_paragraph(text: &str, offset: usize) -> usize {
+    let mut start = line_start(text, offset);
+    let mut seen_text = false;
+    loop {
+        let end = line_end(text, start);
+        let blank = is_blank(&text[start..end]);
+        if blank && seen_text {
+            return start;
+        }
+        seen_text |= !blank;
+        if end == text.len() {
+            return end;
+        }
+        start = end + 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +324,47 @@ mod tests {
             &SQL[line_start(SQL, ix)..line_end(SQL, ix)],
             "from public.users"
         );
+    }
+    #[test]
+    fn the_line_start_stops_at_the_indent_first() {
+        let text = "select\n    id";
+        let end = text.len();
+        let indent = text.find("id").unwrap();
+        assert_eq!(smart_line_start(text, end), indent);
+        // A second press goes on to column zero, and a third comes back.
+        assert_eq!(smart_line_start(text, indent), indent - 4);
+        assert_eq!(smart_line_start(text, indent - 4), indent);
+        // A line with no indent has one stop.
+        assert_eq!(smart_line_start(text, 3), 0);
+        assert_eq!(smart_line_start(text, 0), 0);
+    }
+
+    #[test]
+    fn a_subword_ends_at_an_underscore_or_a_hump() {
+        let text = "master_client_reference";
+        assert_eq!(&text[..next_subword_end(text, 0)], "master");
+        assert_eq!(&text[..next_subword_end(text, 6)], "master_client");
+        assert_eq!(
+            &text[previous_subword_start(text, text.len())..],
+            "reference"
+        );
+        assert_eq!(&text[previous_subword_start(text, 14)..14], "client_");
+        let camel = "masterClientRef";
+        assert_eq!(&camel[..next_subword_end(camel, 0)], "master");
+        assert_eq!(&camel[previous_subword_start(camel, camel.len())..], "Ref");
+        assert_eq!(&camel[previous_subword_start(camel, 12)..12], "Client");
+    }
+
+    #[test]
+    fn a_paragraph_is_bounded_by_blank_lines() {
+        let text = "select 1;\n\nselect 2\nfrom t;\n\nselect 3;";
+        let inside = text.find("from").unwrap();
+        assert_eq!(start_of_paragraph(text, inside), 10);
+        assert_eq!(
+            end_of_paragraph(text, inside),
+            text.find("\n\nselect 3").unwrap() + 1
+        );
+        assert_eq!(start_of_paragraph(text, 3), 0);
+        assert_eq!(end_of_paragraph(text, text.len() - 2), text.len());
     }
 }

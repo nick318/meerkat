@@ -84,6 +84,10 @@ pub struct ThemeColors {
     /// Selected row / active list item background. In the results grid it
     /// is what a *ticked* row wears, whole.
     pub selection: Hsla,
+    /// The wash behind the line the SQL editor's caret is on. A shade off
+    /// the paper and no more: it says which line, and must not compete
+    /// with the selection or a statement's own wash.
+    pub active_line: Hsla,
     /// The wash under a range of cells in the results grid. Lighter than
     /// `selection`, because three marks have to stay apart at a glance in
     /// the same warm family: the cursor's own cell (`match_strong`), the
@@ -243,6 +247,7 @@ impl Theme {
                 syntax_literal: rgb(0x5C7A4E).into(),
                 syntax_identifier: rgb(0x3F5A6B).into(),
                 selection: rgb(0xF3E7D3).into(),
+                active_line: rgb(0xF6F3EC).into(),
                 range_surface: rgb(0xF8F1E3).into(),
                 match_wash: rgb(0xEFE3CC).into(),
                 match_strong: rgb(0xEBD3A8).into(),

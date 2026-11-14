@@ -16,9 +16,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    App, Div, ElementId, FontWeight, InteractiveElement as _, MouseButton, MouseDownEvent,
-    ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _,
-    Window, WindowControlArea, div, px,
+    App, BoxShadow, Div, ElementId, FontWeight, InteractiveElement as _, MouseButton,
+    MouseDownEvent, ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _,
+    Styled as _, Window, WindowControlArea, div, px,
 };
 use theme::{MONO_FONT_FAMILY, theme};
 
@@ -129,6 +129,35 @@ pub fn key_hint(key: impl Into<SharedString>, label: impl Into<SharedString>, cx
         .child(label.into())
 }
 
+/// The radius of a control: a button, a field, a chip.
+pub const CONTROL_RADIUS: f32 = 7.;
+
+/// The radius of a surface that holds controls. Outer radius is inner
+/// radius plus the padding between them, or the two curves pull apart at
+/// the corner: a 7px control three pixels inside its card wants 10.
+pub const SURFACE_RADIUS: f32 = 10.;
+
+/// The lift under a control that sits on the paper: one hairline of
+/// shadow, tight under its bottom edge. A border alone draws a box; the
+/// shadow is what says the box can be pressed.
+pub fn control_shadow(cx: &App) -> Vec<BoxShadow> {
+    let colors = &theme(cx).colors;
+    vec![BoxShadow::new(px(0.), px(1.), colors.shadow_soft).blur_radius(px(1.5))]
+}
+
+/// The lift under a surface that floats over the workspace — a card, a
+/// menu, a dialog. Two layers, as a real shadow has: a tight one that
+/// seats the edge and a wide soft one that says how far up it is.
+pub fn surface_shadow(cx: &App) -> Vec<BoxShadow> {
+    let colors = &theme(cx).colors;
+    vec![
+        BoxShadow::new(px(0.), px(1.), colors.shadow_soft).blur_radius(px(2.)),
+        BoxShadow::new(px(0.), px(8.), colors.shadow_soft)
+            .blur_radius(px(24.))
+            .spread_radius(px(-4.)),
+    ]
+}
+
 /// A bordered card surface sitting on a panel (connection card, inputs).
 pub fn card(cx: &App) -> Div {
     let colors = &theme(cx).colors;
@@ -136,7 +165,8 @@ pub fn card(cx: &App) -> Div {
         .bg(colors.elevated)
         .border_1()
         .border_color(colors.border_strong)
-        .rounded(px(7.))
+        .rounded(px(SURFACE_RADIUS))
+        .shadow(surface_shadow(cx))
 }
 
 /// A small bordered toolbar button ("filter", "export", "format").
@@ -158,12 +188,13 @@ pub fn toolbar_button_bare(cx: &App) -> Div {
         .px(px(10.))
         .border_1()
         .border_color(colors.border)
-        .rounded(px(7.))
-        .bg(colors.window)
+        .rounded(px(CONTROL_RADIUS))
+        .bg(colors.raised)
+        .shadow(control_shadow(cx))
         .text_size(px(12.))
         .text_color(colors.text_secondary)
         .cursor_pointer()
-        .hover(|s| s.bg(colors.panel).border_color(colors.border_strong))
+        .hover(|s| s.bg(colors.window).border_color(colors.border_strong))
 }
 
 /// The one filled button in a view ("Connect", "Save", "Restart now").
@@ -182,8 +213,9 @@ pub fn accent_button_bare(cx: &App) -> Div {
         .items_center()
         .gap(px(7.))
         .px(px(11.))
-        .rounded(px(7.))
+        .rounded(px(CONTROL_RADIUS))
         .bg(colors.accent_fill)
+        .shadow(control_shadow(cx))
         .text_size(px(12.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(colors.on_accent)
@@ -471,7 +503,13 @@ pub fn switch(on: bool, cx: &App) -> Div {
         } else {
             colors.border_strong
         })
-        .child(div().size(px(13.)).rounded_full().bg(colors.raised));
+        .child(
+            div()
+                .size(px(13.))
+                .rounded_full()
+                .bg(colors.raised)
+                .shadow(control_shadow(cx)),
+        );
     if on {
         track = track.justify_end();
     }

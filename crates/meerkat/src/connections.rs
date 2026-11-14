@@ -56,7 +56,7 @@ use gpui::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage::{SavedConnection, Store};
-use theme::{MONO_FONT_FAMILY, ThemeColors, UI_FONT_FAMILY, theme};
+use theme::{ThemeColors, UI_FONT_FAMILY, theme};
 use ui::{
     TextField, TextFieldEvent, TitleDrag, accent_button, meerkat_mark, section_label, status_dot,
     switch, title_bar, toolbar_button, toolbar_button_bare,

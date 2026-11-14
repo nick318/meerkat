@@ -255,6 +255,39 @@ loading and sends nothing; `resume_pending_pages` asks again when the
 connection lands, and a failed connect marks those tabs `NOT_CONNECTED`
 instead of leaving them waiting for ever.
 
+### When the connect fails
+
+**A failed connect is classified, and the class is what the user reads.**
+`db_client::ConnectFailure` is the class — unreachable, refused, timeout,
+DNS, sign-in, no such database, TLS, a pooler that refused the startup
+option, other — and `db_client::classify_connect` decides it, a pure
+function over `ConnectEvidence`: a SQLSTATE, an `io::ErrorKind`, two flags
+and the message. The driver fills the evidence in from sqlx's error, so
+the rules know nothing about sqlx and are argued with in a test.
+`ConnectError` carries the class and the server's or the system's own
+words through `anyhow`; `ConnectError::of` reads it back.
+
+**The driver knocks on the port before the pool does** — `reach` in
+`db_postgres`, one bare TCP connect under `CONNECT_TIMEOUT`. sqlx's pool
+reads "connection refused" as a server still starting up and retries until
+`acquire_timeout` runs out, so a wrong port came back ten seconds later as
+"pool timed out", in the words of a host that never answered. The knock
+says refused, no route or no such host at once, and costs one round trip.
+
+`Shell::connect_strip` paints the connect over the pane, whichever tab is
+open: `Connecting to host:port…` once it has been out for `CONNECT_ARM`
+(a connect that lands at once raises nothing), and on a failure the
+headline, the detail in the mono with a `copy` link, the hint, **Retry**
+and **Back to connections**. Connected, there is no strip. A run or a
+table page asked for with no connection repeats the reason through
+`not_connected_copy` rather than a bare "not connected".
+
+**Retry is the first attempt's own path.** `Shell::connect` reads the
+`target` the shell keeps and bumps `connect_generation`, so a reply to an
+older attempt is dropped. `retry_connect` takes the "not connected" lines
+down and puts the table tabs back to waiting, which is the state
+`resume_pending_pages` picks up when the connection lands.
+
 ### The sidebar
 
 The tree is schema → `TABLES`, `VIEWS`, `SEQUENCES`, `ROUTINES` and
@@ -928,6 +961,51 @@ comes back to the first.
 Both keys are bound to the `Shell` context. The walk does nothing while
 the palette is open: that dialog is already the one taking keys. Every
 path that changes the active tab still goes through `Shell::activate`.
+
+### The SQL editor
+
+**Only what is on screen is shaped and laid out.** The first edition
+shaped every line and gave the gutter, the rail and the statistics a row
+per line on every frame, so a pasted script of a thousand lines made each
+keystroke after it cost a thousand — the lag after a paste. `SqlEditor`
+keeps an index of its line starts (`reindex`, redone on every edit, with
+the shape-changing lines and the widest line beside it), and everything
+paints `display::visible_rows`: the columns beside the text from the
+scroll offset, with a spacer above and below, and the text element from
+the clip its scroll containers set. `EditorLayout` holds the rows that
+were on screen and no others.
+
+**The viewport follows the caret in `render`, before layout.** It used
+to be worked out in `paint` and take effect a frame late, which is a
+caret off screen for a frame after every paste. Rows are `LINE_HEIGHT`
+tall, so the vertical half needs no layout at all; the horizontal half
+shapes the caret's line up to the caret. `paint` only asks for another
+frame when nothing had measured the pane yet.
+
+**A tab is one byte and several columns.** The text system shapes it as
+a glyph of no useful width, so a script indented with tabs painted its
+caret where the text was not. The buffer keeps the tab — rewriting it
+would change a string literal — and each line is shaped from
+`display::Expanded`, which maps offsets both ways. `\r\n` is the one
+thing normalized on the way in.
+
+**The keys are Zed's `default-macos.json`**, the `Editor` context, less
+what a single-cursor buffer with no language server has no use for:
+word, subword (`⌃⌥←→`, which walks `snake_case`), line, paragraph and
+page motion, each with its ⇧ twin; a goal column that ↑↓ hold; ⇥ and ⇧⇥
+over a selection, ⌘/ with `-- `, ⌥↑↓ to move lines, ⇧⌥↑↓ to duplicate,
+⇧⌘K, ⌃J, ⌃T, ⌃K, ⌘L, ⌘D. ⌘← stops at the indent first. ⌘⏎ is **not**
+Zed's newline-below here: it runs the statement. The line edits are
+plain functions in `edit.rs`, argued with in tests.
+
+⌘C with nothing selected copies the caret's line, and pasting that back
+puts it above the caret's line rather than splitting it. A paste opens
+no completion panel. A drag carries on in the unit its click took — a
+double click grows by words, a triple click by lines — and its move and
+release listeners are the window's, hung by the element while the drag
+is on, for the reason the grid's are. The caret is painted with a
+selection as well as without one, and the caret's line wears
+`active_line`.
 
 ### Async bridge
 

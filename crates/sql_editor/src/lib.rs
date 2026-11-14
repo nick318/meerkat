@@ -6,11 +6,26 @@
 //! This one is multi-line, so it keeps a shaped line per row and maps byte
 //! offsets to (row, column) both ways.
 //!
-//! It carries what a macOS editor is expected to have: word and line
-//! motion, selection for every motion, word and line deletion, undo and
-//! redo, double and triple click selection, and a viewport that follows
-//! the caret. Colouring comes from a one-pass tokenizer that also knows
-//! the names in the connected database. There is no soft wrap.
+//! It carries what a macOS editor is expected to have, and the keys are
+//! Zed's `default-macos.json` wherever this buffer has the thing the key
+//! names: word, subword, line, paragraph and page motion, selection for
+//! every motion, a goal column that ↑ and ↓ keep, line edits (indent,
+//! comment, move, duplicate, join, delete), undo and redo, and word and
+//! line selection that a drag carries on in the unit the click started.
+//! Colouring comes from a one-pass tokenizer that also knows the names in
+//! the connected database. There is no soft wrap.
+//!
+//! **Only what is on screen is shaped and laid out.** The first edition
+//! shaped every line and gave the gutter a row per line on every frame,
+//! so a pasted script of a thousand lines made each keystroke after it
+//! cost a thousand. The buffer keeps an index of its line starts, redone
+//! on each edit, and the gutter, the rail, the statistics and the text all
+//! paint `display::visible_rows` and nothing else.
+//!
+//! **The viewport follows the caret in `render`, before anything is
+//! painted**, so the frame an edit lands in is already scrolled to it. It
+//! used to be worked out in `paint` and take effect a frame late, which is
+//! a caret that is off screen for a frame after every paste.
 //!
 //! ⌘F opens a find strip over the buffer: every hit washed, the one the
 //! walk stands on selected, ⏎ and ⇧⏎ (or ⌘G and ⇧⌘G) stepping between
@@ -23,19 +38,22 @@
 //! boundary.
 
 mod completion;
+mod display;
+mod edit;
 mod highlight;
 mod motion;
 
 pub use completion::{Kind, Name, Vocabulary};
 
 use completion::Completion;
+use display::Expanded;
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, Div,
-    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
-    FontWeight, GlobalElementId, Hsla, IntoElement, KeyContext, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollHandle,
-    ShapedLine, SharedString, Style, Subscription, TextRun, UTF16Selection, UnderlineStyle, Window,
-    actions, div, fill, point, prelude::*, px, relative, size,
+    Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle,
+    DispatchPhase, Div, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
+    FocusHandle, Focusable, FontWeight, GlobalElementId, Hsla, IntoElement, KeyContext, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    ScrollHandle, ShapedLine, SharedString, Style, Subscription, TextRun, UTF16Selection,
+    UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, size,
 };
 use highlight::Token;
 use std::ops::Range;
@@ -51,46 +69,75 @@ actions!(
     sql_editor,
     [
         Backspace,
+        Cancel,
         Copy,
         ConfirmCompletion,
         Cut,
         DismissCompletion,
         Delete,
+        DeleteLine,
         DeleteToBeginningOfLine,
         DeleteToEndOfLine,
+        DeleteToNextSubwordEnd,
         DeleteToNextWordEnd,
+        DeleteToPreviousSubwordStart,
         DeleteToPreviousWordStart,
+        DuplicateLineDown,
+        DuplicateLineUp,
         Find,
         FindNext,
         FindPrevious,
         Indent,
+        IndentLines,
+        JoinLines,
+        KillToEndOfLine,
         MoveDown,
         MoveLeft,
+        MoveLineDown,
+        MoveLineUp,
+        MovePageDown,
+        MovePageUp,
         MoveRight,
         MoveToBeginning,
         MoveToBeginningOfLine,
         MoveToEnd,
         MoveToEndOfLine,
+        MoveToEndOfParagraph,
+        MoveToNextSubwordEnd,
         MoveToNextWordEnd,
+        MoveToPreviousSubwordStart,
         MoveToPreviousWordStart,
+        MoveToStartOfParagraph,
         MoveUp,
         Newline,
         NextCompletion,
         OpenCompletion,
+        Outdent,
         Paste,
         PreviousCompletion,
         Redo,
+        ScrollCursorCenter,
         SelectAll,
         SelectDown,
         SelectLeft,
+        SelectLine,
+        SelectNext,
+        SelectPageDown,
+        SelectPageUp,
         SelectRight,
         SelectToBeginning,
         SelectToBeginningOfLine,
         SelectToEnd,
         SelectToEndOfLine,
+        SelectToEndOfParagraph,
+        SelectToNextSubwordEnd,
         SelectToNextWordEnd,
+        SelectToPreviousSubwordStart,
         SelectToPreviousWordStart,
+        SelectToStartOfParagraph,
         SelectUp,
+        ToggleComment,
+        Transpose,
         Undo,
     ]
 );
@@ -117,42 +164,99 @@ pub fn key_bindings() -> Vec<gpui::KeyBinding> {
         };
     }
     vec![
+        // Zed's `default-macos.json`, the `Editor` context, less what this
+        // buffer has no use for (multiple cursors, syntax nodes, an LSP).
+        // ⌘⏎ is left to the shell: here it runs the statement.
+        bind!("escape", Cancel),
         bind!("backspace", Backspace),
+        bind!("shift-backspace", Backspace),
+        bind!("ctrl-h", Backspace),
         bind!("delete", Delete),
+        bind!("ctrl-d", Delete),
         bind!("alt-backspace", DeleteToPreviousWordStart),
+        bind!("ctrl-w", DeleteToPreviousWordStart),
         bind!("alt-delete", DeleteToNextWordEnd),
+        bind!("ctrl-alt-backspace", DeleteToPreviousSubwordStart),
+        bind!("ctrl-alt-h", DeleteToPreviousSubwordStart),
+        bind!("ctrl-alt-delete", DeleteToNextSubwordEnd),
+        bind!("ctrl-alt-d", DeleteToNextSubwordEnd),
         bind!("cmd-backspace", DeleteToBeginningOfLine),
         bind!("cmd-delete", DeleteToEndOfLine),
+        bind!("ctrl-k", KillToEndOfLine),
+        bind!("ctrl-t", Transpose),
         bind!("left", MoveLeft),
+        bind!("ctrl-b", MoveLeft),
         bind!("right", MoveRight),
+        bind!("ctrl-f", MoveRight),
         bind!("up", MoveUp),
+        bind!("ctrl-p", MoveUp),
         bind!("down", MoveDown),
+        bind!("ctrl-n", MoveDown),
+        bind!("pageup", MovePageUp),
+        bind!("pagedown", MovePageDown),
+        bind!("ctrl-shift-v", MovePageUp),
+        bind!("ctrl-v", MovePageDown),
+        bind!("ctrl-up", MoveToStartOfParagraph),
+        bind!("ctrl-down", MoveToEndOfParagraph),
         bind!("alt-left", MoveToPreviousWordStart),
         bind!("alt-right", MoveToNextWordEnd),
+        bind!("ctrl-alt-left", MoveToPreviousSubwordStart),
+        bind!("ctrl-alt-b", MoveToPreviousSubwordStart),
+        bind!("ctrl-alt-right", MoveToNextSubwordEnd),
+        bind!("ctrl-alt-f", MoveToNextSubwordEnd),
         bind!("cmd-left", MoveToBeginningOfLine),
         bind!("cmd-right", MoveToEndOfLine),
         bind!("home", MoveToBeginningOfLine),
         bind!("end", MoveToEndOfLine),
-        // The emacs pair macOS honours in every text field.
         bind!("ctrl-a", MoveToBeginningOfLine),
         bind!("ctrl-e", MoveToEndOfLine),
         bind!("cmd-up", MoveToBeginning),
         bind!("cmd-down", MoveToEnd),
+        bind!("cmd-home", MoveToBeginning),
+        bind!("cmd-end", MoveToEnd),
+        bind!("ctrl-l", ScrollCursorCenter),
         bind!("shift-left", SelectLeft),
+        bind!("ctrl-shift-b", SelectLeft),
         bind!("shift-right", SelectRight),
+        bind!("ctrl-shift-f", SelectRight),
         bind!("shift-up", SelectUp),
+        bind!("ctrl-shift-p", SelectUp),
         bind!("shift-down", SelectDown),
+        bind!("ctrl-shift-n", SelectDown),
+        bind!("shift-pageup", SelectPageUp),
+        bind!("shift-pagedown", SelectPageDown),
+        bind!("ctrl-shift-up", SelectToStartOfParagraph),
+        bind!("ctrl-shift-down", SelectToEndOfParagraph),
         bind!("alt-shift-left", SelectToPreviousWordStart),
         bind!("alt-shift-right", SelectToNextWordEnd),
+        bind!("ctrl-alt-shift-left", SelectToPreviousSubwordStart),
+        bind!("ctrl-alt-shift-b", SelectToPreviousSubwordStart),
+        bind!("ctrl-alt-shift-right", SelectToNextSubwordEnd),
+        bind!("ctrl-alt-shift-f", SelectToNextSubwordEnd),
         bind!("cmd-shift-left", SelectToBeginningOfLine),
         bind!("cmd-shift-right", SelectToEndOfLine),
         bind!("shift-home", SelectToBeginningOfLine),
         bind!("shift-end", SelectToEndOfLine),
+        bind!("ctrl-shift-a", SelectToBeginningOfLine),
+        bind!("ctrl-shift-e", SelectToEndOfLine),
         bind!("cmd-shift-up", SelectToBeginning),
         bind!("cmd-shift-down", SelectToEnd),
         bind!("cmd-a", SelectAll),
+        bind!("cmd-l", SelectLine),
+        bind!("cmd-d", SelectNext),
         bind!("enter", Newline),
+        bind!("shift-enter", Newline),
         bind!("tab", Indent),
+        bind!("shift-tab", Outdent),
+        bind!("cmd-]", IndentLines),
+        bind!("cmd-[", Outdent),
+        bind!("cmd-/", ToggleComment),
+        bind!("alt-up", MoveLineUp),
+        bind!("alt-down", MoveLineDown),
+        bind!("alt-shift-up", DuplicateLineUp),
+        bind!("alt-shift-down", DuplicateLineDown),
+        bind!("cmd-shift-k", DeleteLine),
+        bind!("ctrl-j", JoinLines),
         bind!("cmd-z", Undo),
         bind!("cmd-shift-z", Redo),
         bind!("cmd-v", Paste),
@@ -198,6 +302,9 @@ const MENU_MAX_WIDTH: f32 = 380.;
 const MENU_GAP: f32 = 4.;
 /// One tab inserts this much, matching the design comp's indented SQL.
 const INDENT: &str = "  ";
+/// The caret's width. Zed's bar is two pixels, and one and a half was a
+/// line the eye lost against a wash.
+const CARET_WIDTH: f32 = 2.;
 /// 12px text on the comp's 1.75 line height.
 const FONT_SIZE: f32 = 12.;
 const LINE_HEIGHT: f32 = 21.;
@@ -325,6 +432,25 @@ pub struct SqlEditor {
     /// Which of the two scrollbars is being dragged, if either.
     scroll_drag: DragState,
     content: String,
+    /// Byte offset where each line of `content` starts. Redone by
+    /// `reindex` on every edit, so a row is a binary search and the line
+    /// count is a length rather than a walk over the buffer per frame.
+    line_starts: Vec<usize>,
+    /// Which lines the buffer's shape-changing statements cover: see
+    /// [`line_shape`]. Read off the text, so it is redone with the index.
+    shape_lines: Vec<Option<bool>>,
+    /// The widest line, in columns, for the scrollable width.
+    widest: usize,
+    /// The column ↑ and ↓ are holding to. A walk down through a short
+    /// line comes back out to where it started, as it does in every
+    /// editor; any other motion or edit forgets it.
+    goal_column: Option<usize>,
+    /// What a drag extends by: the unit the click that started it took.
+    select_mode: SelectMode,
+    /// The line ⌘C copied with nothing selected, while it is still what
+    /// the clipboard holds: pasting it back puts a line above the caret's
+    /// rather than splitting the caret's line, as Zed does.
+    line_clip: Option<String>,
     placeholder: SharedString,
     vocabulary: Arc<Vocabulary>,
     selected_range: Range<usize>,
@@ -406,6 +532,16 @@ impl Blinking for SqlEditor {
     }
 }
 
+/// The unit a click selected, and so the unit a drag from it extends by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelectMode {
+    Character,
+    /// A double click: the word it took, which the drag never gives up.
+    Word(Range<usize>),
+    /// A triple click: likewise the line.
+    Line(Range<usize>),
+}
+
 #[derive(Clone)]
 struct Snapshot {
     content: String,
@@ -421,13 +557,44 @@ enum EditKind {
     Delete,
 }
 
+/// One shaped line, and the map between the buffer's bytes and what was
+/// shaped: a tab is one byte and several columns.
+struct LineLayout {
+    shaped: ShapedLine,
+    tabs: Expanded,
+}
+
+impl LineLayout {
+    /// Where byte `ix` of the line sits, from the line's left edge.
+    fn x_for(&self, ix: usize) -> Pixels {
+        self.shaped.x_for_index(self.tabs.to_display(ix))
+    }
+
+    /// The byte of the line nearest to `x`.
+    fn index_for_x(&self, x: Pixels) -> usize {
+        self.tabs.to_buffer(self.shaped.closest_index_for_x(x))
+    }
+}
+
 /// What the last paint produced, kept so mouse hits and IME rectangles can
-/// be answered without shaping the text again.
+/// be answered without shaping the text again. It holds the rows that were
+/// on screen and no others.
 struct EditorLayout {
-    lines: Vec<ShapedLine>,
-    /// Byte offset where each line starts in the buffer.
-    line_starts: Vec<usize>,
+    /// The buffer row `lines[0]` is.
+    first_row: usize,
+    lines: Vec<LineLayout>,
     line_height: Pixels,
+}
+
+impl EditorLayout {
+    fn line(&self, row: usize) -> Option<&LineLayout> {
+        self.lines.get(row.checked_sub(self.first_row)?)
+    }
+
+    /// The rows this layout holds.
+    fn rows(&self) -> Range<usize> {
+        self.first_row..self.first_row + self.lines.len()
+    }
 }
 
 impl SqlEditor {
@@ -436,14 +603,20 @@ impl SqlEditor {
         vocabulary: Arc<Vocabulary>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let content = content.into();
+        let content = display::normalize(&content.into()).into_owned();
         let end = content.len();
-        Self {
+        let mut editor = Self {
             focus_handle: cx.focus_handle(),
             scroll_handle: ScrollHandle::new(),
             h_scroll_handle: ScrollHandle::new(),
             scroll_drag: DragState::default(),
             content,
+            line_starts: Vec::new(),
+            shape_lines: Vec::new(),
+            widest: 0,
+            goal_column: None,
+            select_mode: SelectMode::Character,
+            line_clip: None,
             placeholder: "select * from".into(),
             vocabulary,
             selected_range: end..end,
@@ -468,7 +641,147 @@ impl SqlEditor {
             hits: Vec::new(),
             hits_capped: false,
             found: None,
+        };
+        editor.reindex();
+        editor
+    }
+
+    /// Work out again everything that is read off the text: where its
+    /// lines start, which of them a shape-changing statement covers, and
+    /// how wide the widest is. One walk per edit, in place of one per
+    /// frame for each of them.
+    fn reindex(&mut self) {
+        self.line_starts.clear();
+        self.line_starts.push(0);
+        self.line_starts
+            .extend(self.content.match_indices('\n').map(|(ix, _)| ix + 1));
+        let shape: Vec<Range<usize>> = query::statement_ranges(&self.content)
+            .into_iter()
+            .filter(|range| query::ddl_verb(&self.content[range.clone()]).is_some())
+            .collect();
+        self.shape_lines = line_shape(&self.content, &shape);
+        self.widest = display::widest_line(if self.content.is_empty() {
+            self.placeholder.as_ref()
+        } else {
+            &self.content
+        });
+    }
+
+    fn row_of(&self, offset: usize) -> usize {
+        row_for_offset(&self.line_starts, offset)
+    }
+
+    /// The bytes of one line, without its break.
+    fn line_range(&self, row: usize) -> Range<usize> {
+        let start = self.line_starts.get(row).copied().unwrap_or(0);
+        let end = self
+            .line_starts
+            .get(row + 1)
+            .map(|next| next - 1)
+            .unwrap_or(self.content.len());
+        start..end.max(start)
+    }
+
+    fn line(&self, row: usize) -> &str {
+        &self.content[self.line_range(row)]
+    }
+
+    /// The rows the pane is showing, with a few to spare, read off the
+    /// scroll position the last frame left.
+    fn visible_rows(&self) -> Range<usize> {
+        display::visible_rows(
+            f32::from(-self.scroll_handle.offset().y),
+            f32::from(self.scroll_handle.bounds().size.height),
+            TEXT_PADDING_Y,
+            LINE_HEIGHT,
+            self.line_count(),
+        )
+    }
+
+    /// Put the viewport over the caret, **down and across**, before the
+    /// frame is laid out — so the frame an edit lands in is the frame that
+    /// shows it. Everything here is in the content's own coordinates: a
+    /// row is `LINE_HEIGHT` tall whatever the window is doing.
+    ///
+    /// Answers whether it could: a pane nothing has measured yet has no
+    /// height to scroll within, and `paint` asks for another frame.
+    fn autoscroll(&mut self, center: bool, window: &mut Window) -> bool {
+        let viewport = self.scroll_handle.bounds().size;
+        if viewport.height <= px(0.) {
+            return false;
         }
+        let offset = self.cursor_offset();
+        let row = self.row_of(offset);
+
+        // The editor's padding stays visible above and below the caret,
+        // so it never sits flush against the edge of the pane.
+        let top = px(LINE_HEIGHT * row as f32);
+        let bottom = top + px(LINE_HEIGHT + TEXT_PADDING_Y * 2.);
+        let mut scroll = self.scroll_handle.offset();
+        let at = -scroll.y;
+        let at = if center {
+            top - (viewport.height - px(LINE_HEIGHT)) / 2.
+        } else if top < at {
+            top
+        } else if bottom > at + viewport.height {
+            bottom - viewport.height
+        } else {
+            at
+        };
+        scroll.y = -at.max(px(0.));
+        self.scroll_handle.set_offset(scroll);
+
+        let width = self.h_scroll_handle.bounds().size.width;
+        if width > px(0.) {
+            // One column of slack past the padding, so typing at the end
+            // of a long line slides the view along rather than following
+            // a character late.
+            let left = self.caret_x(row, offset, window);
+            let right = left + px(TEXT_PADDING_X * 2. + CHAR_WIDTH);
+            let mut scroll = self.h_scroll_handle.offset();
+            let at = -scroll.x;
+            let at = if left < at {
+                left
+            } else if right > at + width {
+                right - width
+            } else {
+                at
+            };
+            scroll.x = -at.max(px(0.));
+            self.h_scroll_handle.set_offset(scroll);
+        }
+        true
+    }
+
+    /// How far across its line the caret is. Shaped, not counted: a wide
+    /// character or a fallback font moves it off the column grid.
+    fn caret_x(&self, row: usize, offset: usize, window: &mut Window) -> Pixels {
+        let line = self.line(row);
+        let start = self.line_starts.get(row).copied().unwrap_or(0);
+        let (text, tabs) = Expanded::new(line);
+        let ix = tabs
+            .to_display(offset.saturating_sub(start).min(line.len()))
+            .min(text.len());
+        if ix == 0 || !text.is_char_boundary(ix) {
+            return px(0.);
+        }
+        let run = TextRun {
+            len: ix,
+            font: gpui::font(MONO_FONT_FAMILY),
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        window
+            .text_system()
+            .shape_line(
+                SharedString::from(text[..ix].to_string()),
+                px(FONT_SIZE),
+                &[run],
+                None,
+            )
+            .x_for_index(ix)
     }
 
     pub fn text(&self) -> &str {
@@ -529,18 +842,6 @@ impl SqlEditor {
             })
             .collect();
         cx.notify();
-    }
-
-    /// Where the shape-changing statements of the buffer are, read off the
-    /// text as it is now. Worked out per frame rather than kept, because
-    /// the buffer changes under every keystroke and a kept answer would be
-    /// one edit stale exactly when it is looked at; it costs one walk over
-    /// the text, which `line_count` and `widest_line` already pay.
-    fn shape(&self) -> Vec<Range<usize>> {
-        query::statement_ranges(&self.content)
-            .into_iter()
-            .filter(|range| query::ddl_verb(&self.content[range.clone()]).is_some())
-            .collect()
     }
 
     /// Say how the statement at `ix` ended, and what to write beside it.
@@ -625,7 +926,7 @@ impl SqlEditor {
     }
 
     pub fn line_count(&self) -> usize {
-        self.content.split('\n').count()
+        self.line_starts.len().max(1)
     }
 
     /// The column at the right of the pane that carries each statement's
@@ -642,6 +943,7 @@ impl SqlEditor {
         &self,
         line_marks: &[Option<LineMark>],
         shape_lines: &[Option<bool>],
+        rows: Range<usize>,
         colors: &ThemeColors,
     ) -> Option<Div> {
         // Nothing run and nothing shape-changing in the buffer: no column.
@@ -656,10 +958,13 @@ impl SqlEditor {
                 .flex()
                 .flex_col()
                 .items_end()
-                .children(line_marks.iter().enumerate().map(|(row_ix, on_line)| {
+                .child(row_spacer(rows.start))
+                .children(rows.clone().map(|row_ix| {
+                    let on_line = line_marks.get(row_ix).copied().flatten();
                     let kind = kind_at(shape_lines, row_ix);
                     let first_ddl = shape_lines.get(row_ix).copied().flatten() == Some(true);
                     let row = div()
+                        .flex_none()
                         .h(px(LINE_HEIGHT))
                         .w_full()
                         .flex()
@@ -705,27 +1010,9 @@ impl SqlEditor {
                                 })
                                 .child(meta)
                         }))
-                })),
+                }))
+                .child(row_spacer(self.line_count().saturating_sub(rows.end))),
         )
-    }
-
-    /// The longest line, in characters. The element sizes itself by it, so
-    /// the container around it knows there is something to scroll across to.
-    ///
-    /// Characters, not shaped pixels: the font is monospaced, and measuring
-    /// it exactly would mean shaping every line a second time on every
-    /// frame, before there is a layout to shape into. The placeholder
-    /// counts when the buffer is empty, because that is what is on screen.
-    fn widest_line(&self) -> usize {
-        let text = if self.content.is_empty() {
-            self.placeholder.as_ref()
-        } else {
-            &self.content
-        };
-        text.split('\n')
-            .map(|line| line.chars().count())
-            .max()
-            .unwrap_or(0)
     }
 
     /// Swap in the names of the connected database, so the tokenizer can
@@ -738,7 +1025,8 @@ impl SqlEditor {
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.push_undo(EditKind::None);
         self.edited(cx);
-        self.content = text.into();
+        self.content = display::normalize(&text.into()).into_owned();
+        self.reindex();
         let end = self.content.len();
         self.selected_range = end..end;
         self.selection_reversed = false;
@@ -778,6 +1066,7 @@ impl SqlEditor {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         let offset = clamp_offset(&self.content, offset);
         self.close_completions();
+        self.goal_column = None;
         self.selected_range = offset..offset;
         self.selection_reversed = false;
         // Moving the caret ends the current typing run: undo should stop
@@ -790,6 +1079,7 @@ impl SqlEditor {
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         let offset = clamp_offset(&self.content, offset);
         self.close_completions();
+        self.goal_column = None;
         if self.selection_reversed {
             self.selected_range.start = offset;
         } else {
@@ -843,7 +1133,9 @@ impl SqlEditor {
                 snapshot.selection_reversed,
             ),
         };
+        self.reindex();
         self.found = None;
+        self.goal_column = None;
         self.marked_range = None;
         self.last_edit = EditKind::None;
         self.pending_autoscroll = true;
@@ -890,34 +1182,68 @@ impl SqlEditor {
         motion::next_boundary(&self.content, offset)
     }
 
-    /// One line up or down, keeping the column as close to the current one
-    /// as the target line allows.
-    fn vertical_target(&self, down: bool) -> Option<usize> {
+    /// `rows` lines up or down, holding the column the walk started in.
+    /// Past either end of the buffer it goes to that end, as ↑ on the
+    /// first line goes to the start of it in every macOS field.
+    fn move_vertically(&mut self, rows: isize, select: bool, cx: &mut Context<Self>) {
         let offset = self.cursor_offset();
-        let start = self.line_start(offset);
-        let column = self.content[start..offset].chars().count();
-
-        let target_start = if down {
-            let end = self.line_end(offset);
-            if end == self.content.len() {
-                return None;
-            }
-            end + 1
+        let row = self.row_of(offset);
+        let goal = self
+            .goal_column
+            .unwrap_or_else(|| display::column_of(self.line(row), offset - self.line_starts[row]));
+        let target_row = row as isize + rows;
+        let target = if target_row < 0 {
+            0
+        } else if target_row as usize >= self.line_count() {
+            self.content.len()
         } else {
-            if start == 0 {
-                return None;
-            }
-            self.line_start(start - 1)
+            let target_row = target_row as usize;
+            self.line_starts[target_row] + display::index_at_column(self.line(target_row), goal)
         };
+        if select {
+            self.select_to(target, cx);
+        } else {
+            self.move_to(target, cx);
+        }
+        self.goal_column = Some(goal);
+    }
 
-        let target_end = self.line_end(target_start);
-        Some(
-            self.content[target_start..target_end]
-                .char_indices()
-                .nth(column)
-                .map(|(ix, _)| target_start + ix)
-                .unwrap_or(target_end),
-        )
+    /// How many rows a page key moves: what the pane shows, less one, so
+    /// the last line read is still on screen as the first.
+    fn page_rows(&self) -> isize {
+        let rows = (self.scroll_handle.bounds().size.height / px(LINE_HEIGHT)).floor() as isize;
+        (rows - 1).max(1)
+    }
+
+    /// Set the selection outright, for the gestures that name both ends.
+    fn set_selection(&mut self, range: Range<usize>, reversed: bool, cx: &mut Context<Self>) {
+        self.close_completions();
+        self.goal_column = None;
+        self.selected_range = clamp_range(&self.content, range);
+        self.selection_reversed = reversed && !self.selected_range.is_empty();
+        self.last_edit = EditKind::None;
+        self.pending_autoscroll = true;
+        self.touched(cx);
+    }
+
+    /// A line and the break that ends it: what a triple click, ⌘L and a
+    /// copy with nothing selected all take.
+    fn whole_line(&self, offset: usize) -> Range<usize> {
+        let end = self.line_end(offset);
+        self.line_start(offset)..(end + 1).min(self.content.len())
+    }
+
+    /// Make one of `edit`'s line edits, as one undo step.
+    fn apply(&mut self, edit: Option<edit::Edit>, cx: &mut Context<Self>) {
+        let Some(edit) = edit else {
+            return;
+        };
+        self.last_edit = EditKind::None;
+        self.replace(edit.range, &edit.text, cx);
+        self.last_edit = EditKind::None;
+        self.selected_range = clamp_range(&self.content, edit.selection);
+        self.selection_reversed = false;
+        self.close_completions();
     }
 
     fn offset_from_utf16(&self, target: usize) -> usize {
@@ -960,13 +1286,22 @@ impl SqlEditor {
             return self.cursor_offset();
         };
         if layout.lines.is_empty() {
-            return 0;
+            return self.cursor_offset();
         }
+        // A point past the rows on screen reaches for the nearest of them:
+        // that is the row a drag over the edge is pulling toward, and the
+        // viewport then follows the selection there.
+        let rows = layout.rows();
         let row = ((position.y - bounds.top()) / layout.line_height).floor();
-        let row = (row.max(0.) as usize).min(layout.lines.len() - 1);
-        let line = &layout.lines[row];
-        let local = line.closest_index_for_x(position.x - bounds.left());
-        layout.line_starts[row] + local
+        let row = (row.max(0.) as usize)
+            .clamp(rows.start, rows.end - 1)
+            .min(self.line_count() - 1);
+        let Some(line) = layout.line(row) else {
+            return self.cursor_offset();
+        };
+        let range = self.line_range(row);
+        let local = line.index_for_x(position.x - bounds.left());
+        clamp_offset(&self.content, range.start + local.min(range.len()))
     }
 
     // --- finding text ----------------------------------------------------
@@ -1277,13 +1612,11 @@ impl SqlEditor {
     }
 
     fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
-        let target = self.vertical_target(false).unwrap_or(0);
-        self.move_to(target, cx);
+        self.move_vertically(-1, false, cx);
     }
 
     fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
-        let target = self.vertical_target(true).unwrap_or(self.content.len());
-        self.move_to(target, cx);
+        self.move_vertically(1, false, cx);
     }
 
     fn move_to_previous_word_start(
@@ -1312,7 +1645,7 @@ impl SqlEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let target = self.line_start(self.cursor_offset());
+        let target = motion::smart_line_start(&self.content, self.cursor_offset());
         self.move_to(target, cx);
     }
 
@@ -1340,13 +1673,11 @@ impl SqlEditor {
     }
 
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
-        let target = self.vertical_target(false).unwrap_or(0);
-        self.select_to(target, cx);
+        self.move_vertically(-1, true, cx);
     }
 
     fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
-        let target = self.vertical_target(true).unwrap_or(self.content.len());
-        self.select_to(target, cx);
+        self.move_vertically(1, true, cx);
     }
 
     fn select_to_previous_word_start(
@@ -1375,7 +1706,7 @@ impl SqlEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let target = self.line_start(self.cursor_offset());
+        let target = motion::smart_line_start(&self.content, self.cursor_offset());
         self.select_to(target, cx);
     }
 
@@ -1403,8 +1734,68 @@ impl SqlEditor {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(0, cx);
-        self.select_to(self.content.len(), cx);
+        // No autoscroll: ⌘A is not a request to go to the end of the buffer.
+        self.set_selection(0..self.content.len(), false, cx);
+        self.pending_autoscroll = false;
+    }
+
+    /// ⌘L: the caret's line, break and all — and the next one on each
+    /// further press, as Zed's does.
+    fn select_line(&mut self, _: &SelectLine, _: &mut Window, cx: &mut Context<Self>) {
+        let start = self.line_start(self.selected_range.start);
+        let end = self.whole_line(self.selected_range.end).end;
+        self.set_selection(start..end, false, cx);
+    }
+
+    /// ⌘D: the word under the caret, then the next place that text occurs,
+    /// wrapping. One selection, so it is "find the next one of these"
+    /// rather than Zed's second cursor.
+    fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            let word = motion::word_at(&self.content, self.cursor_offset());
+            self.set_selection(word, false, cx);
+            return;
+        }
+        let needle = &self.content[clamp_range(&self.content, self.selected_range.clone())];
+        let from = self.selected_range.end;
+        let next = self.content[from..]
+            .find(needle)
+            .map(|ix| from + ix)
+            .or_else(|| self.content.find(needle));
+        if let Some(start) = next {
+            self.set_selection(start..start + needle.len(), false, cx);
+        }
+    }
+
+    /// ⎋: drop the selection and keep the caret. With nothing selected the
+    /// key is not the editor's, and goes on to whoever wants it.
+    fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            cx.propagate();
+            return;
+        }
+        self.move_to(self.cursor_offset(), cx);
+    }
+
+    /// Move or select by one of the plain motions over the text.
+    fn go(&mut self, to: fn(&str, usize) -> usize, select: bool, cx: &mut Context<Self>) {
+        let target = to(&self.content, self.cursor_offset());
+        if select {
+            self.select_to(target, cx);
+        } else {
+            self.move_to(target, cx);
+        }
+    }
+
+    /// ⌃L: the caret's line to the middle of the pane.
+    fn scroll_cursor_center(
+        &mut self,
+        _: &ScrollCursorCenter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.autoscroll(true, window);
+        cx.notify();
     }
 
     // --- editing actions -------------------------------------------------
@@ -1462,37 +1853,170 @@ impl SqlEditor {
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
         // Carry the current line's indent onto the new one, the way every
         // editor does; a query indented by hand stays indented.
-        let start = self.line_start(self.cursor_offset());
-        let indent: String = self.content[start..]
+        // Only the indent in front of the caret: a break made inside the
+        // indent must not hand the new line more than the old one had.
+        let caret = self.selected_range.start;
+        let start = self.line_start(caret);
+        let indent: String = self.content[start..caret]
             .chars()
             .take_while(|ch| *ch == ' ' || *ch == '\t')
             .collect();
         self.replace_text_in_range(None, &format!("\n{indent}"), window, cx);
     }
 
+    /// ⇥: an indent at the caret, or — over a selection that reaches a
+    /// second line — an indent in front of every line it touches.
     fn indent(&mut self, _: &Indent, window: &mut Window, cx: &mut Context<Self>) {
-        self.replace_text_in_range(None, INDENT, window, cx);
-    }
-
-    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            // A paste is one undo step, never joined to the typing around it.
-            self.last_edit = EditKind::None;
-            self.replace_text_in_range(None, &text, window, cx);
-            self.last_edit = EditKind::None;
+        let range = self.selected_range.clone();
+        if self.content[clamp_range(&self.content, range.clone())].contains('\n') {
+            self.apply(edit::indent(&self.content, &range, INDENT), cx);
+        } else {
+            self.replace_text_in_range(None, INDENT, window, cx);
         }
     }
 
+    fn indent_lines(&mut self, _: &IndentLines, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply(
+            edit::indent(&self.content, &self.selected_range, INDENT),
+            cx,
+        );
+    }
+
+    fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply(
+            edit::outdent(&self.content, &self.selected_range, INDENT),
+            cx,
+        );
+    }
+
+    fn toggle_comment(&mut self, _: &ToggleComment, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply(
+            edit::toggle_comment(&self.content, &self.selected_range),
+            cx,
+        );
+    }
+
+    fn move_line_up(&mut self, _: &MoveLineUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply(
+            edit::move_lines(&self.content, &self.selected_range, false),
+            cx,
+        );
+    }
+
+    fn move_line_down(&mut self, _: &MoveLineDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply(
+            edit::move_lines(&self.content, &self.selected_range, true),
+            cx,
+        );
+    }
+
+    fn duplicate_line_up(&mut self, _: &DuplicateLineUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply(
+            edit::duplicate_lines(&self.content, &self.selected_range, false),
+            cx,
+        );
+    }
+
+    fn duplicate_line_down(
+        &mut self,
+        _: &DuplicateLineDown,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply(
+            edit::duplicate_lines(&self.content, &self.selected_range, true),
+            cx,
+        );
+    }
+
+    fn delete_line(&mut self, _: &DeleteLine, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply(edit::delete_lines(&self.content, &self.selected_range), cx);
+    }
+
+    fn join_lines(&mut self, _: &JoinLines, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply(edit::join_lines(&self.content, &self.selected_range), cx);
+    }
+
+    fn transpose(&mut self, _: &Transpose, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            self.apply(edit::transpose(&self.content, self.cursor_offset()), cx);
+        }
+    }
+
+    /// ⌃K: cut from the caret to the end of the line — or the break
+    /// itself, when the caret is already there, so repeated presses eat
+    /// the lines below one at a time.
+    fn kill_to_end_of_line(
+        &mut self,
+        _: &KillToEndOfLine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let caret = self.cursor_offset();
+        let mut end = self.line_end(caret);
+        if end == caret {
+            end = self.next_boundary(caret);
+        }
+        if end > caret {
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                self.content[caret..end].to_string(),
+            ));
+            self.line_clip = None;
+        }
+        self.delete_to(end, window, cx);
+    }
+
+    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let text = display::normalize(&text);
+        // A paste is one undo step, never joined to the typing around it,
+        // and it opens no completion panel: the word it ends in was not
+        // typed, and ranking the catalog against it is work nobody asked
+        // for on what may be a thousand lines.
+        self.last_edit = EditKind::None;
+        if self.selected_range.is_empty() && self.line_clip.as_deref() == Some(text.as_ref()) {
+            // A line copied whole goes back in as a line, above the
+            // caret's, and the caret stays in the text it was in.
+            let caret = self.cursor_offset();
+            let at = self.line_start(caret);
+            self.replace(at..at, &text, cx);
+            let caret = caret + text.len();
+            self.selected_range = caret..caret;
+        } else {
+            self.replace(self.selected_range.clone(), &text, cx);
+        }
+        self.last_edit = EditKind::None;
+        self.close_completions();
+    }
+
+    /// ⌘C: the selection — or, with nothing selected, the caret's whole
+    /// line, which is what Zed copies and what makes ⌘C ⌘V duplicate it.
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         let range = clamp_range(&self.content, self.selected_range.clone());
-        if !range.is_empty() {
+        if range.is_empty() {
+            self.copy_line(cx);
+        } else {
+            self.line_clip = None;
             cx.write_to_clipboard(ClipboardItem::new_string(self.content[range].to_string()));
         }
     }
 
+    fn copy_line(&mut self, cx: &mut Context<Self>) {
+        let line = self.line_range(self.row_of(self.cursor_offset()));
+        let text = format!("{}\n", &self.content[line]);
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        self.line_clip = Some(text);
+    }
+
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         let range = clamp_range(&self.content, self.selected_range.clone());
-        if !range.is_empty() {
+        if range.is_empty() {
+            self.copy_line(cx);
+            self.apply(edit::delete_lines(&self.content, &self.selected_range), cx);
+        } else {
+            self.line_clip = None;
             cx.write_to_clipboard(ClipboardItem::new_string(self.content[range].to_string()));
             self.last_edit = EditKind::None;
             self.replace_text_in_range(None, "", window, cx);
@@ -1503,32 +2027,107 @@ impl SqlEditor {
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let offset = self.offset_for_position(event.position);
+        self.is_selecting = true;
         match event.click_count {
-            1 if event.modifiers.shift => self.select_to(offset, cx),
             1 => {
-                self.is_selecting = true;
-                self.move_to(offset, cx);
+                self.select_mode = SelectMode::Character;
+                if event.modifiers.shift {
+                    self.select_to(offset, cx);
+                } else {
+                    self.move_to(offset, cx);
+                }
             }
             2 => {
                 let word = motion::word_at(&self.content, offset);
-                self.move_to(word.start, cx);
-                self.select_to(word.end, cx);
+                self.select_mode = SelectMode::Word(word.clone());
+                self.set_selection(word, false, cx);
+            }
+            3 => {
+                let line = self.whole_line(offset);
+                self.select_mode = SelectMode::Line(line.clone());
+                self.set_selection(line, false, cx);
             }
             _ => {
-                self.move_to(self.line_start(offset), cx);
-                self.select_to(self.line_end(offset), cx);
+                self.is_selecting = false;
+                self.set_selection(0..self.content.len(), false, cx);
             }
         }
+        // A click is not a request to scroll: the row under the pointer is
+        // on screen already, and following the far end of a word or a line
+        // would slide the text out from under the click.
+        self.pending_autoscroll = false;
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        self.is_selecting = false;
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.end_drag(cx);
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn end_drag(&mut self, cx: &mut Context<Self>) {
         if self.is_selecting {
-            self.select_to(self.offset_for_position(event.position), cx);
+            self.is_selecting = false;
+            // The window's listeners are hung while a drag is on; one more
+            // frame takes them down.
+            cx.notify();
         }
+    }
+
+    /// The pointer moved with the button down: carry the selection to it,
+    /// in the unit the click that started the drag took — a drag out of a
+    /// double click grows by words, out of a triple click by lines.
+    fn drag_to(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let offset = self.offset_for_position(position);
+        let (origin, under) = match &self.select_mode {
+            SelectMode::Character => {
+                self.select_to(offset, cx);
+                return;
+            }
+            SelectMode::Word(origin) => (origin.clone(), motion::word_at(&self.content, offset)),
+            SelectMode::Line(origin) => (origin.clone(), self.whole_line(offset)),
+        };
+        // The unit the drag started on is never given up; the caret is at
+        // whichever end the pointer is pulling.
+        if offset < origin.start {
+            self.set_selection(under.start.min(origin.start)..origin.end, true, cx);
+        } else {
+            self.set_selection(origin.start..under.end.max(origin.end), false, cx);
+        }
+    }
+}
+
+impl SqlEditor {
+    /// Put `new_text` where `range` was and leave the caret after it. Every
+    /// edit of the buffer comes through here: it is the one place the undo
+    /// step is taken, the marks are dropped and the line index is redone.
+    fn replace(&mut self, range: Range<usize>, new_text: &str, cx: &mut Context<Self>) {
+        let range = clamp_range(&self.content, range);
+
+        // A newline breaks the undo run, so undo lands on line boundaries
+        // rather than swallowing the whole query. So does replacing a
+        // selection: the selection is part of what undo must bring back.
+        let kind = if !range.is_empty() || new_text.contains('\n') {
+            EditKind::None
+        } else if new_text.is_empty() {
+            EditKind::Delete
+        } else {
+            EditKind::Insert
+        };
+        self.push_undo(kind);
+        self.last_edit = kind;
+        // The marks name byte ranges in the text that was run, and this
+        // moves that text. A tick beside a line the user has rewritten
+        // would say the wrong thing about the wrong statement.
+        self.edited(cx);
+
+        self.content.replace_range(range.clone(), new_text);
+        self.reindex();
+        let cursor = range.start + new_text.len();
+        self.selected_range = cursor..cursor;
+        self.selection_reversed = false;
+        self.goal_column = None;
+        self.marked_range.take();
+        self.pending_autoscroll = true;
+        self.close_completions();
+        self.touched(cx);
     }
 }
 
@@ -1574,44 +2173,16 @@ impl EntityInputHandler for SqlEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = clamp_range(
-            &self.content,
-            range_utf16
-                .as_ref()
-                .map(|range| self.range_from_utf16(range))
-                .or(self.marked_range.clone())
-                .unwrap_or(self.selected_range.clone()),
-        );
-
-        // A newline breaks the undo run, so undo lands on line boundaries
-        // rather than swallowing the whole query. So does replacing a
-        // selection: the selection is part of what undo must bring back.
-        let kind = if !range.is_empty() || new_text.contains('\n') {
-            EditKind::None
-        } else if new_text.is_empty() {
-            EditKind::Delete
-        } else {
-            EditKind::Insert
-        };
-        self.push_undo(kind);
-        self.last_edit = kind;
-        // The marks name byte ranges in the text that was run, and this
-        // moves that text. A tick beside a line the user has rewritten
-        // would say the wrong thing about the wrong statement.
-        self.edited(cx);
-
-        self.content =
-            self.content[..range.start].to_owned() + new_text + &self.content[range.end..];
-        let cursor = range.start + new_text.len();
-        self.selected_range = cursor..cursor;
-        self.selection_reversed = false;
-        self.marked_range.take();
-        self.pending_autoscroll = true;
+        let range = range_utf16
+            .as_ref()
+            .map(|range| self.range_from_utf16(range))
+            .or(self.marked_range.clone())
+            .unwrap_or(self.selected_range.clone());
+        self.replace(range, &display::normalize(new_text), cx);
         // Any edit re-opens the panel that Escape closed: the user is
         // typing a different word now.
         self.completions_dismissed = false;
         self.refresh_completions(false);
-        self.touched(cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -1639,8 +2210,9 @@ impl EntityInputHandler for SqlEditor {
         self.last_edit = EditKind::None;
         self.edited(cx);
 
-        self.content =
-            self.content[..range.start].to_owned() + new_text + &self.content[range.end..];
+        self.content.replace_range(range.clone(), new_text);
+        self.reindex();
+        self.goal_column = None;
         self.marked_range =
             (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
         // The platform reports this selection relative to `new_text`, so
@@ -1671,20 +2243,17 @@ impl EntityInputHandler for SqlEditor {
     ) -> Option<Bounds<Pixels>> {
         let layout = self.last_layout.as_ref()?;
         let range = clamp_range(&self.content, self.range_from_utf16(&range_utf16));
-        let row = row_for_offset(&layout.line_starts, range.start);
-        let line = layout.lines.get(row)?;
-        let line_start = layout.line_starts[row];
+        let row = self.row_of(range.start);
+        let line = layout.line(row)?;
+        let on_row = self.line_range(row);
         // The IME can ask about a range that runs past this line; keep the
         // rectangle on the line the range starts on.
-        let from = range.start.saturating_sub(line_start).min(line.len());
-        let to = range.end.saturating_sub(line_start).min(line.len());
+        let from = range.start.saturating_sub(on_row.start).min(on_row.len());
+        let to = range.end.saturating_sub(on_row.start).min(on_row.len());
         let top = bounds.top() + layout.line_height * row as f32;
         Some(Bounds::from_corners(
-            point(bounds.left() + line.x_for_index(from), top),
-            point(
-                bounds.left() + line.x_for_index(to),
-                top + layout.line_height,
-            ),
+            point(bounds.left() + line.x_for(from), top),
+            point(bounds.left() + line.x_for(to), top + layout.line_height),
         ))
     }
 
@@ -1710,14 +2279,28 @@ impl Render for SqlEditor {
         // Focus belongs to the window, and this is the one place that has
         // one, so the blink is started and stopped from the edge here
         // rather than from a focus listener the constructor cannot install.
-        self.track_blink_focus(self.focus_handle.is_focused(window), cx);
+        let focused = self.focus_handle.is_focused(window);
+        self.track_blink_focus(focused, cx);
+        // Before anything is laid out, so this frame is the one that shows
+        // the caret where the edit left it. A pane nothing has measured
+        // yet keeps the request, and `paint` asks for the frame after.
+        if self.pending_autoscroll && self.autoscroll(false, window) {
+            self.pending_autoscroll = false;
+        }
         let line_count = self.line_count();
+        // Only these rows get a gutter number, a rail and a statistic: a
+        // row per line of a long script was most of what a frame cost.
+        let rows = self.visible_rows();
         let line_marks = line_marks(&self.content, &self.statements);
-        let shape_lines = line_shape(&self.content, &self.shape());
+        let shape_lines = self.shape_lines.clone();
+        // The line the caret is on, while it is a bare caret: its number
+        // is inked, and the element washes the line behind it.
+        let active_row =
+            (focused && self.selected_range.is_empty()).then(|| self.row_of(self.cursor_offset()));
         // How wide the text is, and so how far there is to scroll. The
         // element inside fills this box; the box is what the scroll
         // container measures.
-        let text_width = TEXT_PADDING_X * 2. + self.widest_line() as f32 * CHAR_WIDTH;
+        let text_width = TEXT_PADDING_X * 2. + (self.widest + 1) as f32 * CHAR_WIDTH;
         // The hits are read off the buffer and the line as they are now, so
         // an edit under an open strip is searched again on the next frame.
         (self.hits, self.hits_capped) = match &self.find {
@@ -1739,22 +2322,74 @@ impl Render for SqlEditor {
             .key_context(key_context)
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
+            .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::delete_to_previous_word_start))
             .on_action(cx.listener(Self::delete_to_next_word_end))
             .on_action(cx.listener(Self::delete_to_beginning_of_line))
             .on_action(cx.listener(Self::delete_to_end_of_line))
+            .on_action(
+                cx.listener(|this, _: &DeleteToPreviousSubwordStart, window, cx| {
+                    let to = motion::previous_subword_start(&this.content, this.cursor_offset());
+                    this.delete_to(to, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &DeleteToNextSubwordEnd, window, cx| {
+                let to = motion::next_subword_end(&this.content, this.cursor_offset());
+                this.delete_to(to, window, cx);
+            }))
+            .on_action(cx.listener(Self::kill_to_end_of_line))
+            .on_action(cx.listener(Self::transpose))
             .on_action(cx.listener(Self::move_left))
             .on_action(cx.listener(Self::move_right))
             .on_action(cx.listener(Self::move_up))
             .on_action(cx.listener(Self::move_down))
+            .on_action(cx.listener(|this, _: &MovePageUp, _, cx| {
+                this.move_vertically(-this.page_rows(), false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &MovePageDown, _, cx| {
+                this.move_vertically(this.page_rows(), false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectPageUp, _, cx| {
+                this.move_vertically(-this.page_rows(), true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectPageDown, _, cx| {
+                this.move_vertically(this.page_rows(), true, cx)
+            }))
             .on_action(cx.listener(Self::move_to_previous_word_start))
             .on_action(cx.listener(Self::move_to_next_word_end))
+            .on_action(cx.listener(|this, _: &MoveToPreviousSubwordStart, _, cx| {
+                this.go(motion::previous_subword_start, false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &MoveToNextSubwordEnd, _, cx| {
+                this.go(motion::next_subword_end, false, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &SelectToPreviousSubwordStart, _, cx| {
+                    this.go(motion::previous_subword_start, true, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &SelectToNextSubwordEnd, _, cx| {
+                this.go(motion::next_subword_end, true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &MoveToStartOfParagraph, _, cx| {
+                this.go(motion::start_of_paragraph, false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &MoveToEndOfParagraph, _, cx| {
+                this.go(motion::end_of_paragraph, false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectToStartOfParagraph, _, cx| {
+                this.go(motion::start_of_paragraph, true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectToEndOfParagraph, _, cx| {
+                this.go(motion::end_of_paragraph, true, cx)
+            }))
             .on_action(cx.listener(Self::move_to_beginning_of_line))
             .on_action(cx.listener(Self::move_to_end_of_line))
             .on_action(cx.listener(Self::move_to_beginning))
             .on_action(cx.listener(Self::move_to_end))
+            .on_action(cx.listener(Self::scroll_cursor_center))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
             .on_action(cx.listener(Self::select_up))
@@ -1766,8 +2401,19 @@ impl Render for SqlEditor {
             .on_action(cx.listener(Self::select_to_beginning))
             .on_action(cx.listener(Self::select_to_end))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::select_line))
+            .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::indent))
+            .on_action(cx.listener(Self::indent_lines))
+            .on_action(cx.listener(Self::outdent))
+            .on_action(cx.listener(Self::toggle_comment))
+            .on_action(cx.listener(Self::move_line_up))
+            .on_action(cx.listener(Self::move_line_down))
+            .on_action(cx.listener(Self::duplicate_line_up))
+            .on_action(cx.listener(Self::duplicate_line_down))
+            .on_action(cx.listener(Self::delete_line))
+            .on_action(cx.listener(Self::join_lines))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::paste))
@@ -1781,10 +2427,13 @@ impl Render for SqlEditor {
             .on_action(cx.listener(Self::find_action))
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_previous))
+            // The press is the pane's; everything after it is the
+            // window's, hung by the element while a drag is on — the
+            // pointer leaves the pane on the way to the line it is
+            // reaching for, and a listener bound here would go deaf.
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
             .w_full()
             .flex_1()
             .min_h(px(0.))
@@ -1853,7 +2502,9 @@ impl Render for SqlEditor {
                             .text_color(colors.line_number)
                             .flex()
                             .flex_col()
-                            .children((1..=line_count).map(|n| {
+                            .child(row_spacer(rows.start))
+                            .children(rows.clone().map(|row| {
+                                let n = row + 1;
                                 let on_line = line_marks.get(n - 1).copied().flatten();
                                 let mark = on_line
                                     .filter(|mark| mark.first)
@@ -1864,6 +2515,7 @@ impl Render for SqlEditor {
                                 // from the numbers to the far edge.
                                 let ddl = kind_at(&shape_lines, n - 1) == StatementKind::Ddl;
                                 div()
+                                    .flex_none()
                                     .h(px(LINE_HEIGHT))
                                     .flex()
                                     .items_center()
@@ -1886,8 +2538,16 @@ impl Render for SqlEditor {
                                             .children(mark),
                                     )
                                     .child(div().flex_1())
-                                    .child(div().flex_none().child(n.to_string()))
-                            })),
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .when(active_row == Some(row) && !ddl, |number| {
+                                                number.text_color(colors.text_secondary)
+                                            })
+                                            .child(n.to_string()),
+                                    )
+                            }))
+                            .child(row_spacer(line_count.saturating_sub(rows.end))),
                     )
                     .child(
                         // The rail. It is a column of its own rather than a
@@ -1903,7 +2563,8 @@ impl Render for SqlEditor {
                             .py(px(TEXT_PADDING_Y))
                             .flex()
                             .flex_col()
-                            .children((0..line_count).map(|row| {
+                            .child(row_spacer(rows.start))
+                            .children(rows.clone().map(|row| {
                                 let kind = kind_at(&shape_lines, row);
                                 // A shape-changing statement nobody has
                                 // run yet already wears its rail, in the
@@ -1916,12 +2577,13 @@ impl Render for SqlEditor {
                                     .map(|mark| mark.status)
                                     .or((kind == StatementKind::Ddl)
                                         .then_some(StatementStatus::Queued));
-                                let line = div().h(px(LINE_HEIGHT));
+                                let line = div().flex_none().h(px(LINE_HEIGHT));
                                 match status {
                                     Some(status) => line.bg(rail_color(kind, status, &colors)),
                                     None => line,
                                 }
-                            })),
+                            }))
+                            .child(row_spacer(line_count.saturating_sub(rows.end))),
                     )
                     .child(
                         div()
@@ -1955,7 +2617,7 @@ impl Render for SqlEditor {
                                     }),
                             ),
                     )
-                    .children(self.statistics_column(&line_marks, &shape_lines, &colors)),
+                    .children(self.statistics_column(&line_marks, &shape_lines, rows, &colors)),
             )
             // The bars are painted outside the containers they drive, or
             // they would scroll away with the text. Both appear only when
@@ -2026,8 +2688,10 @@ impl SqlEditor {
             .bg(colors.elevated)
             .border_1()
             .border_color(colors.border_strong)
-            .rounded(px(8.))
-            .shadow_md()
+            // The rows are 6px round and sit 4px in, so the panel is 10:
+            // the two curves stay one shape at the corner.
+            .rounded(px(ui::SURFACE_RADIUS))
+            .shadow(ui::surface_shadow(cx))
             .text_size(px(12.))
             .children(self.completions.iter().enumerate().map(|(ix, completion)| {
                 let selected = ix == self.completion_ix;
@@ -2042,7 +2706,7 @@ impl SqlEditor {
                     .gap(px(12.))
                     .px(px(8.))
                     .py(px(4.))
-                    .rounded(px(5.))
+                    .rounded(px(6.))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _event, window, cx| {
                         this.apply_completion(ix, window, cx)
@@ -2093,6 +2757,13 @@ impl SqlEditor {
                     .child("↩ or ⇥ to insert · esc to dismiss"),
             )
     }
+}
+
+/// The room `rows` lines take, with nothing in it: what stands in for the
+/// rows above and below the ones on screen, so the columns beside the text
+/// stay as tall as the buffer and scroll with it.
+fn row_spacer(rows: usize) -> Div {
+    div().flex_none().h(px(LINE_HEIGHT * rows as f32))
 }
 
 /// What one line of the buffer wears: which statement of the last run
@@ -2369,12 +3040,6 @@ struct PrepaintState {
     layout: Option<EditorLayout>,
     quads: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
-    /// Top of the caret's line in window coordinates, so paint can pull
-    /// the viewport back over it.
-    cursor_top: Option<Pixels>,
-    /// The caret's left edge, likewise: a line long enough to scroll is a
-    /// line the caret can walk off the right of.
-    cursor_left: Option<Pixels>,
 }
 
 impl IntoElement for EditorElement {
@@ -2428,35 +3093,53 @@ impl Element for EditorElement {
         let style = window.text_style();
         let line_height = window.line_height();
         let font_size = style.font_size.to_pixels(window.rem_size());
+        let focused = editor.focus_handle.is_focused(window);
 
         let placeholder = editor.content.is_empty();
-        let text = if placeholder {
-            editor.placeholder.to_string()
-        } else {
-            editor.content.clone()
-        };
         let text_color = if placeholder {
             colors.text_faint
         } else {
             style.color
         };
 
-        let mut lines = Vec::new();
-        let mut line_starts = Vec::new();
-        let mut offset = 0;
-        for line in text.split('\n') {
-            line_starts.push(offset);
-            let underline = underline_for(editor, offset, line.len());
-            let runs = if placeholder {
-                single_run(line, style.font(), text_color, underline)
+        // The rows the scroll containers leave in view, read off the clip
+        // they set: these bounds are the whole buffer's, and shaping the
+        // whole buffer is what made a long one slow.
+        let clip = window.content_mask().bounds;
+        let rows = display::visible_rows(
+            f32::from(clip.top() - bounds.top()),
+            f32::from(clip.size.height),
+            0.,
+            f32::from(line_height),
+            editor.line_count(),
+        );
+
+        let squiggle = UnderlineStyle {
+            color: Some(colors.error),
+            thickness: px(1.),
+            wavy: true,
+        };
+        let mut lines = Vec::with_capacity(rows.len());
+        for row in rows.clone() {
+            let on_row = editor.line_range(row);
+            let line = if placeholder {
+                editor.placeholder.split('\n').next().unwrap_or("")
             } else {
-                let marks = marks_on_line(&editor.diagnostics, offset, line.len());
-                let squiggle = UnderlineStyle {
-                    color: Some(colors.error),
-                    thickness: px(1.),
-                    wavy: true,
-                };
-                split_spans(highlight::spans(line, &editor.vocabulary), &marks)
+                &editor.content[on_row.clone()]
+            };
+            let (text, tabs) = Expanded::new(line);
+            let underline = underline_for(editor, on_row.start, on_row.len());
+            let runs = if placeholder {
+                single_run(&text, style.font(), text_color, underline)
+            } else {
+                // The marks are the buffer's bytes; the runs are the
+                // shaped text's.
+                let marks: Vec<Range<usize>> =
+                    marks_on_line(&editor.diagnostics, on_row.start, on_row.len())
+                        .into_iter()
+                        .map(|mark| tabs.to_display(mark.start)..tabs.to_display(mark.end))
+                        .collect();
+                split_spans(highlight::spans(&text, &editor.vocabulary), &marks)
                     .into_iter()
                     .map(|(range, token, marked)| TextRun {
                         len: range.len(),
@@ -2471,50 +3154,69 @@ impl Element for EditorElement {
                     })
                     .collect()
             };
-            lines.push(window.text_system().shape_line(
-                SharedString::from(line.to_string()),
-                font_size,
-                &runs,
-                None,
-            ));
-            offset += line.len() + 1;
+            lines.push(LineLayout {
+                shaped: window.text_system().shape_line(
+                    SharedString::from(text.into_owned()),
+                    font_size,
+                    &runs,
+                    None,
+                ),
+                tabs,
+            });
         }
 
         let layout = EditorLayout {
+            first_row: rows.start,
             lines,
-            line_starts,
             line_height,
         };
 
-        let (quads, cursor, cursor_top, cursor_left) = if placeholder {
-            (Vec::new(), None, None, None)
+        let (quads, cursor) = if placeholder {
+            // An empty buffer still has a caret: it is where the typing
+            // will go, and a pane with none reads as one that is not
+            // listening.
+            (
+                Vec::new(),
+                cursor_quad(editor, &layout, bounds, colors.accent),
+            )
         } else {
-            let offset = editor.cursor_offset();
-            let row = row_for_offset(&layout.line_starts, offset);
-            let column = layout
-                .lines
-                .get(row)
-                .map(|line| line.x_for_index(offset - layout.line_starts[row]))
-                .unwrap_or_default();
-            let mut quads = wash_quads(editor, &layout, bounds, &colors);
-            quads.extend(selection_quads(editor, &layout, bounds, colors.selection));
+            let mut quads = Vec::new();
+            if focused && editor.selected_range.is_empty() {
+                quads.extend(active_line_quad(
+                    editor,
+                    &layout,
+                    bounds,
+                    clip,
+                    colors.active_line,
+                ));
+            }
+            quads.extend(wash_quads(editor, &layout, bounds, &colors));
+            quads.extend(range_quads(
+                &editor.selected_range,
+                editor,
+                &layout,
+                bounds,
+                colors.selection,
+            ));
             // Over the selection, because the hit the walk stands on *is*
             // the selection, and it has to read as the current hit rather
-            // than as text the user happened to mark.
-            for hit in &editor.hits {
+            // than as text the user happened to mark. Only the hits that
+            // reach the rows on screen: a buffer can hold ten thousand.
+            let on_screen = editor.line_range(layout.first_row).start
+                ..editor.line_range(layout.rows().end.saturating_sub(1)).end;
+            for hit in editor
+                .hits
+                .iter()
+                .filter(|hit| hit.start <= on_screen.end && hit.end >= on_screen.start)
+            {
                 let color = if *hit == editor.selected_range {
                     colors.find_current
                 } else {
                     colors.find_hit
                 };
-                quads.extend(range_quads(hit, &layout, bounds, color));
+                quads.extend(range_quads(hit, editor, &layout, bounds, color));
             }
-            (
-                quads,
-                cursor_quad(editor, &layout, bounds, colors.accent),
-                Some(bounds.top() + line_height * row as f32),
-                Some(bounds.left() + column),
-            )
+            (quads, cursor_quad(editor, &layout, bounds, colors.accent))
         };
 
         if !editor.completions.is_empty() {
@@ -2525,8 +3227,6 @@ impl Element for EditorElement {
             layout: Some(layout),
             quads,
             cursor,
-            cursor_top,
-            cursor_left,
         }
     }
 
@@ -2555,20 +3255,21 @@ impl Element for EditorElement {
             .layout
             .take()
             .expect("prepaint always builds a layout");
-        for (row, line) in layout.lines.iter().enumerate() {
+        for (ix, line) in layout.lines.iter().enumerate() {
             let origin = point(
                 bounds.left(),
-                bounds.top() + layout.line_height * row as f32,
+                bounds.top() + layout.line_height * (layout.first_row + ix) as f32,
             );
-            line.paint(
-                origin,
-                layout.line_height,
-                gpui::TextAlign::Left,
-                None,
-                window,
-                cx,
-            )
-            .ok();
+            line.shaped
+                .paint(
+                    origin,
+                    layout.line_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                )
+                .ok();
         }
 
         if focus_handle.is_focused(window)
@@ -2577,18 +3278,53 @@ impl Element for EditorElement {
             window.paint_quad(cursor);
         }
 
-        let line_height = layout.line_height;
-        let following = self.editor.read(cx).pending_autoscroll;
-        let follow = prepaint.cursor_top.filter(|_| following);
-        let follow_x = prepaint.cursor_left.filter(|_| following);
+        let (selecting, unscrolled) = {
+            let editor = self.editor.read(cx);
+            (
+                editor.is_selecting,
+                // `render` could not follow the caret because nothing had
+                // measured the pane. This paint has, so ask once more.
+                editor.pending_autoscroll && editor.scroll_handle.bounds().size.height > px(0.),
+            )
+        };
+
+        // A drag is the window's for as long as it lasts: the pointer
+        // leaves the pane on the way to the line it is reaching for, and
+        // the release may land anywhere.
+        if selecting {
+            let editor = self.editor.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                editor.update(cx, |editor, cx| {
+                    if !editor.is_selecting {
+                        return;
+                    }
+                    // A move with no button held is a release nothing here
+                    // heard about; it must not leave the buffer selecting.
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        editor.drag_to(event.position, cx);
+                    } else {
+                        editor.end_drag(cx);
+                    }
+                });
+            });
+            let editor = self.editor.clone();
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
+                if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
+                    editor.update(cx, |editor, cx| editor.end_drag(cx));
+                }
+            });
+        }
 
         self.editor.update(cx, |editor, _| {
             editor.last_layout = Some(layout);
             editor.last_bounds = Some(bounds);
         });
 
-        if follow.is_some() || follow_x.is_some() {
-            self.follow_cursor(follow, follow_x, line_height, window, cx);
+        if unscrolled {
+            window.refresh();
         }
     }
 }
@@ -2606,25 +3342,20 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (offset, row) = {
-            let editor = self.editor.read(cx);
-            let offset = editor.cursor_offset();
-            (offset, row_for_offset(&layout.line_starts, offset))
-        };
-        let Some(line) = layout.lines.get(row) else {
-            return;
-        };
         // Anchor to the start of the word, so the popup lines up with what
         // it is completing rather than drifting right as the user types.
-        let anchor = {
+        let (row, anchor) = {
             let editor = self.editor.read(cx);
-            editor.completion_range.start.min(offset)
+            let offset = editor.cursor_offset();
+            let row = editor.row_of(offset);
+            let on_row = editor.line_range(row);
+            let anchor = editor.completion_range.start.min(offset);
+            (row, anchor.saturating_sub(on_row.start).min(on_row.len()))
         };
-        let x = line.x_for_index(
-            anchor
-                .saturating_sub(layout.line_starts[row])
-                .min(line.len()),
-        );
+        let Some(line) = layout.line(row) else {
+            return;
+        };
+        let x = line.x_for(anchor);
 
         let mut menu = self.editor.update(cx, |editor, cx| {
             editor.completions_menu(cx).into_any_element()
@@ -2646,78 +3377,6 @@ impl EditorElement {
             .max(px(0.));
 
         window.defer_draw(menu, point(x, y), 1, None);
-    }
-
-    /// Pull the viewport back over the caret after it moved out of sight,
-    /// **down and across**: the caret walks off the right of a long line as
-    /// readily as off the bottom of a long buffer.
-    ///
-    /// A new offset only takes effect on the next frame, so ask for one —
-    /// and only when something actually moved, or the editor would refresh
-    /// itself for ever.
-    fn follow_cursor(
-        &self,
-        cursor_top: Option<Pixels>,
-        cursor_left: Option<Pixels>,
-        line_height: Pixels,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let (rows, columns) = {
-            let editor = self.editor.read(cx);
-            (editor.scroll_handle.clone(), editor.h_scroll_handle.clone())
-        };
-        let mut moved = false;
-
-        let viewport = rows.bounds();
-        if let Some(cursor_top) = cursor_top
-            && viewport.size.height > px(0.)
-        {
-            // Keep the editor's padding visible above and below the caret,
-            // so it never sits flush against the edge of the pane.
-            let above = cursor_top - px(TEXT_PADDING_Y);
-            let below = cursor_top + line_height + px(TEXT_PADDING_Y);
-            let mut offset = rows.offset();
-            if above < viewport.top() {
-                offset.y += viewport.top() - above;
-            } else if below > viewport.bottom() {
-                offset.y -= below - viewport.bottom();
-            }
-            offset.y = offset.y.min(px(0.));
-            if offset.y != rows.offset().y {
-                rows.set_offset(offset);
-                moved = true;
-            }
-        }
-
-        let viewport = columns.bounds();
-        if let Some(cursor_left) = cursor_left
-            && viewport.size.width > px(0.)
-        {
-            // A caret sitting exactly on the right edge is a caret the user
-            // cannot see, so it keeps the text padding beside it as well —
-            // and one column of slack, so typing at the end of a long line
-            // slides the view along rather than following a character late.
-            let left = cursor_left - px(TEXT_PADDING_X);
-            let right = cursor_left + px(TEXT_PADDING_X);
-            let mut offset = columns.offset();
-            if left < viewport.left() {
-                offset.x += viewport.left() - left;
-            } else if right > viewport.right() {
-                offset.x -= right - viewport.right();
-            }
-            offset.x = offset.x.min(px(0.));
-            if offset.x != columns.offset().x {
-                columns.set_offset(offset);
-                moved = true;
-            }
-        }
-
-        self.editor
-            .update(cx, |editor, _| editor.pending_autoscroll = false);
-        if moved {
-            window.refresh();
-        }
     }
 }
 
@@ -2831,15 +3490,16 @@ fn wash_quads(
     bounds: Bounds<Pixels>,
     colors: &ThemeColors,
 ) -> Vec<PaintQuad> {
-    let shape_lines = line_shape(&editor.content, &editor.shape());
+    let shape_lines = &editor.shape_lines;
     if editor.statements.is_empty() && shape_lines.iter().all(Option::is_none) {
         return Vec::new();
     }
-    line_marks(&editor.content, &editor.statements)
-        .into_iter()
-        .enumerate()
-        .filter_map(|(row, mark)| {
-            let kind = kind_at(&shape_lines, row);
+    let marks = line_marks(&editor.content, &editor.statements);
+    layout
+        .rows()
+        .filter_map(|row| {
+            let mark = marks.get(row).copied().flatten();
+            let kind = kind_at(shape_lines, row);
             // A shape-changing statement is washed before any run, in the
             // queued state; a plain one only once a run has marked it.
             let status = match (mark, kind) {
@@ -2865,41 +3525,60 @@ fn wash_quads(
         .collect()
 }
 
-fn selection_quads(
+/// The wash behind the caret's line, the width of the pane rather than of
+/// the text: it is the row that is marked, however far the text is
+/// scrolled across.
+fn active_line_quad(
+    editor: &SqlEditor,
+    layout: &EditorLayout,
+    bounds: Bounds<Pixels>,
+    clip: Bounds<Pixels>,
+    color: Hsla,
+) -> Option<PaintQuad> {
+    let row = editor.row_of(editor.cursor_offset());
+    layout.line(row)?;
+    let top = bounds.top() + layout.line_height * row as f32;
+    Some(fill(
+        Bounds::from_corners(
+            point(clip.left().min(bounds.left() - px(TEXT_PADDING_X)), top),
+            point(
+                clip.right().max(bounds.right() + px(TEXT_PADDING_X)),
+                top + layout.line_height,
+            ),
+        ),
+        color,
+    ))
+}
+
+/// The blocks behind one range of the buffer, a block per line it covers
+/// of the lines on screen.
+fn range_quads(
+    range: &Range<usize>,
     editor: &SqlEditor,
     layout: &EditorLayout,
     bounds: Bounds<Pixels>,
     color: Hsla,
 ) -> Vec<PaintQuad> {
-    range_quads(&editor.selected_range, layout, bounds, color)
-}
-
-/// The blocks behind one range of the buffer, a block per line it covers.
-fn range_quads(
-    range: &Range<usize>,
-    layout: &EditorLayout,
-    bounds: Bounds<Pixels>,
-    color: Hsla,
-) -> Vec<PaintQuad> {
-    if range.is_empty() {
+    if range.is_empty() || layout.lines.is_empty() {
         return Vec::new();
     }
-    // Only the lines the range reaches: a buffer can carry thousands of
-    // hits, and a walk over every line for each of them is a frame nobody
-    // gets to see.
-    let first = row_for_offset(&layout.line_starts, range.start);
-    let last = row_for_offset(&layout.line_starts, range.end);
+    let rows = layout.rows();
+    let first = editor.row_of(range.start).max(rows.start);
+    let last = editor.row_of(range.end).min(rows.end - 1);
     let mut quads = Vec::new();
-    for (row, line) in layout.lines.iter().enumerate().take(last + 1).skip(first) {
-        let start = layout.line_starts[row];
-        let end = start + line.len();
+    for row in first..=last {
+        let Some(line) = layout.line(row) else {
+            continue;
+        };
+        let on_row = editor.line_range(row);
+        let (start, end) = (on_row.start, on_row.end);
         let from = range.start.clamp(start, end);
         let to = range.end.clamp(start, end);
         // A line whose break is inside the selection gets a sliver of
         // trailing highlight, so a multi-line selection reads as one block
         // instead of ragged stripes.
         let trailing = if range.start <= end && range.end > end {
-            px(4.)
+            px(CHAR_WIDTH)
         } else {
             px(0.)
         };
@@ -2909,9 +3588,9 @@ fn range_quads(
         let top = bounds.top() + layout.line_height * row as f32;
         quads.push(fill(
             Bounds::from_corners(
-                point(bounds.left() + line.x_for_index(from - start), top),
+                point(bounds.left() + line.x_for(from - start), top),
                 point(
-                    bounds.left() + line.x_for_index(to - start) + trailing,
+                    bounds.left() + line.x_for(to - start) + trailing,
                     top + layout.line_height,
                 ),
             ),
@@ -2921,28 +3600,31 @@ fn range_quads(
     quads
 }
 
+/// The caret, at the end of the selection that moves. It is painted with
+/// a selection as well as without one: the selection says what is marked,
+/// and only the caret says which end the next ⇧→ will carry.
 fn cursor_quad(
     editor: &SqlEditor,
     layout: &EditorLayout,
     bounds: Bounds<Pixels>,
     color: Hsla,
 ) -> Option<PaintQuad> {
-    // A selection paints its own block; the off half of the blink simply
-    // has no caret to paint.
-    if !editor.selected_range.is_empty() || !editor.blink.on() {
+    // The off half of the blink simply has no caret to paint.
+    if !editor.blink.on() {
         return None;
     }
     let offset = editor.cursor_offset();
-    let row = row_for_offset(&layout.line_starts, offset);
-    let line = layout.lines.get(row)?;
-    let x = line.x_for_index(offset.saturating_sub(layout.line_starts[row]));
+    let row = editor.row_of(offset);
+    let line = layout.line(row)?;
+    let on_row = editor.line_range(row);
+    let x = line.x_for(offset.saturating_sub(on_row.start).min(on_row.len()));
     Some(fill(
         Bounds::new(
             point(
                 bounds.left() + x,
                 bounds.top() + layout.line_height * row as f32,
             ),
-            size(px(1.5), layout.line_height),
+            size(px(CARET_WIDTH), layout.line_height),
         ),
         color,
     ))
