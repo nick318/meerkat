@@ -33,7 +33,7 @@ var (
 // version is the version of this build. It mirrors `version` in the
 // workspace Cargo.toml, which `env!("CARGO_PKG_VERSION")` read in the Rust;
 // bump the two together.
-const version = "0.1.6"
+const version = "0.1.7"
 
 // Channel is where a build came from, and so where its updates come from.
 type Channel int
