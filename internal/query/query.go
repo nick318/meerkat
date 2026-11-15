@@ -94,9 +94,9 @@ const (
 // all, because [Statements] hands such a body over whole.
 func TransactionVerb(statement string) (TxVerb, bool) {
 	body := skipLeadingComments(statement)
-	words := strings.FieldsFunc(body, func(c rune) bool {
+	words := leadingFields(body, func(c rune) bool {
 		return unicode.IsSpace(c) || c == ';'
-	})
+	}, 2)
 	if len(words) == 0 {
 		return 0, false
 	}
@@ -845,11 +845,39 @@ func endOfDollarQuoted(bytes []byte, start int) (int, bool) {
 
 // firstWord is `split(pred).find(|w| !w.is_empty())`.
 func firstWord(body string, pred func(rune) bool) (string, bool) {
-	words := strings.FieldsFunc(body, pred)
+	words := leadingFields(body, pred, 1)
 	if len(words) == 0 {
 		return "", false
 	}
 	return words[0], true
+}
+
+// leadingFields is the first `n` of `strings.FieldsFunc(body, pred)`, read
+// no further than the end of the last of them. The verb readers want a
+// word or two off the front of a statement, and splitting the whole of it
+// to get them cost a walk and a slice of every word in a statement that
+// can be a megabyte long — once per statement on every edit, for the
+// editor's shape-change marks.
+func leadingFields(body string, pred func(rune) bool, n int) []string {
+	var words []string
+	start := -1
+	for i, c := range body {
+		if pred(c) {
+			if start >= 0 {
+				words = append(words, body[start:i])
+				if len(words) == n {
+					return words
+				}
+				start = -1
+			}
+		} else if start < 0 {
+			start = i
+		}
+	}
+	if start >= 0 {
+		words = append(words, body[start:])
+	}
+	return words
 }
 
 // asciiLower is `str::to_ascii_lowercase`: only `A`–`Z` change.

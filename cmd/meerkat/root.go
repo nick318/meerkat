@@ -149,6 +149,9 @@ func (r *Root) release() {
 	if r.screen.workspace != nil {
 		r.screen.workspace.release()
 	}
+	if r.screen.connections != nil {
+		r.screen.connections.release()
+	}
 }
 
 func (r *Root) onConnectionsEvent(_ *Connections, event ConnectionsEvent) {
@@ -156,6 +159,7 @@ func (r *Root) onConnectionsEvent(_ *Connections, event ConnectionsEvent) {
 	if !ok {
 		return
 	}
+	r.release()
 	r.screen = r.workspaceScreen(TargetProfile{Profile: open.Profile})
 	r.window.Invalidate()
 }

@@ -61,6 +61,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -524,8 +525,16 @@ type SqlEditor struct {
 	// Which lines the buffer's shape-changing statements cover: see
 	// [lineShape]. Read off the text, so it is redone with the index.
 	shapeLines []shapeMark
+	// Whether any line is in `shapeLines`, so a frame need not look.
+	anyShape bool
 	// The widest line, in columns, for the scrollable width.
 	widest int
+	// Whether the buffer is all ASCII, and otherwise (when it is valid
+	// UTF-8) the UTF-16 offset each line starts at: the two things that
+	// keep a UTF-16 offset from being a walk over the whole buffer.
+	// Redone with the index.
+	ascii     bool
+	lineUTF16 []int
 	// The column ↑ and ↓ are holding to. A walk down through a short
 	// line comes back out to where it started, as it does in every
 	// editor; any other motion or edit forgets it. Nil is `None`.
@@ -569,6 +578,15 @@ type SqlEditor struct {
 	// them. So **every edit drops them**, rather than paint a tick
 	// beside a line the user has since rewritten.
 	statements []StatementMark
+	// statementsRev counts every change to `statements`, so the gutter's
+	// per-line marks can be kept from one frame to the next rather than
+	// worked out again on every frame (see cachedLineMarks).
+	statementsRev uint64
+	// marksCache is what lineMarks last answered, for `marksContent`
+	// at `marksRev`.
+	marksCache   []*lineMark
+	marksContent string
+	marksRev     uint64
 	// What the last syntax check found, if anything. Empty is both
 	// "nothing is wrong" and "nobody has checked since the last edit",
 	// and the editor need not tell them apart: it paints marks, and there
@@ -588,6 +606,9 @@ type SqlEditor struct {
 	hits []Range
 	// The strip stopped counting at `find_bar::MAX_HITS`.
 	hitsCapped bool
+	// The last search, kept while the buffer and the needle are the
+	// ones it was made over (see searchCapped).
+	hitMemo hitMemo
 	// The selection the find walk put there, while it is still the
 	// selection.
 	//
@@ -607,10 +628,26 @@ type SqlEditor struct {
 	// told at the end of the edit that caused it.
 	listeners      []func(*SqlEditor, SqlEditorEvent)
 	pendingChanged bool
-	// Go port: mygo's `Shape` caches nothing; the lines shaped for the
-	// last paint, by their text, so a line that did not change is not
-	// shaped again on the next frame.
-	shapes map[string]*shapedLine
+	// Go port: mygo's `Shape` caches nothing; the lines of the last paint
+	// (and of the caret's line), by their expanded text, so a line that
+	// did not change is neither tokenized nor shaped again on the next
+	// frame. See layout.go.
+	lines map[string]*lineCache
+}
+
+// lineCacheFor is the kept state of one expanded line, made if no frame
+// kept it.
+func (e *SqlEditor) lineCacheFor(text string) *lineCache {
+	font := editorFont()
+	if lc := e.lines[text]; lc != nil && lc.font == font {
+		return lc
+	}
+	lc := newLineCache(text, font)
+	if e.lines == nil {
+		e.lines = map[string]*lineCache{}
+	}
+	e.lines[text] = lc
+	return lc
 }
 
 // findStrip is the open find strip. What it found is not kept here — see
@@ -673,20 +710,42 @@ const (
 // lineLayout is one shaped line, and the map between the buffer's bytes
 // and what was shaped: a tab is one byte and several columns.
 type lineLayout struct {
+	// What is painted: the whole line shaped, or — for a long line on the
+	// mono grid — the window of it around the clip. See layout.go.
 	shaped *shapedLine
-	tabs   Expanded
+	// Where `shaped`'s x = 0 sits from the line's left edge: the window's
+	// first column for a grid line, nothing otherwise.
+	paintX float32
+	// The expanded text, and its grid when it is placed on one: a grid
+	// line's positions are arithmetic, not a walk over glyphs.
+	text string
+	grid *gridLine
+	tabs Expanded
 	// Go port: the runs the line was shaped with (GPUI's `TextRun`s),
-	// in shaped-text offsets, for the paint to colour and underline.
+	// in shaped-text offsets, for the paint to colour and underline. For
+	// a long line, only the runs that reach the glyphs painted.
 	runs []textRun
+}
+
+// displayX is where offset `d` of the expanded text sits from the line's
+// left edge.
+func (l *lineLayout) displayX(d int) float32 {
+	if l.grid != nil {
+		return l.grid.xForIndex(l.text, d)
+	}
+	return l.shaped.xForIndex(d)
 }
 
 // xFor is where byte `ix` of the line sits, from the line's left edge.
 func (l *lineLayout) xFor(ix int) float32 {
-	return l.shaped.xForIndex(l.tabs.ToDisplay(ix))
+	return l.displayX(l.tabs.ToDisplay(ix))
 }
 
 // indexForX is the byte of the line nearest to `x`.
 func (l *lineLayout) indexForX(x float32) int {
+	if l.grid != nil {
+		return l.tabs.ToBuffer(l.grid.closestIndexForX(l.text, x))
+	}
 	return l.tabs.ToBuffer(l.shaped.closestIndexForX(x))
 }
 
@@ -740,9 +799,46 @@ func New(content string, vocabulary *Vocabulary) *SqlEditor {
 func (e *SqlEditor) reindex() {
 	e.lineStarts = e.lineStarts[:0]
 	e.lineStarts = append(e.lineStarts, 0)
+	// The same walk measures the lines: one that is ASCII with no tab is
+	// as many columns wide as it is long, and only the others are
+	// counted a character at a time (`widestLine`'s rule).
+	var high byte
+	widest, start, plain := 0, 0, true
+	columns := func(end int) int {
+		if plain {
+			return end - start
+		}
+		return columnOf(e.content[start:end], end-start)
+	}
 	for ix := 0; ix < len(e.content); ix++ {
-		if e.content[ix] == '\n' {
+		b := e.content[ix]
+		high |= b
+		switch {
+		case b == '\n':
+			widest = max(widest, columns(ix))
 			e.lineStarts = append(e.lineStarts, ix+1)
+			start, plain = ix+1, true
+		case b == '\t' || b >= utf8.RuneSelf:
+			plain = false
+		}
+	}
+	widest = max(widest, columns(len(e.content)))
+	// What the UTF-16 offsets the platform speaks in need: nothing for
+	// an ASCII buffer, where they are the byte offsets, and otherwise
+	// where each line starts in UTF-16.
+	e.ascii = high < utf8.RuneSelf
+	e.lineUTF16 = e.lineUTF16[:0]
+	if !e.ascii && utf8.ValidString(e.content) {
+		utf16n := 0
+		for row, start := range e.lineStarts {
+			e.lineUTF16 = append(e.lineUTF16, utf16n)
+			end := len(e.content)
+			if row+1 < len(e.lineStarts) {
+				end = e.lineStarts[row+1]
+			}
+			for _, ch := range e.content[start:end] {
+				utf16n += utf16Len(ch)
+			}
 		}
 	}
 	var shape []Range
@@ -751,11 +847,12 @@ func (e *SqlEditor) reindex() {
 			shape = append(shape, Range(r))
 		}
 	}
-	e.shapeLines = lineShape(e.content, shape)
+	e.shapeLines = lineShapeAt(e.lineStarts, shape)
+	e.anyShape = len(shape) > 0
 	if e.content == "" {
 		e.widest = widestLine(e.placeholder)
 	} else {
-		e.widest = widestLine(e.content)
+		e.widest = widest
 	}
 }
 
@@ -846,7 +943,10 @@ func (e *SqlEditor) autoscroll(center bool) bool {
 }
 
 // caretX is how far across its line the caret is. Shaped, not counted: a
-// wide character or a fallback font moves it off the column grid.
+// wide character or a fallback font moves it off the column grid. The
+// line is the one the paint keeps (see layout.go), so a caret moving
+// along an unchanged line shapes nothing, and a long line on the grid is
+// never shaped for it at all.
 func (e *SqlEditor) caretX(row, offset int) float32 {
 	line := e.line(row)
 	start := 0
@@ -858,7 +958,7 @@ func (e *SqlEditor) caretX(row, offset int) float32 {
 	if ix == 0 || !isCharBoundary(text, ix) {
 		return 0.
 	}
-	return shapeLine(text[:ix], editorFont()).xForIndex(ix)
+	return e.lineCacheFor(text).xForIndex(ix)
 }
 
 func (e *SqlEditor) Text() string {
@@ -916,6 +1016,7 @@ func (e *SqlEditor) SetStatements(ranges []Range, offset int) {
 			Meta:   "queued",
 		})
 	}
+	e.statementsRev++
 }
 
 // SetStatementStatus says how the statement at `ix` ended, and what to
@@ -928,6 +1029,7 @@ func (e *SqlEditor) SetStatementStatus(ix int, status StatementStatus, meta stri
 	}
 	e.statements[ix].Status = status
 	e.statements[ix].Meta = meta
+	e.statementsRev++
 }
 
 // SetStatementMeta rewrites the statistic beside the statement at `ix` and
@@ -949,6 +1051,7 @@ func (e *SqlEditor) SkipStatementsFrom(ix int, meta string) {
 		e.statements[i].Status = StatementSkipped
 		e.statements[i].Meta = meta
 	}
+	e.statementsRev++
 }
 
 // SetDiagnostics takes what a syntax check found. The ranges are byte
@@ -976,6 +1079,7 @@ func (e *SqlEditor) ClearStatements() {
 		return
 	}
 	e.statements = e.statements[:0]
+	e.statementsRev++
 }
 
 func (e *SqlEditor) LineCount() int {
@@ -995,7 +1099,7 @@ func (e *SqlEditor) LineCount() int {
 // has sent gives up no room to a column of nothing.
 func (e *SqlEditor) statisticsColumn(c *ui.Context, marks []*lineMark, shapeLines []shapeMark, rows Range, colors *theme.ThemeColors) {
 	// Nothing run and nothing shape-changing in the buffer: no column.
-	if len(e.statements) == 0 && allNone(shapeLines) {
+	if len(e.statements) == 0 && !e.anyShape {
 		return
 	}
 	ui.Column(c).
@@ -1092,6 +1196,7 @@ func (e *SqlEditor) SetText(text string) {
 func (e *SqlEditor) edited() {
 	e.found = nil
 	e.statements = e.statements[:0]
+	e.statementsRev++
 	e.diagnostics = nil
 	e.pendingChanged = true
 }
@@ -1309,9 +1414,25 @@ func (e *SqlEditor) apply(edit *Edit) {
 	e.closeCompletions()
 }
 
+// offsetFromUTF16 is the byte offset of UTF-16 offset `target`. mygo asks
+// for the selection and the IME's rectangle in UTF-16 on every frame, so
+// this is not a walk over the buffer: an ASCII buffer counts the same in
+// both, and any other is a binary search over the line index and a walk
+// along one line. (A buffer that is not valid UTF-8 keeps the walk from
+// the start, which is what its counts were always made of.)
 func (e *SqlEditor) offsetFromUTF16(target int) int {
-	utf8n, utf16n := 0, 0
-	for _, ch := range e.content {
+	if e.ascii {
+		return min(max(target, 0), len(e.content))
+	}
+	from, utf16n := 0, 0
+	if len(e.lineUTF16) > 0 {
+		row := sort.Search(len(e.lineUTF16), func(i int) bool { return e.lineUTF16[i] > target }) - 1
+		if row > 0 {
+			from, utf16n = e.lineStarts[row], e.lineUTF16[row]
+		}
+	}
+	utf8n := from
+	for _, ch := range e.content[from:] {
 		if utf16n >= target {
 			break
 		}
@@ -1321,9 +1442,19 @@ func (e *SqlEditor) offsetFromUTF16(target int) int {
 	return utf8n
 }
 
+// offsetToUTF16 is the UTF-16 offset of byte offset `target`, by the same
+// index as offsetFromUTF16.
 func (e *SqlEditor) offsetToUTF16(target int) int {
-	utf8n, utf16n := 0, 0
-	for _, ch := range e.content {
+	if e.ascii {
+		return min(max(target, 0), len(e.content))
+	}
+	from, utf16n := 0, 0
+	if len(e.lineUTF16) > 0 && target > 0 {
+		row := e.rowOf(min(target, len(e.content)))
+		from, utf16n = e.lineStarts[row], e.lineUTF16[row]
+	}
+	utf8n := from
+	for _, ch := range e.content[from:] {
 		if utf8n >= target {
 			break
 		}
@@ -1406,7 +1537,7 @@ func (e *SqlEditor) closeFind() {
 		e.lastNeedle = e.find.query.Text()
 		e.find = nil
 	}
-	e.hits = e.hits[:0]
+	e.hits = nil
 	e.focusHandle.Focus()
 }
 
@@ -1424,9 +1555,25 @@ func (e *SqlEditor) search(needle string) []Range {
 	return hits
 }
 
+// searchCapped is every hit of `needle`, up to `find_bar::MAX_HITS`. The
+// strip asks on every frame it is open and each step of the walk asks
+// again, so the answer is kept for the buffer and the needle it was found
+// for: a search walks the buffer once per edit or keystroke in the line,
+// not once per frame. The hits are shared and never written to.
 func (e *SqlEditor) searchCapped(needle string) ([]Range, bool) {
+	if m := &e.hitMemo; m.valid && m.needle == needle && m.content == e.content {
+		return m.hits, m.capped
+	}
 	hits, capped := fuzzy.NewNeedle(needle).FindCapped(e.content, uikit.MaxHits)
-	return fromFuzzy(hits), capped
+	e.hitMemo = hitMemo{content: e.content, needle: needle, hits: fromFuzzy(hits), capped: capped, valid: true}
+	return e.hitMemo.hits, capped
+}
+
+// hitMemo is what searchCapped last found, and in what.
+type hitMemo struct {
+	content, needle string
+	hits            []Range
+	capped, valid   bool
 }
 
 // compareInt is the order `find_bar`'s walk is given over byte offsets.
@@ -1522,7 +1669,6 @@ func (e *SqlEditor) findStripView(c *ui.Context, find *findStrip) {
 		case FindPrevious:
 			e.stepFind(false)
 		}
-		c.Invalidate()
 	}
 	strip.Children(func() {
 		uikit.FindBar(c, "sql-editor-find", find.query, count,
@@ -2361,14 +2507,16 @@ func (e *SqlEditor) View(c *ui.Context) ui.Element {
 	// Focus belongs to the window, and this is the one place that has
 	// one, so the blink is started and stopped from the edge here
 	// rather than from a focus listener the constructor cannot install.
+	// The turns themselves are read in `paint`, from the painter's
+	// clock, so a blink repaints the editor and builds nothing.
 	focused := e.focusHandle.Focused(c)
-	uikit.TrackBlinkFocus(e, focused, c)
+	uikit.NoteBlinkFocus(e, focused)
 	// The hits are read off the buffer and the line as they are now, so
 	// an edit under an open strip is searched again on the next frame.
 	if e.find != nil {
 		e.hits, e.hitsCapped = e.searchCapped(e.find.query.Text())
 	} else {
-		e.hits, e.hitsCapped = e.hits[:0], false
+		e.hits, e.hitsCapped = nil, false
 	}
 
 	// The strip sits over the editor and beside its key context, never
@@ -2405,10 +2553,10 @@ func (e *SqlEditor) editorView(c *ui.Context, colors *theme.ThemeColors, focused
 
 	// The `SqlEditor` key context (and `completing` while the panel is
 	// open). An action run here lands after the find strip above was
-	// built, so ask for one more frame to show it everywhere.
+	// built; mygo builds the view again in the same frame after a key is
+	// taken, so the strip shows it in the frame the key arrived in.
 	if action, ok := uikit.DispatchKeys(editor, e.keyTable()); ok {
 		e.perform(c, action)
-		c.Invalidate()
 	}
 
 	// Before anything is laid out, so this frame is the one that shows
@@ -2421,7 +2569,7 @@ func (e *SqlEditor) editorView(c *ui.Context, colors *theme.ThemeColors, focused
 	// Only these rows get a gutter number, a rail and a statistic: a
 	// row per line of a long script was most of what a frame cost.
 	rows := e.visibleRows()
-	marks := lineMarks(e.content, e.statements)
+	marks := e.cachedLineMarks()
 	shapeLines := e.shapeLines
 	// The line the caret is on, while it is a bare caret: its number
 	// is inked, and the element washes the line behind it.
@@ -2559,7 +2707,7 @@ func (e *SqlEditor) gutterView(c *ui.Context, colors *theme.ThemeColors, rows Ra
 				el.Children(func() {
 					ui.Row(c).Width(markWidth).Shrink(0).Justify(ui.Center).Children(func() {
 						if onLine != nil && onLine.first {
-							statementMark(c, n, onLine.status, colors)
+							statementMark(c, onLine.status, colors)
 						}
 					})
 					ui.Box(c).Grow(1).Basis(0)
@@ -2780,11 +2928,15 @@ func lineStartsOf(content string) []int {
 // Read off the text alone, so it is right before a run and after an edit
 // alike.
 func lineShape(content string, shape []Range) []shapeMark {
-	lines := make([]shapeMark, lineCountOf(content))
+	return lineShapeAt(lineStartsOf(content), shape)
+}
+
+// lineShapeAt is lineShape over a buffer whose lines start at `starts`.
+func lineShapeAt(starts []int, shape []Range) []shapeMark {
+	lines := make([]shapeMark, len(starts))
 	if len(shape) == 0 {
 		return lines
 	}
-	starts := lineStartsOf(content)
 	for _, r := range shape {
 		first := rowForOffset(starts, r.Start)
 		last := max(rowForOffset(starts, max(r.End-1, 0)), first)
@@ -2834,6 +2986,21 @@ func lineMarks(content string, statements []StatementMark) []*lineMark {
 	return marks
 }
 
+// cachedLineMarks is lineMarks for the buffer as it is, kept until the
+// text or the statements change. The gutter, the rail and the wash all
+// ask for it on every frame, and working it out walks the whole buffer
+// and allocates a mark per marked line; the Rust paid that per frame too.
+// Comparing the kept text with the buffer costs nothing while neither has
+// changed: Go compares two strings that share their bytes by pointer.
+func (e *SqlEditor) cachedLineMarks() []*lineMark {
+	if e.marksCache == nil || e.marksRev != e.statementsRev || e.marksContent != e.content {
+		e.marksCache = lineMarks(e.content, e.statements)
+		e.marksContent = e.content
+		e.marksRev = e.statementsRev
+	}
+	return e.marksCache
+}
+
 // washColor is the wash behind a statement's lines, if it wears one.
 //
 // A plain statement is washed only while it is news — running, or
@@ -2873,19 +3040,12 @@ func metaColor(kind StatementKind, status StatementStatus, colors *theme.ThemeCo
 	}
 }
 
-// runningMarkID is the breathing dot's animation id, Rust's
-// `("statement-running", line)`.
-type runningMarkID struct {
-	name string
-	line int
-}
-
 // statementMark is the mark a statement wears in the gutter, on the line
 // its text starts on. Five states, and they have to be told apart at 8
 // pixels: **the shape says which**, not the colour alone — a ring, a dot,
 // a tick, a filled square and a dash, in the same warm family as
 // everything else on this screen.
-func statementMark(c *ui.Context, line int, status StatementStatus, colors *theme.ThemeColors) {
+func statementMark(c *ui.Context, status StatementStatus, colors *theme.ThemeColors) {
 	switch status {
 	// A ring: the outline of the dot it is about to become.
 	case StatementQueued:
@@ -2894,17 +3054,16 @@ func statementMark(c *ui.Context, line int, status StatementStatus, colors *them
 			Radius(markSize/2.).
 			Border(2, colors.RunningBorder.Color())
 	case StatementRunning:
-		dot := ui.Box(c).
+		// The dot is painted by its own `Draw`, which reads the breath
+		// off the painter's clock and asks for repaints: a tone that
+		// moves while nothing else does must not rebuild the whole view
+		// at the display's rate for as long as a statement runs.
+		color := colors.RunningMark.Color()
+		ui.Box(c).
 			Size(markSize, markSize).
-			Radius(markSize / 2.).
-			Background(colors.RunningMark.Color())
-		// Phase-locked to the app's clock, as the run button's breath
-		// is, so the dot does not start over every time a keystroke
-		// rebuilds the editor. It holds still under `reduce_motion`,
-		// which `AnimationDelta` answers for us.
-		delta := uikit.AnimationDelta(c, dot, runningMarkID{"statement-running", line},
-			uikit.NewAnimation(markBreath).RepeatSynced().WithEasing(uikit.PulsatingBetween(0., 1.)))
-		dot.Opacity(1. - markBreathDepth*delta)
+			Draw(func(p *ui.Painter, r ui.Rect) {
+				p.Fill(r, color.Alpha(1.-markBreathDepth*runningBreath(p)), markSize/2.)
+			})
 	case StatementDone:
 		ui.Row(c).
 			Size(markSize+1., markSize+1.).
@@ -2934,6 +3093,31 @@ func statementMark(c *ui.Context, line int, status StatementStatus, colors *them
 			Height(2.).
 			Background(colors.Idle.Color())
 	}
+}
+
+// markBreathFPS is how often the breathing dot is repainted. A tone that
+// takes 1.4 s to go down and back up looks no different at thirty frames
+// a second than at a display's hundred and twenty.
+const markBreathFPS = 30
+
+// runningBreath is how far into its breath the running dot is, 0..1, in
+// the frame being painted, and it asks the painter for the next repaint.
+// The breath is phase-locked to the clock — its phase is the time since
+// the Unix epoch modulo the period — as the run button's is, so the dot
+// never starts over; under reduce motion it holds still at the start and
+// asks for nothing. (`uikit.AnimationDelta`'s arithmetic for a synced
+// repeating animation, read off the painter rather than the view.)
+func runningBreath(p *ui.Painter) float32 {
+	ease := uikit.PulsatingBetween(0., 1.)
+	if p.Preferences().ReduceMotion {
+		return ease(0.)
+	}
+	n := p.Now().UnixNano() % int64(markBreath)
+	if n < 0 {
+		n += int64(markBreath)
+	}
+	p.AnimationFrameRate(markBreathFPS)
+	return ease(float32(time.Duration(n).Seconds()) / float32(markBreath.Seconds()))
 }
 
 // railColor is the rail's colour beside a statement's lines. Queued and
@@ -3107,13 +3291,10 @@ func editorFont() ui.Font {
 }
 
 // monoAdvance is the mono font's fixed advance (docs/tasks/gpui-to-mygo.md
-// §5: every JetBrains Mono glyph has it).
+// §5: every JetBrains Mono glyph has it), asked of the text system once.
 func monoAdvance() float32 {
-	glyphs := ui.Shape("M", editorFont())
-	if len(glyphs) == 0 {
-		return charWidth
-	}
-	return glyphs[0].Advance
+	advance, _ := fontGrid(editorFont())
+	return advance
 }
 
 // paint is the Rust `EditorElement`: its prepaint — the rows the clip
@@ -3134,8 +3315,11 @@ func (e *SqlEditor) paint(p *ui.Painter, bounds ui.Rect, focused bool, colors *t
 	rows := visibleRows(clip.Y-bounds.Y, clip.H, 0., lineHeight, e.LineCount())
 
 	squiggle := underlineStyle{color: &colors.Error, thickness: 1., wavy: true}
-	font := editorFont()
-	shapes := make(map[string]*shapedLine, rows.End-rows.Start)
+	// Across, the clip leaves a stretch of each line in view as well:
+	// a long line is shaped and coloured only there (see layout.go).
+	visLeft, visRight := clip.X-bounds.X-glyphPad, clip.X+clip.W-bounds.X+glyphPad
+	kept := e.lines
+	e.lines = make(map[string]*lineCache, rows.End-rows.Start)
 	lines := make([]lineLayout, 0, rows.End-rows.Start)
 	for row := rows.Start; row < rows.End; row++ {
 		onRow := e.lineRange(row)
@@ -3146,10 +3330,33 @@ func (e *SqlEditor) paint(p *ui.Painter, bounds ui.Rect, focused bool, colors *t
 			line = e.content[onRow.Start:onRow.End]
 		}
 		text, tabs := NewExpanded(line)
+		lc := kept[text]
+		if lc == nil || lc.font != editorFont() {
+			lc = newLineCache(text, editorFont())
+		}
+		e.lines[text] = lc
+		ll := lineLayout{text: text, grid: lc.grid, tabs: tabs}
+		// The stretch of the expanded text worth colouring: the glyphs
+		// this paint walks, and no more.
+		lo, hi := 0, len(text)
+		if g := lc.grid; g != nil {
+			from := toUsize(float32(math.Floor(float64(visLeft / g.advance))))
+			to := toUsize(float32(math.Ceil(float64(visRight / g.advance))))
+			window, column := lc.windowOf(from, to)
+			ll.shaped, ll.paintX = window, float32(column)*g.advance
+			lo, hi = lc.windowFrom, lc.windowTo
+		} else {
+			ll.shaped = lc.whole()
+			if g0, g1 := ll.shaped.visible(visLeft, visRight); g0 > 0 || g1 < len(ll.shaped.glyphs) {
+				lo, hi = len(text), 0
+				for i := g0; i < g1; i++ {
+					lo, hi = min(lo, ll.shaped.index[i]), max(hi, ll.shaped.index[i]+1)
+				}
+			}
+		}
 		underline := e.underlineFor(onRow.Start, onRow.End-onRow.Start)
-		var runs []textRun
 		if placeholder {
-			runs = singleRun(text, textColor, underline)
+			ll.runs = singleRun(text, textColor, underline)
 		} else {
 			// The marks are the buffer's bytes; the runs are the
 			// shaped text's.
@@ -3157,7 +3364,7 @@ func (e *SqlEditor) paint(p *ui.Painter, bounds ui.Rect, focused bool, colors *t
 			for _, mark := range marksOnLine(e.diagnostics, onRow.Start, onRow.End-onRow.Start) {
 				marks = append(marks, Range{tabs.ToDisplay(mark.Start), tabs.ToDisplay(mark.End)})
 			}
-			for _, piece := range splitSpans(spans(text, e.vocabulary), marks) {
+			for _, piece := range splitSpans(spansIn(lc.spansFor(e.vocabulary), lo, hi), marks) {
 				run := textRun{r: piece.Range, color: tokenColor(piece.Token, textColor, colors)}
 				// A squiggle under an IME composition would be two
 				// underlines in one place; the composition is what
@@ -3167,17 +3374,11 @@ func (e *SqlEditor) paint(p *ui.Painter, bounds ui.Rect, focused bool, colors *t
 				} else if piece.Marked {
 					run.underline = &squiggle
 				}
-				runs = append(runs, run)
+				ll.runs = append(ll.runs, run)
 			}
 		}
-		shaped := e.shapes[text]
-		if shaped == nil || shaped.font != font {
-			shaped = shapeLine(text, font)
-		}
-		shapes[text] = shaped
-		lines = append(lines, lineLayout{shaped: shaped, tabs: tabs, runs: runs})
+		lines = append(lines, ll)
 	}
-	e.shapes = shapes
 
 	layout := &editorLayout{
 		firstRow:   rows.Start,
@@ -3185,13 +3386,19 @@ func (e *SqlEditor) paint(p *ui.Painter, bounds ui.Rect, focused bool, colors *t
 		lineHeight: lineHeight,
 	}
 
+	// Where the caret is in its blink, by this frame's clock; the
+	// painter is asked for the repaint of the next turn.
+	caretOn := e.blink.On()
+	if focused {
+		caretOn = e.blink.PaintOn(p)
+	}
 	var quads []quad
 	var cursor *quad
 	if placeholder {
 		// An empty buffer still has a caret: it is where the typing
 		// will go, and a pane with none reads as one that is not
 		// listening.
-		cursor = e.cursorQuad(layout, bounds, colors.Accent)
+		cursor = e.cursorQuad(layout, bounds, colors.Accent, caretOn)
 	} else {
 		if focused && e.selectedRange.IsEmpty() {
 			if q := e.activeLineQuad(layout, bounds, clip, colors.ActiveLine); q != nil {
@@ -3215,7 +3422,7 @@ func (e *SqlEditor) paint(p *ui.Painter, bounds ui.Rect, focused bool, colors *t
 			}
 			quads = append(quads, e.rangeQuads(hit, layout, bounds, color)...)
 		}
-		cursor = e.cursorQuad(layout, bounds, colors.Accent)
+		cursor = e.cursorQuad(layout, bounds, colors.Accent, caretOn)
 	}
 
 	// --- paint ---
@@ -3224,10 +3431,10 @@ func (e *SqlEditor) paint(p *ui.Painter, bounds ui.Rect, focused bool, colors *t
 		p.Fill(q.r, q.color.Color(), 0)
 	}
 
-	metrics := font.Metrics()
+	metrics := editorFont().Metrics()
 	for ix, line := range layout.lines {
 		top := bounds.Y + layout.lineHeight*float32(layout.firstRow+ix)
-		paintLine(p, &line, bounds.X, top, layout.lineHeight, metrics)
+		paintLine(p, &line, bounds.X, top, layout.lineHeight, metrics, visLeft, visRight)
 	}
 
 	if focused && cursor != nil {
@@ -3248,7 +3455,12 @@ func (e *SqlEditor) paint(p *ui.Painter, bounds ui.Rect, focused bool, colors *t
 // paintLine paints one shaped line at `top`, its glyphs centred in the
 // line height as GPUI's `ShapedLine::paint` placed them, each run in its
 // colour and with its underline.
-func paintLine(p *ui.Painter, line *lineLayout, left, top, height float32, metrics ui.FontMetrics) {
+//
+// Only the glyphs whose left edge falls in `visLeft..=visRight` (from the
+// line's left edge) are walked, and they are walked once: consecutive
+// glyphs of one run go to the painter as one slice of the shaped line,
+// never copied. A long line used to be walked whole once per run.
+func paintLine(p *ui.Painter, line *lineLayout, left, top, height float32, metrics ui.FontMetrics, visLeft, visRight float32) {
 	shaped := line.shaped
 	if len(shaped.glyphs) == 0 {
 		return
@@ -3256,39 +3468,82 @@ func paintLine(p *ui.Painter, line *lineLayout, left, top, height float32, metri
 	// GPUI centres the glyphs in the line height (text_system/line.rs,
 	// `padding_top`).
 	baseline := top + (height-metrics.Ascent-metrics.Descent)/2 + metrics.Ascent
+	origin := left + line.paintX
+	g0, g1 := shaped.visible(visLeft-line.paintX, visRight-line.paintX)
+	run, from := -1, g0
+	flush := func(to int) {
+		if run >= 0 && to > from {
+			p.Glyphs(shaped.glyphs[from:to], origin, baseline, line.runs[run].color.Color())
+		}
+	}
+	for i := g0; i < g1; i++ {
+		at := runAt(line.runs, shaped.index[i], run)
+		if at != run {
+			flush(i)
+			run, from = at, i
+		}
+	}
+	flush(g1)
 	for _, run := range line.runs {
-		var glyphs []ui.Glyph
-		for i, g := range shaped.glyphs {
-			if shaped.index[i] >= run.r.Start && shaped.index[i] < run.r.End {
-				glyphs = append(glyphs, g)
-			}
+		u := run.underline
+		if u == nil {
+			continue
 		}
-		if len(glyphs) > 0 {
-			p.Glyphs(glyphs, left, baseline, run.color.Color())
+		color := run.color
+		if u.color != nil {
+			color = *u.color
 		}
-		if u := run.underline; u != nil {
-			color := run.color
-			if u.color != nil {
-				color = *u.color
-			}
-			x0 := left + shaped.xForIndex(run.r.Start)
-			x1 := left + shaped.xForIndex(run.r.End)
-			// GPUI's underline origin (text_system/line.rs).
-			y := baseline + metrics.Descent*0.618
-			if u.wavy {
-				paintWave(p, x0, x1, y, u.thickness, color)
-			} else {
-				p.Fill(ui.Rect{X: x0, Y: y, W: x1 - x0, H: u.thickness}, color.Color(), 0)
-			}
+		x0 := left + line.displayX(run.r.Start)
+		x1 := left + line.displayX(run.r.End)
+		// GPUI's underline origin (text_system/line.rs).
+		y := baseline + metrics.Descent*0.618
+		// Drawn only as far as the clip reaches: a squiggle the width of
+		// a two-hundred-kilobyte line is a point per pixel of it.
+		lo, hi := left+visLeft, left+visRight
+		if u.wavy {
+			paintWave(p, x0, x1, max(x0, lo), min(x1, hi), y, u.thickness, color)
+		} else if a, b := max(x0, lo), min(x1, hi); b >= a {
+			p.Fill(ui.Rect{X: a, Y: y, W: b - a, H: u.thickness}, color.Color(), 0)
 		}
 	}
 }
 
+// runAt is the run that holds offset `ix` of the shaped text, or -1. The
+// runs are in order and never overlap, and the glyphs of a line mostly
+// come in order too, so the run the last glyph was in is asked first.
+func runAt(runs []textRun, ix, hint int) int {
+	if hint >= 0 && hint < len(runs) {
+		if r := runs[hint].r; r.Start <= ix && ix < r.End {
+			return hint
+		}
+		if next := hint + 1; next < len(runs) {
+			if r := runs[next].r; r.Start <= ix && ix < r.End {
+				return next
+			}
+		}
+	}
+	i := sort.Search(len(runs), func(i int) bool { return runs[i].r.End > ix })
+	if i < len(runs) && runs[i].r.Start <= ix {
+		return i
+	}
+	return -1
+}
+
+// spansIn is the spans that reach into `lo..hi` of the line, whole: the
+// colour of the stretch a paint walks, and nothing past it.
+func spansIn(list []span, lo, hi int) []span {
+	i := sort.Search(len(list), func(i int) bool { return list[i].Range.End > lo })
+	j := sort.Search(len(list), func(i int) bool { return list[i].Range.Start >= hi })
+	return list[i:max(j, i)]
+}
+
 // paintWave is GPUI's wavy underline: a box three thicknesses tall with a
 // sine through its middle, a period of sixteen pixels at a thickness of
-// one (the underline shader's `frequency` and `amplitude`).
-func paintWave(p *ui.Painter, x0, x1, y, thickness float32, color theme.Hsla) {
-	if x1 <= x0 {
+// one (the underline shader's `frequency` and `amplitude`). The wave runs
+// `x0..x1` and is drawn over `from..to` of it, at the very points the
+// whole wave would have there, so a clipped squiggle keeps its phase.
+func paintWave(p *ui.Painter, x0, x1, from, to, y, thickness float32, color theme.Hsla) {
+	if x1 <= x0 || to <= from {
 		return
 	}
 	height := thickness * 3.
@@ -3298,13 +3553,14 @@ func paintWave(p *ui.Painter, x0, x1, y, thickness float32, color theme.Hsla) {
 	amplitude := height / (2. * thickness)
 	frequency := float32(math.Pi*3.*float64(thickness)/8.) / height
 	var points [][2]float32
-	for x := x0; ; x += 1. {
-		if x > x1 {
-			x = x1
+	start := x0 + float32(math.Max(math.Floor(float64(from-x0)), 0))
+	for x := start; ; x += 1. {
+		if x > to {
+			x = to
 		}
 		dy := float32(math.Sin(float64((x - x0) * frequency)))
 		points = append(points, [2]float32{x, middle + dy*amplitude})
-		if x >= x1 {
+		if x >= to {
 			break
 		}
 	}
@@ -3424,10 +3680,10 @@ func (e *SqlEditor) underlineFor(lineStart, lineLen int) *underlineStyle {
 // legible over it because the two are far apart in tone.
 func (e *SqlEditor) washQuads(layout *editorLayout, bounds ui.Rect, colors *theme.ThemeColors) []quad {
 	shapeLines := e.shapeLines
-	if len(e.statements) == 0 && allNone(shapeLines) {
+	if len(e.statements) == 0 && !e.anyShape {
 		return nil
 	}
-	marks := lineMarks(e.content, e.statements)
+	marks := e.cachedLineMarks()
 	var out []quad
 	rows := layout.rows()
 	for row := rows.Start; row < rows.End; row++ {
@@ -3519,9 +3775,9 @@ func (e *SqlEditor) rangeQuads(r Range, layout *editorLayout, bounds ui.Rect, co
 // painted with a selection as well as without one: the selection says
 // what is marked, and only the caret says which end the next ⇧→ will
 // carry.
-func (e *SqlEditor) cursorQuad(layout *editorLayout, bounds ui.Rect, color theme.Hsla) *quad {
+func (e *SqlEditor) cursorQuad(layout *editorLayout, bounds ui.Rect, color theme.Hsla, on bool) *quad {
 	// The off half of the blink simply has no caret to paint.
-	if !e.blink.On() {
+	if !on {
 		return nil
 	}
 	offset := e.cursorOffset()
@@ -3543,73 +3799,4 @@ func (e *SqlEditor) cursorQuad(layout *editorLayout, bounds ui.Rect, color theme
 // fromCorners is GPUI's `Bounds::from_corners`.
 func fromCorners(x0, y0, x1, y1 float32) ui.Rect {
 	return ui.Rect{X: x0, Y: y0, W: x1 - x0, H: y1 - y0}
-}
-
-// shapedLine is GPUI's `ShapedLine` for one font: the glyphs and the byte
-// offset each starts at. (The same port as `uikit`'s, which keeps it
-// private to the text field.)
-type shapedLine struct {
-	text   string
-	font   ui.Font
-	glyphs []ui.Glyph
-	// index is the byte offset of each glyph's cluster (GPUI's
-	// `glyph.index`).
-	index []int
-	width float32
-}
-
-func shapeLine(text string, font ui.Font) *shapedLine {
-	l := &shapedLine{text: text, font: font}
-	if text == "" {
-		return l
-	}
-	l.glyphs = ui.Shape(text, font)
-	byteOf := make([]int, 0, len(text)+1)
-	for ix := range text {
-		byteOf = append(byteOf, ix)
-	}
-	byteOf = append(byteOf, len(text))
-	l.index = make([]int, len(l.glyphs))
-	for i, g := range l.glyphs {
-		l.index[i] = byteOf[min(g.Cluster, len(byteOf)-1)]
-		l.width = max(l.width, g.X+g.Advance)
-	}
-	return l
-}
-
-func (l *shapedLine) len() int { return len(l.text) }
-
-// xForIndex is GPUI's `x_for_index`: the x of the first glyph at or past
-// the byte offset, else the line's width.
-func (l *shapedLine) xForIndex(index int) float32 {
-	for i, g := range l.glyphs {
-		if l.index[i] >= index {
-			return g.X
-		}
-	}
-	return l.width
-}
-
-// closestIndexForX is GPUI's `closest_index_for_x`: the character boundary
-// closest to x.
-func (l *shapedLine) closestIndexForX(x float32) int {
-	prevIndex := 0
-	var prevX float32
-	for i, g := range l.glyphs {
-		if g.X >= x {
-			if g.X-x < x-prevX {
-				return l.index[i]
-			}
-			return prevIndex
-		}
-		prevIndex = l.index[i]
-		prevX = g.X
-	}
-	if l.len() == 1 {
-		if x > l.width/2. {
-			return 1
-		}
-		return 0
-	}
-	return l.len()
 }

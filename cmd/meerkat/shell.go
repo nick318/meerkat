@@ -352,6 +352,15 @@ func (s *Shell) release() {
 	}
 	connection := s.connection
 	s.connection = nil
+	// The shell opened its own handle on the local file; the Rust dropped
+	// it with the shell. Left open, every "‹ connections" and every closed
+	// window would leak a database/sql opener goroutine and two file
+	// descriptors. Nothing reads it after this: replies to a released
+	// shell are dropped, and the tabs were written back before it went.
+	if s.store != nil {
+		_ = s.store.Close()
+		s.store = nil
+	}
 	go func() {
 		ctx := context.Background()
 		for _, session := range sessions {

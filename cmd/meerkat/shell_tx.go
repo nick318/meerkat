@@ -32,6 +32,12 @@ func (s *Shell) refreshTransaction(tabID uint64) {
 	if session == nil {
 		return
 	}
+	// The answer is about the session as this run left it. A run started
+	// since may have opened or ended a transaction of its own, and an
+	// answer read while it was out says nothing about where it left
+	// things — so a reply from before the latest run is dropped, and that
+	// run asks again when it lands. (The Rust applied every reply.)
+	generation := tab.generation
 	go func() {
 		if !s.alive() {
 			return
@@ -45,6 +51,9 @@ func (s *Shell) refreshTransaction(tabID uint64) {
 		s.update(func() {
 			tab, ok := s.tabMut(tabID).(*QueryTab)
 			if !ok {
+				return
+			}
+			if tab.generation != generation || tab.session != session {
 				return
 			}
 			if tab.inTransaction != open {
@@ -63,6 +72,17 @@ func (s *Shell) refreshTransaction(tabID uint64) {
 }
 
 // --- transactions -----------------------------------------------------
+
+// commitRolledBack is what the tab says when a `COMMIT` comes back as a
+// rollback. Postgres does that, with no error, to a transaction one of
+// whose statements had failed: everything in it is gone.
+const commitRolledBack = "the transaction had failed, so the server rolled it back instead of committing: nothing was saved"
+
+// rolledBack reads a boundary's command tag: true when the server
+// answered with `ROLLBACK`, whatever was sent.
+func rolledBack(tag string) bool {
+	return tag == "ROLLBACK"
+}
 
 // setTxMode switches which way this tab commits.
 //
@@ -140,8 +160,10 @@ func (s *Shell) endTransaction(how dbclient.TxEnd) {
 		if !s.alive() {
 			return
 		}
-		_, err := flatten(joinTask(func() (struct{}, error) {
-			return struct{}{}, session.EndTransaction(context.Background(), how)
+		// What the server actually did, which is not always what was
+		// asked: the `COMMIT` of a failed transaction rolls it back.
+		did, err := flatten(joinTask(func() (dbclient.TxEnd, error) {
+			return session.EndTransaction(context.Background(), how)
 		}))
 		s.update(func() {
 			tab, ok := s.tabMut(tabID).(*QueryTab)
@@ -154,12 +176,19 @@ func (s *Shell) endTransaction(how dbclient.TxEnd) {
 			if err == nil {
 				tab.inTransaction = false
 				tab.txTally = TxTally{}
-				done := how
+				done := did
 				tab.txDone = &done
+				if how == dbclient.TxEndCommit && did == dbclient.TxEndRollback {
+					// Said out loud: the bar alone would read as the
+					// user's own rollback, and the work they asked to
+					// keep is gone.
+					message := commitRolledBack
+					tab.error = &message
+				}
 				// A shape change the transaction held is decided
 				// with it: permanent, and the sidebar's to show, or
 				// never happened.
-				switch how {
+				switch did {
 				case dbclient.TxEndCommit:
 					if report := tab.schemaReport; report != nil && report.held {
 						report.held = false
@@ -174,6 +203,14 @@ func (s *Shell) endTransaction(how dbclient.TxEnd) {
 				// below is what corrects it.
 				message := err.Error()
 				tab.error = &message
+				// A boundary that failed because the connection is gone
+				// leaves nothing to end: the transaction died with the
+				// backend. The session goes, as a run's does.
+				if tab.session != nil && tab.session.IsClosed() {
+					tab.inTransaction = false
+					tab.txTally = TxTally{}
+					s.endSession(tabID)
+				}
 			}
 			// A boundary is a statement the user ran on this
 			// connection, so the history keeps it: "why did my work

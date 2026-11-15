@@ -159,8 +159,26 @@ func (s *sqliteSession) Begin(ctx context.Context) error {
 	return s.boundary(ctx, "BEGIN")
 }
 
-func (s *sqliteSession) EndTransaction(ctx context.Context, how dbclient.TxEnd) error {
-	return s.boundary(ctx, how.SQL())
+// EndTransaction answers with `how`: SQLite refuses a `COMMIT` it cannot
+// carry out rather than quietly rolling back, so what was asked for is
+// what happened.
+func (s *sqliteSession) EndTransaction(ctx context.Context, how dbclient.TxEnd) (dbclient.TxEnd, error) {
+	if err := s.boundary(ctx, how.SQL()); err != nil {
+		return how, err
+	}
+	return how, nil
+}
+
+// IsClosed is true once `Close` has run. The database is a file on this
+// machine, so there is no peer to vanish underneath an open connection.
+// A run holds the lock for as long as it is out, and a busy session is not
+// a closed one, so it does not wait for the run.
+func (s *sqliteSession) IsClosed() bool {
+	if !s.mu.TryLock() {
+		return false
+	}
+	defer s.mu.Unlock()
+	return s.conn == nil
 }
 
 func (s *sqliteSession) Close(ctx context.Context) {

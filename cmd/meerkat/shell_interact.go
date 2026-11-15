@@ -925,24 +925,23 @@ func (s *Shell) resultHits() ([]resultsgrid.Cell, bool) {
 	memo := find.found
 	sameData := memo != nil && memo.data == data
 	fresh := sameData && memo.needle == needle
-	// A needle that only grew is looked for among the hits it already
-	// has, so typing a word reads the whole result once rather than
-	// once per letter. A capped answer left cells out and cannot be.
-	var refined *FoundCells
-	if sameData && !memo.capped && memo.needle != "" && len(needle) >= len(memo.needle) &&
-		needle[:len(memo.needle)] == memo.needle {
-		pattern := fuzzy.NewNeedle(needle)
-		cells := resultsgrid.RefineCells(data, memo.cells, &pattern)
-		refined = &FoundCells{
-			data:   data,
-			needle: needle,
-			cells:  cells,
-			capped: false,
-		}
-	}
+	// The memo is what makes this cheap: the view asks for the hits on
+	// every frame, so nothing below may run while the memo is current.
+	// (The Rust worked the refinement out eagerly and threw it away when
+	// the memo was fresh — a full re-match per call, twice a frame.)
 	if !fresh {
-		if refined != nil {
-			find.found = refined
+		// A needle that only grew is looked for among the hits it already
+		// has, so typing a word reads the whole result once rather than
+		// once per letter. A capped answer left cells out and cannot be.
+		if sameData && !memo.capped && memo.needle != "" && len(needle) >= len(memo.needle) &&
+			needle[:len(memo.needle)] == memo.needle {
+			pattern := fuzzy.NewNeedle(needle)
+			find.found = &FoundCells{
+				data:   data,
+				needle: needle,
+				cells:  resultsgrid.RefineCells(data, memo.cells, &pattern),
+				capped: false,
+			}
 		} else {
 			find.found = search()
 		}
@@ -1022,9 +1021,11 @@ func (s *Shell) resultFindStrip(c *ui.Context, tabID uint64) (ui.Element, bool) 
 		return ui.Element{}, false
 	}
 	strip := ui.Box(c.Key("result-find-context")).Shrink(0)
+	// No `Invalidate` after the action: a shortcut the strip claims is a
+	// consumed input, and mygo builds the view again in the same frame
+	// for it, so the count already moves with the step.
 	if action, ok := uikit.DispatchKeys(strip, resultFindKeys); ok {
 		s.handleAction(action)
-		c.Invalidate()
 	}
 	find := s.resultFind
 	if find == nil || find.tab != tabID {

@@ -252,3 +252,40 @@ func TestASessionMayBeDroppedOffTheRuntime(t *testing.T) {
 	}
 	mustExecute(t, session.Execute, "SELECT 1")
 }
+
+// --- Extra regression tests for the session API (Tag, EndTransaction,
+// IsClosed). ---
+
+// SQLite refuses a commit it cannot carry out, so what was asked for is
+// what happened; it sends no command tag; and its session is closed only
+// once `Close` has run.
+func TestASqliteSessionAnswersTheSessionAPI(t *testing.T) {
+	ctx := context.Background()
+	conn := openInMemory(t)
+	session, err := conn.OpenSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.IsClosed() {
+		t.Fatal("a fresh session reads as closed")
+	}
+	if tag := mustExecute(t, session.Execute, "SELECT 1").Tag; tag != "" {
+		t.Fatalf("tag = %q, want none", tag)
+	}
+	if err := session.Begin(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := session.EndTransaction(ctx, dbclient.TxEndCommit); err != nil || got != dbclient.TxEndCommit {
+		t.Fatalf("commit: got (%v, %v)", got, err)
+	}
+	if err := session.Begin(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := session.EndTransaction(ctx, dbclient.TxEndRollback); err != nil || got != dbclient.TxEndRollback {
+		t.Fatalf("rollback: got (%v, %v)", got, err)
+	}
+	session.Close(ctx)
+	if !session.IsClosed() {
+		t.Fatal("a closed session does not read as closed")
+	}
+}

@@ -21,27 +21,55 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/nick318/meerkat/internal/releasechannel"
 )
 
-// httpClient is the one HTTP client. A bare GET with a plain user agent — no
-// ids, no query, no cookies: nothing in a request says who is asking.
-// Compression is off because Go would otherwise add an
-// `Accept-Encoding` the Rust client never sent.
+// The updater's deadlines. A check is background work nobody waits for,
+// but the updater refuses a new check while one is out, so a request that
+// stalls for ever (a captive portal, a half-open socket) would end every
+// later check, hourly and manual alike. reqwest's defaults had no timeout
+// either; that was a bug there too.
+const (
+	// dialTimeout and tlsTimeout bound reaching the CDN at all.
+	dialTimeout = 15 * time.Second
+	tlsTimeout  = 15 * time.Second
+	// headerTimeout bounds the wait for an answer once the request is out.
+	headerTimeout = 30 * time.Second
+	// requestTimeout bounds a whole request, body included: room for the
+	// ~10 MB archive on a slow link, and still an end.
+	requestTimeout = 10 * time.Minute
+)
+
+// client is the one HTTP client, shared so its connections are reused
+// rather than one transport (and its idle sockets) left behind per
+// request. A bare GET with a plain user agent — no ids, no query, no
+// cookies: nothing in a request says who is asking. Compression is off
+// because Go would otherwise add an `Accept-Encoding` the Rust client
+// never sent.
+var client = &http.Client{
+	Timeout: requestTimeout,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   tlsTimeout,
+		ResponseHeaderTimeout: headerTimeout,
+		IdleConnTimeout:       90 * time.Second,
+		DisableCompression:    true,
+		ForceAttemptHTTP2:     true,
+	},
+}
+
+// httpClient is the one HTTP client.
 func httpClient() *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			Proxy:              http.ProxyFromEnvironment,
-			DisableCompression: true,
-			ForceAttemptHTTP2:  true,
-		},
-	}
+	return client
 }
 
 // get is the bare GET, with the user agent and nothing else.

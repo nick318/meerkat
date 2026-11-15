@@ -502,14 +502,16 @@ func paletteTables(catalog *introspect.Catalog, needle string) []paletteCandidat
 		return nil
 	}
 	var found []paletteCandidate
+	query := newPalettePathQuery(needle)
 	for _, schema := range catalog.Schemas {
 		for _, table := range schema.Tables {
-			parts := []string{schema.Name, table.Name}
+			probe := [2]string{schema.Name, table.Name}
 			// A bare schema name answers with the tables it holds.
-			aligned, ok := paletteFindPath(parts, needle)
+			aligned, ok := query.locate(probe[:])
 			if !ok {
 				continue
 			}
+			parts := []string{schema.Name, table.Name}
 			named := aligned.named
 			glyph := paletteGlyphTable
 			// A relation says what it is, not how big it is. The
@@ -691,7 +693,36 @@ func paletteFinish(path []string, named int, needle string) (string, bool) {
 //	"dev.ta"      ^hit         ^hit
 //	"dev_sample"  ^hit  (slid out one part, so the whole schema answers)
 func paletteFindPath(parts []string, needle string) (paletteAligned, bool) {
-	typed := strings.Split(needle, ".")
+	return newPalettePathQuery(needle).locate(parts)
+}
+
+// palettePathQuery is a query cut at its dots, with each part compiled
+// into a `fuzzy.Pattern` once. The palette and the sidebar match one
+// query against every relation in the catalog, and compiling the parts
+// per name — which is what `fuzzy.Score` does — cost a pattern and an
+// alignment table per name on every keystroke. Like the patterns it
+// holds, it is for one thread: the UI's.
+type palettePathQuery struct {
+	typed []fuzzy.Pattern
+	// The matches of one alignment, kept until it is known to hold.
+	matches []*fuzzy.Match
+}
+
+func newPalettePathQuery(needle string) *palettePathQuery {
+	parts := strings.Split(needle, ".")
+	q := &palettePathQuery{
+		typed:   make([]fuzzy.Pattern, len(parts)),
+		matches: make([]*fuzzy.Match, len(parts)),
+	}
+	for ix, part := range parts {
+		q.typed[ix] = fuzzy.NewPattern(part)
+	}
+	return q
+}
+
+// locate is paletteFindPath for a query compiled once.
+func (q *palettePathQuery) locate(parts []string) (paletteAligned, bool) {
+	typed := q.typed
 	if len(typed) > len(parts) {
 		return paletteAligned{}, false
 	}
@@ -699,20 +730,24 @@ func paletteFindPath(parts []string, needle string) (paletteAligned, bool) {
 
 	// Innermost alignment first: `task` is a table before it is a schema.
 	for named := flush; named >= 0; named-- {
-		hits := make([][]fuzzy.Range, len(parts))
 		var score int32
 		matched := true
 		for ix, part := range typed {
-			hit := fuzzy.Score(parts[named+ix], part)
+			hit := part.Score(parts[named+ix])
 			if hit == nil {
 				matched = false
 				break
 			}
 			score += hit.Score
-			hits[named+ix] = hit.Ranges
+			q.matches[ix] = hit
 		}
 		if !matched {
 			continue
+		}
+		hits := make([][]fuzzy.Range, len(parts))
+		for ix := range typed {
+			hits[named+ix] = q.matches[ix].Ranges
+			q.matches[ix] = nil
 		}
 		return paletteAligned{
 			hits:  hits,
@@ -748,7 +783,12 @@ type paletteAligned struct {
 // order: an alignment further out first, then the score, then the length
 // of the name.
 func PalettePathRank(parts []string, needle string) (PaletteRank, bool) {
-	aligned, ok := paletteFindPath(parts, needle)
+	return newPalettePathQuery(needle).rank(parts)
+}
+
+// rank is PalettePathRank for a query compiled once.
+func (q *palettePathQuery) rank(parts []string) (PaletteRank, bool) {
+	aligned, ok := q.locate(parts)
 	if !ok {
 		return PaletteRank{}, false
 	}

@@ -667,6 +667,19 @@ func (s *Shell) runActiveQuery() {
 						tab.inTransaction = true
 					case query.TxVerbCommit:
 						tab.inTransaction = false
+						if rolledBack(ran.boundaryTag) {
+							// The transaction had failed, and the
+							// server rolled it back in place of the
+							// commit — with no error, only the tag.
+							// Saying "committed" here would be
+							// silent data loss.
+							done := dbclient.TxEndRollback
+							tab.txDone = &done
+							tab.schemaReport = nil
+							message := commitRolledBack
+							tab.error = &message
+							break
+						}
 						done := dbclient.TxEndCommit
 						tab.txDone = &done
 						// A shape change the transaction was
@@ -732,6 +745,21 @@ func (s *Shell) runActiveQuery() {
 			}
 			s.recordRun(recorded, storage.RunSourceUser, &run)
 			s.reloadOpenHistory()
+			// The session is kept whether the run worked or not — unless
+			// the connection under it is gone: a terminate, a server
+			// restart, a backend a DBA killed, a dropped network. Kept, it
+			// would fail every later run with "conn closed" until the idle
+			// sweep came round. Ended here, after everything above has
+			// had its say, the toolbar says `session ended · a run opens a
+			// new one` and the next run does. Whatever transaction it held
+			// died with the backend. (The Rust kept it; sqlx had no way to
+			// ask.)
+			if tab.session != nil && tab.session.IsClosed() {
+				tab.inTransaction = false
+				tab.txTally = TxTally{}
+				tab.txDone = nil
+				s.endSession(tabID)
+			}
 			s.refreshTransaction(tabID)
 			if oneStatement {
 				s.refreshServerTiming(tabID, generation)
@@ -1386,9 +1414,11 @@ func (s *Shell) runStatements(
 		// of it, which is the number that says *which* of five was the
 		// slow one.
 		sent := time.Now()
-		if !s.alive() {
-			return abandonedRunOutcome()
-		}
+		// The Rust checked the shell was still there before it spawned
+		// the statement. The `s.call` that marked the statement running a
+		// moment ago already answered that, on this goroutine, so a second
+		// hop to the main thread (and the redraw it forces) per statement
+		// would buy nothing.
 		result, err := flatten(joinTask(func() (dbclient.QueryResult, error) {
 			return session.Execute(ctx, statement)
 		}))
@@ -1472,6 +1502,9 @@ func (t *Tally) add(
 	ms uint64,
 ) {
 	t.ran++
+	if _, ok := query.TransactionVerb(statement); ok {
+		t.boundaryTag = result.Tag
+	}
 	if ddl != nil {
 		t.shape.ddl = append(t.shape.ddl, ddlAt{ix: ix, verb: *ddl})
 		t.shape.ms += ms
@@ -1513,11 +1546,12 @@ func (t *Tally) finish(started time.Time) Ran {
 		verb = t.verb.verb
 	}
 	return Ran{
-		result:    t.last,
-		affected:  t.affected,
-		counted:   t.counted,
-		verb:      verb,
-		elapsedMs: uint64(time.Since(started).Milliseconds()),
-		ran:       t.ran,
+		result:      t.last,
+		affected:    t.affected,
+		counted:     t.counted,
+		verb:        verb,
+		elapsedMs:   uint64(time.Since(started).Milliseconds()),
+		ran:         t.ran,
+		boundaryTag: t.boundaryTag,
 	}
 }

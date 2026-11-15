@@ -1193,8 +1193,10 @@ func (s *Shell) runButton(c *ui.Context, tab *QueryTab, colors *theme.ThemeColor
 		breath := uikit.NewAnimation(runBreath).
 			RepeatSynced().
 			WithEasing(uikit.PulsatingBetween(0., 1.))
-		delta := uikit.AnimationDelta(c, button, "run-breath", breath)
-		return button.Background(resting.Blend(ink.Opacity(runBreathDepth * delta)).Color())
+		anim := uikit.StartPaintAnimation(c, button, "run-breath", breath)
+		return breatheFill(button, func(p *ui.Painter) theme.Hsla {
+			return resting.Blend(ink.Opacity(runBreathDepth * anim.Delta(p, runBreathFps)))
+		})
 	}
 	// `landed == 0` is a tab that has never answered, and the first
 	// paint of every window is exactly that: nothing to exhale.
@@ -1202,8 +1204,33 @@ func (s *Shell) runButton(c *ui.Context, tab *QueryTab, colors *theme.ThemeColor
 		return button
 	}
 	settle := uikit.NewAnimation(runSettle).WithEasing(uikit.EaseOutQuint())
-	delta := uikit.AnimationDelta(c, button, fmt.Sprintf("run-settle-%d", tab.landed), settle)
-	return button.Background(resting.Blend(ink.Opacity(runSettleDepth * (1. - delta))).Color())
+	anim := uikit.StartPaintAnimation(c, button, fmt.Sprintf("run-settle-%d", tab.landed), settle)
+	return breatheFill(button, func(p *ui.Painter) theme.Hsla {
+		return resting.Blend(ink.Opacity(runSettleDepth * (1. - anim.Delta(p, 0))))
+	})
+}
+
+// runBreathFps is how often the breath repaints. It is a change of tone
+// over `RUN_BREATH`, 2.6 seconds, and 30 frames a second is as smooth to
+// the eye as the display's 120.
+const runBreathFps = 30
+
+// breatheFill paints the run button's moving fill inside its own `Draw`,
+// from the painter's clock, rather than as the element's background.
+//
+// Go port: GPUI's `with_animation` re-ran the element's closure every
+// frame, and the port's `AnimationDelta` did the same by asking for a
+// frame — a build of the whole shell at the display's rate for as long as
+// a run was out, all to change one button's tone. The view now builds the
+// button once, and the frames the breath and the settle ask for are
+// repaints that paint it again with a new tone. The fill sits inside the
+// 1px border, where the background would have been, and the border the
+// element paints with its background stays as it was.
+func breatheFill(button ui.Element, fill func(p *ui.Painter) theme.Hsla) ui.Element {
+	return button.Draw(func(p *ui.Painter, r ui.Rect) {
+		inner := ui.Rect{X: r.X + 1, Y: r.Y + 1, W: r.W - 2, H: r.H - 2}
+		p.Fill(inner, fill(p).Color(), 6)
+	})
 }
 
 func (s *Shell) queryPane(c *ui.Context, tab *QueryTab, colors *theme.ThemeColors) {

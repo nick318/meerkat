@@ -584,6 +584,11 @@ func catalogRows(
 	needle string,
 ) []CatalogRow {
 	filtering := needle != ""
+	// Compiled once for the whole catalog, not once per name.
+	var query *palettePathQuery
+	if filtering {
+		query = newPalettePathQuery(needle)
+	}
 	var rows []CatalogRow
 	for gi := range groups {
 		group := &groups[gi]
@@ -604,8 +609,8 @@ func catalogRows(
 				}
 				var ranked []rankedEntry
 				for _, entry := range section.entries {
-					path := []string{group.schema, entry.Name()}
-					if rank, ok := PalettePathRank(path, needle); ok {
+					path := [2]string{group.schema, entry.Name()}
+					if rank, ok := query.rank(path[:]); ok {
 						ranked = append(ranked, rankedEntry{rank, entry})
 					}
 				}

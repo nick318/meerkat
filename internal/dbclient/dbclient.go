@@ -388,6 +388,18 @@ type QueryResult struct {
 	// What the server's own completion tag counted. Meaningful only where
 	// `columns` is empty — see the note above.
 	RowsAffected uint64
+	// The statement's command tag, exactly as the server sent it: "SELECT
+	// 5", "UPDATE 3", "COMMIT", "ROLLBACK". "" when the engine sends none
+	// (SQLite), or when the statement never reached its end (a cancel, an
+	// error).
+	//
+	// It is here for the one answer the count cannot give: a `COMMIT` the
+	// user typed inside a transaction that had already failed comes back
+	// with **no error** and the tag `ROLLBACK`, which is how Postgres says
+	// nothing was kept. [Session.EndTransaction] reads the same tag for the
+	// app's own commit. Nothing else should parse it — the count is in
+	// `RowsAffected` and the verb is the app's to read off the SQL.
+	Tag string
 	// Set when the memory cap stopped the read before the server ran out
 	// of rows. `false` means the result is the whole result.
 	Truncated bool
@@ -789,8 +801,8 @@ type Session interface {
 	//
 	// It is **not** `execute`. A transaction boundary is not a run: it has
 	// no result to cap, no timing worth reporting to the user and no
-	// columns to describe — and `execute` would pay a round trip on the
-	// app pool asking the server what columns `COMMIT` returns.
+	// columns to describe — and `execute` would pay a prepare round trip
+	// asking the server what columns `COMMIT` returns.
 	//
 	// The caller must not send this on a session already inside a
 	// transaction. Postgres answers a second `BEGIN` with a warning and
@@ -799,12 +811,32 @@ type Session interface {
 	// corrects it.
 	Begin(ctx context.Context) error
 
-	// EndTransaction ends the transaction this session is in, either way.
+	// EndTransaction ends the transaction this session is in, either way,
+	// and answers with what the server **actually** did.
+	//
+	// The two can differ, and only one way round: a `COMMIT` of a
+	// transaction that has already failed is not refused — Postgres
+	// answers it with no error and the tag `ROLLBACK`, having thrown the
+	// work away. So asking for [TxEndCommit] can come back as
+	// [TxEndRollback], and the app must say "rolled back", not
+	// "committed". An engine that cannot tell answers with `how`.
 	//
 	// Sent whether or not one is open, for the reason [Session.Close]
 	// sends its `ROLLBACK` that way: outside a transaction the server says
 	// so and carries on, which is cheaper than asking first.
-	EndTransaction(ctx context.Context, how TxEnd) error
+	EndTransaction(ctx context.Context, how TxEnd) (TxEnd, error)
+
+	// IsClosed says the session's connection is gone for good: its backend
+	// was terminated, the server restarted, the network dropped, or
+	// [Session.Close] already ran. Every statement on it would fail, so
+	// the app drops the session and the next run opens a new one.
+	//
+	// It sends nothing. A connection whose peer vanished while it sat idle
+	// is not known to be gone until something is sent down it, so this
+	// turns true after the run that found out, not before it. While a run
+	// is out it answers `false`: the connection is busy, and a dead one
+	// is reported by the run itself.
+	IsClosed() bool
 
 	// ServerTiming is what the server says the statement this session ran
 	// **last** cost.
@@ -855,6 +887,13 @@ func (SessionDefaults) RelationExists(context.Context, string) (bool, bool, erro
 
 func (SessionDefaults) ServerTiming(context.Context) (*ServerTiming, error) {
 	return nil, nil
+}
+
+// IsClosed is `false`: an engine that cannot see its connection die has
+// only [Session.Close] to go on, and a driver that has a closed state of
+// its own overrides this.
+func (SessionDefaults) IsClosed() bool {
+	return false
 }
 
 // MaxSessions is how many sessions may be open at once — one pinned

@@ -1704,6 +1704,8 @@ type Ran struct {
 	elapsedMs uint64
 	// How many statements were sent.
 	ran int
+	// See [Tally]'s field of the same name.
+	boundaryTag string
 }
 
 // RunOutcome is what a run hands back: the tab's session, and how the
@@ -1814,6 +1816,11 @@ type Tally struct {
 	verb *tallyVerb
 	// The shape-changing statements so far, handed back on every path.
 	shape Shape
+	// The command tag the last transaction boundary (`COMMIT`, `END`,
+	// `ROLLBACK`…) of the buffer answered with. Postgres answers the
+	// `COMMIT` of a failed transaction with the tag `ROLLBACK` and no
+	// error, and this is the only place that is said.
+	boundaryTag string
 }
 
 // CatalogRow is one row of the sidebar's tree, flattened so the list can

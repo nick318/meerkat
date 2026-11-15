@@ -158,3 +158,87 @@ func PulsatingBetween(lo, hi float32) func(float32) float32 {
 		return lo + normalized*span
 	}
 }
+
+// paintAnimationState is `animationState` for an animation whose delta is
+// read in a `Draw`: only when it started, and under which id.
+type paintAnimationState struct {
+	id    any
+	start time.Time
+}
+
+// PaintAnimation is an animation whose delta is read inside a `Draw`, from
+// the painter's clock, rather than in the view. **A tone that moves while
+// the layout stays still must not rebuild the view to move**: GPUI's
+// `with_animation` asked for a frame and re-ran the element's closure,
+// which in mygo is a build of the whole view at the display's rate. Here
+// the view only notes when the animation started; the drawing computes
+// the delta and asks the painter for repaint-only frames, which paint the
+// elements of the frame before again without building anything.
+//
+// The rules are `AnimationDelta`'s: a change of id starts it over, a
+// synced animation takes its phase from the frame clock modulo the period
+// from the Unix epoch, and under reduce motion it holds its static state —
+// the end of a oneshot, the start of a repeating one — and asks for no
+// frames.
+type PaintAnimation struct {
+	anim  Animation
+	start time.Time
+}
+
+// StartPaintAnimation notes, in the view, when animation a under id on el
+// started — now, the first time it sees that id — and returns what the
+// element's `Draw` reads the delta from with `Delta`.
+func StartPaintAnimation(c *ui.Context, el ui.Element, id any, a Animation) PaintAnimation {
+	st := ui.Local(el, "uikit.paintAnimation", func() *paintAnimationState { return &paintAnimationState{} })
+	if (*st).id != id || (*st).start.IsZero() {
+		**st = paintAnimationState{id: id, start: c.Now()}
+	}
+	return PaintAnimation{anim: a, start: (*st).start}
+}
+
+// Delta is the eased delta, 0..1, at the painter's frame, by the same
+// arithmetic as `AnimationDelta`. While the animation runs it asks the
+// painter for the next repaint at fps frames a second (`AnimationFrame`'s
+// display rate when fps is 0).
+func (pa PaintAnimation) Delta(p *ui.Painter, fps float32) float32 {
+	a := pa.anim
+	easing := a.Easing
+	if easing == nil {
+		easing = Linear
+	}
+	if p.Preferences().ReduceMotion {
+		if a.Oneshot {
+			return easing(1.0)
+		}
+		return easing(0.0)
+	}
+	now := p.Now()
+	var elapsed time.Duration
+	if a.Synced && a.Duration > 0 {
+		n := now.UnixNano() % int64(a.Duration)
+		if n < 0 {
+			n += int64(a.Duration)
+		}
+		elapsed = time.Duration(n)
+	} else {
+		elapsed = now.Sub(pa.start)
+	}
+	delta := float32(elapsed.Seconds()) / float32(a.Duration.Seconds())
+	done := false
+	if delta > 1.0 {
+		if a.Oneshot {
+			done = true
+			delta = 1.0
+		} else {
+			delta = float32(math.Mod(float64(delta), 1.0))
+		}
+	}
+	if !done {
+		if fps > 0 {
+			p.AnimationFrameRate(fps)
+		} else {
+			p.AnimationFrame()
+		}
+	}
+	return easing(delta)
+}

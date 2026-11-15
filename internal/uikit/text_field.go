@@ -194,6 +194,9 @@ type TextField struct {
 	// in view. Written by the paint after every frame.
 	scroll     float32
 	lastLayout *shapedLine
+	// The ghost as last shaped, kept for the reason `lastLayout` is: the
+	// ghost changes far less often than the field is painted.
+	ghostLayout *shapedLine
 	// The line's box, relative to the field's element: the content box
 	// inside the padding and the border.
 	lastBounds  *ui.Rect
@@ -700,8 +703,10 @@ func (f *TextField) View(c *ui.Context) ui.Element {
 	focused := f.focusHandle.Focused(c)
 	// Focus belongs to the window, and this is the one place that has
 	// one, so the blink is started and stopped from the edge here rather
-	// than from a focus listener the constructor cannot install.
-	TrackBlinkFocus(f, focused, c)
+	// than from a focus listener the constructor cannot install. The
+	// turns themselves are read in `paint`, from the painter's clock, so
+	// a blink repaints the field and builds nothing.
+	NoteBlinkFocus(f, focused)
 
 	el := ui.Box(c).
 		Bind(&f.focusHandle).
@@ -808,12 +813,12 @@ func (f *TextField) paint(p *ui.Painter, box ui.Rect, focused bool, colors *them
 		// value is what has to stay in view, and a long suggestion must
 		// not push it out.
 		if !placeholder && !f.masked && f.ghost != "" {
-			ghost := shapeLine(f.ghost, font)
+			ghost := f.shapeGhost(font)
 			p.Glyphs(ghost.glyphs, originX+line.width, baseline, colors.TextFaint.Color())
 		}
 
 		// The off half of the blink simply has no caret to paint.
-		if focused && f.blink.On() {
+		if focused && f.blink.PaintOn(p) {
 			p.Fill(ui.Rect{X: cursorX + originX, Y: bounds.Y, W: 1.5, H: bounds.H}, colors.Accent.Color(), 0)
 		}
 	})
@@ -832,6 +837,16 @@ func (f *TextField) shape(text string, font ui.Font) *shapedLine {
 		return l
 	}
 	return shapeLine(text, font)
+}
+
+// shapeGhost shapes the ghost, reusing the last shape while the ghost
+// and the font are the ones it was shaped from.
+func (f *TextField) shapeGhost(font ui.Font) *shapedLine {
+	if l := f.ghostLayout; l != nil && l.text == f.ghost && l.font == font {
+		return l
+	}
+	f.ghostLayout = shapeLine(f.ghost, font)
+	return f.ghostLayout
 }
 
 // shapedLine is GPUI's `ShapedLine` for one run of one font: the glyphs

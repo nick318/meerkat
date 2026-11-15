@@ -153,11 +153,30 @@ type Match struct {
 
 // Pattern is a query, cut into fragments once so a long list of names is
 // not charged for it per name.
+//
+// **A Pattern is not safe for concurrent use.** Scoring a name lays it
+// out and fills an alignment table, and both live in buffers the pattern
+// keeps from one name to the next, so a list of three thousand names costs
+// three buffers rather than six thousand. Copies of a Pattern share those
+// buffers. Every caller scores on the UI thread, one name at a time; one
+// that wants to score from two goroutines compiles a pattern for each.
 type Pattern struct {
 	chars []typedChar
 	// Whether an upper-case character in the query is a demand. See the
 	// module docs: only a query written in both cases means it.
 	strictCase bool
+	// What scoring a name reuses; nil until the first name is scored.
+	scratch *scratch
+}
+
+// scratch is what one score fills and the next one overwrites: the name
+// laid out, the alignment table, and the places walked back out of it.
+// Nothing in it outlives the call that filled it — a `Match` gets ranges
+// of its own.
+type scratch struct {
+	glyphs []glyph
+	table  []cell
+	places []int
 }
 
 type typedChar struct {
@@ -188,7 +207,7 @@ func NewPattern(query string) Pattern {
 		})
 		opens = false
 	}
-	return Pattern{chars: chars, strictCase: strictCase}
+	return Pattern{chars: chars, strictCase: strictCase, scratch: &scratch{}}
 }
 
 // IsEmpty reports an empty query. An empty query matches everything, so a
@@ -212,8 +231,13 @@ func (p Pattern) Score(name string) *Match {
 	if !p.couldMatch(name) {
 		return nil
 	}
-	laid := newNameLayout(name)
-	return p.align(&laid)
+	work := p.scratch
+	if work == nil {
+		work = &scratch{}
+	}
+	laid := layOut(name, work.glyphs[:0])
+	work.glyphs = laid.chars
+	return p.align(&laid, work)
 }
 
 // Matches reports whether `name` answers this query.
@@ -243,12 +267,15 @@ func (p Pattern) couldMatch(name string) bool {
 // [cell.score] is what it is worth, `none` where no such alignment
 // is legal, and [cell.from] is where the character before it sat, so
 // the ranges can be walked back out.
-func (p Pattern) align(name *nameLayout) *Match {
+func (p Pattern) align(name *nameLayout, work *scratch) *Match {
 	n, m := len(name.chars), len(p.chars)
 	if m > n {
 		return nil
 	}
-	table := make([]cell, n*m)
+	if cap(work.table) < n*m {
+		work.table = make([]cell, n*m)
+	}
+	table := work.table[:n*m]
 	for k := range table {
 		table[k] = cell{score: none, from: 0}
 	}
@@ -327,7 +354,7 @@ func (p Pattern) align(name *nameLayout) *Match {
 	}
 
 	at := end
-	places := make([]int, 0, m)
+	places := work.places[:0]
 	for j := m - 1; j >= 0; j-- {
 		places = append(places, at)
 		if j > 0 {
@@ -337,6 +364,7 @@ func (p Pattern) align(name *nameLayout) *Match {
 	for a, b := 0, len(places)-1; a < b; a, b = a+1, b-1 {
 		places[a], places[b] = places[b], places[a]
 	}
+	work.places = places
 	return &Match{
 		Score:  score,
 		Ranges: name.runs(places, p.chars),
@@ -412,8 +440,10 @@ type glyph struct {
 	bonus int32
 }
 
-func newNameLayout(text string) nameLayout {
-	chars := make([]glyph, 0, len(text))
+// layOut lays a name out into `chars`, a buffer the pattern keeps and
+// appends to from its start, so a list of names fills one buffer rather
+// than allocating one each.
+func layOut(text string, chars []glyph) nameLayout {
 	var before rune
 	hasBefore := false
 	for at, ch := range text {

@@ -956,6 +956,17 @@ func (s *Connections) setFormError(message string) {
 	}
 }
 
+// release closes the screen's handle on the local file. The Rust dropped
+// it with the screen; Go has no drop, so the root calls this whenever it
+// lets the screen go. A probe still in flight finds the store gone and
+// records nothing, which is what a dropped screen did.
+func (s *Connections) release() {
+	if s.store != nil {
+		_ = s.store.Close()
+		s.store = nil
+	}
+}
+
 // FocusHandle is the screen's focus identity (GPUI's `Focusable`).
 func (s *Connections) FocusHandle() *ui.Handle {
 	return &s.focusHandle

@@ -1381,7 +1381,7 @@ func TestASessionOpensAndEndsATransactionOnRequest(t *testing.T) {
 		t.Fatal("not in a transaction across the runs")
 	}
 
-	if err := session.EndTransaction(ctx, dbclient.TxEndRollback); err != nil {
+	if _, err := session.EndTransaction(ctx, dbclient.TxEndRollback); err != nil {
 		t.Fatal(err)
 	}
 	if must(session.InTransaction(ctx)) {
@@ -1399,7 +1399,7 @@ func TestASessionOpensAndEndsATransactionOnRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	execOK(t, session.Execute, "CREATE TEMP TABLE meerkat_manual_kept (id int)")
-	if err := session.EndTransaction(ctx, dbclient.TxEndCommit); err != nil {
+	if _, err := session.EndTransaction(ctx, dbclient.TxEndCommit); err != nil {
 		t.Fatal(err)
 	}
 	if must(session.InTransaction(ctx)) {
@@ -1452,7 +1452,7 @@ func TestASessionReadsTheCatalogItCanSee(t *testing.T) {
 		t.Fatal("the pool does not, until it commits")
 	}
 
-	if err := session.EndTransaction(ctx, dbclient.TxEndRollback); err != nil {
+	if _, err := session.EndTransaction(ctx, dbclient.TxEndRollback); err != nil {
 		t.Fatal(err)
 	}
 	after := must(session.Introspect(ctx))
@@ -1474,10 +1474,10 @@ func TestEndingATransactionThatIsNotOpenIsNotAnError(t *testing.T) {
 	ctx := context.Background()
 	conn := connectTest(t, url, true)
 	session := must(conn.OpenSession(ctx))
-	if err := session.EndTransaction(ctx, dbclient.TxEndCommit); err != nil {
+	if _, err := session.EndTransaction(ctx, dbclient.TxEndCommit); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.EndTransaction(ctx, dbclient.TxEndRollback); err != nil {
+	if _, err := session.EndTransaction(ctx, dbclient.TxEndRollback); err != nil {
 		t.Fatal(err)
 	}
 	// The session is unharmed and still answers questions.
@@ -1939,5 +1939,275 @@ func TestTheServerVersionReadsShort(t *testing.T) {
 	}
 	if got := shortVersion("15.6"); got != "15.6" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// --- Extra regression tests for the session fixes: a check inside a
+// transaction, a commit that rolled back, the cap inside a transaction, a
+// dead session, a transaction whose statement is running, and the columns
+// of an empty result on the session's own connection. ---
+
+// A statement the server refuses to parse aborts the transaction it is
+// parsed in. The check fences itself off with a savepoint, so a squiggle
+// under a typo costs the user nothing they ran since `BEGIN`; and inside
+// a transaction that has already failed it sends nothing at all.
+func TestACheckInsideATransactionLeavesItOpen(t *testing.T) {
+	url := testURL(t)
+	ctx := context.Background()
+	conn := connectTest(t, url, false)
+	session := must(conn.OpenSession(ctx))
+	defer session.Close(ctx)
+
+	execOK(t, session.Execute, "BEGIN")
+	execOK(t, session.Execute, "CREATE TEMP TABLE meerkat_check_tx (id int)")
+	execOK(t, session.Execute, "INSERT INTO meerkat_check_tx VALUES (1)")
+
+	syntax := must(session.Check(ctx, "SELEC 1"))
+	if syntax == nil || syntax.Refusal != dbclient.RefusalSyntax {
+		t.Fatalf("syntax: %+v", syntax)
+	}
+	name := must(session.Check(ctx, "SELECT * FROM meerkat_no_such_table"))
+	if name == nil || name.Refusal != dbclient.RefusalName {
+		t.Fatalf("name: %+v", name)
+	}
+	// The temp table made inside the transaction resolves: the check is
+	// still on the session's own connection, inside its transaction.
+	if got := must(session.Check(ctx, "SELECT * FROM meerkat_check_tx")); got != nil {
+		t.Fatalf("valid: %+v", got)
+	}
+
+	// The transaction survived all three, and so did what it holds.
+	if !must(session.InTransaction(ctx)) {
+		t.Fatal("the check ended the transaction")
+	}
+	count := execOK(t, session.Execute, "SELECT count(*) FROM meerkat_check_tx")
+	wantValue(t, count.Rows[0][0], dbclient.ValueInt(1))
+	// No savepoint is left behind: the commit keeps the work.
+	if got := must(session.EndTransaction(ctx, dbclient.TxEndCommit)); got != dbclient.TxEndCommit {
+		t.Fatalf("the commit came back as %v", got)
+	}
+	count = execOK(t, session.Execute, "SELECT count(*) FROM meerkat_check_tx")
+	wantValue(t, count.Rows[0][0], dbclient.ValueInt(1))
+
+	// A transaction that has already failed: nothing is sent, nothing is
+	// said, and the transaction is still the user's to roll back.
+	execOK(t, session.Execute, "BEGIN")
+	execErr(t, session.Execute, "SELECT no_such_column")
+	if got := must(session.Check(ctx, "SELEC 1")); got != nil {
+		t.Fatalf("a failed transaction answered a check: %+v", got)
+	}
+	if !must(session.InTransaction(ctx)) {
+		t.Fatal("not in a transaction after the check")
+	}
+	execOK(t, session.Execute, "ROLLBACK")
+
+	// Outside a transaction the check is unchanged.
+	if got := must(session.Check(ctx, "SELEC 1")); got == nil {
+		t.Fatal("no syntax error outside a transaction")
+	}
+	execOK(t, session.Execute, "SELECT 1")
+}
+
+// Postgres takes a `COMMIT` of a failed transaction without an error and
+// answers with the tag `ROLLBACK`. The app's own commit reads that tag
+// and says so; a typed one carries it on the result.
+func TestACommitOfAFailedTransactionReportsARollback(t *testing.T) {
+	url := testURL(t)
+	ctx := context.Background()
+	conn := connectTest(t, url, false)
+	session := must(conn.OpenSession(ctx))
+	defer session.Close(ctx)
+
+	// The app's commit, over a transaction that failed.
+	if err := session.Begin(ctx); err != nil {
+		t.Fatal(err)
+	}
+	execOK(t, session.Execute, "CREATE TEMP TABLE meerkat_lost (id int)")
+	execErr(t, session.Execute, "SELECT no_such_column")
+	got, err := session.EndTransaction(ctx, dbclient.TxEndCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != dbclient.TxEndRollback {
+		t.Fatalf("a failed transaction's commit came back as %v", got)
+	}
+	if must(session.InTransaction(ctx)) {
+		t.Fatal("still in a transaction")
+	}
+	execErr(t, session.Execute, "SELECT * FROM meerkat_lost")
+
+	// A healthy commit is a commit.
+	if err := session.Begin(ctx); err != nil {
+		t.Fatal(err)
+	}
+	execOK(t, session.Execute, "CREATE TEMP TABLE meerkat_kept (id int)")
+	if got := must(session.EndTransaction(ctx, dbclient.TxEndCommit)); got != dbclient.TxEndCommit {
+		t.Fatalf("a healthy commit came back as %v", got)
+	}
+	execOK(t, session.Execute, "SELECT * FROM meerkat_kept")
+
+	// A typed `COMMIT` reads the same way, off the result's tag.
+	execOK(t, session.Execute, "BEGIN")
+	execErr(t, session.Execute, "SELECT no_such_column")
+	if tag := execOK(t, session.Execute, "COMMIT").Tag; tag != "ROLLBACK" {
+		t.Fatalf("typed commit tag = %q", tag)
+	}
+	execOK(t, session.Execute, "BEGIN")
+	if tag := execOK(t, session.Execute, "COMMIT").Tag; tag != "COMMIT" {
+		t.Fatalf("typed healthy commit tag = %q", tag)
+	}
+
+	// And every run carries its tag as the server sent it.
+	if tag := execOK(t, session.Execute, "SELECT * FROM generate_series(1, 5)").Tag; tag != "SELECT 5" {
+		t.Fatalf("select tag = %q", tag)
+	}
+	execOK(t, session.Execute, "INSERT INTO meerkat_kept VALUES (1), (2), (3)")
+	if tag := execOK(t, session.Execute, "UPDATE meerkat_kept SET id = id + 1").Tag; tag != "UPDATE 3" {
+		t.Fatalf("update tag = %q", tag)
+	}
+	if tag := execOK(t, conn.Execute, "SELECT 1").Tag; tag != "SELECT 1" {
+		t.Fatalf("pooled select tag = %q", tag)
+	}
+}
+
+// A cancel aborts the transaction block the statement ran in, so the cap
+// must not send one there: the rest is read and thrown away, the result
+// is still marked truncated, and the transaction is still open and whole.
+func TestTheCapInsideATransactionDoesNotAbortIt(t *testing.T) {
+	url := testURL(t)
+	ctx := context.Background()
+	limits := dbclient.Limits{
+		MaxBytes:     64 * 1024,
+		MaxCellBytes: dbclient.MaxCellBytes,
+	}
+	conn := connectTest(t, url, false).WithLimits(limits)
+	session := must(conn.OpenSession(ctx))
+	defer session.Close(ctx)
+
+	execOK(t, session.Execute, "BEGIN")
+	execOK(t, session.Execute, "CREATE TEMP TABLE meerkat_cap_tx (id int)")
+	execOK(t, session.Execute, "INSERT INTO meerkat_cap_tx VALUES (1)")
+
+	result := execOK(t, session.Execute, "SELECT g, repeat('x', 100) FROM generate_series(1, 200000) g")
+	if !result.Truncated {
+		t.Fatal("the result was not marked truncated")
+	}
+	if len(result.Rows) == 0 || len(result.Rows) >= 200_000 {
+		t.Fatalf("rows = %d", len(result.Rows))
+	}
+	// Read to its end, so the tag is the server's whole count.
+	if result.Tag != "SELECT 200000" {
+		t.Fatalf("tag = %q", result.Tag)
+	}
+
+	if !must(session.InTransaction(ctx)) {
+		t.Fatal("the cap ended the transaction")
+	}
+	count := execOK(t, session.Execute, "SELECT count(*) FROM meerkat_cap_tx")
+	wantValue(t, count.Rows[0][0], dbclient.ValueInt(1))
+	if got := must(session.EndTransaction(ctx, dbclient.TxEndCommit)); got != dbclient.TxEndCommit {
+		t.Fatalf("the commit after the cap came back as %v", got)
+	}
+
+	// Outside a transaction the cap still cancels, and the session lives.
+	result = execOK(t, session.Execute, "SELECT g, repeat('x', 100) FROM generate_series(1, 10000000) g")
+	if !result.Truncated {
+		t.Fatal("not truncated outside a transaction")
+	}
+	wantValue(t, execOK(t, session.Execute, "SELECT 1 AS x").Rows[0][0], dbclient.ValueInt(1))
+}
+
+// A session whose backend was terminated is dead, and says so once the
+// run that found out has come back; a closed session says so at once.
+func TestATerminatedSessionReportsClosed(t *testing.T) {
+	url := testURL(t)
+	ctx := context.Background()
+	conn := connectTest(t, url, true)
+
+	session := must(conn.OpenSession(ctx))
+	if session.IsClosed() {
+		t.Fatal("a fresh session reads as closed")
+	}
+	id, _ := session.Backend()
+	// This test's own backend, and no other.
+	if !must(conn.Stop(ctx, id, dbclient.StopTerminate)) {
+		t.Fatal("the server refused the terminate")
+	}
+	// Give the backend a moment to go; the next statement is what tells
+	// the client.
+	time.Sleep(200 * time.Millisecond)
+	execErr(t, session.Execute, "SELECT 1")
+	if !session.IsClosed() {
+		t.Fatal("a terminated session does not read as closed")
+	}
+	session.Close(ctx)
+	if !session.IsClosed() {
+		t.Fatal("closing it changed the answer")
+	}
+
+	other := must(conn.OpenSession(ctx))
+	execOK(t, other.Execute, "SELECT 1")
+	if other.IsClosed() {
+		t.Fatal("a live session reads as closed")
+	}
+	other.Close(ctx)
+	if !other.IsClosed() {
+		t.Fatal("a closed session does not read as closed")
+	}
+}
+
+// A transaction whose statement is still running is still a transaction.
+// Reading `idle in transaction*` off the backend's state said it was not.
+func TestInTransactionWhileAStatementRuns(t *testing.T) {
+	url := testURL(t)
+	ctx := context.Background()
+	conn := connectTest(t, url, true)
+	session := must(conn.OpenSession(ctx))
+	defer session.Close(ctx)
+
+	execOK(t, session.Execute, "BEGIN")
+	runner := make(chan runOutcome, 1)
+	go func() {
+		result, err := session.Execute(ctx, "SELECT pg_sleep(2)")
+		runner <- runOutcome{result, err}
+	}()
+	time.Sleep(500 * time.Millisecond)
+	if !must(session.InTransaction(ctx)) {
+		t.Fatal("a transaction whose statement runs reads as not in a transaction")
+	}
+	if outcome := <-runner; outcome.err != nil {
+		t.Fatal(outcome.err)
+	}
+	if !must(session.InTransaction(ctx)) {
+		t.Fatal("not in a transaction after the statement")
+	}
+	execOK(t, session.Execute, "ROLLBACK")
+	if must(session.InTransaction(ctx)) {
+		t.Fatal("in a transaction after ROLLBACK")
+	}
+}
+
+// An empty result is named by the connection that ran it. The app pool
+// cannot see a session's temp table, so naming the columns there lost
+// them.
+func TestAnEmptyResultKeepsTheSessionsColumns(t *testing.T) {
+	url := testURL(t)
+	ctx := context.Background()
+	conn := connectTest(t, url, false)
+	session := must(conn.OpenSession(ctx))
+	defer session.Close(ctx)
+
+	execOK(t, session.Execute, "CREATE TEMP TABLE meerkat_empty_probe (a int, b text)")
+	result := execOK(t, session.Execute, "SELECT * FROM meerkat_empty_probe")
+	if len(result.Rows) != 0 {
+		t.Fatalf("rows = %d", len(result.Rows))
+	}
+	if fmt.Sprint(result.Columns) != fmt.Sprint([]string{"a", "b"}) {
+		t.Fatalf("columns = %v", result.Columns)
+	}
+	// A statement with no result set still has none.
+	updated := execOK(t, session.Execute, "UPDATE meerkat_empty_probe SET a = 1")
+	if len(updated.Columns) != 0 {
+		t.Fatalf("update columns = %v", updated.Columns)
 	}
 }

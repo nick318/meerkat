@@ -62,6 +62,19 @@ import (
 const appConnections int32 = 3
 const connectTimeout = 10 * time.Second
 
+// stopTimeout bounds one stop request — `pg_cancel_backend` or
+// `pg_terminate_backend` on the app pool, the wait for a connection
+// included.
+//
+// A stop is sent exactly when something has already gone wrong, and the
+// worst of those is a network that dropped without a word: no reset, no
+// refusal, packets simply gone. A request with no deadline then waits out
+// the operating system's TCP retries, which is minutes — and ⌘Q waits
+// for its cancels, so the app would sit there unable to quit. Five
+// seconds is far past a cancel's one round trip on any link the app is
+// usable over, and short enough that quitting still feels like quitting.
+const stopTimeout = 5 * time.Second
+
 // reach knocks on the server's port before the pool does.
 //
 // **sqlx's pool hides the two failures a person most needs named.** Its
@@ -888,16 +901,20 @@ func (h *heldConn) detach() {
 // It has to be this connection and no other: a transaction belongs to
 // the connection that opened it, so a `COMMIT` on a pooled one would
 // commit nothing and say it worked.
-func (s *PostgresSession) boundary(ctx context.Context, sql string) error {
+//
+// It answers with the server's command tag, because a boundary can work
+// and still not do what it was asked: see [PostgresSession.EndTransaction].
+func (s *PostgresSession) boundary(ctx context.Context, sql string) (string, error) {
 	conn, err := s.held.lock()
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer s.held.mu.Unlock()
-	if _, err := conn.Exec(ctx, sql); err != nil {
-		return fmt.Errorf("the server refused %s: %w", sql, wrapDB(err))
+	tag, err := conn.Exec(ctx, sql)
+	if err != nil {
+		return "", fmt.Errorf("the server refused %s: %w", sql, wrapDB(err))
 	}
-	return nil
+	return tag.String(), nil
 }
 
 // counted is one reading of a statement's running totals.
@@ -930,13 +947,66 @@ func (s *PostgresSession) Execute(ctx context.Context, sql string) (dbclient.Que
 //
 // It takes the session's lock, which is why the caller must not send
 // one while a run is out.
+//
+// **Inside the user's transaction the check must not cost them it.** A
+// statement the server refuses to parse aborts the transaction it was
+// parsed in, so a squiggle under a typo would have thrown away every
+// statement the user ran since `BEGIN`. So inside an open transaction the
+// prepare is fenced off by a savepoint of its own, rolled back to and
+// released whatever the answer was, and the transaction comes out as it
+// went in. A transaction that has already failed refuses every statement,
+// the parse included, so nothing is sent and nothing is said: its answer
+// would be about the transaction, not about the text.
 func (s *PostgresSession) Check(ctx context.Context, sql string) (*dbclient.CheckError, error) {
 	conn, err := s.held.lock()
 	if err != nil {
 		return nil, err
 	}
 	defer s.held.mu.Unlock()
+	switch conn.PgConn().TxStatus() {
+	case txFailed:
+		return nil, nil
+	case txOpen:
+		return checkInsideTransaction(ctx, conn, sql), nil
+	}
 	return checkStatement(ctx, conn, sql), nil
+}
+
+// The transaction status the server reports with every `ReadyForQuery`,
+// as pgconn keeps it: idle, inside a transaction block, or inside one
+// that has failed and refuses everything until it is rolled back.
+const (
+	txOpen   byte = 'T'
+	txFailed byte = 'E'
+)
+
+// checkSavepoints numbers the savepoints a check fences itself off with,
+// so a name of the user's own is never the one rolled back to.
+var checkSavepoints atomic.Uint64
+
+// checkInsideTransaction is `checkStatement` between `SAVEPOINT` and
+// `ROLLBACK TO SAVEPOINT` + `RELEASE SAVEPOINT`. The savepoint is rolled
+// back to even when the statement parsed, because "the transaction is
+// exactly as it was" is the one promise worth making here.
+//
+// The way back out runs whatever happened to `ctx`: a check called off
+// between the two must not leave a savepoint — or an aborted
+// transaction — behind in the user's work.
+func checkInsideTransaction(ctx context.Context, conn *pgx.Conn, sql string) *dbclient.CheckError {
+	name := fmt.Sprintf("meerkat_check_%d", checkSavepoints.Add(1))
+	if _, err := conn.Exec(ctx, "SAVEPOINT "+name); err != nil {
+		return nil
+	}
+	refused := checkStatement(ctx, conn, sql)
+	restore, done := context.WithTimeout(context.WithoutCancel(ctx), stopTimeout)
+	defer done()
+	if _, err := conn.Exec(restore, "ROLLBACK TO SAVEPOINT "+name); err != nil {
+		return nil
+	}
+	if _, err := conn.Exec(restore, "RELEASE SAVEPOINT "+name); err != nil {
+		return nil
+	}
+	return refused
 }
 
 func (s *PostgresSession) RelationExists(ctx context.Context, name string) (bool, bool, error) {
@@ -1035,34 +1105,78 @@ func (s *PostgresSession) Introspect(ctx context.Context) (*introspect.Catalog, 
 // gone wrong refuses every statement until it is rolled back, so a session
 // in the state most worth reporting is the one that could not answer.
 //
-// `idle in transaction` and `idle in transaction (aborted)` both
-// count — a rollback is what leaves either one.
+// The answer is `xact_start`, not `state` alone. A backend inside a
+// transaction block keeps the block's start there whether it sits idle or
+// is running a statement — so a transaction whose statement is still
+// running reads as open, which reading `idle in transaction*` off `state`
+// got wrong. A transaction that has **failed** clears `xact_start`,
+// though, and still waits for a rollback, so `idle in transaction
+// (aborted)` is counted from `state`: a rollback is what leaves it.
+//
+// It reads `true` as well while a statement runs outside any block,
+// because the server runs it in a transaction of its own. The app asks
+// after each run, when the connection is idle and the two cannot be
+// confused.
 func (s *PostgresSession) InTransaction(ctx context.Context) (bool, error) {
 	conn, err := acquire(ctx, s.app)
 	if err != nil {
 		return false, fmt.Errorf("failed to read what the session is doing: %w", err)
 	}
 	defer conn.Release()
-	var state *string
-	err = conn.QueryRow(ctx, "SELECT state FROM pg_stat_activity WHERE pid = $1", int32(s.backend)).Scan(&state)
+	var open bool
+	err = conn.QueryRow(ctx,
+		"SELECT xact_start IS NOT NULL "+
+			"OR coalesce(state LIKE 'idle in transaction%', false) "+
+			"FROM pg_stat_activity WHERE pid = $1",
+		int32(s.backend),
+	).Scan(&open)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("failed to read what the session is doing: %w", err)
 	}
-	return state != nil && strings.HasPrefix(*state, "idle in transaction"), nil
+	return open, nil
 }
 
 // Begin is one statement, one round trip, and nothing else: no cap, no
-// timing, no `describe` to ask what columns `BEGIN` returns. See
+// timing, no prepare to ask what columns `BEGIN` returns. See
 // [dbclient.Session.Begin] for why a boundary is not a run.
 func (s *PostgresSession) Begin(ctx context.Context) error {
-	return s.boundary(ctx, "BEGIN")
+	_, err := s.boundary(ctx, "BEGIN")
+	return err
 }
 
-func (s *PostgresSession) EndTransaction(ctx context.Context, how dbclient.TxEnd) error {
-	return s.boundary(ctx, how.SQL())
+// EndTransaction reads the tag, because a `COMMIT` is not refused when it
+// cannot commit. A transaction that has failed takes the `COMMIT` without
+// an error and answers with the tag `ROLLBACK`: the work is gone, and the
+// only place that is said is the tag.
+func (s *PostgresSession) EndTransaction(ctx context.Context, how dbclient.TxEnd) (dbclient.TxEnd, error) {
+	tag, err := s.boundary(ctx, how.SQL())
+	if err != nil {
+		return how, err
+	}
+	if tag == dbclient.TxEndRollback.SQL() {
+		return dbclient.TxEndRollback, nil
+	}
+	return how, nil
+}
+
+// IsClosed asks pgconn, which marks a connection closed as soon as it
+// learns the backend is gone — a `FATAL` from a terminate or a shutdown,
+// or a socket that failed under a read or a write. It sends nothing.
+//
+// A run holds the session's lock for as long as it is out, and pgconn's
+// state is not to be read from another goroutine while a statement uses
+// it. A busy connection is not a closed one, so a run in flight answers
+// `false` without waiting; the run itself reports a connection that died
+// under it, and the answer is right from then on.
+func (s *PostgresSession) IsClosed() bool {
+	if !s.held.mu.TryLock() {
+		return false
+	}
+	defer s.held.mu.Unlock()
+	return s.held.conn == nil || s.held.conn.Conn().IsClosed()
 }
 
 func (s *PostgresSession) Close(ctx context.Context) {
@@ -1203,8 +1317,12 @@ func between(before *counted, now counted) *dbclient.ServerTiming {
 // alone answered one with nothing whatever: no rows, no columns and no
 // count. The tag is where `rows_affected` comes from.
 //
-// `app` is the pool used to cancel and to describe: both must reach the
-// server while `conn` is busy with the statement, so neither may be `conn`.
+// `app` is the pool used to cancel at the cap: the cancel must reach the
+// server while `conn` is busy with the statement, so it may not be `conn`.
+//
+// The column names come from the statement's own prepare, on `conn`, so
+// an empty result is named by the connection that ran it — the one that
+// can see the session's temp tables and its `search_path`.
 //
 // Go port: sqlx prepared the statement, resolved its column types on the
 // same connection, and executed it asking for every column in binary.
@@ -1229,6 +1347,8 @@ func collectCapped(
 	var firstRow *time.Time
 	// The server's own count, off the completion tag.
 	var affected uint64
+	// The completion tag itself, as the server worded it.
+	var tag string
 
 	pg := conn.PgConn()
 	described, err := pg.Prepare(ctx, "", sql, nil)
@@ -1246,6 +1366,10 @@ func collectCapped(
 			return dbclient.QueryResult{}, wrapDB(err)
 		}
 	}
+	// Whether the statement runs inside the user's transaction block. The
+	// status is the one the prepare's `ReadyForQuery` reported, and nothing
+	// changes it before this statement ends.
+	inTransaction := pg.TxStatus() == txOpen
 	reader := pg.ExecPrepared(ctx, "", nil, nil, []int16{formatBinary})
 	capped := false
 	for reader.NextRow() {
@@ -1281,10 +1405,23 @@ func collectCapped(
 			// used again, so the server would go on building and
 			// sending the whole result. Ask it to stop instead — the
 			// same `pg_cancel_backend` the stop button sends.
-			stopped, _ := cancel(ctx, app, backend, dbclient.StopCancel)
-			if err := drain(reader, stopped); err != nil {
+			//
+			// **Except inside the user's transaction.** A cancelled
+			// statement aborts the transaction block it ran in, so the cap
+			// would throw away every statement since `BEGIN` while the
+			// run reported success. There the rest is read off the wire
+			// and thrown away instead: nothing more is kept, so memory
+			// stays bounded, and the cost is the server's work and the
+			// bandwidth, which is the user's own statement to pay for.
+			stopped := false
+			if !inTransaction {
+				stopped, _ = cancel(ctx, app, backend, dbclient.StopCancel)
+			}
+			finished, err := drain(reader, stopped)
+			if err != nil {
 				return dbclient.QueryResult{}, err
 			}
+			tag = finished
 			capped = true
 			break
 		}
@@ -1293,52 +1430,32 @@ func collectCapped(
 		// The statement finished. For an `UPDATE` this is the whole of the
 		// answer; for a `SELECT` it repeats the row count, which is why
 		// the caller reads it only where there are no columns.
-		tag, err := reader.Close()
+		finished, err := reader.Close()
 		if err != nil {
 			return dbclient.QueryResult{}, wrapDB(err)
 		}
-		affected += uint64(tag.RowsAffected())
+		affected += uint64(finished.RowsAffected())
+		tag = finished.String()
 	}
 
-	// A statement that changed rows has none to name columns with and no
-	// columns to describe — the describe would answer `NoData`. So the
-	// count is what says not to ask: a round trip on the app pool for
-	// headers that cannot exist is a round trip on every `UPDATE`.
-	//
-	// A count of zero is the case that still has to ask, because a
-	// `SELECT` matching nothing reads exactly the same way here, and an
-	// empty result set has headers worth painting.
-	if !sink.HasColumns() && affected == 0 {
-		// No rows came back, so the row metadata cannot name the columns.
-		// Ask the server to describe the statement instead, so an empty
-		// result still renders its headers. DDL and other statements
-		// without a result set simply describe to nothing.
-		if names, err := describe(ctx, app, sql); err == nil {
-			sink.Columns(names)
+	// No row came back, so no row named the columns — but the prepare
+	// already did. A `SELECT` that matched nothing still has headers worth
+	// painting; a statement with no result set described to `NoData`, and
+	// its fields are empty, which is what says there was no result set.
+	// The names come from this connection's own prepare, never another
+	// one's: a pooled describe could not see the session's temp tables or
+	// its `search_path`, and cost a round trip besides.
+	if !sink.HasColumns() && len(described.Fields) > 0 {
+		names := make([]string, len(described.Fields))
+		for i, field := range described.Fields {
+			names[i] = field.Name
 		}
+		sink.Columns(names)
 	}
 	result := sink.Finish(affected)
+	result.Tag = tag
 	result.Wire = wireOf(sent, firstRow)
 	return result, nil
-}
-
-// describe is sqlx's `describe` on the app pool, as far as it is read
-// here: the names of the columns a statement would return.
-func describe(ctx context.Context, app *pgxpool.Pool, sql string) ([]string, error) {
-	conn, err := acquire(ctx, app)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Release()
-	described, err := conn.Conn().PgConn().Prepare(ctx, "", sql, nil)
-	if err != nil {
-		return nil, err
-	}
-	names := make([]string, len(described.Fields))
-	for i, field := range described.Fields {
-		names[i] = field.Name
-	}
-	return names, nil
 }
 
 // wireOf is the client's own view of where a run's time went. `link_ms`
@@ -1363,7 +1480,13 @@ func wireOf(sent time.Time, firstRow *time.Time) dbclient.Wire {
 // which comes back to the runner as SQLSTATE 57014. `pg_terminate_backend`
 // closes the backend outright, and the driver then throws that connection
 // away — which is why it is the second press.
+//
+// The request runs under [stopTimeout], waiting for a connection included:
+// a stop is often sent over a link that has just died, and must give up
+// rather than hold up whoever is waiting for it.
 func cancel(ctx context.Context, pool *pgxpool.Pool, run dbclient.RunId, how dbclient.Stop) (bool, error) {
+	ctx, done := context.WithTimeout(ctx, stopTimeout)
+	defer done()
 	var sql string
 	switch how {
 	case dbclient.StopCancel:
@@ -1391,17 +1514,20 @@ func cancel(ctx context.Context, pool *pgxpool.Pool, run dbclient.RunId, how dbc
 // `stopped` says the cancel was accepted, and only then is `57014` the
 // answer we asked for rather than news. Any other error is the server's own
 // and is reported.
-func drain(rows *pgconn.ResultReader, stopped bool) error {
+//
+// It answers with the completion tag when the statement ran to its end,
+// and "" when the cancel ended it first.
+func drain(rows *pgconn.ResultReader, stopped bool) (string, error) {
 	for rows.NextRow() {
 	}
-	_, err := rows.Close()
+	tag, err := rows.Close()
 	switch {
 	case err == nil:
-		return nil
+		return tag.String(), nil
 	case stopped && isCancelled(err):
-		return nil
+		return "", nil
 	default:
-		return wrapDB(err)
+		return "", wrapDB(err)
 	}
 }
 
