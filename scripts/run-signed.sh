@@ -1,13 +1,13 @@
 #!/bin/sh
-# Cargo's runner on macOS: give the binary a stable code signature, then
-# run it.
+# The runner on macOS (`go run -exec`, through scripts/dev.sh): give the
+# binary a stable code signature, then run it.
 #
 # Meerkat keeps database passwords in the login keychain, and a keychain
-# item's ACL identifies an app by its code signature. Cargo's output is
-# ad-hoc signed by the linker, so the identity *is* the hash of the binary
+# item's ACL identifies an app by its code signature. The toolchain's
+# output is ad-hoc signed by the linker, so the identity *is* the hash of the binary
 # and changes with every build: macOS reads each rebuild as a different
 # app and asks for the keychain password again. "Always Allow" trusts one
-# binary, and the next `cargo build` throws that trust away.
+# binary, and the next build throws that trust away.
 #
 # Signing with a certificate puts a stable identity in place of the hash,
 # so the grant survives a rebuild.
@@ -18,8 +18,8 @@
 # the prompts carry on, so a machine that has never made one still builds
 # and runs.
 #
-# Cargo hands this script the binary and its arguments. Only the app is
-# signed; the test binaries cargo runs through here go straight to exec.
+# The toolchain hands this script the binary and its arguments. Only the
+# app is signed; any other binary run through here goes straight to exec.
 
 set -eu
 

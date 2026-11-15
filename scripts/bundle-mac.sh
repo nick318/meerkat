@@ -5,8 +5,8 @@
 #   scripts/bundle-mac.sh dev
 #   scripts/bundle-mac.sh public
 #
-# The channel is baked into the binary through MEERKAT_CHANNEL (see
-# crates/release_channel), and each channel is its own app — its own name
+# The channel is baked into the binary at link time (see
+# internal/releasechannel), and each channel is its own app — its own name
 # and its own bundle id — so the two can sit in /Applications side by
 # side and neither ever updates onto the other.
 #
@@ -36,8 +36,8 @@ esac
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 
-version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml" | head -1)"
-[ -n "$version" ] || { echo "could not read the version out of Cargo.toml" >&2; exit 1; }
+version="$(sed -n 's/^const version = "\(.*\)"$/\1/p' "$root/internal/releasechannel/releasechannel.go" | head -1)"
+[ -n "$version" ] || { echo "could not read the version out of internal/releasechannel" >&2; exit 1; }
 
 sha="${MEERKAT_COMMIT_SHA:-$(git -C "$root" rev-parse --short=7 HEAD)}"
 build="${MEERKAT_BUILD_NUMBER:-$version}"
@@ -54,8 +54,20 @@ case "$channel" in
 esac
 
 echo "building meerkat $version ($channel, $sha)"
-MEERKAT_CHANNEL="$channel" MEERKAT_COMMIT_SHA="$sha" \
-    cargo build --release -p meerkat --manifest-path "$root/Cargo.toml"
+# mygo forbids cgo, and needs the Go toolchain go.mod names. The -X flags
+# are what `option_env!` was in the Rust build; the mygo ones are what
+# `mygo build` links into a production app.
+mkdir -p "$root/target/release"
+(cd "$root" && CGO_ENABLED=0 GOTOOLCHAIN="${GOTOOLCHAIN_MEERKAT:-go1.27.3}" \
+    go build -trimpath -tags mygo_noinspector -o "$root/target/release/meerkat" \
+    -ldflags "-s -w \
+        -X github.com/egoist/mygo.production=1 \
+        -X 'github.com/egoist/mygo.packageName=$app_name' \
+        -X github.com/egoist/mygo.packageVersion=$version \
+        -X github.com/egoist/mygo.packageIdentifier=$bundle_id \
+        -X github.com/nick318/meerkat/internal/releasechannel.channel=$channel \
+        -X github.com/nick318/meerkat/internal/releasechannel.commitSHA=$sha" \
+    ./cmd/meerkat)
 
 dist="$root/target/dist"
 app="$dist/$app_name.app"

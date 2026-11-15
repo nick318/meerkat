@@ -4,37 +4,55 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Meerkat is a native cross-platform database viewer built on [GPUI](https://www.gpui.rs),
-the UI framework behind Zed. One Rust binary, no webview, no server. The repo
-is a Cargo workspace of small crates in the Zed style. Current milestone:
-read-only PostgreSQL. In-place editing and MySQL are Phase 2.
+Meerkat is a native cross-platform database viewer written in Go on
+[mygo](https://github.com/egoist/mygo), whose native UI is immediate mode and
+drawn on the GPU. One Go binary, no webview, no server. The repo is one Go
+module: a package per former Rust crate under `internal/`, and the binary in
+`cmd/meerkat`. Current milestone: read-only PostgreSQL. In-place editing and
+MySQL are Phase 2.
+
+**The Go code is a mechanical port of the first edition, Rust on
+[GPUI](https://www.gpui.rs)**, whose source is still in `crates/` as the
+reference. The behaviour sections below were written about the Rust and
+still name Rust items (`shell.rs`, `Shell::activate`, `QueryTab::landed`);
+each one has a Go twin of the same name in camelCase or CamelCase
+(`shell.rs` is split into `cmd/meerkat/shell*.go`, see
+`docs/tasks/shell-split.md`). `docs/tasks/gpui-to-mygo.md` maps every GPUI
+construct the app used to the mygo construct that replaced it.
 
 ## Commands
 
 ```sh
-cargo dev                                                   # connections screen
-cargo dev postgres://user@host:5432/database                # straight to a database
-cargo check --workspace
-cargo test --workspace
-cargo test -p sql_editor completion::tests                  # one crate / one module
-cargo test -p meerkat pages_order_by_the_primary_key        # one test by name
+scripts/dev.sh                                              # connections screen
+scripts/dev.sh postgres://user@host:5432/database           # straight to a database
+go build ./...
+go vet ./...
+go test -p 4 -parallel 4 ./...
+go test ./internal/sqleditor/ -run Completion               # one package / some tests
+go test ./cmd/meerkat/ -run TestPagesOrderByThePrimaryKey   # one test by name
 ```
+
+Go 1.27.3 is required (mygo needs it). The machine's default `go` may be
+older with `GOTOOLCHAIN=local`, so prefix commands with
+`GOTOOLCHAIN=go1.27.3`. Everything builds with `CGO_ENABLED=0`: mygo forbids
+cgo, which is why SQLite is `modernc.org/sqlite` and PostgreSQL is `pgx`.
 
 `MEERKAT_DATABASE_URL` works instead of the CLI argument.
 
-`cargo dev` is an alias for `cargo run -p meerkat --`, in
-`.cargo/config.toml`. Plain `cargo run -p meerkat` does the same thing.
+`scripts/dev.sh` is `go run ./cmd/meerkat` with `-exec
+scripts/run-signed.sh`. Plain `go run ./cmd/meerkat` does the same thing,
+unsigned.
 
 ### Signing, and why the keychain keeps asking
 
-On macOS both go through `scripts/run-signed.sh`, cargo's `runner` for the
-platform, which signs the binary before launching it.
+On macOS `scripts/dev.sh` goes through `scripts/run-signed.sh`, which signs
+the binary before launching it.
 
-A keychain item's ACL identifies an app by its code signature, and cargo's
-output is ad-hoc signed by the linker — the identity *is* the hash of the
+A keychain item's ACL identifies an app by its code signature, and the Go
+toolchain's output is ad-hoc signed by the linker — the identity *is* the hash of the
 binary, so it changes with every build. macOS then reads each rebuild as a
 different app and asks for the login keychain password again; "Always
-Allow" trusts one binary and the next `cargo build` throws that away.
+Allow" trusts one binary and the next build throws that away.
 
 Make the certificate once, in Keychain Access: Certificate Assistant →
 Create a Certificate, named `Meerkat Dev`, type "Code Signing",
@@ -42,7 +60,7 @@ self-signed. `MEERKAT_SIGN_IDENTITY` overrides the name. With no such
 certificate the script says so and runs the binary anyway, so a fresh
 clone still works — the prompts simply carry on.
 
-The script only signs the app. Test binaries pass through it untouched.
+The script only signs the app; any other binary passes through untouched.
 
 ### Bundling the macOS app
 
@@ -57,12 +75,14 @@ beside each archive. The two channels are two apps — different names,
 different bundle ids — so they install side by side and neither ever
 updates onto the other.
 
-The channel is baked in at compile time through `MEERKAT_CHANNEL`, read
-by `crates/release_channel` via `option_env!`. A plain `cargo build`
-sets nothing and is therefore a `local` build, which never polls for
-updates; `local` cannot be asked for by name, so CI cannot ship one by
-accident. `MEERKAT_COMMIT_SHA` rides in the same way and is what tells
-two dev builds of one version apart.
+The channel is baked in at link time: `bundle-mac.sh` passes
+`-X github.com/nick318/meerkat/internal/releasechannel.channel=<channel>`.
+A plain `go build` sets nothing and is therefore a `local` build, which
+never polls for updates; `local` cannot be asked for by name, so CI cannot
+ship one by accident. The commit rides in the same way
+(`releasechannel.commitSHA`, from `MEERKAT_COMMIT_SHA` or `git rev-parse`)
+and is what tells two dev builds of one version apart. The version is the
+one constant `version` in `internal/releasechannel/releasechannel.go`.
 
 Signing follows `run-signed.sh`'s ladder: `MEERKAT_SIGN_IDENTITY`, else
 the self-signed `Meerkat Dev` certificate, else ad-hoc. A "Developer ID"
@@ -80,8 +100,8 @@ its dev twin, built from the **same commit**, in the same sitting.
 
 Every step is run by hand from a clean `main`; there is no CI for it.
 
-1. Commit the work, then bump `version` in the workspace `Cargo.toml`,
-   run `cargo check` so `Cargo.lock` follows, and commit that alone as
+1. Commit the work, then bump `const version` in
+   `internal/releasechannel/releasechannel.go`, and commit that alone as
    "Bump the version to X.Y.Z". Tag it `vX.Y.Z` (annotated,
    "Meerkat X.Y.Z"). Push `main` and the tag.
 2. Build **public**, signed with the Developer ID and notarized:
@@ -128,40 +148,38 @@ between public versions is the same recipe from step 5 with no bump: a
 new `vX.Y.Z-dev.<sha>` tag, release and `dev.json`.
 
 The PostgreSQL driver tests skip themselves when no server is configured, so
-`cargo test` stays green without one. To actually run them:
+`go test` stays green without one. To actually run them:
 
 ```sh
-MEERKAT_TEST_PG_URL=postgres://postgres:pg@localhost:5432/postgres cargo test -p db_postgres
+MEERKAT_TEST_PG_URL=postgres://postgres:pg@localhost:5432/postgres go test ./internal/dbpostgres/...
 ```
 
-The first build compiles GPUI from the pinned Zed git revision and takes a
-long time. macOS needs Xcode and its command line tools, because GPUI renders
-with Metal.
+`TestTheServerReportsWhatItSpent` also skips itself when the server does not
+load `pg_stat_statements` through `shared_preload_libraries`.
 
 ## Architecture
 
 ### Dependency direction
 
-UI crates may depend on data crates; the reverse is forbidden. `db_postgres`,
-`db_sqlite`, `db_client`, `introspect`, `storage`, `secrets`, `query`,
-`fuzzy`, `settings` and `release_channel` must not know about `gpui`.
+UI packages may depend on data packages; the reverse is forbidden.
+`dbpostgres`, `dbsqlite`, `dbclient`, `introspect`, `storage`, `secrets`,
+`query`, `fuzzy`, `settings` and `releasechannel` must not import mygo.
 
-| Crate | Role |
+| Package (Rust crate) | Role |
 |---|---|
-| `meerkat` | Binary: `main.rs` boots, `root.rs` switches screens, `connections.rs` and `shell.rs` are the two screens, `history.rs` is the query-history tab, `palette.rs` is the ⌘K palette, `sql.rs` builds the app's own SQL |
-| `db_client` | Engine-agnostic `Connection` trait, `Profile`, `Value`, `QueryResult`, `RowChange` |
-| `db_postgres`, `db_sqlite` | sqlx drivers behind that trait |
-| `introspect` | Schema model (`Catalog` → `Schema` → `Table` → `Column`) that drivers fill |
-| `query` | `statements()`: split a buffer into statements, quote- and comment-aware |
-| `fuzzy` | `Pattern::score`: one matcher for every search line over names; `Needle`: the ⌘F substring over text |
-| `sql_editor` | Multi-line SQL buffer: motion, undo, colouring, completion |
-| `results_grid` | Virtualized grid |
-| `ui`, `theme` | Component kit (incl. `TextField`, the overlay `scrollbar` and the ⌘F `find_bar`) and color tokens |
-| `storage` | Local SQLite: profiles, cached probe counts, layout, history, cached catalogs |
-| `secrets` | OS keychain wrapper for passwords |
-| `release_channel` | Which channel this build is (`local`/`dev`/`public`), its version and commit — baked in at compile time |
-| `auto_update` | Poll the channel's feed, download what is newer, lay it over the running bundle; the restart stays the user's |
-| `workspace`, `schema_tree` | Empty placeholders |
+| `cmd/meerkat` (`meerkat`) | Binary: `main.go` boots, `root.go` switches screens, `connections.go` and `shell*.go` are the two screens, `history.go` is the query-history tab, `palette.go` is the ⌘K palette, `sql.go` builds the app's own SQL |
+| `internal/dbclient` (`db_client`) | Engine-agnostic `Connection` and `Session` interfaces, `Profile`, `Value`, `QueryResult`, `RowChange` |
+| `internal/dbpostgres`, `internal/dbsqlite` | pgx and modernc drivers behind those interfaces |
+| `internal/introspect` | Schema model (`Catalog` → `Schema` → `Table` → `Column`) that drivers fill |
+| `internal/query` | `Statements()`: split a buffer into statements, quote- and comment-aware |
+| `internal/fuzzy` | `Pattern.Score`: one matcher for every search line over names; `Needle`: the ⌘F substring over text |
+| `internal/sqleditor` (`sql_editor`) | Multi-line SQL buffer: motion, undo, colouring, completion |
+| `internal/resultsgrid` (`results_grid`) | Virtualized grid |
+| `internal/uikit` (`ui`), `internal/theme` | Component kit (incl. `TextField`, the overlay scrollbar, the ⌘F bar and the one key dispatcher in `keys.go`) and color tokens |
+| `internal/storage` | Local SQLite: profiles, cached probe counts, layout, history, cached catalogs |
+| `internal/secrets` | OS keychain wrapper for passwords (mygo's secrets module, the same items the Rust `keyring` wrote) |
+| `internal/releasechannel` | Which channel this build is (`local`/`dev`/`public`), its version and commit — baked in at link time |
+| `internal/autoupdate` | Poll the channel's feed, download what is newer, lay it over the running bundle; the restart stays the user's |
 
 ### Screens
 
@@ -2175,16 +2193,15 @@ Profiles live in a SQLite file under the user data directory. `Store::migrate`
 adds columns one at a time so an older profiles file keeps its rows. Passwords
 go to the OS keychain keyed by profile id, and never touch that file.
 
-## Pinned GPUI
+## Pinned mygo
 
-`gpui`, `gpui_platform` and `gpui_tokio` are pinned by git rev to a single Zed
-revision in the workspace `Cargo.toml`. Bump all three together and only
-deliberately — GPUI is pre-1.0 and breaks APIs. `[profile.dev.package."*"]
-opt-level = 2` is set because GPUI is unusably slow unoptimized; leave it.
+`github.com/egoist/mygo` is pinned to one pseudo-version in `go.mod`. Bump it
+only deliberately — mygo is pre-1.0 and breaks APIs — and re-run the
+`ui.NewTester` view tests, which render frames headless.
 
 ## Conventions
 
-- Run `cargo fmt --all` before every commit, so a later formatting run
+- Run `gofmt -w` over the Go tree (`gofmt -l .` must print nothing) before every commit, so a later formatting run
   cannot bury a change under whitespace it has nothing to do with.
 - Commit subjects are short imperative sentences in sentence case, no
   conventional-commit prefix: "Add scrollbars to the results grid".

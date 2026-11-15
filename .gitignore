@@ -1,2 +1,5 @@
 /target
 .DS_Store
+
+# `go build ./cmd/meerkat` drops the binary here.
+/meerkat
