@@ -179,6 +179,10 @@ func (r *Root) onShellEvent(_ *Shell, event ShellEvent) {
 	// inside that update. `Window.Update` posts to the main loop, which is
 	// that next tick.
 	case ShellEventQuit:
+		// The user has answered a question about this quit, in words
+		// about what it ends, so the plain "Quit Meerkat?" is not asked
+		// on top of it.
+		quitAgreed = true
 		r.window.Update(quit)
 	// Same reason for the next tick: the walk updates every window, and
 	// this callback is inside one of those updates.

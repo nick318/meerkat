@@ -167,6 +167,10 @@ func main() {
 	// The update toast's "restart now".
 	updateRestart = restartToUpdate
 
+	// The menu bar, before the app is ready, so mygo's default one is
+	// never installed: see `appMenu`.
+	mygo.App.SetMenu(mygo.NewMenu(appMenu()))
+
 	mygo.App.WhenReady(func() {
 		// The updater exists only on a distributed channel; a plain `go
 		// build` is a `local` build and gets none. What `cx.observe` did
@@ -301,6 +305,80 @@ func centeredOrigin() (int, int) {
 	return wa.X + (wa.Width-windowWidth)/2, wa.Y + (wa.Height-windowHeight)/2
 }
 
+// appMenu is the menu bar. The Rust app had none: GPUI installs nothing
+// unless asked, so every key reached the window's own bindings.
+//
+// mygo installs a default one, and on macOS a menu item's key equivalent
+// is matched **before** the window sees the key. Its File menu carried
+// "Close Window ⌘W", so ⌘W closed the window — and with it, on the last
+// window, the app — instead of the tab the strip answers ⌘W with. Its View
+// menu took ⇧⌘R, which rolls a transaction back here. So the bar is ours,
+// and it carries no item whose key the window binds:
+//
+//   - the app menu, whose Quit goes through `OnBeforeQuit` and so through
+//     `quitWalk`, the same as ⌘Q;
+//   - the Edit menu, whose items AppKit routes to the focused element as
+//     edit commands — copy and paste from the menu, and dictation;
+//   - full screen, and the Window menu.
+func appMenu() []*mygo.MenuItem {
+	return []*mygo.MenuItem{
+		{Role: mygo.RoleAppMenu},
+		{Role: mygo.RoleEditMenu},
+		{Label: "View", Submenu: []*mygo.MenuItem{{Role: mygo.RoleToggleFullScreen}}},
+		{Role: mygo.RoleWindowMenu},
+	}
+}
+
+// quitAgreed says the user has already answered a question about this
+// quit — a window's own dialog about its runs and transactions — so the
+// plain "Quit Meerkat?" is not asked on top of it.
+var quitAgreed bool
+
+// quitAsking says the "Quit Meerkat?" question is on screen, so a second
+// ⌘Q under it does not put up a second one.
+var quitAsking bool
+
+// needsQuitConfirm says whether a quit every window has agreed to still
+// asks the user. **Every quit asks**, because ⌘Q sits one key away from ⌘W
+// and ends every window at once; a window with something at stake has
+// asked already, in words about what is at stake. A restart into an update
+// was asked for by a click on "restart now", so it does not ask again. And
+// with no window left the quit is the last window's close, which the user
+// already chose — mygo quits when the last window goes, as GPUI's
+// `on_window_closed` did — so there is nothing left to ask about.
+func needsQuitConfirm(restarting, agreed bool, windows int) bool {
+	return windows > 0 && !restarting && !agreed
+}
+
+// confirmQuit puts the question up and carries the quit on from the
+// answer. The dialog blocks until it is answered, so it is shown from a
+// goroutine and the answer comes back on the main thread.
+func confirmQuit() {
+	if quitAsking {
+		return
+	}
+	quitAsking = true
+	go func() {
+		result, err := mygo.Dialog.Message(mygo.MessageOptions{
+			Type:          mygo.MessageQuestion,
+			Message:       "Quit Meerkat?",
+			Detail:        "Every window closes, and its connection with it. The tabs come back the next time you open the connection.",
+			Buttons:       []string{"Quit", "Cancel"},
+			DefaultButton: 0,
+			CancelButton:  1,
+		})
+		mygo.RunOnMain(func() {
+			quitAsking = false
+			if err != nil || result.Button != 0 {
+				quitCancelled()
+				return
+			}
+			quitAgreed = true
+			quit()
+		})
+	}()
+}
+
 // quitCancelled calls a quit off, at every window that had already agreed
 // to it.
 func quitCancelled() {
@@ -308,6 +386,7 @@ func quitCancelled() {
 	// and this ending is not happening — a restart asked for later must
 	// not inherit it either.
 	restarting = false
+	quitAgreed = false
 	for _, w := range roots {
 		w.root.forgetQuit()
 	}
@@ -341,6 +420,10 @@ func quitWalk() {
 		if !w.root.guardQuit() {
 			return
 		}
+	}
+	if needsQuitConfirm(restarting, quitAgreed, len(windows)) {
+		confirmQuit()
+		return
 	}
 	var stops []*StopTask
 	for _, w := range windows {

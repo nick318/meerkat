@@ -236,6 +236,15 @@ rather than quitting the app. See "Closing something that is still running".
 **With no window the app has nothing left to be** — there is no menu bar to
 open one from — so `cx.on_window_closed` quits once the list is empty.
 
+**The menu bar is the app's own, and it binds no key the window binds.**
+mygo installs a default bar unless the app sets one, and on macOS a menu
+item's key equivalent wins over the window: its "Close Window ⌘W" closed
+the window (and, on the last one, the app) instead of the tab, and its
+"Force Reload ⇧⌘R" took the rollback key. `main::appMenu` keeps the app
+menu (Quit goes through `OnBeforeQuit`, so through the quit walk), the
+Edit menu (mygo routes its commands to the focused element's own keys)
+and the window items, and nothing else.
+
 `Store::open` sets `journal_mode = WAL` and a `busy_timeout`, because every
 window opens its own handle on the one file and two windows write it at the
 same moment: a run lands in one while the other saves its tab strip. The
@@ -1690,7 +1699,15 @@ The cancels for a quit are sent by `main::quit` over every window at once,
 not by the window that happened to be asked — only the app knows how many
 windows there are.
 
-A close that loses nothing never asks. **Two things count**: a run still in
+**⌘Q always asks.** It sits one key from ⌘W and ends every window at
+once, so a quit with nothing at stake still puts up "Quit Meerkat?" —
+`main::needsQuitConfirm`. A window that asked about its runs or its
+transaction has asked already, so the plain question is not put on top
+of it; "restart now" was the question for an update's restart; and the
+quit that follows the last window's close asks nothing, because that close
+was the user's.
+
+A tab or window close that loses nothing never asks. **Two things count**: a run still in
 flight, and a transaction still open. Each gets its own line, because they
 are lost in different ways — a run the server can be asked to give up, a
 transaction it throws away — and one line cannot stand for the other. A tab
