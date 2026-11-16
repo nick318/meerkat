@@ -306,6 +306,15 @@ func openWindow(target Target) {
 // app has nothing left to be; mygo quits on its own when the last window
 // goes, which is what `cx.on_window_closed` did.
 func forgetWindow(entry *rootWindow) {
+	// A window closed under the quit card takes the question with it, so
+	// the quit it was asking about is called off rather than left
+	// waiting on a card nobody can see — or a later ⌘Q would read as its
+	// answer and quit without asking.
+	if entry.root.quitAsk {
+		entry.root.quitAsk = false
+		quitAsking = false
+		quitCancelled()
+	}
 	for i, w := range roots {
 		if w == entry {
 			roots = append(roots[:i], roots[i+1:]...)
@@ -350,8 +359,8 @@ func appMenu() []*mygo.MenuItem {
 // plain "Quit Meerkat?" is not asked on top of it.
 var quitAgreed bool
 
-// quitAsking says the "Quit Meerkat?" question is on screen, so a second
-// ⌘Q under it does not put up a second one.
+// quitAsking says the "Quit Meerkat?" card is on screen (quit_dialog.go),
+// so a second ⌘Q under it is the answer rather than a second card.
 var quitAsking bool
 
 // needsQuitConfirm says whether a quit every window has agreed to still
@@ -364,35 +373,6 @@ var quitAsking bool
 // `on_window_closed` did — so there is nothing left to ask about.
 func needsQuitConfirm(restarting, agreed bool, windows int) bool {
 	return windows > 0 && !restarting && !agreed
-}
-
-// confirmQuit puts the question up and carries the quit on from the
-// answer. The dialog blocks until it is answered, so it is shown from a
-// goroutine and the answer comes back on the main thread.
-func confirmQuit() {
-	if quitAsking {
-		return
-	}
-	quitAsking = true
-	go func() {
-		result, err := mygo.Dialog.Message(mygo.MessageOptions{
-			Type:          mygo.MessageQuestion,
-			Message:       "Quit Meerkat?",
-			Detail:        "Every window closes, and its connection with it. The tabs come back the next time you open the connection.",
-			Buttons:       []string{"Quit", "Cancel"},
-			DefaultButton: 0,
-			CancelButton:  1,
-		})
-		mygo.RunOnMain(func() {
-			quitAsking = false
-			if err != nil || result.Button != 0 {
-				quitCancelled()
-				return
-			}
-			quitAgreed = true
-			quit()
-		})
-	}()
 }
 
 // quitCancelled calls a quit off, at every window that had already agreed
@@ -412,8 +392,12 @@ func quitCancelled() {
 // the app menu's Quit and ⌘Q take the same walk: `OnBeforeQuit` calls
 // `quitWalk`.
 func quit() {
-	mygo.App.Quit()
+	quitNow()
 }
+
+// quitNow is mygo's quit, a variable so a test can watch the quit go out
+// without ending its process.
+var quitNow = func() { mygo.App.Quit() }
 
 // quitReady says the walk has finished and every cancel has been waited
 // for; the quit that follows goes through without being asked again.

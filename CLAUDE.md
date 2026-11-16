@@ -1719,6 +1719,15 @@ of it; "restart now" was the question for an update's restart; and the
 quit that follows the last window's close asks nothing, because that close
 was the user's.
 
+**The question is the app's own card, not an NSAlert.** A system alert
+slides in late and reads apart from everything else on screen, so
+`quit_dialog.go` draws the close confirmation's scrim and card in the
+window's **root** — over the connections screen as well as a workspace —
+on the focused window. One key answers it: ⏎ quits, ⎋ or a click on the
+scrim stays, and a second ⌘Q while it is up quits, as holding to the
+gesture means. A window closed under it calls the quit off, so a later
+⌘Q is never read as its answer.
+
 A tab or window close that loses nothing never asks. **Two things count**: a run still in
 flight, and a transaction still open. Each gets its own line, because they
 are lost in different ways — a run the server can be asked to give up, a

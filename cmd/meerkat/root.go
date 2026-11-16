@@ -42,6 +42,10 @@ var rootKeys = rootKeyBindings()
 type Root struct {
 	window *mygo.Window
 	screen rootScreen
+	// quitAsk says the "Quit Meerkat?" card is up on this window, and
+	// quitFocus is the card's focus while it is (quit_dialog.go).
+	quitAsk   bool
+	quitFocus ui.Handle
 }
 
 // rootScreen is the Rust `enum Screen`: exactly one of the two is set.
@@ -191,6 +195,17 @@ func (r *Root) onShellEvent(_ *Shell, event ShellEvent) {
 	}
 }
 
+// restoreFocus hands the keys back to the screen after the quit card
+// goes: a workspace to its active tab, the way every other overlay of the
+// shell gives them back.
+func (r *Root) restoreFocus() {
+	if r.screen.workspace != nil {
+		r.screen.workspace.focusActiveTab()
+		return
+	}
+	r.screen.connections.FocusHandle().Focus()
+}
+
 // FocusHandle is the Rust `Focusable for Root`.
 func (r *Root) FocusHandle() *ui.Handle {
 	if r.screen.workspace != nil {
@@ -207,6 +222,8 @@ func (r *Root) View(c *ui.Context) ui.Element {
 		} else {
 			r.screen.connections.View(c)
 		}
+		// Last, so it paints over every overlay the screen has.
+		r.quitOverlay(c)
 	})
 	if action, ok := uikit.DispatchKeys(el, rootKeys); ok {
 		switch action {
