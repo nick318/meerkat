@@ -165,6 +165,15 @@ func (s *Shell) proceedClose(what Close) {
 		// nothing aborts it when the handle is dropped.
 		s.closeTab(what.Tab)
 	case CloseKindShell:
+		// ⌘W on the last tab leaves with that tab closed: it is gone
+		// from the strip written back, so the connection opens on a
+		// fresh query tab next time rather than on the tab the user
+		// just closed. Its session dies with the shell's pools, which
+		// is a rollback too, so nothing needs sending.
+		if what.Tab != 0 {
+			s.tabs = slices.DeleteFunc(s.tabs, func(tab Tab) bool { return tab.ID() == what.Tab })
+			s.active = min(s.active, max(len(s.tabs)-1, 0))
+		}
 		// The shell is dropped from here, and with it every editor
 		// buffer. Write the strip back while there is still
 		// something to read it from.

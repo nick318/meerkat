@@ -1644,26 +1644,27 @@ for — not tidiness.
 | Way out | Asks about | Ends |
 |---|---|---|
 | ⌘W, or the × on a tab | that tab | the tab |
-| ⌘W, or the ×, on the **last** tab | every tab of this window | the window |
-| ⌘W with no tab strip at all | nothing — there is nothing at stake | the window |
+| ⌘W, or the ×, on the **last** tab | that tab | the session, back to the connections screen |
+| ⌘W on the connections screen | nothing — there is nothing at stake | the window |
 | "‹ connections" | every tab of this window | the session |
 | the window's close button | every tab of this window | the window |
 | ⌘Q | every tab of every window | the app |
 
-**The last tab is the window.** An empty strip is a window with nothing in
-it — no way back to the connections screen and no tab to open the next
-query in — so the gesture that takes the last tab away takes the window
-with it, which is what ⌘W does in a browser. `shell::close_intent` is that
-one decision, a plain function over the number of tabs, and it answers
-with a `Close::Window` rather than a tab close followed by a window close:
-the guard has to ask the window's question, because the window is what is
-ending. Both paths then go through `proceed_close`, so the last ⌘W stops
-the runs, writes the strip back and waits for the cancels exactly as the
-window's close button does.
+**The last tab is the session.** An empty strip has no tab to open the
+next query in, so the gesture that takes the last tab away takes the
+session with it and puts the window back on the connections screen. The
+window stays. The Rust app closed the window here, the browser's rule, and
+with one window that quit the app on a key that closes tabs.
+`shell::close_intent` is that one decision, a plain function over the
+number of tabs, and it answers with a `Close::Shell` **carrying the tab**
+rather than a tab close followed by a leave: the guard asks the leave's
+question, because the session is what is ending, and `proceed_close` drops
+the tab from the strip it writes back, so the connection does not open on
+the tab the user just closed.
 
 **The connections screen answers ⌘W too, and it answers with the window.**
 There is no tab to close there and no screen behind it to go back to, so
-the gesture reads exactly as it does on the last tab of a strip. The key is
+⌘W, ⌘W from a one-tab workspace closes the tab, then the window. The key is
 bound twice: to `root::KEY_CONTEXT` as well as to `Shell`. GPUI gives a
 keystroke to the binding that matched deepest, and the shell's element sits
 *inside* the root's — so a window with a strip answers in the strip, and a
@@ -1671,7 +1672,7 @@ window with none answers in `Root::on_close_window`, which runs
 `guard_close_window` and `remember` before removing the window, the path
 the window's own close button already takes. `on_close_tab` covers the
 third case: a strip that is somehow empty asks `close_intent` with no tab
-id, and gets a `Close::Window` back.
+id, and gets a plain `Close::Shell` back.
 
 The window's own button and ⌘Q reach the shell through
 `Root::guard_close_window` and `Root::guard_quit`. `on_window_should_close` wants a yes or no on the spot

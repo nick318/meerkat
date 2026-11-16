@@ -833,19 +833,19 @@ func shellNames(names ...string) []string {
 	return append([]string{}, names...)
 }
 
-// ⌘W closes a tab while there is another one to leave the window
-// on, and closes the window once there is not.
-func TestTheLastTabClosesTheWindow(t *testing.T) {
+// ⌘W closes a tab while there is another one to stay on, and goes back
+// to the connections screen, forgetting the tab, once there is not.
+func TestTheLastTabGoesBackToConnections(t *testing.T) {
 	for _, c := range []struct {
 		tabs int
 		want Close
 	}{
 		{3, Close{Kind: CloseKindTab, Tab: 7}},
 		{2, Close{Kind: CloseKindTab, Tab: 7}},
-		{1, Close{Kind: CloseKindWindow}},
+		{1, Close{Kind: CloseKindShell, Tab: 7}},
 		// A strip that is already empty has no × and no active tab, so
-		// this is unreachable — it answers the same way regardless.
-		{0, Close{Kind: CloseKindWindow}},
+		// this is unreachable — it leaves, and forgets nothing.
+		{0, Close{Kind: CloseKindShell}},
 	} {
 		if got := closeIntent(c.tabs, 7); got != c.want {
 			t.Errorf("close_intent(%d, 7) = %+v, want %+v", c.tabs, got, c.want)

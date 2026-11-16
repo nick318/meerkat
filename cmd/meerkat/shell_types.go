@@ -1057,18 +1057,27 @@ type Close struct {
 }
 
 // closeIntent is what a ⌘W — or a click on a tab's × — actually ends. The
-// last tab is the exception: a window with an empty strip is a window
-// with nothing in it, no way back to the connections screen and no tab to
+// last tab is the exception: a workspace with an empty strip has no tab to
 // open the next query in, so the gesture that took the last tab away
-// takes the window with it. That is the browser's rule, which is the one
-// this app already follows for ⌘T and ⌘N.
+// takes the **session** with it and puts the window back on the
+// connections screen. The window stays: closing it, and with the last
+// window the app, is the next ⌘W there, or the close button.
 //
-// It is a `Close::Window`, not a tab close followed by a window close,
-// because the guard has to ask the window's question: the dialog says
-// what is ending, and what is ending is the window.
+// The Rust app closed the window here, the browser's rule. That made a
+// ⌘W on the last tab quit an app of one window outright, which is not
+// what a key that closes tabs should do.
+//
+// It is a `Close::Shell` carrying the tab, not a tab close followed by a
+// leave, because the guard has to ask the leave's question: the dialog
+// says what is ending, and what is ending is the session. The tab rides
+// along so the leave forgets it — the user closed it, so the connection
+// must not open on it again next time.
 func closeIntent(tabs int, tabID uint64) Close {
 	if tabs <= 1 {
-		return Close{Kind: CloseKindWindow}
+		if tabs == 0 {
+			tabID = 0
+		}
+		return Close{Kind: CloseKindShell, Tab: tabID}
 	}
 	return Close{Kind: CloseKindTab, Tab: tabID}
 }

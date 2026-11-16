@@ -77,3 +77,22 @@ func TestCmdWClosesTheActiveTab(t *testing.T) {
 		t.Fatalf("after ⌘W the strip has %d tabs, want 1", len(s.tabs))
 	}
 }
+
+// ⌘W on the last tab goes back to the connections screen: the shell asks
+// to be closed, and the tab is gone from the strip it writes back.
+func TestCmdWOnTheLastTabGoesBackToConnections(t *testing.T) {
+	s, _, tt, _ := framesRig(t)
+	var events []ShellEvent
+	s.Subscribe(func(_ *Shell, e ShellEvent) { events = append(events, e) })
+	if len(s.tabs) != 1 {
+		t.Fatalf("rig has %d tabs, want 1", len(s.tabs))
+	}
+	tt.Key(ui.Cmd, ui.KeyW)
+	tt.Frame()
+	if len(events) != 1 || events[0] != ShellEventClose {
+		t.Fatalf("after ⌘W on the last tab the shell emitted %v, want [ShellEventClose]", events)
+	}
+	if len(s.tabs) != 0 {
+		t.Errorf("the closed tab is still in the strip: %d tabs", len(s.tabs))
+	}
+}
