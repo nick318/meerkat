@@ -345,12 +345,65 @@ func centeredOrigin() (int, int) {
 //   - the Edit menu, whose items AppKit routes to the focused element as
 //     edit commands — copy and paste from the menu, and dictation;
 //   - full screen, and the Window menu.
+//
+// The Window menu carries the two keys that are the exception: ⌃⇥ and
+// ⌃⇧⇥. AppKit keeps Control-Tab for its own keyboard navigation between
+// controls and never hands it to the view's `keyDown:`, so a binding in
+// the shell's table could not hear it. The menu sees key equivalents
+// before the window does, which is how Safari's "Show Next Tab ⌃⇥" works,
+// and it is the only way in for the key.
 func appMenu() []*mygo.MenuItem {
 	return []*mygo.MenuItem{
 		{Role: mygo.RoleAppMenu},
 		{Role: mygo.RoleEditMenu},
 		{Label: "View", Submenu: []*mygo.MenuItem{{Role: mygo.RoleToggleFullScreen}}},
-		{Role: mygo.RoleWindowMenu},
+		{Label: "Window", Submenu: []*mygo.MenuItem{
+			{Role: mygo.RoleMinimize},
+			{Role: mygo.RoleZoom},
+			mygo.Separator(),
+			{
+				Label:       "Show Next Tab",
+				Accelerator: tabMenuNext,
+				Click:       func(_ *mygo.MenuItem, win *mygo.Window) { stepTabIn(win, true) },
+			},
+			{
+				Label:       "Show Previous Tab",
+				Accelerator: tabMenuPrev,
+				Click:       func(_ *mygo.MenuItem, win *mygo.Window) { stepTabIn(win, false) },
+			},
+			mygo.Separator(),
+			{Role: mygo.RoleFront},
+		}},
+	}
+}
+
+// The accelerators of the two tab items, which the window cannot hear for
+// itself (see appMenu).
+const (
+	tabMenuNext = "Ctrl+Tab"
+	tabMenuPrev = "Ctrl+Shift+Tab"
+)
+
+// stepTabIn walks the tab strip of the window a menu item was chosen in —
+// the focused one on macOS — the way ⌃⇥ in the shell's own table does.
+// The connections screen has no strip, so there it does nothing.
+func stepTabIn(win *mygo.Window, forward bool) {
+	if win == nil {
+		win = focusedWindow()
+	}
+	for _, w := range roots {
+		if w.window != win || w.root.screen.workspace == nil || w.root.quitAsk {
+			continue
+		}
+		action := ShellPrevTab
+		if forward {
+			action = ShellNextTab
+		}
+		w.root.screen.workspace.handleAction(action)
+		if w.window != nil {
+			w.window.Invalidate()
+		}
+		return
 	}
 }
 

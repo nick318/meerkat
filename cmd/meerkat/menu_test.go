@@ -20,7 +20,9 @@ func TestTheMenuBarTakesNoKeyTheWindowBinds(t *testing.T) {
 				mygo.RoleReload, mygo.RoleForceReload, mygo.RoleNew:
 				t.Errorf("the menu bar carries %q, whose key the window binds", item.Role)
 			}
-			if item.Accelerator != "" {
+			// ⌃⇥ and ⌃⇧⇥ are the exception: AppKit never hands
+			// them to the window, so the menu is their only way in.
+			if item.Accelerator != "" && item.Accelerator != tabMenuNext && item.Accelerator != tabMenuPrev {
 				t.Errorf("the menu item %q takes %s from the window", item.Label, item.Accelerator)
 			}
 			walk(item.Submenu)
@@ -95,4 +97,48 @@ func TestCmdWOnTheLastTabGoesBackToConnections(t *testing.T) {
 	if len(s.tabs) != 0 {
 		t.Errorf("the closed tab is still in the strip: %d tabs", len(s.tabs))
 	}
+}
+
+// The Window menu's tab items walk the strip of the window they were
+// chosen in, which is how ⌃⇥ reaches the app at all.
+func TestTheWindowMenuWalksTheTabs(t *testing.T) {
+	s := newViewTestShell(nil)
+	s.newQuery()
+	s.newQuery()
+	s.newQuery()
+	s.activate(0)
+	savedRoots := roots
+	t.Cleanup(func() { roots = savedRoots })
+	r := &Root{screen: rootScreen{workspace: s}}
+	roots = []*rootWindow{{root: r}}
+	var next, prev func(*mygo.MenuItem, *mygo.Window)
+	for _, menu := range appMenu() {
+		for _, item := range menu.Submenu {
+			switch item.Accelerator {
+			case tabMenuNext:
+				next = item.Click
+			case tabMenuPrev:
+				prev = item.Click
+			}
+		}
+	}
+	if next == nil || prev == nil {
+		t.Fatal("the Window menu has no ⌃⇥ or ⌃⇧⇥ item")
+	}
+	// A nil window here is the one registered with none, as in a test.
+	stepTabInWindow := func(click func(*mygo.MenuItem, *mygo.Window), want int) {
+		t.Helper()
+		click(nil, nil)
+		if s.active != want {
+			t.Errorf("active tab %d, want %d", s.active, want)
+		}
+	}
+	saved := focusedWindow
+	focusedWindow = func() *mygo.Window { return nil }
+	t.Cleanup(func() { focusedWindow = saved })
+	stepTabInWindow(next, 1)
+	stepTabInWindow(next, 2)
+	stepTabInWindow(prev, 1)
+	stepTabInWindow(prev, 0)
+	stepTabInWindow(prev, len(s.tabs)-1)
 }

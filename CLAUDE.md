@@ -243,7 +243,8 @@ the window (and, on the last one, the app) instead of the tab, and its
 "Force Reload ⇧⌘R" took the rollback key. `main::appMenu` keeps the app
 menu (Quit goes through `OnBeforeQuit`, so through the quit walk), the
 Edit menu (mygo routes its commands to the focused element's own keys)
-and the window items, and nothing else.
+and the Window menu — whose two tab items are the one exception to the
+rule, because AppKit never gives the window ⌃⇥ at all — and nothing else.
 
 `Store::open` sets `journal_mode = WAL` and a `busy_timeout`, because every
 window opens its own handle on the one file and two windows write it at the
@@ -990,6 +991,14 @@ strip, which paints the tabs in the order they were opened, and the strip
 is the list the user is reading. `step_wrapping` **wraps** at both ends,
 because the tabs are a ring — one press past the last is how the user
 comes back to the first.
+
+**⌃⇥ reaches the app through the menu bar.** AppKit keeps Control-Tab
+for its own keyboard navigation between controls and never hands it to
+the view's `keyDown:`, so the shell's binding alone never fired in the
+real app (a headless window delivers it, which is why the tests passed).
+`main::appMenu`'s Window menu carries "Show Next Tab ⌃⇥" and "Show
+Previous Tab ⌃⇧⇥" — Safari's items — and `stepTabIn` hands them to the
+focused window's shell. They are the only key equivalents on the bar.
 
 **A browser's other tab keys work too**: ⌘⌥←→ walk the strip as ⌃⇥
 does, ⌘1 … ⌘8 jump to a place in it and ⌘9 to its end. ⌘⇥ cannot be

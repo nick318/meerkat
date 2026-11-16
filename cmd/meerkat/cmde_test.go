@@ -74,6 +74,8 @@ func TestBrowserTabKeysSwitchTabs(t *testing.T) {
 	press(ui.Cmd, ui.Key2, 1)
 	press(ui.Cmd, ui.Key8, 1) // no eighth tab: nothing moves
 	press(ui.Cmd, ui.Key9, last)
+	press(ui.Ctrl, ui.KeyTab, 0)
+	press(ui.Ctrl|ui.Shift, ui.KeyTab, last)
 }
 
 // The history screen searches its statements: ⌘F puts the keys on the
