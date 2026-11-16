@@ -1437,6 +1437,7 @@ func (s *Shell) historyPane(c *ui.Context, tab *HistoryTab, colors *theme.ThemeC
 				FontSize(11).
 				TextColor(colors.TextMuted.Color())
 			ui.Box(c).Grow(1).Basis(0)
+			s.historySearchBox(c, tab, colors)
 			HistoryFilterChip(c, "mine-only", "mine only", tab.userOnly, colors).
 				KeepFocus().
 				OnClick(func() { s.toggleHistoryFilter(tabID, false) })
@@ -1450,11 +1451,40 @@ func (s *Shell) historyPane(c *ui.Context, tab *HistoryTab, colors *theme.ThemeC
 	s.historyList(c, tab, colors)
 }
 
+// historySearchBox is the history screen's search line, drawn the way the
+// sidebar's filter line is: a hairline box, the magnifier, the bare field,
+// and the ⌘F cap while it is empty — a gesture nothing on screen names is
+// a gesture nobody finds.
+func (s *Shell) historySearchBox(c *ui.Context, tab *HistoryTab, colors *theme.ThemeColors) {
+	field := s.historySearch(tab)
+	ui.Row(c.Key("history-search")).
+		Width(280).
+		Height(28).
+		AlignItems(ui.Center).
+		Gap(8).
+		Padding(0, 6, 0, 9).
+		Border(1, colors.Border.Color()).
+		Radius(7).
+		Background(colors.Window.Color()).
+		Children(func() {
+			uikit.DrawIcon(c, uikit.IconSearch, 12., colors.TextMuted)
+			ui.Column(c).Grow(1).Basis(0).MinWidth(0).Children(func() {
+				field.View(c)
+			})
+			if field.IsEmpty() {
+				uikit.Keycap(c, "⌘F")
+			}
+		})
+}
+
 func (s *Shell) historyList(c *ui.Context, tab *HistoryTab, colors *theme.ThemeColors) ui.Element {
 	if len(tab.rows) == 0 {
 		note := "nothing run yet on this connection"
 		if tab.userOnly || tab.errorsOnly {
 			note = "no runs match these filters"
+		}
+		if tab.search != nil && !tab.search.IsEmpty() {
+			note = "no statement holds “" + tab.search.Trimmed() + "”"
 		}
 		return ui.Column(c.Key("history")).
 			Grow(1).Basis(0).

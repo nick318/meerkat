@@ -900,6 +900,12 @@ generation counter. `history.rs` flattens the runs into day headings plus
 runs of one height, because `uniform_list` needs one row height. Clicking
 a run opens it in a new query tab; it never re-runs behind the user.
 
+**The screen searches its statements.** A line in its header, which ⌘F
+reaches, narrows the runs to the statements that hold its text —
+`fuzzy::Needle`, the ⌘F substring, because a statement is prose. Every
+keystroke reads the file again rather than keeping a second copy of
+the runs: it is at most 500 rows of local SQLite.
+
 ### The ⌘K palette
 
 `palette.rs` searches only what the session already holds: the `Catalog`
@@ -984,6 +990,11 @@ strip, which paints the tabs in the order they were opened, and the strip
 is the list the user is reading. `step_wrapping` **wraps** at both ends,
 because the tabs are a ring — one press past the last is how the user
 comes back to the first.
+
+**A browser's other tab keys work too**: ⌘⌥←→ walk the strip as ⌃⇥
+does, ⌘1 … ⌘8 jump to a place in it and ⌘9 to its end. ⌘⇥ cannot be
+one of them — the system's app switcher takes it before any window
+hears it.
 
 Both keys are bound to the `Shell` context. The walk does nothing while
 the palette is open: that dialog is already the one taking keys. Every

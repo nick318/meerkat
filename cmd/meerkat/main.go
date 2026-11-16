@@ -89,6 +89,22 @@ func ShellKeyBindings() []uikit.KeyBinding[ShellAction] {
 		// both keys are bound to the shell and nowhere else.
 		uikit.Bind("ctrl-tab", ShellNextTab),
 		uikit.Bind("ctrl-shift-tab", ShellPrevTab),
+		// A browser's other tab keys, because a strip of tabs is read
+		// as a browser's and ⌘⇥ is the system's, never the app's: the
+		// app switcher takes it before any window hears it. ⌘⌥←→ walk
+		// the strip like ⌃⇥, and ⌘1 … ⌘8 jump to a place in it, ⌘9 to
+		// its end. Neither the editor nor the grid binds any of them.
+		uikit.Bind("cmd-alt-right", ShellNextTab),
+		uikit.Bind("cmd-alt-left", ShellPrevTab),
+		uikit.Bind("cmd-1", ShellGoToTab1),
+		uikit.Bind("cmd-2", ShellGoToTab2),
+		uikit.Bind("cmd-3", ShellGoToTab3),
+		uikit.Bind("cmd-4", ShellGoToTab4),
+		uikit.Bind("cmd-5", ShellGoToTab5),
+		uikit.Bind("cmd-6", ShellGoToTab6),
+		uikit.Bind("cmd-7", ShellGoToTab7),
+		uikit.Bind("cmd-8", ShellGoToTab8),
+		uikit.Bind("cmd-9", ShellGoToLastTab),
 	}
 }
 

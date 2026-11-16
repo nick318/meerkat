@@ -145,6 +145,18 @@ const (
 	ShellSelectAllPeek
 	ShellCommitTransaction
 	ShellRollbackTransaction
+	// ShellGoToTab1 … ShellGoToTab8 are ⌘1 … ⌘8, and ShellGoToLastTab is
+	// ⌘9: a browser's keys for a tab by its place in the strip. The eight
+	// are consecutive, so the place is the action less ShellGoToTab1.
+	ShellGoToTab1
+	ShellGoToTab2
+	ShellGoToTab3
+	ShellGoToTab4
+	ShellGoToTab5
+	ShellGoToTab6
+	ShellGoToTab7
+	ShellGoToTab8
+	ShellGoToLastTab
 )
 
 // ShellKeyContext is the shell's own key context. The Rust wrote it as the
@@ -1545,8 +1557,12 @@ type HistoryTab struct {
 	// The comp's two chips.
 	userOnly   bool
 	errorsOnly bool
-	error      *string
-	scroll     uniformListScroll
+	// search narrows the runs to the statements that hold its text. Made
+	// on first use by `Shell.historySearch`, so a tab built without one
+	// still works.
+	search *uikit.TextField
+	error  *string
+	scroll uniformListScroll
 }
 
 func (*TableTab) isTab()   {}

@@ -860,6 +860,15 @@ func (s *Store) ListHistory(scope string, filter HistoryFilter) ([]QueryRun, err
 	if filter.Since != nil {
 		since = *filter.Since
 	}
+	// A zero limit is a filter nobody filled in, not a request for no
+	// runs: the Rust `HistoryFilter::default()` carried the limit, and Go's
+	// zero value does not. ⌘K read its runs through a bare
+	// `HistoryFilter{}` and got `LIMIT 0` — an empty RECENT QUERIES over a
+	// full history. So zero reads the default cap, as the Rust default did.
+	limit := int64(filter.Limit)
+	if limit <= 0 {
+		limit = int64(historyLimit)
+	}
 	rows, err := s.conn.Query(
 		`SELECT id, statement, ran_at, source, elapsed_ms, row_count, affected, error
                FROM query_history
@@ -874,7 +883,7 @@ func (s *Store) ListHistory(scope string, filter HistoryFilter) ([]QueryRun, err
 		boolInt(filter.ErrorsOnly),
 		boolInt(filter.Since != nil),
 		since,
-		int64(filter.Limit),
+		limit,
 	)
 	if err != nil {
 		return nil, err

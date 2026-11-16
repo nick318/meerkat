@@ -531,3 +531,17 @@ func TestTheMostRecentlyOpenedConnectionComesFirst(t *testing.T) {
 		t.Fatalf("order = %q", order)
 	}
 }
+
+// A filter nobody filled in reads the runs rather than none: ⌘K read its
+// history through a zero `HistoryFilter{}`, and `LIMIT 0` left RECENT
+// QUERIES empty over a full history.
+func TestAZeroFilterReadsTheHistory(t *testing.T) {
+	store := storeAt(t, "zero-filter.sqlite")
+	must(t, store.RecordQuery(run("prod", "select 1", 100, RunSourceUser)))
+	must(t, store.RecordQuery(run("prod", "select 2", 200, RunSourceUser)))
+	runs, err := store.ListHistory("prod", HistoryFilter{})
+	must(t, err)
+	if len(runs) != 2 {
+		t.Fatalf("a zero filter read %d runs, want 2", len(runs))
+	}
+}

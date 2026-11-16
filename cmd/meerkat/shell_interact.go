@@ -224,7 +224,10 @@ func (s *Shell) focusCatalogFilter() {
 	if s.palette != nil || s.confirm != nil {
 		return
 	}
-	s.closeColumnFind()
+	// Dropped rather than closed: `closeColumnFind` hands the focus back
+	// to the tab, and that request lands in the same frame as this one
+	// and wins it, so ⌘E would put the keys on the tab instead.
+	s.columnFind = nil
 	s.catalogFilter.SelectEverything()
 	s.catalogFilter.FocusHandle().Focus()
 }
@@ -439,7 +442,7 @@ func (s *Shell) openPalette() {
 
 	var runs []storage.QueryRun
 	if s.store != nil {
-		if found, err := s.store.ListHistory(s.scope, storage.HistoryFilter{}); err == nil {
+		if found, err := s.store.ListHistory(s.scope, storage.DefaultHistoryFilter()); err == nil {
 			runs = found
 		}
 	}
@@ -816,6 +819,8 @@ func (s *Shell) findInTab() {
 		tab.editor.Find()
 	case *TableTab:
 		s.openResultFind()
+	case *HistoryTab:
+		s.focusHistorySearch(tab)
 	}
 }
 
@@ -1328,6 +1333,27 @@ func (s *Shell) stepTab(forward bool) {
 	s.focusActiveTab()
 }
 
+// tabAtPlace is the tab ⌘1 … ⌘8 ask for, by its place in the strip
+// counted from zero, or -1 when the strip is shorter: a browser does
+// nothing for ⌘5 over three tabs, and neither does this.
+func tabAtPlace(tabs, place int) int {
+	if place < 0 || place >= tabs {
+		return -1
+	}
+	return place
+}
+
+// goToTab is ⌘1 … ⌘9: the tab at that index, focused the way a click on
+// it focuses it. The walk does nothing while the palette is open, for the
+// reason ⌃⇥ does nothing then.
+func (s *Shell) goToTab(ix int) {
+	if s.palette != nil || ix < 0 || ix >= len(s.tabs) {
+		return
+	}
+	s.activate(ix)
+	s.focusActiveTab()
+}
+
 // activate makes one tab the active one. Every path that changes the
 // active tab goes through here, which is also what makes this the place
 // the strip is written back from.
@@ -1464,6 +1490,11 @@ func (s *Shell) handleAction(action ShellAction) {
 		s.stepPage(true)
 	case ShellShowHistory:
 		s.onShowHistory()
+	case ShellGoToTab1, ShellGoToTab2, ShellGoToTab3, ShellGoToTab4,
+		ShellGoToTab5, ShellGoToTab6, ShellGoToTab7, ShellGoToTab8:
+		s.goToTab(tabAtPlace(len(s.tabs), int(action-ShellGoToTab1)))
+	case ShellGoToLastTab:
+		s.goToTab(len(s.tabs) - 1)
 	case ShellNextTab:
 		s.stepTab(true)
 	case ShellPrevTab:

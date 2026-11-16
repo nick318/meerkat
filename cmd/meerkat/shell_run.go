@@ -18,8 +18,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/egoist/mygo/ui"
+
 	"github.com/nick318/meerkat/internal/dbclient"
 	"github.com/nick318/meerkat/internal/dbpostgres"
+	"github.com/nick318/meerkat/internal/fuzzy"
 	"github.com/nick318/meerkat/internal/introspect"
 	"github.com/nick318/meerkat/internal/query"
 	"github.com/nick318/meerkat/internal/resultsgrid"
@@ -1129,6 +1132,7 @@ func (s *Shell) loadHistory(tabID uint64) {
 	}
 	runs, err := s.store.ListHistory(scope, filter)
 	if err == nil {
+		runs = historyMatching(runs, s.historySearch(tab).Trimmed())
 		rows := HistoryFlatten(runs, HistoryToday())
 		tab.runs = len(runs)
 		tab.rows = rows
@@ -1139,6 +1143,63 @@ func (s *Shell) loadHistory(tabID uint64) {
 		message := err.Error()
 		tab.error = &message
 	}
+}
+
+// historyMatching is the runs whose statement holds the search line's
+// text, in the order they came. A statement is prose, not a path of
+// words, so it is the plain substring the ⌘F line uses — `fuzzy.Needle`,
+// whose case rule is every other search line's — and not the name
+// matcher, which would answer a short query with every run there is.
+func historyMatching(runs []storage.QueryRun, text string) []storage.QueryRun {
+	needle := fuzzy.NewNeedle(text)
+	if needle.IsEmpty() {
+		return runs
+	}
+	kept := runs[:0:0]
+	for _, run := range runs {
+		if needle.IsIn(run.Statement) {
+			kept = append(kept, run)
+		}
+	}
+	return kept
+}
+
+// historySearch is the history tab's search line, made the first time it
+// is asked for. A keystroke reads the runs again: it is a local SQLite
+// read of at most `storage`'s cap, which costs less than keeping a second
+// copy of the runs to filter.
+func (s *Shell) historySearch(tab *HistoryTab) *uikit.TextField {
+	if tab.search != nil {
+		return tab.search
+	}
+	field := uikit.NewTextField("search statements…").Bare(filterFontSize)
+	tabID := tab.id
+	field.Subscribe(func(field *uikit.TextField, event uikit.TextFieldEvent) {
+		switch event {
+		case uikit.TextFieldChanged:
+			if tab, ok := s.tabMut(tabID).(*HistoryTab); ok {
+				tab.scroll.List.ScrollTo(0, ui.Start)
+			}
+			s.loadHistory(tabID)
+		case uikit.TextFieldCancelled:
+			// ⎋ empties the line, and a second ⎋ hands the keys back.
+			if field.Text() != "" {
+				field.Clear()
+			} else {
+				s.focusHandle.Focus()
+			}
+		}
+	})
+	tab.search = field
+	return field
+}
+
+// focusHistorySearch is ⌘F on the history tab: the search line takes the
+// keys, with what it holds marked so the next character replaces it.
+func (s *Shell) focusHistorySearch(tab *HistoryTab) {
+	field := s.historySearch(tab)
+	field.SelectEverything()
+	field.FocusHandle().Focus()
 }
 
 // reloadOpenHistory keeps an open history tab current when a run finishes
