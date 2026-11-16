@@ -12,8 +12,9 @@ module: a package per former Rust crate under `internal/`, and the binary in
 MySQL are Phase 2.
 
 **The Go code is a mechanical port of the first edition, Rust on
-[GPUI](https://www.gpui.rs)**, whose source is still in `crates/` as the
-reference. The behaviour sections below were written about the Rust and
+[GPUI](https://www.gpui.rs)**. Its source was removed from the tree after
+0.1.8 and is in git history as the reference (`git show v0.1.8:crates/`,
+or `git worktree add /tmp/meerkat-rust v0.1.8`). The behaviour sections below were written about the Rust and
 still name Rust items (`shell.rs`, `Shell::activate`, `QueryTab::landed`);
 each one has a Go twin of the same name in camelCase or CamelCase
 (`shell.rs` is split into `cmd/meerkat/shell*.go`, see
@@ -2123,7 +2124,7 @@ paging arithmetic that must be exact.
 ### GPUI conventions
 
 - Every color comes from `theme::ThemeColors` tokens, never a literal in view
-  code. If a token is missing, add it to `crates/theme` with a comment. The
+  code. If a token is missing, add it to `internal/theme` with a comment. The
   visual language is "warm paper", second edition — the "Meerkat facelift"
   design canvas, direction A; the first edition is the comp at
   `docs/design/Meerkat.dc.html`. **Text reads at 4.5:1 or better**:
@@ -2163,7 +2164,7 @@ paging arithmetic that must be exact.
 version, so semver answers. The dev channel ships from `main` and rarely
 bumps the version, so two dev builds are told apart by their commit —
 Zed's nightly rule. `auto_update::update_available` is pure and holds
-both; a `local` build (any plain `cargo build`) is never offered
+both; a `local` build (any plain `go build`) is never offered
 anything, and `init` gives it no updater at all.
 
 **The feed is a static file, never an endpoint.** One JSON per channel on

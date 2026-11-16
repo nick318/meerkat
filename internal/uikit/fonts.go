@@ -1,11 +1,10 @@
 package uikit
 
 // The two bundled families. Rust loaded them in `main` with
-// `cx.text_system().add_fonts(include_bytes!(…))`, from
-// crates/meerkat/assets/fonts. Go's embed cannot reach outside its
-// package's directory, so the same files are copied beside this one
-// (fonts/, with their OFL licences) and `main` calls RegisterFonts in
-// place of `add_fonts`.
+// `cx.text_system().add_fonts(include_bytes!(…))`. The files live beside
+// this one (fonts/, with their OFL licences), because Go's embed cannot
+// reach outside its package's directory, and `main` calls RegisterFonts
+// in place of `add_fonts`.
 //
 // Each file is registered under its family name, so the three weights of
 // a family make up that family and `FontWeight(500)` or `(600)` picks the

@@ -1,6 +1,5 @@
 #!/bin/sh
-# `scripts/dev.sh [postgres://...]` builds, signs and launches the app —
-# what `cargo dev` was for the Rust build.
+# `scripts/dev.sh [postgres://...]` builds, signs and launches the app.
 #
 # Everything goes through scripts/run-signed.sh, so the binary carries a
 # stable code signature and the keychain stops asking after every rebuild.

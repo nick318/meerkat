@@ -1,5 +1,8 @@
 # How `crates/meerkat/src/shell.rs` is split into Go files
 
+> The Rust is gone from `main`; read it at tag `v0.1.8`:
+> `git show v0.1.8:crates/meerkat/src/shell.rs`.
+
 `shell.rs` is 12,169 lines; its `#[cfg(test)]` module starts at line
 10,693. Every item belongs to exactly one Go file below, all in package
 `main` under `cmd/meerkat/`. Line numbers are the item's first line in

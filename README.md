@@ -5,8 +5,9 @@ read results. Written in Go on [mygo](https://github.com/egoist/mygo),
 whose native UI is drawn on the GPU. One Go binary per platform — no
 webview, no server.
 
-The first edition was Rust on [GPUI](https://www.gpui.rs); its source is
-still in `crates/` as the reference the Go port was made from.
+The first edition was Rust on [GPUI](https://www.gpui.rs). Its source,
+the reference the Go port was made from, was removed after 0.1.8 and
+lives on in git history: `git show v0.1.8:crates/`.
 
 `CLAUDE.md` is the architecture document: it explains why each part is
 shaped the way it is. The visual language is the "warm paper" comp at

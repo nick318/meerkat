@@ -75,12 +75,12 @@ rm -rf "$dist"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
 cp "$root/target/release/meerkat" "$app/Contents/MacOS/meerkat"
-cp "$root/crates/meerkat/resources/meerkat.icns" "$app/Contents/Resources/meerkat.icns"
+cp "$root/packaging/macos/meerkat.icns" "$app/Contents/Resources/meerkat.icns"
 sed -e "s/{{APP_NAME}}/$app_name/g" \
     -e "s/{{BUNDLE_ID}}/$bundle_id/g" \
     -e "s/{{VERSION}}/$version/g" \
     -e "s/{{BUILD}}/$build/g" \
-    "$root/crates/meerkat/resources/Info.plist.template" \
+    "$root/packaging/macos/Info.plist.template" \
     > "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist" >/dev/null
 

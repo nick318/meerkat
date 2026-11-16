@@ -1,11 +1,11 @@
 // Package releasechannel says which release channel this build belongs to,
 // and the identity a build carries: version and commit.
 //
-// The channel is baked in at compile time from `MEERKAT_CHANNEL`, which
-// only the bundle script and CI set. A plain `cargo build` therefore
+// The channel is baked in at link time (`-ldflags -X …channel=`), which
+// only the bundle script sets. A plain `go build` therefore
 // always produces a `Local` build, and a `Local` build never polls for
 // updates — there is nothing an update could replace. The commit rides in
-// the same way, through `MEERKAT_COMMIT_SHA`, because two dev builds of
+// the same way, through `commitSHA`, because two dev builds of
 // the same version differ only by their commit.
 //
 // In Go both ride in through the linker rather than the environment:
@@ -30,16 +30,16 @@ var (
 	commitSHA string
 )
 
-// version is the version of this build. It mirrors `version` in the
-// workspace Cargo.toml, which `env!("CARGO_PKG_VERSION")` read in the Rust;
-// bump the two together.
+// version is the version of this build, and the one place it is written:
+// `scripts/bundle-mac.sh` reads it from here for the bundle's
+// Info.plist.
 const version = "0.1.8"
 
 // Channel is where a build came from, and so where its updates come from.
 type Channel int
 
 const (
-	// Local is a `cargo build` on somebody's machine. Never polls for
+	// Local is a plain `go build` on somebody's machine. Never polls for
 	// updates.
 	Local Channel = iota
 	// Dev is the moving channel: built from `main`, replaced often.
@@ -91,7 +91,7 @@ func Current() Channel {
 	return parsed
 }
 
-// Version is the version out of the workspace's Cargo.toml.
+// Version is the version of this build.
 func Version() string {
 	return version
 }

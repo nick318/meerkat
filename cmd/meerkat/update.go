@@ -224,7 +224,7 @@ func footSummary(c *ui.Context, colors *theme.ThemeColors) ui.Element {
 
 			if updater == nil {
 				// A local build: the version is worth a line, an update
-				// story is not — updates come from `cargo build`.
+				// story is not — updates come from `go build`.
 				return
 			}
 

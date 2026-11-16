@@ -1,5 +1,8 @@
 # GPUI → mygo: the mapping sheet
 
+> The port is done and the Rust tree is gone from `main`. Paths under
+> `crates/` below name the Rust at tag `v0.1.8`: `git show v0.1.8:<path>`.
+
 Every UI agent of the port (SQL editor, results grid, the app shell, the
 connections screen, the palette) reads this instead of rediscovering
 mygo. It covers every GPUI construct the Rust UI crates use (counted with

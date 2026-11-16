@@ -9,7 +9,8 @@
 // and a reply that does not carry the tab's current generation is thrown
 // away. Without that, a slow first page would overwrite a fast second one.
 //
-// Port notes: `crates/meerkat/src/shell.rs` is split by topic over
+// Port notes: `crates/meerkat/src/shell.rs` (the Rust, at tag v0.1.8) is
+// split by topic over
 // `shell*.go` (see docs/tasks/shell-split.md). This file holds every type,
 // constant and key table; shell.go the constructor and the tab restore;
 // shell_policy.go the pure functions; the rest belong to K2 (runs,
