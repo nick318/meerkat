@@ -38,6 +38,9 @@ type appAction int
 const (
 	appQuit appAction = iota
 	appNewWindow
+	appZoomIn
+	appZoomOut
+	appZoomReset
 )
 
 // windowCascade is how far a new window is offset from the one before it,
@@ -151,6 +154,16 @@ func appKeyBindings() []uikit.KeyBinding[appAction] {
 		// it means the same thing on the connections screen and inside
 		// a session, and nothing else in the app takes the key.
 		uikit.Bind("cmd-n", appNewWindow),
+		// The zoom (zoom.go), bound globally for the reason ⌘N is: it
+		// means the same on every screen and over every dialog. ⌘+ is
+		// ⇧⌘= on most layouts, and ⌘= is the same key without the
+		// shift, which browsers take as well; ⇧⌘- is the same courtesy
+		// on the way down.
+		uikit.Bind("cmd-=", appZoomIn),
+		uikit.Bind("cmd-shift-=", appZoomIn),
+		uikit.Bind("cmd--", appZoomOut),
+		uikit.Bind("cmd-shift--", appZoomOut),
+		uikit.Bind("cmd-0", appZoomReset),
 	}
 }
 
@@ -177,6 +190,10 @@ func main() {
 	}
 
 	theme.SetGlobal(theme.WarmPaper())
+
+	// The zoom ⌘+ and ⌘- left at the last run, before the first frame,
+	// so the first window does not open at 100% and jump.
+	loadZoom()
 
 	// Saved profiles read their password out of the keychain.
 	dbpostgres.KeychainPassword = secrets.GetPassword
@@ -242,23 +259,7 @@ func openWindow(target Target) {
 	}
 
 	entry := &rootWindow{}
-	view := func(c *ui.Context) {
-		c.Root().Background(theme.Current().Colors.Window.Color()).Font(theme.UiFontFamily)
-		if action, ok := uikit.DispatchWindowKeys(c, appKeys); ok {
-			switch action {
-			case appQuit:
-				quit()
-			case appNewWindow:
-				// On the connections screen, whatever this window is on:
-				// ⌘N asks for a window, not for a second view of this
-				// database.
-				openWindow(nil)
-			}
-		}
-		if entry.root != nil {
-			entry.root.View(c)
-		}
-	}
+	view := windowView(entry)
 	// The screens draw their own title bar, so the tab strip can sit where
 	// the system's empty one was: three bars of chrome became one.
 	// `uikit.TitleBar` moves the window.
@@ -300,6 +301,39 @@ func openWindow(target Target) {
 		forgetWindow(entry)
 	})
 	window.Invalidate()
+}
+
+// windowView is what every window draws: the zoom, the app's own keys,
+// and the window's Root.
+func windowView(entry *rootWindow) func(c *ui.Context) {
+	return func(c *ui.Context) {
+		c.Root().Background(theme.Current().Colors.Window.Color()).Font(theme.UiFontFamily)
+		if action, ok := uikit.DispatchWindowKeys(c, appKeys); ok {
+			switch action {
+			case appQuit:
+				quit()
+			case appNewWindow:
+				// On the connections screen, whatever this window is on:
+				// ⌘N asks for a window, not for a second view of this
+				// database.
+				openWindow(nil)
+			case appZoomIn:
+				zoomIn()
+			case appZoomOut:
+				zoomOut()
+			case appZoomReset:
+				zoomReset()
+			}
+		}
+		// Every frame, so a step taken in another window lands here on
+		// its next repaint (zoomTo repaints every window). After the
+		// keys, so the frame that heard ⌘+ builds again at the new zoom
+		// before it shows, rather than one frame late.
+		c.SetZoom(uiZoom)
+		if entry.root != nil {
+			entry.root.View(c)
+		}
+	}
 }
 
 // forgetWindow takes a closed window out of `roots`. With no window the
@@ -344,7 +378,8 @@ func centeredOrigin() (int, int) {
 //     `quitWalk`, the same as ⌘Q;
 //   - the Edit menu, whose items AppKit routes to the focused element as
 //     edit commands — copy and paste from the menu, and dictation;
-//   - full screen, and the Window menu.
+//   - the View menu: the zoom and full screen;
+//   - the Window menu.
 //
 // The Window menu carries the two keys that are the exception: ⌃⇥ and
 // ⌃⇧⇥. AppKit keeps Control-Tab for its own keyboard navigation between
@@ -352,11 +387,17 @@ func centeredOrigin() (int, int) {
 // the shell's table could not hear it. The menu sees key equivalents
 // before the window does, which is how Safari's "Show Next Tab ⌃⇥" works,
 // and it is the only way in for the key.
+//
+// The View menu's zoom items carry ⌘0, ⌘+ and ⌘- too, and are the other
+// exception, of a different kind: the window binds those keys itself, but
+// to the very calls the menu makes (zoom.go), so whichever hears the key
+// first does what the other would have done. Every Mac app writes them
+// there, and a menu bar is where people look for them.
 func appMenu() []*mygo.MenuItem {
 	return []*mygo.MenuItem{
 		{Role: mygo.RoleAppMenu},
 		{Role: mygo.RoleEditMenu},
-		{Label: "View", Submenu: []*mygo.MenuItem{{Role: mygo.RoleToggleFullScreen}}},
+		{Label: "View", Submenu: append(zoomMenu(), mygo.Separator(), &mygo.MenuItem{Role: mygo.RoleToggleFullScreen})},
 		{Label: "Window", Submenu: []*mygo.MenuItem{
 			{Role: mygo.RoleMinimize},
 			{Role: mygo.RoleZoom},

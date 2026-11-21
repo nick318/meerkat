@@ -243,9 +243,28 @@ item's key equivalent wins over the window: its "Close Window ⌘W" closed
 the window (and, on the last one, the app) instead of the tab, and its
 "Force Reload ⇧⌘R" took the rollback key. `main::appMenu` keeps the app
 menu (Quit goes through `OnBeforeQuit`, so through the quit walk), the
-Edit menu (mygo routes its commands to the focused element's own keys)
-and the Window menu — whose two tab items are the one exception to the
-rule, because AppKit never gives the window ⌃⇥ at all — and nothing else.
+Edit menu (mygo routes its commands to the focused element's own keys),
+the View menu's zoom and full screen, and the Window menu — whose two tab
+items are the one exception to the rule, because AppKit never gives the
+window ⌃⇥ at all — and nothing else. The zoom items carry ⌘0, ⌘+ and ⌘-,
+which the window binds as well, but to the same calls: whichever hears
+the key first does what the other would have done.
+
+### Zoom
+
+**⌘+, ⌘- and ⌘0 zoom the window, the way a browser does; they do not
+change a font size.** The type scale is six tokens and the layout is
+built on them — the grid and the editor measure by a fixed advance, rows
+are a fixed height, icons sit on a 14-unit grid — so bigger fonts alone
+would overflow every row. mygo's `Context.SetZoom` lays the view out in a
+window 1/z its size and draws it z times larger at the screen's
+resolution times z, so everything grows together and stays sharp.
+`zoom.go` holds it: `zoomSteps` are a browser's (50% to 300%),
+`stepZoom` walks them as a plain function, and ⌘= and ⇧⌘- answer as
+⌘+ and ⌘- do. The zoom is one value for the whole app, like the pane
+sizes: every window's view sets `uiZoom` each frame, a step repaints
+every window, and the value lives in `ui_state` under `ui_zoom`, read
+before the first window so it does not open at 100% and jump.
 
 `Store::open` sets `journal_mode = WAL` and a `busy_timeout`, because every
 window opens its own handle on the one file and two windows write it at the

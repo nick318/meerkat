@@ -22,7 +22,11 @@ func TestTheMenuBarTakesNoKeyTheWindowBinds(t *testing.T) {
 			}
 			// ⌃⇥ and ⌃⇧⇥ are the exception: AppKit never hands
 			// them to the window, so the menu is their only way in.
-			if item.Accelerator != "" && item.Accelerator != tabMenuNext && item.Accelerator != tabMenuPrev {
+			// The zoom keys are the other: the window binds them to
+			// the same calls the menu makes.
+			switch item.Accelerator {
+			case "", tabMenuNext, tabMenuPrev, zoomMenuReset, zoomMenuIn, zoomMenuOut:
+			default:
 				t.Errorf("the menu item %q takes %s from the window", item.Label, item.Accelerator)
 			}
 			walk(item.Submenu)
