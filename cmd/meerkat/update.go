@@ -96,7 +96,7 @@ func toast(c *ui.Context, colors *theme.ThemeColors, bottom float32) (ui.Element
 		el := ui.Box(c.Key("dismiss-update-toast")).
 			Shrink(0).
 			Padding(0, 3).
-			FontSize(12).
+			FontSize(theme.SizeBody).
 			TextColor(colors.TextFaint.Color()).
 			Cursor(ui.CursorPointer).
 			Children(func() { ui.Text(c, "×") })
@@ -129,7 +129,7 @@ func toast(c *ui.Context, colors *theme.ThemeColors, bottom float32) (ui.Element
 				ui.Box(c).
 					Grow(1).Basis(0).
 					MinWidth(0).
-					FontSize(12).
+					FontSize(theme.SizeBody).
 					FontWeight(600).
 					TextColor(colors.Text.Color()).
 					Children(func() { ui.Text(c, headline) })
@@ -139,16 +139,16 @@ func toast(c *ui.Context, colors *theme.ThemeColors, bottom float32) (ui.Element
 		// short. What a restart asks about first is the close dialog's
 		// to say, at the moment it asks.
 		ui.Box(c).
-			FontSize(10).
+			FontSize(theme.SizeMeta).
 			TextColor(colors.TextMuted.Color()).
 			Children(func() { ui.Text(c, "a restart picks it up") })
 		button := ui.Box(c.Key("restart-to-update")).
 			Shrink(0).
 			AlignSelf(ui.Start).
-			Padding(4, 9).
+			Padding(5, 11).
 			Radius(5).
 			Background(colors.Accent.Color()).
-			FontSize(10).
+			FontSize(theme.SizeBody).
 			FontWeight(600).
 			TextColor(colors.Window.Color()).
 			Cursor(ui.CursorPointer).
@@ -196,7 +196,7 @@ func footSummary(c *ui.Context, colors *theme.ThemeColors) ui.Element {
 
 	check := func(label string) {
 		el := ui.Box(c.Key("check-for-updates")).
-			FontSize(10).
+			FontSize(theme.SizeCaption).
 			TextColor(colors.Accent.Color()).
 			Cursor(ui.CursorPointer).
 			Children(func() { ui.Text(c, label) })
@@ -208,7 +208,7 @@ func footSummary(c *ui.Context, colors *theme.ThemeColors) ui.Element {
 
 	faint := func(text string) {
 		ui.Box(c).
-			FontSize(10).
+			FontSize(theme.SizeCaption).
 			TextColor(colors.TextFaint.Color()).
 			Children(func() { ui.Text(c, text) })
 	}
@@ -218,7 +218,7 @@ func footSummary(c *ui.Context, colors *theme.ThemeColors) ui.Element {
 		Gap(2).
 		Children(func() {
 			ui.Box(c).
-				FontSize(10).
+				FontSize(theme.SizeCaption).
 				TextColor(colors.TextFaint.Color()).
 				Children(func() { ui.Text(c, identity) })
 
@@ -252,7 +252,7 @@ func footSummary(c *ui.Context, colors *theme.ThemeColors) ui.Element {
 					Children(func() {
 						ui.Box(c).
 							MaxWidth(360).
-							FontSize(10).
+							FontSize(theme.SizeCaption).
 							TextColor(colors.Error.Color()).
 							Children(func() {
 								ui.Text(c, fmt.Sprintf("update failed: %s", status.Error)).SingleLine()

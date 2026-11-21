@@ -219,23 +219,17 @@ func (s *Shell) tableToolbar(c *ui.Context, tab *TableTab, colors *theme.ThemeCo
 		Padding(9, 14).
 		BorderWidth(0, 0, 1, 0).
 		BorderColor(colors.Hairline.Color())
-	// Go port: the popover hangs out of this row over the grid below,
-	// which GPUI's `deferred` painted after it; a z-index over its
-	// siblings does that here (see columnFindControl).
-	if s.columnFindOpen() != nil {
-		toolbar.ZIndex(1)
-	}
 	return toolbar.Children(func() {
 		ui.Text(c, tab.table).
-			FontSize(12).
+			FontSize(theme.SizeBody).
 			FontWeight(500).
 			TextColor(colors.Text.Color())
 		ui.Text(c, fmt.Sprintf("%s · %d columns", rows, columns)).
-			FontSize(11).
+			FontSize(theme.SizeMeta).
 			TextColor(colors.TextMuted.Color())
 		if tab.loading {
 			ui.Text(c, "loading…").
-				FontSize(11).
+				FontSize(theme.SizeMeta).
 				TextColor(colors.Accent.Color())
 		}
 		ui.Box(c).Grow(1).Basis(0)
@@ -245,7 +239,7 @@ func (s *Shell) tableToolbar(c *ui.Context, tab *TableTab, colors *theme.ThemeCo
 			Border(1, colors.BorderStrong.Color()).
 			Radius(6).
 			Background(colors.Elevated.Color()).
-			FontSize(11).
+			FontSize(theme.SizeMeta).
 			TextColor(colors.TextSecondary.Color()).
 			Cursor(ui.CursorPointer).
 			KeepFocus()
@@ -270,23 +264,13 @@ func (s *Shell) columnFindOpen() *ColumnFind {
 	return find
 }
 
-// columnFindControl is the comp's "column ⌘J" button, and the popover it
-// opens under itself. Both kinds of tab that show a result carry it: a
-// result is as wide wherever it came from.
+// columnFindControl is the comp's "column ⌘J" button. Both kinds of tab
+// that show a result carry it: a result is as wide wherever it came from.
+// The popover it opens is not drawn here — see columnFindOverlay.
 //
 // Nothing is drawn while the result has no columns. A button that opened
 // an empty list would be a control that says it can do something it
 // cannot.
-//
-// The popover is `deferred`, which paints it after everything around it
-// rather than under: GPUI paints siblings in order, and the toolbar is
-// painted before the grid it hangs over.
-//
-// Go port: `deferred` is a z-index on the popover and on the row that
-// holds the control (the caller's), so the popover paints and hit-tests
-// over the grid while staying inside the shell's focus chain — a
-// `ui.Overlay` would take it out of the chain, and ⌘J would no longer
-// reach the shell from the popover's search line.
 func (s *Shell) columnFindControl(c *ui.Context, colors *theme.ThemeColors) {
 	if s.active >= len(s.tabs) {
 		return
@@ -304,11 +288,7 @@ func (s *Shell) columnFindControl(c *ui.Context, colors *theme.ThemeColors) {
 		border, fill = colors.RunningBorder, colors.RunningSurface
 	}
 
-	wrapper := ui.Box(c.Key("find-column-control")).Shrink(0)
-	if open != nil {
-		wrapper.ZIndex(1)
-	}
-	wrapper.Children(func() {
+	ui.Box(c.Key("find-column-control")).Shrink(0).Children(func() {
 		button := ui.Row(c.Key("find-column")).
 			Height(28).
 			AlignItems(ui.Center).
@@ -317,7 +297,7 @@ func (s *Shell) columnFindControl(c *ui.Context, colors *theme.ThemeColors) {
 			Border(1, border.Color()).
 			Radius(7).
 			Background(fill.Color()).
-			FontSize(12).
+			FontSize(theme.SizeBody).
 			TextColor(colors.TextSecondary.Color()).
 			Cursor(ui.CursorPointer)
 		if button.Hovered() {
@@ -329,9 +309,46 @@ func (s *Shell) columnFindControl(c *ui.Context, colors *theme.ThemeColors) {
 			ui.Text(c, "Column")
 			keyBadge(c, "⌘J", colors)
 		})
-		if open != nil {
-			s.columnFindPopover(c, open, colors)
-		}
+	})
+}
+
+// columnFindOverlay is the column find, centred over the shell both ways.
+// It hung from the button once, as the comp draws it, which put it in a
+// corner of the window, away from the header the user is reading; the
+// middle of the window is where the eye already is.
+//
+// The scrim follows the peek's: **no wash**, because the result behind it
+// is what the search is about, and a click on it closes the popover. It is
+// an absolutely positioned child of the shell rather than a `ui.Overlay`,
+// so the search line stays inside the shell's focus chain and ⌘J still
+// reaches the shell from it.
+func (s *Shell) columnFindOverlay(c *ui.Context, colors *theme.ThemeColors) {
+	find := s.columnFindOpen()
+	if find == nil || len(s.resultColumns()) == 0 {
+		return
+	}
+	scrim := ui.Row(c.Key("column-find-scrim")).
+		Absolute().
+		Top(0).
+		Left(0).
+		Fill().
+		Justify(ui.Center).
+		AlignItems(ui.Center)
+	scrim.OnClick(func() { s.closeColumnFind() })
+	// What is centred is the popover at its tallest, not the popover as it
+	// is: the list shrinks with every keystroke, and a card centred on its
+	// own height would carry the search line up and down under the caret.
+	// So the frame keeps one height and the card hangs from its top — the
+	// line stays put and only the list below it changes. The frame takes
+	// no press of its own, so a click beside the card still reaches the
+	// scrim and closes it.
+	scrim.Children(func() {
+		ui.Column(c.Key("column-find-frame")).
+			Width(columnFindWidth).
+			Height(columnFindMaxHeight).
+			Shrink(0).
+			Justify(ui.Start).
+			Children(func() { s.columnFindPopover(c, find, colors) })
 	})
 }
 
@@ -343,20 +360,13 @@ func (s *Shell) columnFindPopover(c *ui.Context, find *ColumnFind, colors *theme
 	count := fmt.Sprintf("%d/%d", len(matches), len(columns))
 
 	popover := ui.Column(c.Key("column-find")).
-		Absolute().
-		Top(columnFindTop).
-		// Hung from the button's right edge, not its left as the comp
-		// draws it: the button sits at the right end of the toolbar
-		// here, and 290px to the right of it is off the window.
-		Right(0).
 		Width(columnFindWidth).
-		ZIndex(1).
 		Clip().
 		Border(1, colors.BorderStrong.Color()).
-		Radius(9).
+		Radius(10).
 		Background(colors.Elevated.Color()).
-		// A click in the popover is not a click in the grid under it,
-		// and it leaves the focus on the search line.
+		// A click in the popover is not a click on the scrim, so it must
+		// not close it, and it leaves the focus on the search line.
 		KeepFocus()
 	popover.OnClick(func() {})
 	uikit.BoxShadow{OffsetX: 0, OffsetY: 18, BlurRadius: 40, SpreadRadius: -14, Color: colors.Shadow}.Apply(popover)
@@ -367,31 +377,33 @@ func (s *Shell) columnFindPopover(c *ui.Context, find *ColumnFind, colors *theme
 		ui.Row(c).
 			Shrink(0).
 			AlignItems(ui.Center).
-			Gap(8).
-			Padding(9, 11).
+			Gap(10).
+			Padding(13, 15).
 			BorderWidth(0, 0, 1, 0).
 			BorderColor(colors.Border.Color()).
 			Children(func() {
-				uikit.SearchGlyph(c, colors.TextFaint)
+				// The icon the button wears, at the search line's size: the
+				// 11px glyph the sidebar's filter uses reads as a speck here.
+				uikit.DrawIcon(c, uikit.IconSearch, 15., colors.TextFaint)
 				ui.Column(c).Grow(1).Basis(0).MinWidth(0).Children(func() {
 					find.query.View(c)
 				})
 				// How much of the result is left, so a search that has
 				// narrowed to one column says so without counting rows.
 				ui.Text(c, count).
-					FontSize(10).
+					FontSize(theme.SizeBody).
 					TextColor(colors.TextFaint.Color())
 			})
 		s.columnFindList(c, find, matches, colors)
 		ui.Row(c).
 			Shrink(0).
 			AlignItems(ui.Center).
-			Gap(10).
-			Padding(7, 11).
+			Gap(12).
+			Padding(9, 15).
 			BorderWidth(1, 0, 0, 0).
 			BorderColor(colors.Border.Color()).
 			Background(colors.Panel.Color()).
-			FontSize(9).
+			FontSize(theme.SizeBody).
 			TextColor(colors.TextMuted.Color()).
 			Children(func() {
 				ui.Text(c, "↑↓ browse")
@@ -408,8 +420,8 @@ func (s *Shell) columnFindList(c *ui.Context, find *ColumnFind, matches []int, c
 	if len(matches) == 0 {
 		return ui.Box(c).
 			Shrink(0).
-			Padding(10, 13).
-			FontSize(11).
+			Padding(12, 16).
+			FontSize(theme.SizeBody).
 			TextColor(colors.TextFaint.Color()).
 			Children(func() { ui.Text(c, "no column matches") })
 	}
@@ -427,7 +439,7 @@ func (s *Shell) columnFindList(c *ui.Context, find *ColumnFind, matches []int, c
 	// The 5px of padding the list sits in counts towards the height the
 	// comp gives the box, so it comes off the rows rather than being
 	// added to them: a scrolling list must not be a half-row tall.
-	const padding float32 = 5.
+	const padding float32 = 6.
 	height := minF32(float32(len(matches))*columnRowHeight, columnListMaxHeight-2.*padding)
 	return ui.Column(c.Key("column-matches-box")).
 		Height(height + 2.*padding).
@@ -474,9 +486,9 @@ func columnRow(
 	row := ui.Row(c.Key(fmt.Sprintf("column-row-%d", ix))).
 		Height(columnRowHeight).
 		AlignItems(ui.Center).
-		Gap(9).
-		Padding(0, 8).
-		Radius(5).
+		Gap(10).
+		Padding(0, 10).
+		Radius(6).
 		Cursor(ui.CursorPointer)
 	row.OnClick(func() { jump(column) })
 	if selected {
@@ -488,23 +500,27 @@ func columnRow(
 		// The lane's own number, counted from one as the header reads,
 		// so the popover and the result agree about where a column is.
 		ui.Box(c).
-			Width(15).
+			Width(18).
 			Shrink(0).
-			FontSize(9).
+			FontSize(theme.SizeBody).
 			TextColor(colors.LineNumber.Color()).
 			Children(func() { ui.Text(c, fmt.Sprintf("%d", column+1)) })
 		nameInk := colors.TextSecondary
 		if selected {
 			nameInk = colors.Text
 		}
+		// In the mono, as the header the user jumps to spells it: one
+		// name in two shapes reads as two names. A size up from the grid,
+		// because the list is the whole of this dialog.
 		ui.Box(c).
 			Grow(1).Basis(0).
 			MinWidth(0).
-			FontSize(11).
+			Font(theme.MonoFontFamily).
+			FontSize(theme.SizeEmphasis).
 			TextColor(nameInk.Color()).
 			Children(func() { ui.Text(c, name).SingleLine() })
 		ui.Text(c, mark).
-			FontSize(10).
+			FontSize(theme.SizeBody).
 			TextColor(markInk.Color())
 	})
 }
@@ -533,7 +549,7 @@ func (s *Shell) runTimer(c *ui.Context, tab *QueryTab, colors *theme.ThemeColors
 		Radius(7).
 		Background(colors.RunningSurface.Color()).
 		Font(theme.MonoFontFamily).
-		FontSize(12).
+		FontSize(theme.SizeBody).
 		TextColor(colors.AccentDeep.Color()).
 		Children(func() {
 			uikit.StatusDot(c, colors.RunningMark)
@@ -571,7 +587,7 @@ func (s *Shell) txSwitch(c *ui.Context, tab *QueryTab, colors *theme.ThemeColors
 			Gap(6).
 			Padding(0, 10).
 			Radius(5).
-			FontSize(12.5).
+			FontSize(theme.SizeBody).
 			FontWeight(weight).
 			TextColor(ink.Color()).
 			KeepFocus()
@@ -598,33 +614,45 @@ func (s *Shell) txSwitch(c *ui.Context, tab *QueryTab, colors *theme.ThemeColors
 	if manual {
 		border, fill, labelInk = colors.RunningBorder, colors.RunningSurface, colors.AccentMuted
 	}
+	// **The label sits outside the track.** Inside it, "Transaction"
+	// was a third segment to the eye — one more word in the same box,
+	// on the same ground — and the switch read as a three-way choice.
+	// The track holds the two answers and nothing else; the word in
+	// front of it is the question.
+	// More room in front of the word than between it and the track, so
+	// the word belongs to the track and not to the run button beside it.
 	return ui.Row(c.Key("tx-switch")).
 		Shrink(0).
-		Height(30).
 		AlignItems(ui.Center).
-		Gap(2).
-		Padding(2).
-		Border(1, border.Color()).
-		Radius(7).
-		Background(fill.Color()).
+		Gap(8).
+		Padding(0, 0, 0, 8).
 		Children(func() {
-			ui.Box(c).
-				Padding(0, 4, 0, 6).
-				FontSize(12).
-				TextColor(labelInk.Color()).
-				Children(func() { ui.Text(c, "Transaction") })
-			chip(dbclient.TxModeAuto, !manual, locked, nil)
-			var dot func()
-			if manual {
-				dot = func() {
-					ink := colors.RunningBorder
-					if tab.inTransaction {
-						ink = colors.RunningMark
+			ui.Text(c, "Transaction").
+				FontSize(theme.SizeBody).
+				TextColor(labelInk.Color())
+			ui.Row(c.Key("tx-track")).
+				Shrink(0).
+				Height(30).
+				AlignItems(ui.Center).
+				Gap(2).
+				Padding(2).
+				Border(1, border.Color()).
+				Radius(7).
+				Background(fill.Color()).
+				Children(func() {
+					chip(dbclient.TxModeAuto, !manual, locked, nil)
+					var dot func()
+					if manual {
+						dot = func() {
+							ink := colors.RunningBorder
+							if tab.inTransaction {
+								ink = colors.RunningMark
+							}
+							uikit.StatusDot(c, ink)
+						}
 					}
-					uikit.StatusDot(c, ink)
-				}
-			}
-			chip(dbclient.TxModeManual, manual, false, dot)
+					chip(dbclient.TxModeManual, manual, false, dot)
+				})
 		})
 }
 
@@ -697,24 +725,24 @@ func (s *Shell) schemaStrip(c *ui.Context, tab *QueryTab, colors *theme.ThemeCol
 								Background(colors.Ddl.Color()).
 								AlignItems(ui.Center).
 								Justify(ui.Center).
-								FontSize(9).
+								FontSize(theme.SizeCaption).
 								FontWeight(600).
 								TextColor(colors.DdlSurface.Color()).
 								Children(func() { ui.Text(c, "Δ") })
 							ui.Text(c, "SCHEMA CHANGED").
-								FontSize(9).
+								FontSize(theme.SizeCaption).
 								FontWeight(600).
 								TextColor(colors.DdlText.Color())
 							if subject != nil {
 								ui.Box(c).
 									MinWidth(0).
-									FontSize(11).
+									FontSize(theme.SizeMeta).
 									FontWeight(500).
 									TextColor(colors.Text.Color()).
 									Children(func() { ui.Text(c, *subject).SingleLine() })
 							}
 							ui.Text(c, meta).
-								FontSize(10).
+								FontSize(theme.SizeCaption).
 								TextColor(colors.DdlMuted.Color())
 							ui.Box(c).Grow(1).Basis(0)
 							if reveal != nil {
@@ -722,7 +750,7 @@ func (s *Shell) schemaStrip(c *ui.Context, tab *QueryTab, colors *theme.ThemeCol
 								link := ui.Box(c.Key("reveal-relation")).
 									Shrink(0).
 									Cursor(ui.CursorPointer).
-									FontSize(10).
+									FontSize(theme.SizeCaption).
 									TextColor(colors.DdlText.Color())
 								if link.Hovered() {
 									link.TextColor(colors.Ddl.Color())
@@ -733,7 +761,7 @@ func (s *Shell) schemaStrip(c *ui.Context, tab *QueryTab, colors *theme.ThemeCol
 						})
 					deltaRowsView(c, &report.delta, colors)
 					if note != "" {
-						ui.Text(c, note).FontSize(10).TextColor(noteInk.Color())
+						ui.Text(c, note).FontSize(theme.SizeCaption).TextColor(noteInk.Color())
 					}
 				})
 		})
@@ -780,13 +808,13 @@ func (s *Shell) connectStrip(c *ui.Context, colors *theme.ThemeColors) {
 			Children(func() {
 				uikit.StatusDot(c, colors.RunningMark)
 				ui.Text(c, "Connecting to").
-					FontSize(12).
+					FontSize(theme.SizeBody).
 					FontWeight(500).
 					TextColor(colors.AccentDeep.Color())
 				ui.Box(c).
 					MinWidth(0).
 					Font(theme.MonoFontFamily).
-					FontSize(11.5).
+					FontSize(theme.SizeMeta).
 					TextColor(colors.AccentDeep.Color()).
 					Children(func() { ui.Text(c, status.To+"…").SingleLine() })
 			})
@@ -816,7 +844,7 @@ func (s *Shell) connectStrip(c *ui.Context, colors *theme.ThemeColors) {
 				Gap(5).
 				Children(func() {
 					ui.Text(c, connectError.Kind.Headline()).
-						FontSize(13).
+						FontSize(theme.SizeEmphasis).
 						FontWeight(600).
 						TextColor(colors.Error.Color())
 					ui.Row(c).
@@ -827,7 +855,7 @@ func (s *Shell) connectStrip(c *ui.Context, colors *theme.ThemeColors) {
 								MinWidth(0).
 								Shrink(1).
 								Font(theme.MonoFontFamily).
-								FontSize(11.5).
+								FontSize(theme.SizeMeta).
 								TextColor(colors.Error.Color()).
 								Children(func() { ui.Text(c, detail) })
 							copyLink(c, "copy-connect-error", copied, colors, func() {
@@ -835,7 +863,7 @@ func (s *Shell) connectStrip(c *ui.Context, colors *theme.ThemeColors) {
 							})
 						})
 					ui.Text(c, connectError.Kind.Hint()).
-						FontSize(12).
+						FontSize(theme.SizeBody).
 						TextColor(colors.TextSecondary.Color())
 				})
 			ui.Row(c).
@@ -872,7 +900,7 @@ func copyLink(c *ui.Context, id string, copied bool, colors *theme.ThemeColors, 
 	link := ui.Box(c.Key(id)).
 		Shrink(0).
 		Cursor(ui.CursorPointer).
-		FontSize(10).
+		FontSize(theme.SizeCaption).
 		TextColor(colors.ErrorSecondary.Color()).
 		KeepFocus()
 	if link.Hovered() {
@@ -896,7 +924,7 @@ func (s *Shell) errorStrip(c *ui.Context, tabID uint64, message string, colors *
 		BorderWidth(0, 0, 1, 0).
 		BorderColor(colors.ErrorBorder.Color()).
 		Background(colors.ErrorSurface.Color()).
-		FontSize(11).
+		FontSize(theme.SizeMeta).
 		TextColor(colors.Error.Color()).
 		Children(func() {
 			ui.Box(c).Grow(1).Basis(0).MinWidth(0).Children(func() { ui.Text(c, message) })
@@ -964,10 +992,10 @@ func (s *Shell) txBar(c *ui.Context, tab *QueryTab, colors *theme.ThemeColors) {
 		Children(func() {
 			uikit.StatusDot(c, dot)
 			ui.Text(c, title).
-				FontSize(11).
+				FontSize(theme.SizeMeta).
 				FontWeight(500).
 				TextColor(ink.Color())
-			ui.Text(c, sub).FontSize(10).TextColor(subInk.Color())
+			ui.Text(c, sub).FontSize(theme.SizeCaption).TextColor(subInk.Color())
 			ui.Box(c).Grow(1).Basis(0)
 			if state.open {
 				s.txButton(c, dbclient.TxEndRollback, ready, colors)
@@ -1015,11 +1043,11 @@ func (s *Shell) txButton(c *ui.Context, how dbclient.TxEnd, ready bool, colors *
 		Background(fill.Color()).
 		KeepFocus()
 	button.Children(func() {
-		text := ui.Text(c, label).FontSize(10).TextColor(ink.Color())
+		text := ui.Text(c, label).FontSize(theme.SizeMeta).TextColor(ink.Color())
 		if how == dbclient.TxEndCommit {
 			text.FontWeight(500)
 		}
-		keycap(c, keys, 9., capSurface, capBorder, ink)
+		keycap(c, keys, theme.SizeCaption, capSurface, capBorder, ink)
 	})
 	if !ready {
 		return button.Opacity(0.5)
@@ -1172,14 +1200,14 @@ func (s *Shell) runButton(c *ui.Context, tab *QueryTab, colors *theme.ThemeColor
 			// would take the pixels back out of the word.
 			Shrink(0).
 			Width(width).
-			FontSize(12.5).
+			FontSize(theme.SizeBody).
 			FontWeight(600).
 			TextColor(ink.Color()).
 			Children(func() { ui.Text(c, verb).NoWrap() })
 		// The keycap does not move on a press: the tone says the press
 		// landed, and a keycap sinking a pixel is the one thing on this
 		// button that would still read as a mechanism.
-		keycap(c, keys, 10.5, capSurface, capBorder, ink)
+		keycap(c, keys, theme.SizeCaption, capSurface, capBorder, ink)
 	})
 
 	// A press holds the button still at its pressed tone: what is under
@@ -1335,7 +1363,7 @@ func (s *Shell) queryPane(c *ui.Context, tab *QueryTab, colors *theme.ThemeColor
 				AlignItems(ui.Center).
 				Justify(ui.End).
 				Gap(10).
-				FontSize(12).
+				FontSize(theme.SizeBody).
 				Children(func() {
 					sessionMark(c, tab, colors)
 					// With several statements in the buffer, say which
@@ -1388,11 +1416,6 @@ func (s *Shell) queryPane(c *ui.Context, tab *QueryTab, colors *theme.ThemeColor
 		BorderWidth(0, 0, 1, 0).
 		BorderColor(colors.Border.Color()).
 		Background(colors.Panel.Color())
-	// Go port: the column-find popover hangs out of this row over the
-	// grid (see columnFindControl).
-	if s.columnFindOpen() != nil {
-		header.ZIndex(1)
-	}
 	header.Children(func() {
 		// A plain result is named in ink; a run that is out
 		// or was stopped names itself in its own tone.
@@ -1401,13 +1424,13 @@ func (s *Shell) queryPane(c *ui.Context, tab *QueryTab, colors *theme.ThemeColor
 			labelInk = colors.Text
 		}
 		ui.Text(c, label).
-			FontSize(13).
+			FontSize(theme.SizeEmphasis).
 			FontWeight(600).
 			TextColor(labelInk.Color())
 		ui.Box(c).
 			MinWidth(0).
 			Font(theme.MonoFontFamily).
-			FontSize(11.5).
+			FontSize(theme.SizeMeta).
 			TextColor(ink.Color()).
 			Children(func() { ui.Text(c, summary).SingleLine() })
 		capNote(c, tab, colors)
@@ -1434,11 +1457,11 @@ func (s *Shell) historyPane(c *ui.Context, tab *HistoryTab, colors *theme.ThemeC
 		BorderColor(colors.Hairline.Color()).
 		Children(func() {
 			ui.Text(c, "Query history").
-				FontSize(12).
+				FontSize(theme.SizeBody).
 				FontWeight(500).
 				TextColor(colors.Text.Color())
 			ui.Text(c, fmt.Sprintf("%s · last %d days", s.sessionName(), historyDays)).
-				FontSize(11).
+				FontSize(theme.SizeMeta).
 				TextColor(colors.TextMuted.Color())
 			ui.Box(c).Grow(1).Basis(0)
 			s.historySearchBox(c, tab, colors)
@@ -1494,7 +1517,7 @@ func (s *Shell) historyList(c *ui.Context, tab *HistoryTab, colors *theme.ThemeC
 			Grow(1).Basis(0).
 			MinHeight(0).
 			Padding(14, 16, 0, 16).
-			FontSize(11).
+			FontSize(theme.SizeMeta).
 			TextColor(colors.TextFaint.Color()).
 			Children(func() { ui.Text(c, note) })
 	}
@@ -1534,12 +1557,12 @@ func (s *Shell) placeholder(c *ui.Context, colors *theme.ThemeColors) ui.Element
 		Gap(8).
 		Children(func() {
 			ui.Text(c, heading).
-				FontSize(12).
+				FontSize(theme.SizeBody).
 				FontWeight(500).
 				TextColor(headingInk.Color())
 			ui.Box(c).
 				MaxWidth(560).
-				FontSize(11).
+				FontSize(theme.SizeMeta).
 				TextColor(detailInk.Color()).
 				Children(func() { ui.Text(c, detail) })
 		})
@@ -1625,13 +1648,13 @@ func (s *Shell) statusStrip(c *ui.Context, colors *theme.ThemeColors) ui.Element
 		BorderWidth(1, 0, 0, 0).
 		BorderColor(colors.Border.Color()).
 		Background(colors.Panel.Color()).
-		FontSize(12).
+		FontSize(theme.SizeBody).
 		TextColor(colors.TextMuted.Color()).
 		Children(func() {
 			ui.Text(c, rangeText).
 				NoWrap().
 				Font(theme.MonoFontFamily).
-				FontSize(11.5).
+				FontSize(theme.SizeMeta).
 				TextColor(colors.TextSecondary.Color())
 			if paging {
 				divider()
@@ -1674,7 +1697,7 @@ func (s *Shell) statusStrip(c *ui.Context, colors *theme.ThemeColors) ui.Element
 					AlignItems(ui.Center).
 					Gap(8).
 					Font(theme.MonoFontFamily).
-					FontSize(11.5).
+					FontSize(theme.SizeMeta).
 					Children(func() {
 						// The split of the wait, drawn: the server's part
 						// in the accent, the lag in the track. A number
@@ -1728,7 +1751,7 @@ func noResultNote(c *ui.Context, tab Tab, colors *theme.ThemeColors) {
 	}
 	ui.Box(c).
 		Padding(14, 16, 0, 16).
-		FontSize(11).
+		FontSize(theme.SizeMeta).
 		TextColor(colors.TextFaint.Color()).
 		Children(func() { ui.Text(c, "nothing run yet · ⌘⏎ runs the statement") })
 }
@@ -1809,7 +1832,7 @@ func deltaRowsView(c *ui.Context, delta *introspect.Delta, colors *theme.ThemeCo
 	if total > rows {
 		ui.Box(c).
 			Padding(0, 9).
-			FontSize(10).
+			FontSize(theme.SizeCaption).
 			TextColor(colors.DdlMuted.Color()).
 			Children(func() { ui.Text(c, fmt.Sprintf("… and %d more", total-rows)) })
 	}
@@ -1843,14 +1866,14 @@ func deltaRow(c *ui.Context, sign Sign, name, kind, note string, colors *theme.T
 				Width(10).
 				Shrink(0).
 				TextAlign(ui.Center).
-				FontSize(12).
+				FontSize(theme.SizeBody).
 				FontWeight(600).
 				TextColor(mark.Color()).
 				Children(func() { ui.Text(c, glyph) })
 			nameText := ui.Box(c).
 				Width(150).
 				Shrink(0).
-				FontSize(11).
+				FontSize(theme.SizeMeta).
 				FontWeight(500).
 				TextColor(nameInk.Color())
 			nameText.Children(func() {
@@ -1864,12 +1887,12 @@ func deltaRow(c *ui.Context, sign Sign, name, kind, note string, colors *theme.T
 			ui.Box(c).
 				Width(130).
 				Shrink(0).
-				FontSize(11).
+				FontSize(theme.SizeMeta).
 				TextColor(kindInk.Color()).
 				Children(func() { ui.Text(c, kind).SingleLine() })
 			ui.Box(c).
 				MinWidth(0).
-				FontSize(10).
+				FontSize(theme.SizeCaption).
 				TextColor(noteInk.Color()).
 				Children(func() { ui.Text(c, note).SingleLine() })
 		})
@@ -1951,7 +1974,7 @@ func messagesStrip(c *ui.Context, tab *QueryTab, colors *theme.ThemeColors) {
 		BorderColor(colors.Hairline.Color()).
 		Background(colors.Panel.Color()).
 		Font(theme.MonoFontFamily).
-		FontSize(11).
+		FontSize(theme.SizeMeta).
 		TextColor(colors.TextBody.Color()).
 		Children(func() {
 			for _, line := range shown {
@@ -1990,7 +2013,7 @@ func syntaxStrip(c *ui.Context, tab *QueryTab, colors *theme.ThemeColors) {
 		BorderWidth(0, 0, 1, 0).
 		BorderColor(colors.Hairline.Color()).
 		Background(colors.Panel.Color()).
-		FontSize(11).
+		FontSize(theme.SizeMeta).
 		TextColor(colors.Error.Color()).
 		Children(func() {
 			ui.Box(c).

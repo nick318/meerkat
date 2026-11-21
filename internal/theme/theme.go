@@ -336,6 +336,44 @@ const UiFontFamily = "IBM Plex Sans"
 // grid measure columns by a fixed advance, so they must set it themselves.
 const MonoFontFamily = "JetBrains Mono"
 
+// The type scale. Every font size in the app is one of these six, by the
+// rule the colours follow: a size is a token, never a literal in view
+// code. Both families use the scale, but **not at the same step for the
+// same weight on screen**: JetBrains Mono's x-height is near 0.55em and
+// IBM Plex Sans's near 0.52em, so mono 13 reads as large as sans 14. Where
+// the two sit side by side — a dialog's list of names with its chips, its
+// times and its footer — the sans goes one step above what it would be
+// alone, or the sans reads a size smaller than the number says.
+//
+// The steps are whole pixels a visible step apart. Half sizes (10.5,
+// 11.5, 12.5) read as no step at all, and on a 1x display they render
+// softer than the whole sizes around them. Nothing is below `SizeCaption`:
+// 10pt is the smallest text Apple's macOS guidelines call legible, and
+// the smallest text here is often the only place a key is written down.
+//
+// The body is 12 rather than the platform's 13: a database viewer has to
+// show many rows, and JetBrains Mono's tall x-height reads well at 12.
+const (
+	// SizeCaption: key hints, counts, chips, a lane's number — text that
+	// labels something else.
+	SizeCaption float32 = 10.
+	// SizeMeta: the second line of a row, statistics, section headings,
+	// summaries beside a title.
+	SizeMeta float32 = 11.
+	// SizeBody: buttons, list rows, the grid, the SQL editor, text fields.
+	SizeBody float32 = 12.
+	// SizeEmphasis: titles of a pane or a dialog, the tabs, a dialog's
+	// question.
+	SizeEmphasis float32 = 13.
+	// SizeInput: the palette's search line, a size up from the list it
+	// filters, because it is the dialog's whole point. The `×` that
+	// closes a tab or empties a line is drawn at it too: a glyph that
+	// small is a target, and 14 is what makes it one.
+	SizeInput float32 = 14.
+	// SizeTitle: the one screen heading, over the connections list.
+	SizeTitle float32 = 20.
+)
+
 // The GPUI global. Rust installed it with `cx.set_global` in `main` and
 // read it with `theme(cx)`; here it is a package value, set once at start.
 var (

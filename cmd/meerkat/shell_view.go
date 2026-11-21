@@ -193,6 +193,7 @@ func (s *Shell) View(c *ui.Context) ui.Element {
 		// Under the palette and the dialog, both of which clear it on
 		// the way up, so the order only settles the one frame where two
 		// could be painted.
+		s.columnFindOverlay(c, colors)
 		s.peekOverlay(c, colors)
 		s.paletteOverlay(c, colors)
 		// Last, so it paints over the palette on the one frame where
@@ -241,7 +242,7 @@ func (s *Shell) titleRow(c *ui.Context, colors *theme.ThemeColors) ui.Element {
 		BorderWidth(0, 0, 1, 0).
 		BorderColor(barRule.Color()).
 		Background(barBg.Color()).
-		FontSize(13).
+		FontSize(theme.SizeEmphasis).
 		Children(func() {
 			ui.Row(c).
 				Width(sessionWidth - 8.).
@@ -289,7 +290,7 @@ func (s *Shell) titleRow(c *ui.Context, colors *theme.ThemeColors) ui.Element {
 				Border(1, colors.Border.Color()).
 				Radius(7).
 				Background(colors.Window.Color()).
-				FontSize(12.5).
+				FontSize(theme.SizeBody).
 				TextColor(colors.TextMuted.Color()).
 				Cursor(ui.CursorPointer)
 			if palette.Hovered() {
@@ -317,7 +318,7 @@ func (s *Shell) titleRow(c *ui.Context, colors *theme.ThemeColors) ui.Element {
 					Border(1, env.Ring(colors).Color()).
 					Radius(6).
 					Background(colors.Raised.Color()).
-					FontSize(11.5).
+					FontSize(theme.SizeMeta).
 					FontWeight(600).
 					TextColor(env.Text(colors).Color()).
 					Children(func() {
@@ -395,7 +396,7 @@ func (s *Shell) tabItem(c *ui.Context, ix int, tab Tab, colors *theme.ThemeColor
 		Gap(8).
 		Padding(0, 6, 0, 11).
 		Radius(7).
-		FontSize(12.5).
+		FontSize(theme.SizeEmphasis).
 		Cursor(ui.CursorPointer)
 	item.OnClick(func() {
 		s.activate(ix)
@@ -448,7 +449,7 @@ func (s *Shell) tabItem(c *ui.Context, ix int, tab Tab, colors *theme.ThemeColor
 			AlignItems(ui.Center).
 			Justify(ui.Center).
 			Radius(4).
-			FontSize(14).
+			FontSize(theme.SizeInput).
 			TextColor(closeInk.Color()).
 			Cursor(ui.CursorPointer)
 		if close.Hovered() {
@@ -487,7 +488,7 @@ func (s *Shell) modeMark(c *ui.Context, colors *theme.ThemeColors) ui.Element {
 		Children(func() {
 			uikit.LockGlyph(c, ink)
 			ui.Text(c, label).
-				FontSize(11.5).
+				FontSize(theme.SizeMeta).
 				FontWeight(600).
 				TextColor(ink.Color())
 		})

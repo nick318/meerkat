@@ -2204,6 +2204,26 @@ paging arithmetic that must be exact.
   (JetBrains Mono) for SQL, names, values, counts and typed text. The SQL
   editor, the grid and `TextField` set the mono themselves, because the
   first two measure by a fixed advance. Labels are sentence case.
+- Every font size is one of the six `theme.Size*` tokens — caption 10,
+  meta 11, body 12, emphasis 13, input 14, title 20 — never a literal,
+  by the colours' rule. Nothing is smaller than 10, and there are no
+  half sizes: a 0.5px step reads as no step and renders soft at 1x.
+- Every dialog — the palette, the column find, the value card, the close
+  and quit confirmations, the connection form — has one anatomy: a
+  sentence-case title at emphasis/600 (or a search line at input),
+  body text and buttons at body, key hints and secondary lines at meta,
+  list rows `PaletteRowHeight` tall with names in the mono at emphasis,
+  a 10px corner, and a 13×15 header with a 9×15 footer. **A dialog that
+  lists mono names lifts its sans a step** — chips at emphasis, times,
+  counts, hints and the footer at body, the `esc` cap at body — because
+  JetBrains Mono's x-height makes mono 13 read as sans 14 (see the
+  comment on `theme.SizeCaption`'s block).
+- A control is never smaller than the text around it. A button or a
+  chip is body (`ToolbarButton`, `AccentButton`, the palette's scope
+  chips, the history chips) — do not shrink one with a `FontSize`
+  override. A keycap in a dialog's header is `dialogKeyBadge` (body),
+  beside a 13–14px line; caption keycaps belong inside buttons and
+  key hints.
 - Icons are `ui::icon`: stroked paths in one 14-unit grid and one pen, so
   the family reads as one hand. The app still carries no image assets.
 - `.hover()`, `.cursor_pointer()` and `.truncate()` come from

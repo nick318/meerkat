@@ -77,7 +77,7 @@ func Keycap(c *ui.Context, key string) ui.Element {
 		Radius(4).
 		Background(colors.Raised.Color()).
 		Font(theme.MonoFontFamily).
-		FontSize(10.5).
+		FontSize(theme.SizeCaption).
 		FixedLineHeight(15).
 		TextColor(colors.TextSecondary.Color()).
 		Children(func() { ui.Text(c, key) })
@@ -178,7 +178,7 @@ func ToolbarButtonBare(c *ui.Context) ui.Element {
 		Radius(ControlRadius).
 		Background(colors.Raised.Color())
 	WithShadows(el, ControlShadow())
-	el.FontSize(12).
+	el.FontSize(theme.SizeBody).
 		TextColor(colors.TextSecondary.Color()).
 		Cursor(ui.CursorPointer)
 	if el.Hovered() {
@@ -206,7 +206,7 @@ func AccentButtonBare(c *ui.Context) ui.Element {
 		Radius(ControlRadius).
 		Background(colors.AccentFill.Color())
 	WithShadows(el, ControlShadow())
-	el.FontSize(12).
+	el.FontSize(theme.SizeBody).
 		FontWeight(600).
 		TextColor(colors.OnAccent.Color()).
 		Cursor(ui.CursorPointer)
@@ -229,7 +229,7 @@ func KeycapOnFill(c *ui.Context, key string) ui.Element {
 		Radius(4).
 		Background(colors.KeyOnFillSurface.Color()).
 		Font(theme.MonoFontFamily).
-		FontSize(10.5).
+		FontSize(theme.SizeCaption).
 		FixedLineHeight(15).
 		FontWeight(500).
 		Children(func() { ui.Text(c, key) })
@@ -241,7 +241,7 @@ func KeycapOnFill(c *ui.Context, key string) ui.Element {
 func SectionLabel(c *ui.Context, text string) ui.Element {
 	colors := &theme.Current().Colors
 	return ui.Box(c).
-		FontSize(11.5).
+		FontSize(theme.SizeMeta).
 		FontWeight(600).
 		TextColor(colors.TextMuted.Color()).
 		Children(func() { ui.Text(c, text) })

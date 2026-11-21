@@ -986,7 +986,7 @@ func (s *Connections) View(c *ui.Context) ui.Element {
 		AlignItems(ui.Stretch).
 		Background(colors.Window.Color()).
 		Font(theme.UiFontFamily).
-		FontSize(13.).
+		FontSize(theme.SizeEmphasis).
 		TextColor(colors.TextBody.Color())
 	// The `Connections` key context, and its `on_action`s.
 	if action, ok := uikit.DispatchKeys(screen, connectionsKeys); ok {
@@ -1033,7 +1033,7 @@ func (s *Connections) View(c *ui.Context) ui.Element {
 						s.list(c, colors)
 						if s.error != nil {
 							ui.Text(c, *s.error).
-								FontSize(11.).
+								FontSize(theme.SizeMeta).
 								TextColor(colors.Error.Color())
 						}
 						shortcuts(c, colors)
@@ -1092,11 +1092,11 @@ func (s *Connections) header(c *ui.Context, colors *theme.ThemeColors) ui.Elemen
 				Gap(5.).
 				Children(func() {
 					ui.Text(c, greeting()).
-						FontSize(19.).
+						FontSize(theme.SizeTitle).
 						FontWeight(500).
 						TextColor(colors.Text.Color())
 					ui.Text(c, subtitle).
-						FontSize(12.).
+						FontSize(theme.SizeBody).
 						TextColor(colors.TextMuted.Color())
 				})
 		})
@@ -1169,7 +1169,7 @@ func (s *Connections) list(c *ui.Context, colors *theme.ThemeColors) ui.Element 
 					if searching && len(s.matching()) == 0 {
 						ui.Text(c, "no connection matches the search").
 							Padding(12, 13).
-							FontSize(11.).
+							FontSize(theme.SizeMeta).
 							TextColor(colors.TextMuted.Color())
 					}
 					s.footer(c, colors)
@@ -1232,7 +1232,7 @@ func (s *Connections) actionBar(c *ui.Context, colors *theme.ThemeColors) {
 				nameColor = colors.Error
 			}
 			ui.Text(c, row.saved.Profile.Name).
-				FontSize(11.).
+				FontSize(theme.SizeBody).
 				FontWeight(500).
 				TextColor(nameColor.Color()).
 				Shrink(0)
@@ -1246,7 +1246,7 @@ func (s *Connections) actionBar(c *ui.Context, colors *theme.ThemeColors) {
 					Padding(2, 5).
 					Border(1, colors.BorderStrong.Color()).
 					Radius(4.).
-					FontSize(8.).
+					FontSize(theme.SizeCaption).
 					FontWeight(600).
 					TextColor(colors.TextMuted.Color()).
 					Children(func() {
@@ -1262,19 +1262,16 @@ func (s *Connections) actionBar(c *ui.Context, colors *theme.ThemeColors) {
 				Grow(1).
 				Basis(0).
 				MinWidth(0).
-				FontSize(10.).
+				FontSize(theme.SizeMeta).
 				TextColor(metaColor.Color()).
 				SingleLine()
 			uikit.AccentButton(c.Key("connect-selected"), connectLabel).
-				FontSize(10.).
 				OnClick(func() { s.connect(connectID) })
 			uikit.ToolbarButton(c.Key("edit-selected"), "edit ⌘I").
-				FontSize(10.).
 				OnClick(func() { s.openEdit(editID) })
 			// Forgetting a connection drops the profile and its
 			// keychain password. The database itself is untouched.
 			uikit.ToolbarButton(c.Key("forget-selected"), "forget").
-				FontSize(10.).
 				OnClick(func() { s.forget(forgetID) })
 		})
 }
@@ -1295,7 +1292,7 @@ func (s *Connections) groupHeading(c *ui.Context, env *Env, colors *theme.ThemeC
 		Padding(10, 13, 5, 13).
 		BorderWidth(0, 0, 1, 0).
 		BorderColor(colors.Hairline.Color()).
-		FontSize(9.).
+		FontSize(theme.SizeCaption).
 		FontWeight(600).
 		TextColor(colors.TextFaint.Color()).
 		Children(func() {
@@ -1348,7 +1345,7 @@ func (s *Connections) envSwitch(c *ui.Context, colors *theme.ThemeColors) ui.Ele
 			textColor = colors.TextSecondary
 		}
 		ui.Text(c, "group by env").
-			FontSize(10.).
+			FontSize(theme.SizeMeta).
 			TextColor(textColor.Color())
 	})
 }
@@ -1357,7 +1354,7 @@ func (s *Connections) envSwitch(c *ui.Context, colors *theme.ThemeColors) ui.Ele
 func (s *Connections) headerRow(c *ui.Context, colors *theme.ThemeColors) ui.Element {
 	heading := func(text string) ui.Element {
 		return ui.Text(c, text).
-			FontSize(9.).
+			FontSize(theme.SizeCaption).
 			FontWeight(600).
 			TextColor(colors.TextFaint.Color())
 	}
@@ -1388,7 +1385,7 @@ func (s *Connections) headerRow(c *ui.Context, colors *theme.ThemeColors) ui.Ele
 func (s *Connections) footer(c *ui.Context, colors *theme.ThemeColors) ui.Element {
 	key := func(text string) ui.Element {
 		return ui.Text(c, text).
-			FontSize(10.).
+			FontSize(theme.SizeMeta).
 			TextColor(colors.TextFaint.Color())
 	}
 	return ui.Row(c).
@@ -1400,7 +1397,7 @@ func (s *Connections) footer(c *ui.Context, colors *theme.ThemeColors) ui.Elemen
 		BorderColor(colors.Border.Color()).
 		Children(func() {
 			link := ui.Text(c.Key("new-connection"), "+ new connection").
-				FontSize(10.).
+				FontSize(theme.SizeMeta).
 				TextColor(colors.Accent.Color()).
 				Cursor(ui.CursorPointer)
 			if link.Hovered() {
@@ -1436,11 +1433,11 @@ func (s *Connections) searchLine(c *ui.Context, colors *theme.ThemeColors) ui.El
 	line.OnClick(func() { s.search.FocusHandle().Focus() })
 	return line.Children(func() {
 		ui.Text(c, "⌕").
-			FontSize(11.).
+			FontSize(theme.SizeMeta).
 			TextColor(colors.TextFaint.Color())
 		ui.Column(c).Grow(1).Basis(0).MinWidth(0).Children(func() { s.search.View(c) })
 		ui.Text(c, "⌘F").
-			FontSize(10.).
+			FontSize(theme.SizeCaption).
 			TextColor(colors.TextFaint.Color())
 	})
 }
@@ -1560,7 +1557,7 @@ func (s *Connections) row(c *ui.Context, row *connectionsRow, colors *theme.Them
 		ui.Text(c, row.saved.Profile.Name).
 			Width(nameWidth).
 			Shrink(0).
-			FontSize(12.).
+			FontSize(theme.SizeBody).
 			FontWeight(weight).
 			TextColor(nameColor.Color()).
 			SingleLine()
@@ -1568,7 +1565,7 @@ func (s *Connections) row(c *ui.Context, row *connectionsRow, colors *theme.Them
 			Grow(1).
 			Basis(0).
 			MinWidth(0).
-			FontSize(11.).
+			FontSize(theme.SizeMeta).
 			TextColor(urlColor.Color()).
 			SingleLine()
 		// The comp marks a guarded connection in the accent and
@@ -1586,13 +1583,13 @@ func (s *Connections) row(c *ui.Context, row *connectionsRow, colors *theme.Them
 		ui.Text(c, mode).
 			Width(modeWidth).
 			Shrink(0).
-			FontSize(11.).
+			FontSize(theme.SizeMeta).
 			TextColor(modeColor.Color()).
 			SingleLine()
 		ui.Text(c, last).
 			Width(lastWidth).
 			Shrink(0).
-			FontSize(10.).
+			FontSize(theme.SizeCaption).
 			TextColor(colors.TextFaint.Color()).
 			TextAlign(ui.End).
 			SingleLine()
@@ -1613,7 +1610,7 @@ func (s *Connections) envChip(c *ui.Context, env Env, selected bool, colors *the
 		BorderWidth(1).
 		Radius(7.).
 		Cursor(ui.CursorPointer).
-		FontSize(11.)
+		FontSize(theme.SizeMeta)
 	chip.OnClick(func() { s.setFormEnv(env) })
 	chip.Children(func() {
 		uikit.StatusDot(c, env.Ring(colors))
@@ -1677,14 +1674,14 @@ func (s *Connections) safetySection(c *ui.Context, form *connectionsForm, colors
 					Gap(3.).
 					Children(func() {
 						ui.Text(c, "read-only session").
-							FontSize(11.).
+							FontSize(theme.SizeBody).
 							TextColor(colors.Text.Color())
 						note := "Every statement you type can change the database. Nothing asks twice."
 						if on {
 							note = "Blocks insert, update, delete and DDL. The server refuses them, not the app."
 						}
 						ui.Text(c, note).
-							FontSize(9.).
+							FontSize(theme.SizeMeta).
 							TextColor(colors.TextFaint.Color())
 					})
 			})
@@ -1716,7 +1713,7 @@ func (s *Connections) testButton(c *ui.Context, form *connectionsForm, colors *t
 		// word is centred rather than pushed off one end.
 		Width(testWidth).
 		Justify(ui.Center).
-		FontSize(10.)
+		FontSize(theme.SizeCaption)
 	button.Children(func() {
 		label := "test"
 		if testing {
@@ -1804,7 +1801,7 @@ func (s *Connections) formMessage(c *ui.Context, form *connectionsForm, colors *
 	}
 	line := ui.Column(c.Key("form-message")).
 		Height(messageHeight).
-		FontSize(10.).
+		FontSize(theme.SizeCaption).
 		TextColor(color.Color()).
 		Children(func() { ui.Text(c, text) })
 	// A form that has said nothing has nothing to fade in, and the
@@ -1852,7 +1849,7 @@ func (s *Connections) formOverlay(c *ui.Context, colors *theme.ThemeColors) {
 func (s *Connections) formCard(c *ui.Context, form *connectionsForm, colors *theme.ThemeColors) ui.Element {
 	label := func(text string) ui.Element {
 		return ui.Text(c, text).
-			FontSize(10.).
+			FontSize(theme.SizeMeta).
 			TextColor(colors.TextMuted.Color())
 	}
 	editing := form.editing != nil
@@ -1874,11 +1871,17 @@ func (s *Connections) formCard(c *ui.Context, form *connectionsForm, colors *the
 			Gap(10.).
 			Padding(18.).
 			Children(func() {
-				title := "NEW CONNECTION"
+				// A dialog's title, as the close confirmation's is:
+				// the card is a question being asked, not a section
+				// of a page.
+				title := "New connection"
 				if editing {
-					title = "EDIT CONNECTION"
+					title = "Edit connection"
 				}
-				uikit.SectionLabel(c, title)
+				ui.Text(c, title).
+					FontSize(theme.SizeEmphasis).
+					FontWeight(600).
+					TextColor(colors.Text.Color())
 				ui.Row(c).
 					AlignItems(ui.Stretch).
 					Gap(12.).
@@ -1953,7 +1956,7 @@ func (s *Connections) formCard(c *ui.Context, form *connectionsForm, colors *the
 						if form.env != nil {
 							note = form.env.FormNote()
 						}
-						ui.Text(c, note).FontSize(10.).TextColor(colors.TextFaint.Color())
+						ui.Text(c, note).FontSize(theme.SizeMeta).TextColor(colors.TextFaint.Color())
 					})
 				s.safetySection(c, form, colors)
 				ui.Row(c).
@@ -1974,12 +1977,12 @@ func (s *Connections) formCard(c *ui.Context, form *connectionsForm, colors *the
 							// it, so without the floor taken away it pushes
 							// "save" out of the card. It wraps instead.
 							MinWidth(0).
-							FontSize(10.).
+							FontSize(theme.SizeMeta).
 							TextColor(colors.TextFaint.Color())
 						cancel := ui.Text(c.Key("cancel-connection"), "cancel").
 							Shrink(0).
 							Padding(5, 10).
-							FontSize(11.).
+							FontSize(theme.SizeBody).
 							TextColor(colors.TextMuted.Color()).
 							Cursor(ui.CursorPointer)
 						if cancel.Hovered() {
@@ -2018,7 +2021,7 @@ func shortcuts(c *ui.Context, colors *theme.ThemeColors) ui.Element {
 				Border(1, colors.Border.Color()).
 				Radius(7.).
 				Background(colors.Panel.Color()).
-				FontSize(11.).
+				FontSize(theme.SizeMeta).
 				TextColor(colors.TextSecondary.Color()).
 				Children(func() {
 					line("new query", "⌘T")

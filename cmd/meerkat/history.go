@@ -258,7 +258,7 @@ func HistoryRowView(
 		statement := run.Statement
 		cell := func(text string, color theme.Hsla) ui.Element {
 			return ui.Box(c).
-				FontSize(10).
+				FontSize(theme.SizeCaption).
 				TextColor(color.Color()).
 				Children(func() { ui.Text(c, text).SingleLine() })
 		}
@@ -297,7 +297,7 @@ func HistoryRowView(
 					ui.Box(c).
 						Grow(1).Basis(0).
 						MinWidth(0).
-						FontSize(11).
+						FontSize(theme.SizeMeta).
 						TextColor(statementColor.Color()).
 						Children(func() { ui.Text(c, run.Statement).SingleLine() })
 					ui.Box(c).Width(historyRowsWidth).Shrink(0).Children(func() {
@@ -360,11 +360,11 @@ func HistoryFilterChip(
 		hoverBorder = colors.AccentDeep
 	}
 	chip := ui.Box(c.Key(id)).
-		Padding(5, 9).
+		Padding(5, 10).
 		Border(1, border.Color()).
 		Radius(6).
 		Background(background.Color()).
-		FontSize(11).
+		FontSize(theme.SizeBody).
 		FontWeight(weight).
 		TextColor(textColor.Color()).
 		Cursor(ui.CursorPointer).

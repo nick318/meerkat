@@ -73,12 +73,12 @@ func (s *Shell) confirmOverlay(c *ui.Context, colors *theme.ThemeColors) {
 		}
 		card.Children(func() {
 			ui.Text(c, copy.Title).
-				FontSize(13).
+				FontSize(theme.SizeEmphasis).
 				FontWeight(600).
 				TextColor(colors.Text.Color())
 			for _, line := range copy.Body {
 				ui.Text(c, line).
-					FontSize(11).
+					FontSize(theme.SizeBody).
 					TextColor(colors.TextSecondary.Color())
 			}
 			// With more than one tab at stake, name them: the
@@ -86,7 +86,7 @@ func (s *Shell) confirmOverlay(c *ui.Context, colors *theme.ThemeColors) {
 			// here.
 			if len(named) > 1 {
 				ui.Box(c).
-					FontSize(11).
+					FontSize(theme.SizeMeta).
 					TextColor(colors.TextMuted.Color()).
 					Children(func() { ui.Text(c, strings.Join(named, ", ")).SingleLine() })
 			}
@@ -97,14 +97,14 @@ func (s *Shell) confirmOverlay(c *ui.Context, colors *theme.ThemeColors) {
 				Children(func() {
 					ui.Box(c).
 						Grow(1).Basis(0).
-						FontSize(10).
+						FontSize(theme.SizeMeta).
 						TextColor(colors.TextFaint.Color()).
 						Children(func() { ui.Text(c, "⌘⏎ confirms · ⎋ or ⏎ keeps") })
 					keep := ui.Box(c.Key("confirm-keep")).
 						Padding(5, 12).
 						Border(1, colors.BorderStrong.Color()).
 						Radius(6).
-						FontSize(11).
+						FontSize(theme.SizeBody).
 						TextColor(colors.Text.Color()).
 						Cursor(ui.CursorPointer)
 					if keep.Hovered() {
@@ -121,7 +121,7 @@ func (s *Shell) confirmOverlay(c *ui.Context, colors *theme.ThemeColors) {
 						Border(1, colors.EnvProd.Color()).
 						Radius(6).
 						Background(colors.EnvProd.Color()).
-						FontSize(11).
+						FontSize(theme.SizeBody).
 						FontWeight(500).
 						TextColor(colors.Window.Color()).
 						Cursor(ui.CursorPointer)
@@ -243,7 +243,10 @@ func (s *Shell) peekOverlay(c *ui.Context, colors *theme.ThemeColors) {
 				end:      end,
 				ink:      ink,
 				selected: colors.Selection,
-				layout:   ui.ShapeRichText(spans, ui.Font{Family: theme.UiFontFamily, Size: 12}, peekValueWidth),
+				// In the mono, as the grid paints it: a uuid, a
+				// `jsonb` blob or a column of digits reads by its
+				// columns, and the cell it came from spelled it so.
+				layout: ui.ShapeRichText(spans, ui.Font{Family: theme.MonoFontFamily, Size: theme.SizeBody}, peekValueWidth),
 			}
 		}
 		layout := cache.layout
@@ -254,22 +257,22 @@ func (s *Shell) peekOverlay(c *ui.Context, colors *theme.ThemeColors) {
 				Shrink(0).
 				AlignItems(ui.Center).
 				Gap(10).
-				Padding(11, 15).
+				Padding(13, 15).
 				BorderWidth(0, 0, 1, 0).
 				BorderColor(colors.Border.Color()).
 				Children(func() {
 					ui.Box(c).
 						MinWidth(0).
-						FontSize(12).
-						FontWeight(500).
+						FontSize(theme.SizeEmphasis).
+						FontWeight(600).
 						TextColor(colors.Text.Color()).
 						Children(func() { ui.Text(c, column).SingleLine() })
 					ui.Text(c, fmt.Sprintf("row %d · %s", row, meta)).
 						NoWrap().
-						FontSize(11).
+						FontSize(theme.SizeBody).
 						TextColor(colors.TextMuted.Color())
 					ui.Box(c).Grow(1).Basis(0)
-					closer := keyBadge(c.Key("close-peek"), "esc", colors).Cursor(ui.CursorPointer)
+					closer := dialogKeyBadge(c.Key("close-peek"), "esc", colors).Cursor(ui.CursorPointer)
 					if closer.Hovered() {
 						closer.TextColor(colors.Accent.Color())
 					}
@@ -318,7 +321,7 @@ func (s *Shell) peekOverlay(c *ui.Context, colors *theme.ThemeColors) {
 				BorderWidth(1, 0, 0, 0).
 				BorderColor(colors.Border.Color()).
 				Background(colors.Panel.Color()).
-				FontSize(10).
+				FontSize(theme.SizeBody).
 				TextColor(colors.TextMuted.Color()).
 				Children(func() {
 					ui.Text(c, hint)
@@ -335,7 +338,7 @@ func (s *Shell) peekOverlay(c *ui.Context, colors *theme.ThemeColors) {
 // byte range). `start` < 0 marks nothing.
 func peekSpans(text string, start, end int, ink, selected theme.Hsla) []ui.Span {
 	plain := func(s string) ui.Span {
-		return ui.Span{Text: s, Font: theme.UiFontFamily, Size: 12, Color: ink.Color()}
+		return ui.Span{Text: s, Font: theme.MonoFontFamily, Size: theme.SizeBody, Color: ink.Color()}
 	}
 	if start < 0 || start >= end || end > len(text) {
 		return []ui.Span{plain(text)}
@@ -412,7 +415,7 @@ func (s *Shell) paletteHeader(c *ui.Context, palette *Palette, colors *theme.The
 		Children(func() {
 			uikit.MeerkatMark(c, 20.)
 			ui.Column(c).Grow(1).Basis(0).MinWidth(0).Children(func() { palette.query.View(c) })
-			closer := keyBadge(c.Key("close-palette"), "esc", colors).Cursor(ui.CursorPointer)
+			closer := dialogKeyBadge(c.Key("close-palette"), "esc", colors).Cursor(ui.CursorPointer)
 			if closer.Hovered() {
 				closer.TextColor(colors.Accent.Color())
 			}
@@ -449,7 +452,7 @@ func (s *Shell) paletteList(c *ui.Context, palette *Palette, colors *theme.Theme
 			Height(PaletteListHeight).
 			Shrink(0).
 			Padding(14, 17, 0, 17).
-			FontSize(11).
+			FontSize(theme.SizeBody).
 			TextColor(colors.TextFaint.Color()).
 			Children(func() { ui.Text(c, note) })
 	}
@@ -498,11 +501,11 @@ func (s *Shell) paletteFooter(c *ui.Context, palette *Palette, colors *theme.The
 		Shrink(0).
 		AlignItems(ui.Center).
 		Gap(14).
-		Padding(9, 14).
+		Padding(9, 15).
 		BorderWidth(1, 0, 0, 0).
 		BorderColor(colors.Border.Color()).
 		Background(colors.Panel.Color()).
-		FontSize(10).
+		FontSize(theme.SizeBody).
 		TextColor(colors.TextMuted.Color()).
 		Children(func() {
 			hint("↑↓", "move")
@@ -587,5 +590,12 @@ func keycap(c *ui.Context, keys string, size float32, surface, border, ink theme
 
 // keyBadge is a keystroke, in the bordered pill the comp puts one in.
 func keyBadge(c *ui.Context, keys string, colors *theme.ThemeColors) ui.Element {
-	return keycap(c, keys, 10.5, colors.Raised, colors.Border, colors.TextSecondary)
+	return keycap(c, keys, theme.SizeCaption, colors.Raised, colors.Border, colors.TextSecondary)
+}
+
+// dialogKeyBadge is the same badge in a dialog's header, a size up: it
+// sits beside a title or a search line of 13 or 14px, and a 10px cap
+// there reads as a speck rather than as the way out.
+func dialogKeyBadge(c *ui.Context, keys string, colors *theme.ThemeColors) ui.Element {
+	return keycap(c, keys, theme.SizeBody, colors.Raised, colors.Border, colors.TextSecondary)
 }

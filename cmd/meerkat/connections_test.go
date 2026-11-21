@@ -354,7 +354,7 @@ func TestConnectionsScreenRendersToPNG(t *testing.T) {
 		t.Errorf("url = %q", got)
 	}
 	write("connections-form.png")
-	if !tt.HasText("EDIT CONNECTION") {
+	if !tt.HasText("Edit connection") {
 		t.Errorf("form title missing; texts %q", tt.Texts())
 	}
 	// ⎋ in a field closes the form.

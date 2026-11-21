@@ -51,7 +51,7 @@ func (s *Shell) sidebar(c *ui.Context, colors *theme.ThemeColors) ui.Element {
 				Padding(6, 6, 8, 6).
 				BorderWidth(1, 0, 0, 0).
 				BorderColor(colors.Border.Color()).
-				FontSize(12).
+				FontSize(theme.SizeBody).
 				TextColor(colors.TextMuted.Color()).
 				Children(func() {
 					ui.Row(c).
@@ -84,7 +84,7 @@ func (s *Shell) sidebar(c *ui.Context, colors *theme.ThemeColors) ui.Element {
 					ui.Box(c).
 						Padding(0, 8).
 						Font(theme.MonoFontFamily).
-						FontSize(11).
+						FontSize(theme.SizeMeta).
 						Children(func() { ui.Text(c, host).SingleLine() })
 				})
 		})
@@ -145,7 +145,7 @@ func (s *Shell) catalogFilterRow(c *ui.Context, colors *theme.ThemeColors) ui.El
 						AlignItems(ui.Center).
 						Justify(ui.Center).
 						Radius(4).
-						FontSize(14).
+						FontSize(theme.SizeInput).
 						TextColor(colors.TextMuted.Color()).
 						Cursor(ui.CursorPointer)
 					if clear.Hovered() {
@@ -191,7 +191,7 @@ func (s *Shell) catalogList(c *ui.Context, colors *theme.ThemeColors) ui.Element
 			Grow(1).Basis(0).
 			MinHeight(0).
 			Padding(6, 16, 0, 16).
-			FontSize(12).
+			FontSize(theme.SizeBody).
 			TextColor(colors.TextMuted.Color()).
 			Children(func() { ui.Text(c, note) })
 	}
@@ -273,7 +273,7 @@ func countLabel(c *ui.Context, count int, colors *theme.ThemeColors) ui.Element 
 	return ui.Box(c).
 		Shrink(0).
 		Font(theme.MonoFontFamily).
-		FontSize(11).
+		FontSize(theme.SizeMeta).
 		TextColor(colors.TextMuted.Color()).
 		Children(func() { ui.Text(c, uikit.FormatCount(uint64(count))) })
 }
@@ -289,7 +289,7 @@ func leafMark(c *ui.Context, mark Mark, colors *theme.ThemeColors) ui.Element {
 		ui.Box(c).Size(4, 4).Radius(2).Background(ink.Color())
 	}
 	glyph := func(text string) {
-		ui.Text(c, text).FontSize(10).TextColor(colors.TextMuted.Color())
+		ui.Text(c, text).FontSize(theme.SizeCaption).TextColor(colors.TextMuted.Color())
 	}
 	return ui.Row(c).
 		Shrink(0).
@@ -355,7 +355,7 @@ func catalogRow(
 				Grow(1).Basis(0).
 				MinWidth(0).
 				Font(theme.MonoFontFamily).
-				FontSize(12.5).
+				FontSize(theme.SizeBody).
 				FontWeight(400).
 				TextColor(colors.Text.Color()).
 				Children(func() { ui.Text(c, row.label).SingleLine() })
@@ -388,14 +388,14 @@ func catalogRow(
 					Shrink(1).
 					MaxWidthPercent(60).
 					MinWidth(0).
-					FontSize(12).
+					FontSize(theme.SizeBody).
 					TextColor(colors.TextSecondary.Color()).
 					Children(func() { ui.Text(c, row.name).SingleLine() })
 				ui.Box(c).
 					Grow(1).Basis(0).
 					MinWidth(0).
 					Padding(0, 0, 0, 3).
-					FontSize(11).
+					FontSize(theme.SizeMeta).
 					TextColor(colors.TextMuted.Color()).
 					Children(func() { ui.Text(c, row.detail).SingleLine() })
 			})
@@ -468,7 +468,7 @@ func catalogRow(
 				Grow(1).Basis(0).
 				MinWidth(0).
 				Font(theme.MonoFontFamily).
-				FontSize(12.5).
+				FontSize(theme.SizeBody).
 				FontWeight(weight).
 				TextColor(ink.Color()).
 				Children(func() { ui.Text(c, row.name).SingleLine() })

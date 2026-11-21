@@ -119,7 +119,7 @@ const (
 
 // PaletteInputFontSize: the search line reads a size larger than the rest
 // of the app: it is the one thing on the screen the user is looking at.
-const PaletteInputFontSize float32 = 14.
+const PaletteInputFontSize = theme.SizeInput
 
 // PaletteRowHeight is one height for headings and results alike, so the
 // list can virtualize.
@@ -958,7 +958,7 @@ func PaletteRowView(
 			Children(func() {
 				uikit.SectionLabel(c, row.Label)
 				ui.Box(c).
-					FontSize(9).
+					FontSize(theme.SizeMeta).
 					TextColor(colors.TextFaint.Color()).
 					Children(func() { ui.Text(c, row.Count) })
 			})
@@ -979,7 +979,7 @@ func PaletteRowView(
 			FillWidth().
 			AlignItems(ui.Center).
 			Gap(10).
-			Padding(0, 9).
+			Padding(0, 10).
 			Radius(6).
 			Cursor(ui.CursorPointer)
 		card.OnClick(func() {
@@ -1002,14 +1002,19 @@ func PaletteRowView(
 				MinWidth(0).
 				AlignItems(ui.Stretch).
 				Clip().
-				FontSize(12).
+				// A relation's name and a run's statement are both
+				// what the database said or the user typed, so the
+				// mono; a size up from the grid, as the column find's
+				// names are, because the list is the dialog.
+				Font(theme.MonoFontFamily).
+				FontSize(theme.SizeEmphasis).
 				FontWeight(weight).
 				TextColor(nameColor.Color()).
 				Children(func() { paletteSpans(c, item, selected, colors) })
 			ui.Box(c).
 				Width(paletteMetaWidth).
 				Shrink(0).
-				FontSize(10).
+				FontSize(theme.SizeBody).
 				TextColor(meta.Color()).
 				Children(func() { ui.Text(c, item.meta).SingleLine() })
 			trailingColor := colors.TextFaint
@@ -1027,7 +1032,7 @@ func PaletteRowView(
 				Shrink(0).
 				AlignItems(ui.Stretch).
 				Justify(ui.End).
-				FontSize(10).
+				FontSize(theme.SizeBody).
 				TextColor(trailingColor.Color()).
 				Children(func() { ui.Text(c, trailing).SingleLine() })
 		})
@@ -1094,7 +1099,7 @@ func paletteGlyphElement(c *ui.Context, glyph paletteGlyph, selected bool, color
 	case paletteGlyphRun:
 		// The letter the history screen is reached by.
 		return ui.Box(c).
-			FontSize(10).
+			FontSize(theme.SizeMeta).
 			TextColor(tone.Color()).
 			Children(func() { ui.Text(c, "h") })
 	default:
@@ -1115,10 +1120,10 @@ func PaletteScopeChip(c *ui.Context, scope PaletteScope, active bool, colors *th
 	}
 	chip := ui.Row(c.Key(fmt.Sprintf("scope-%s", scope.Label()))).
 		AlignItems(ui.Center).
-		Gap(5).
-		Padding(5, 9).
-		Radius(5).
-		FontSize(10).
+		Gap(6).
+		Padding(6, 12).
+		Radius(7).
+		FontSize(theme.SizeEmphasis).
 		FontWeight(weight).
 		TextColor(textColor.Color()).
 		Cursor(ui.CursorPointer).

@@ -372,7 +372,7 @@ const caretWidth float32 = 2.
 
 // fontSize and lineHeight: 12px text on the comp's 1.75 line height.
 const (
-	fontSize   float32 = 12.
+	fontSize   float32 = theme.SizeBody
 	lineHeight float32 = 21.
 )
 
@@ -1148,7 +1148,7 @@ func (e *SqlEditor) statisticsColumn(c *ui.Context, marks []*lineMark, shapeLine
 						el := ui.Box(c).
 							Shrink(0).
 							NoWrap().
-							FontSize(11.).
+							FontSize(theme.SizeMeta).
 							FixedLineHeight(18.).
 							TextColor(metaColor(kind, status, colors).Color())
 						// A statement that worked carries its number
@@ -2681,7 +2681,7 @@ func (e *SqlEditor) gutterView(c *ui.Context, colors *theme.ThemeColors, rows Ra
 		Background(colors.Window.Color()).
 		BorderWidth(0, 1, 0, 0).
 		BorderColor(colors.Hairline.Color()).
-		FontSize(11.5).
+		FontSize(theme.SizeMeta).
 		TextColor(colors.LineNumber.Color()).
 		Children(func() {
 			rowSpacer(c, rows.Start)
@@ -2799,7 +2799,7 @@ func (e *SqlEditor) completionsMenu(c *ui.Context, colors *theme.ThemeColors) {
 			// the two curves stay one shape at the corner.
 			Radius(uikit.SurfaceRadius).
 			Font(theme.MonoFontFamily).
-			FontSize(12.).
+			FontSize(theme.SizeBody).
 			TextColor(colors.Text.Color())
 		uikit.WithShadows(menu, uikit.SurfaceShadow())
 		menu.Children(func() {
@@ -2842,7 +2842,7 @@ func (e *SqlEditor) completionsMenu(c *ui.Context, colors *theme.ThemeColors) {
 							}
 						}
 					})
-					ui.Box(c).Shrink(0).FontSize(11.).TextColor(colors.TextFaint.Color()).Children(func() {
+					ui.Box(c).Shrink(0).FontSize(theme.SizeMeta).TextColor(colors.TextFaint.Color()).Children(func() {
 						ui.Text(c, completion.Detail)
 					})
 				})
@@ -2852,7 +2852,7 @@ func (e *SqlEditor) completionsMenu(c *ui.Context, colors *theme.ThemeColors) {
 				Padding(5., 12., 2., 12.).
 				BorderWidth(1, 0, 0, 0).
 				BorderColor(colors.Hairline.Color()).
-				FontSize(10.).
+				FontSize(theme.SizeCaption).
 				TextColor(colors.TextFaint.Color()).
 				Children(func() { ui.Text(c, "↩ or ⇥ to insert · esc to dismiss") })
 		})
@@ -3086,8 +3086,8 @@ func statementMark(c *ui.Context, status StatementStatus, colors *theme.ThemeCol
 			Background(colors.EnvProd.Color()).
 			AlignItems(ui.Center).
 			Justify(ui.Center).
-			FontSize(10.).
-			FontWeight(700).
+			FontSize(theme.SizeCaption).
+			FontWeight(600).
 			TextColor(colors.OnAccent.Color()).
 			Children(func() { ui.Text(c, "!") })
 	// A dash: nothing happened here, and nothing is what it draws.
@@ -3159,7 +3159,7 @@ func ddlChip(c *ui.Context, colors *theme.ThemeColors) {
 		Padding(3., 6.).
 		Radius(4.).
 		Background(colors.Ddl.Color()).
-		FontSize(8.).
+		FontSize(theme.SizeCaption).
 		FontWeight(600).
 		TextColor(colors.DdlSurface.Color()).
 		Children(func() { ui.Text(c, "DDL") })

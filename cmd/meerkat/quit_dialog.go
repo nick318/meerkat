@@ -158,11 +158,11 @@ func (r *Root) quitOverlay(c *ui.Context) {
 		}
 		card.Children(func() {
 			ui.Text(c, quitDialogTitle).
-				FontSize(13).
+				FontSize(theme.SizeEmphasis).
 				FontWeight(600).
 				TextColor(colors.Text.Color())
 			ui.Text(c, quitDialogBody).
-				FontSize(11).
+				FontSize(theme.SizeBody).
 				TextColor(colors.TextSecondary.Color())
 			ui.Row(c).
 				AlignItems(ui.Center).
@@ -171,14 +171,14 @@ func (r *Root) quitOverlay(c *ui.Context) {
 				Children(func() {
 					ui.Box(c).
 						Grow(1).Basis(0).
-						FontSize(10).
+						FontSize(theme.SizeMeta).
 						TextColor(colors.TextFaint.Color()).
 						Children(func() { ui.Text(c, "⏎ or ⌘Q quits · ⎋ stays") })
 					stay := ui.Box(c.Key("quit-stay")).
 						Padding(5, 12).
 						Border(1, colors.BorderStrong.Color()).
 						Radius(6).
-						FontSize(11).
+						FontSize(theme.SizeBody).
 						TextColor(colors.Text.Color()).
 						Cursor(ui.CursorPointer)
 					if stay.Hovered() {
@@ -194,7 +194,7 @@ func (r *Root) quitOverlay(c *ui.Context) {
 						Border(1, colors.AccentFill.Color()).
 						Radius(6).
 						Background(colors.AccentFill.Color()).
-						FontSize(11).
+						FontSize(theme.SizeBody).
 						FontWeight(500).
 						TextColor(colors.OnAccent.Color()).
 						Cursor(ui.CursorPointer)

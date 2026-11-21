@@ -195,7 +195,7 @@ func FindBar(c *ui.Context, id string, query *TextField, count FindCount, onStep
 			ui.Box(c).
 				Shrink(0).
 				MinWidth(72).
-				FontSize(10).
+				FontSize(theme.SizeCaption).
 				TextColor(countInk.Color()).
 				Children(func() { ui.Text(c, count.Label()) })
 			stepButton(c, "find-previous", "↑", count.Total > 0).OnClick(func() { onStep(false) })
@@ -206,7 +206,7 @@ func FindBar(c *ui.Context, id string, query *TextField, count FindCount, onStep
 			ui.Row(c).
 				Shrink(0).
 				Gap(10).
-				FontSize(9).
+				FontSize(theme.SizeCaption).
 				TextColor(colors.TextMuted.Color()).
 				Children(func() {
 					ui.Text(c, "⏎ next")
@@ -217,7 +217,7 @@ func FindBar(c *ui.Context, id string, query *TextField, count FindCount, onStep
 				Shrink(0).
 				Padding(2, 6).
 				Radius(4).
-				FontSize(12).
+				FontSize(theme.SizeBody).
 				TextColor(colors.TextMuted.Color()).
 				Cursor(ui.CursorPointer)
 			if closeButton.Hovered() {
@@ -241,7 +241,7 @@ func stepButton(c *ui.Context, id, glyph string, live bool) ui.Element {
 		Border(1, colors.BorderStrong.Color()).
 		Radius(5).
 		Background(colors.Elevated.Color()).
-		FontSize(11).
+		FontSize(theme.SizeMeta).
 		FontWeight(500)
 	if live {
 		button.TextColor(colors.TextSecondary.Color()).Cursor(ui.CursorPointer)

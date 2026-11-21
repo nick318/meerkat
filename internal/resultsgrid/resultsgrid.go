@@ -32,7 +32,7 @@ const RowHeight float32 = 28.
 const HeaderHeight float32 = 32.
 
 // dataFontSize is the data text size, from the design comp.
-const dataFontSize float32 = 12.
+const dataFontSize = theme.SizeBody
 
 // charWidth: the app is monospaced throughout, so one character is one
 // advance and a lane can be sized from the character count alone.
@@ -997,7 +997,7 @@ func dataRow(
 			Justify(ui.Center).
 			BorderWidth(0, 1, 0, 0).
 			BorderColor(colors.Hairline.Color()).
-			FontSize(11).
+			FontSize(theme.SizeMeta).
 			TextColor(gutterColor.Color())
 		gutter.Children(func() { ui.Text(c, gutterText) })
 		if onHit != nil {
@@ -1062,7 +1062,7 @@ func dataRow(
 						PaddingX(5).
 						Radius(4).
 						Background(colors.Sunk.Color()).
-						FontSize(10.5).
+						FontSize(theme.SizeCaption).
 						FixedLineHeight(17).
 						Children(func() { ui.Text(c, "NULL") })
 				} else {

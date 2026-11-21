@@ -75,7 +75,7 @@ const textFieldKeyContext = "TextField"
 // textFieldFontSize and textFieldLineHeight: 12px text on a 18px line, the
 // design's form rhythm.
 const (
-	textFieldFontSize   float32 = 12.
+	textFieldFontSize   float32 = theme.SizeBody
 	textFieldLineHeight float32 = 18.
 )
 

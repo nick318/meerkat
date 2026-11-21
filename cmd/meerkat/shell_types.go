@@ -95,6 +95,7 @@ import (
 	"github.com/nick318/meerkat/internal/resultsgrid"
 	"github.com/nick318/meerkat/internal/sqleditor"
 	"github.com/nick318/meerkat/internal/storage"
+	"github.com/nick318/meerkat/internal/theme"
 	"github.com/nick318/meerkat/internal/uikit"
 )
 
@@ -543,19 +544,31 @@ const peekMaxHeight float32 = 360.
 // bound is on what is *painted*, as the row cap is on what is *held*.
 const peekChars int = 4_000
 
-// The column-find popover's geometry, from the comp: 290px wide, hanging
-// straight under the button that opens it, with a list that grows to about
-// nine rows and then scrolls.
-const columnFindWidth float32 = 290.
+// The column-find popover's geometry. It sits in the middle of the shell,
+// not under its button (see columnFindOverlay), so it is a dialog and
+// takes the palette's proportions rather than the comp's 290px dropdown:
+// the palette's row height and search line, and room for a long snake_case
+// name. The list grows to nine rows and then scrolls; the box holds those
+// nine and the 6px it is padded by.
+const columnFindWidth float32 = 440.
 
-const columnFindTop float32 = 34.
+const columnRowHeight float32 = PaletteRowHeight
 
-const columnRowHeight float32 = 24.
+const columnListMaxHeight float32 = 9.*columnRowHeight + 2.*6.
 
-const columnListMaxHeight float32 = 236.
+// The popover at its tallest: the list at its cap, with the search line
+// over it and the key hints under it. The overlay centres a frame of this
+// height rather than the card, so the search line never moves as the
+// list shrinks; the two rows' share only has to be close, since being
+// off by a few pixels moves the card's centre, not the line.
+const columnFindMaxHeight float32 = columnListMaxHeight + columnFindChrome
+
+// columnFindChrome is the search line and the key hints together, borders
+// included, as a headless frame measures them.
+const columnFindChrome float32 = 83.
 
 // The search line inside it, a size up from the list it filters.
-const columnFindFontSize float32 = 12.
+const columnFindFontSize = theme.SizeInput
 
 // A tab's height inside the title bar: a pill, with the bar's own
 // padding above and below it.
