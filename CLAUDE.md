@@ -1748,11 +1748,22 @@ will fetch again. A dialog the user meets every time is one they learn to
 dismiss.
 
 **The transaction is known before it is asked about.** `Session::
-in_transaction` reads `pg_stat_activity` from the *app* pool — not from the
-session, whose connection may be busy with the very run in question, and
-which refuses every statement once its transaction has gone wrong: the
-session in the state most worth reporting is the one that cannot report it.
-`idle in transaction` and `idle in transaction (aborted)` both count.
+in_transaction` sends nothing: Postgres ends every reply with a
+`ReadyForQuery` that carries the transaction status — idle, in a block, in
+a failed block — and the session notes that byte each time it lets its
+connection go. So it answers while a run holds the connection, and it
+answers for a transaction that has gone wrong and refuses every statement:
+the session in the state most worth reporting is the one that cannot be
+asked. In a block and in a failed block both count.
+
+**It must not read the app's own work as a transaction.** It used to ask
+`pg_stat_activity` from the app pool, where `xact_start` is set for *any*
+running statement. After a DDL lands the app reads the catalog down the
+tab's session, and the probe raced that read: a committed `ALTER` in auto
+mode came back as an open transaction, with a commit bar, a "held" schema
+report and a sidebar left stale — and a rollback pressed there "undid" a
+change that was already permanent. The status byte is the state *between*
+statements, which is the only state a transaction has.
 
 `Shell::refresh_transaction` reads it **after every run**, off the run's
 path, and caches it on the tab. The cache is exact rather than a guess: the
@@ -1972,7 +1983,8 @@ front of the grid would add lag to the very measurement the user opened
 this to understand. So the result paints on the client's own reckoning, and
 `Shell::refresh_server_timing` fills the server's figure in a moment later
 — the strip drops its `~` and nothing else moves. It goes out on the **app
-pool**, like `in_transaction` and for the same reasons.
+pool**: the session's connection may still be busy with the statement in
+question, and a failed transaction refuses every statement.
 
 **The view counts, it does not log.** One row holds the running totals for
 every execution of a statement, cluster-wide, so a single reading can only

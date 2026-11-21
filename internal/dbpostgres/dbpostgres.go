@@ -754,6 +754,7 @@ func (c *PostgresConnection) OpenSession(ctx context.Context) (dbclient.Session,
 		return nil, err
 	}
 	held := &heldConn{conn: conn}
+	held.note()
 	session := &PostgresSession{
 		app:     c.pool,
 		held:    held,
@@ -868,10 +869,16 @@ var _ dbclient.Session = (*PostgresSession)(nil)
 type heldConn struct {
 	mu   sync.Mutex
 	conn *pgxpool.Conn
+	// The transaction status the server sent with the last
+	// `ReadyForQuery` this connection read — idle, in a block, or in a
+	// failed block — as of the last time the lock was let go. It is
+	// written under `mu` and read without it, which is the whole of why
+	// it is an atomic: see [PostgresSession.InTransaction].
+	status atomic.Uint32
 }
 
 // lock takes the session's connection, or says the session is closed.
-// The caller unlocks `mu` when it is done with the connection.
+// The caller calls `release` when it is done with the connection.
 func (h *heldConn) lock() (*pgx.Conn, error) {
 	h.mu.Lock()
 	if h.conn == nil {
@@ -879,6 +886,23 @@ func (h *heldConn) lock() (*pgx.Conn, error) {
 		return nil, errors.New("this tab's session is closed")
 	}
 	return h.conn.Conn(), nil
+}
+
+// release notes the transaction status the connection was left in and
+// lets the lock go. Every statement the session sends, the app's own
+// included, reads up to a `ReadyForQuery` before it returns, so the
+// status noted here is the one the next statement will start from.
+func (h *heldConn) release() {
+	h.note()
+	h.mu.Unlock()
+}
+
+// note copies the connection's transaction status into `status`. The
+// caller holds `mu`.
+func (h *heldConn) note() {
+	if h.conn != nil {
+		h.status.Store(uint32(h.conn.Conn().PgConn().TxStatus()))
+	}
 }
 
 // detach takes a connection nobody closed out of the pool's hands and
@@ -909,7 +933,7 @@ func (s *PostgresSession) boundary(ctx context.Context, sql string) (string, err
 	if err != nil {
 		return "", err
 	}
-	defer s.held.mu.Unlock()
+	defer s.held.release()
 	tag, err := conn.Exec(ctx, sql)
 	if err != nil {
 		return "", fmt.Errorf("the server refused %s: %w", sql, wrapDB(err))
@@ -933,7 +957,7 @@ func (s *PostgresSession) Execute(ctx context.Context, sql string) (dbclient.Que
 	if err != nil {
 		return dbclient.QueryResult{}, err
 	}
-	defer s.held.mu.Unlock()
+	defer s.held.release()
 	result, err := collectCapped(ctx, conn, s.app, s.backend, sql, s.limits, s.types)
 	if err == nil {
 		link := s.linkMs
@@ -962,7 +986,7 @@ func (s *PostgresSession) Check(ctx context.Context, sql string) (*dbclient.Chec
 	if err != nil {
 		return nil, err
 	}
-	defer s.held.mu.Unlock()
+	defer s.held.release()
 	switch conn.PgConn().TxStatus() {
 	case txFailed:
 		return nil, nil
@@ -1014,18 +1038,17 @@ func (s *PostgresSession) RelationExists(ctx context.Context, name string) (bool
 	if err != nil {
 		return false, false, err
 	}
-	defer s.held.mu.Unlock()
+	defer s.held.release()
 	return relationOn(ctx, conn, name)
 }
 
 // ServerTiming reads what the server counted for the statement this
 // session ran last, and turns two readings into one execution's time.
 //
-// One round trip, and it goes out on the **app** pool for the reason
-// `in_transaction` does: this session's connection may still be
-// finishing with the very statement being asked about, and a
-// transaction that has gone wrong refuses every statement until it is
-// rolled back. It is also asked *after* the result is on screen, so
+// One round trip, and it goes out on the **app** pool: this session's
+// connection may still be finishing with the very statement being asked
+// about, and a transaction that has gone wrong refuses every statement
+// until it is rolled back. It is also asked *after* the result is on screen, so
 // the round trip is never in front of the user.
 //
 // `pg_stat_activity.query_id` is what names the statement. It needs
@@ -1090,7 +1113,7 @@ func (s *PostgresSession) Introspect(ctx context.Context) (*introspect.Catalog, 
 	if err != nil {
 		return nil, err
 	}
-	defer s.held.mu.Unlock()
+	defer s.held.release()
 	catalog, err := readCatalog(ctx, conn)
 	if err != nil {
 		return nil, err
@@ -1098,45 +1121,38 @@ func (s *PostgresSession) Introspect(ctx context.Context) (*introspect.Catalog, 
 	return &catalog, nil
 }
 
-// InTransaction is asked of `pg_stat_activity` from the **app** pool,
-// never of the session itself. Two reasons: the session's connection may
-// be busy with a statement, and asking it would have to queue behind
-// exactly the run whose state is in question; and a transaction that has
-// gone wrong refuses every statement until it is rolled back, so a session
-// in the state most worth reporting is the one that could not answer.
+// InTransaction answers from the status the server sent with the last
+// `ReadyForQuery` on this session's connection, and sends nothing.
 //
-// The answer is `xact_start`, not `state` alone. A backend inside a
-// transaction block keeps the block's start there whether it sits idle or
-// is running a statement — so a transaction whose statement is still
-// running reads as open, which reading `idle in transaction*` off `state`
-// got wrong. A transaction that has **failed** clears `xact_start`,
-// though, and still waits for a rollback, so `idle in transaction
-// (aborted)` is counted from `state`: a rollback is what leaves it.
+// **The server already says it, after every statement.** `ReadyForQuery`
+// carries one byte — idle, in a block, in a failed block — and pgconn
+// keeps it. `release` copies it out each time the session lets its lock
+// go, so the answer is the state the connection is in *between*
+// statements, which is the only state a transaction has.
 //
-// It reads `true` as well while a statement runs outside any block,
-// because the server runs it in a transaction of its own. The app asks
-// after each run, when the connection is idle and the two cannot be
-// confused.
-func (s *PostgresSession) InTransaction(ctx context.Context) (bool, error) {
-	conn, err := acquire(ctx, s.app)
-	if err != nil {
-		return false, fmt.Errorf("failed to read what the session is doing: %w", err)
+// It used to be read off `pg_stat_activity` from the app pool, and that
+// read a statement in flight as a transaction: `xact_start` is set for
+// every statement, block or not. The app reads the catalog down this very
+// connection after a DDL lands, and the probe asked while that read was
+// out — so a committed `ALTER` in auto mode came back as an open
+// transaction, with a commit bar and a "held" schema report over a
+// change that was already permanent. A rollback pressed there sent a
+// `ROLLBACK` to nothing and said it had undone the DDL.
+//
+// The reasons it went to the app pool still hold, and this answers both
+// without a round trip: nothing queues behind a run, because the lock is
+// not taken; and a transaction that has failed is the `E` byte, which the
+// server sends however many statements it is refusing.
+//
+// While a statement is out the answer is the state it started from: open
+// for a statement inside a block, idle for one outside. That is the
+// truth about the transaction either way.
+func (s *PostgresSession) InTransaction(context.Context) (bool, error) {
+	switch byte(s.held.status.Load()) {
+	case txOpen, txFailed:
+		return true, nil
 	}
-	defer conn.Release()
-	var open bool
-	err = conn.QueryRow(ctx,
-		"SELECT xact_start IS NOT NULL "+
-			"OR coalesce(state LIKE 'idle in transaction%', false) "+
-			"FROM pg_stat_activity WHERE pid = $1",
-		int32(s.backend),
-	).Scan(&open)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("failed to read what the session is doing: %w", err)
-	}
-	return open, nil
+	return false, nil
 }
 
 // Begin is one statement, one round trip, and nothing else: no cap, no

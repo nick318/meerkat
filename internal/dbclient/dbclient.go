@@ -760,6 +760,12 @@ type Session interface {
 	// tab, so nothing but that tab's own statements can change what it is
 	// in. Ask once after each run and the answer holds until the next.
 	//
+	// **What the app sends down the session itself must not move the
+	// answer.** After a DDL the app reads the catalog on this connection
+	// ([Session.Introspect]), and it checks the buffer here as the user
+	// types; neither opens or ends a transaction, so the answer has to be
+	// the state between statements, never "a statement is running".
+	//
 	// An engine that cannot answer says `false` for ever, and the app then
 	// has only what it sent to go on: no transaction bar, and no close
 	// warning. Every engine that lets a tab hold a transaction open owes
@@ -843,8 +849,8 @@ type Session interface {
 	//
 	// Asked after the result is on screen, never before it — the whole
 	// point is that the number is worth having and not worth waiting for.
-	// Like [Session.InTransaction] it goes out on a connection that is
-	// not this session's, so it cannot queue behind the run it is about.
+	// It goes out on a connection that is not this session's, so it
+	// cannot queue behind the run it is about.
 	//
 	// `Ok(None)` (nil, nil) is the ordinary answer, not a failure: the
 	// extension that keeps these numbers is not installed everywhere, and

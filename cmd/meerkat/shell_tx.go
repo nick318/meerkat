@@ -14,8 +14,8 @@ import (
 // refreshTransaction asks what the tab's session is now in, after a run
 // has changed it.
 //
-// It runs **after** the result is on screen and on a connection of
-// the app's own, so it costs the run nothing. The answer is worth
+// It runs **after** the result is on screen and never waits on the
+// session's connection, so it costs the run nothing. The answer is worth
 // having early because the moment it is wanted — a close — cannot
 // wait for a round trip to decide what to ask the user.
 //

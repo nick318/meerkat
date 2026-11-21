@@ -1326,9 +1326,9 @@ func TestClosingASessionRollsItsTransactionBack(t *testing.T) {
 	}
 }
 
-// What the close dialog asks before it asks the user. It is read from
-// the app pool, so it answers about a session that has stopped being
-// able to answer for itself.
+// What the close dialog asks before it asks the user. It is read off the
+// status byte the server sends after every statement, so it answers about
+// a session that has stopped being able to answer for itself.
 func TestASessionSaysWhetherItIsInATransaction(t *testing.T) {
 	url := testURL(t)
 	ctx := context.Background()
@@ -1352,6 +1352,64 @@ func TestASessionSaysWhetherItIsInATransaction(t *testing.T) {
 		t.Fatal("not in a transaction after a failed statement")
 	}
 
+	execOK(t, session.Execute, "ROLLBACK")
+	if must(session.InTransaction(ctx)) {
+		t.Fatal("in a transaction after ROLLBACK")
+	}
+}
+
+// After a DDL lands the shell reads the catalog down the tab's session
+// and asks whether a transaction is open, both at once. The catalog read
+// is the app's own work and opens nothing, so it must not read as a
+// transaction — it did, when the answer came from `pg_stat_activity`,
+// and a committed `ALTER` in auto mode wore a commit bar. Inside a
+// block, the same read must not make the transaction look closed.
+func TestTheAppsOwnCatalogReadIsNotATransaction(t *testing.T) {
+	url := testURL(t)
+	ctx := context.Background()
+	conn := connectTest(t, url, false)
+	session := must(conn.OpenSession(ctx))
+	defer session.Close(ctx)
+	execOK(t, session.Execute, "CREATE TEMP TABLE meerkat_probe_shape (id int)")
+
+	// Every answer given while the read is out, polled as fast as the
+	// probe can go so a one-statement window is not missed.
+	during := func() []bool {
+		done := make(chan error)
+		go func() {
+			_, err := session.Introspect(ctx)
+			done <- err
+		}()
+		var seen []bool
+		for {
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+				return seen
+			default:
+				seen = append(seen, must(session.InTransaction(ctx)))
+			}
+		}
+	}
+
+	for range 5 {
+		execOK(t, session.Execute, "ALTER TABLE meerkat_probe_shape ADD COLUMN IF NOT EXISTS c int")
+		for _, open := range during() {
+			if open {
+				t.Fatal("an auto-commit session read as in a transaction during the catalog read")
+			}
+		}
+	}
+
+	execOK(t, session.Execute, "BEGIN")
+	execOK(t, session.Execute, "ALTER TABLE meerkat_probe_shape ADD COLUMN IF NOT EXISTS d int")
+	for _, open := range during() {
+		if !open {
+			t.Fatal("an open transaction read as closed during the catalog read")
+		}
+	}
 	execOK(t, session.Execute, "ROLLBACK")
 	if must(session.InTransaction(ctx)) {
 		t.Fatal("in a transaction after ROLLBACK")
