@@ -101,5 +101,5 @@ func holds(value dbclient.Value, needle *fuzzy.Needle) bool {
 	if text, ok := value.(dbclient.ValueText); ok {
 		return needle.IsIn(string(text))
 	}
-	return needle.IsIn(value.Display())
+	return needle.IsIn(dbclient.FullText(value))
 }

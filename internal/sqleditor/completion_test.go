@@ -154,3 +154,28 @@ func TestAWordMayNameThePartsOfAName(t *testing.T) {
 	// the middle of neither.
 	expectLabels(t, labels(vocabulary.Candidates("mast", ptr("masters"))), []string{"master_state_type_code", "master_client_reference"})
 }
+
+// A name is written the way a statement must spell it, and a quote the
+// user already opened — or one already after the word — is used, not
+// doubled.
+func TestAcceptingANameQuotesItWhenItMustBe(t *testing.T) {
+	name := func(label string) Completion { return Completion{Label: label, Kind: KindRelation} }
+	cases := []struct {
+		content string
+		r       Range
+		c       Completion
+		want    string
+	}{
+		{"select * from us", Range{14, 16}, name("users"), "users"},
+		{"select * from Us", Range{14, 16}, name("Users"), `"Users"`},
+		{"select * from or", Range{14, 16}, name("order"), `"order"`},
+		{`select * from "Us`, Range{15, 17}, name("Users"), `"Users"`},
+		{`select * from "us"`, Range{15, 17}, name("users"), `"users`},
+		{"sel", Range{0, 3}, Completion{Label: "select", Kind: KindKeyword}, "select"},
+	}
+	for _, c := range cases {
+		if got := completionText(c.c, c.content, c.r); got != c.want {
+			t.Errorf("%q over %q = %s, want %s", c.c.Label, c.content, got, c.want)
+		}
+	}
+}

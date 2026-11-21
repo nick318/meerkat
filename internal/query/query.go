@@ -3,9 +3,17 @@
 //
 // Splitting a buffer into statements: a query buffer is a scratchpad of
 // several, and a driver runs one command at a time, so the app sends
-// them in turn. A semicolon separates statements only when it is plain
-// text — inside a string, a quoted identifier, a comment or a
-// dollar-quoted body it is just a character.
+// them in turn. The split follows psql's lexer (`src/fe_utils/psqlscan.l`),
+// because psql is the client every Postgres user already trusts to cut a
+// script the way the server reads it. A semicolon separates statements
+// only when it is plain text — inside a string, an `E'…'` string with its
+// backslash escapes, a quoted identifier, a comment or a dollar-quoted
+// body it is just a character. Two more places hold it back, as in psql:
+// inside brackets (`CREATE RULE … DO ALSO (…; …)`), and inside the
+// `BEGIN … END` of a SQL-standard body in a statement that opens
+// `CREATE [OR REPLACE] FUNCTION|PROCEDURE`. A stretch of nothing but
+// comments is not a statement, and a byte order mark is trimmed as
+// whitespace is.
 //
 // Reading a statement's transaction verb: the app has to know whether the
 // buffer it is about to send opens or ends a transaction itself, because
@@ -239,9 +247,12 @@ func (v DdlVerb) Past() string {
 // a sidebar refreshed one run late; a false one costs a teal mark and one
 // spare read of the catalog. `SELECT … INTO` and `CREATE … AS SELECT` both
 // create a table: the second opens with `create` and is read, the first
-// does not and is the known gap, as it is for [ChangesNames].
+// does not and is the known gap here ([ChangesNames] reads it).
+//
+// `EXPLAIN ANALYZE` runs the statement it explains, so the verb is read
+// past that prefix; a plain `EXPLAIN` runs nothing and has no verb.
 func DdlVerbOf(statement string) (DdlVerb, bool) {
-	body := skipLeadingComments(statement)
+	body := pastExplainAnalyze(skipLeadingComments(statement))
 	word, ok := firstWord(body, func(c rune) bool {
 		return unicode.IsSpace(c) || c == ';' || c == '('
 	})
@@ -262,9 +273,6 @@ func DdlVerbOf(statement string) (DdlVerb, bool) {
 	}
 }
 
-// The statement past whatever comments open it. A buffer's statements are
-// trimmed already, but `-- what this does` on the line above a `COMMIT` is
-// part of the statement that follows it.
 // IsKeyword reports whether a word is one of SQL's own, whatever case it is
 // written in.
 func IsKeyword(word string) bool {
@@ -542,24 +550,29 @@ func WordBefore(statement string, offset int) (Range, bool) {
 // believing name errors once the buffer holds a statement that could have
 // made one.
 //
-// It reads the first word and nothing else, in [TransactionVerb]'s
-// spirit, and it errs toward `true`: a wrong `true` costs a mark that is
-// not painted, a wrong `false` paints a mark that is not real. `SET` is in
-// the list because `SET search_path` changes what an unqualified name
-// means, which is the same problem wearing different clothes. A
-// `SELECT … INTO` creates a table without opening with a verb that says
-// so, and is the known gap.
+// It reads the first word, in [TransactionVerb]'s spirit, and it errs
+// toward `true`: a wrong `true` costs a mark that is not painted, a wrong
+// `false` paints a mark that is not real. `SET` is in the list because
+// `SET search_path` changes what an unqualified name means, which is the
+// same problem wearing different clothes; `DISCARD` because `DISCARD ALL`
+// and `DISCARD TEMP` drop the session's temp tables.
+//
+// Two shapes need more than the first word. A `SELECT … INTO new_table`
+// creates a table without opening with a verb that says so, so a query
+// with a top-level `INTO` counts — see [selectsInto]. And
+// `EXPLAIN ANALYZE` runs the statement it explains, so the word is read
+// past that prefix.
 func ChangesNames(statement string) bool {
-	body := skipLeadingComments(statement)
-	first, ok := firstWord(body, func(c rune) bool {
-		return unicode.IsSpace(c) || c == ';'
-	})
-	if !ok {
+	body := pastExplainAnalyze(skipLeadingComments(statement))
+	at, tok, ok := codeToken(body, 0)
+	if !ok || tok.kind != tokWord {
 		return false
 	}
-	switch asciiLower(first) {
-	case "create", "drop", "alter", "set", "reset", "rename", "import":
+	switch asciiLower(body[at:tok.end]) {
+	case "create", "drop", "alter", "set", "reset", "rename", "import", "discard":
 		return true
+	case "select", "with", "table", "values":
+		return selectsInto(body)
 	}
 	return false
 }
@@ -696,8 +709,11 @@ func isWordByte(b byte) bool {
 	return isASCIIAlphanumeric(b) || b == '_' || b == '$' || b >= 0x80
 }
 
+// The statement past whatever comments open it. A buffer's statements are
+// trimmed already, but `-- what this does` on the line above a `COMMIT` is
+// part of the statement that follows it.
 func skipLeadingComments(statement string) string {
-	rest := strings.TrimLeftFunc(statement, unicode.IsSpace)
+	rest := strings.TrimLeftFunc(statement, isSpaceOrBOM)
 	for {
 		if after, ok := strings.CutPrefix(rest, "--"); ok {
 			end := strings.IndexByte(after, '\n')
@@ -706,59 +722,257 @@ func skipLeadingComments(statement string) string {
 				// statement, and the whole statement is then no verb.
 				return ""
 			}
-			rest = strings.TrimLeftFunc(after[end+1:], unicode.IsSpace)
+			rest = strings.TrimLeftFunc(after[end+1:], isSpaceOrBOM)
 			continue
 		}
 		if strings.HasPrefix(rest, "/*") {
-			end := endOfBlockComment([]byte(rest), 0)
-			rest = strings.TrimLeftFunc(rest[end:], unicode.IsSpace)
+			end := endOfBlockComment(rest, 0)
+			rest = strings.TrimLeftFunc(rest[end:], isSpaceOrBOM)
 			continue
 		}
 		return rest
 	}
 }
 
-// Byte ranges of the statements in `text`, whitespace trimmed and the
-// separating semicolons left out.
-func ranges(text string) []Range {
-	bytes := []byte(text)
-	var statements []Range
-	start := 0
-	ix := 0
-
-	for ix < len(bytes) {
-		switch {
-		case bytes[ix] == '\'':
-			ix = endOfQuoted(bytes, ix, '\'')
-		case bytes[ix] == '"':
-			ix = endOfQuoted(bytes, ix, '"')
-		case bytes[ix] == '-' && ix+1 < len(bytes) && bytes[ix+1] == '-':
-			if found, ok := memchr(bytes, '\n', ix); ok {
-				ix = found + 1
-			} else {
-				ix = len(bytes)
-			}
-		case bytes[ix] == '/' && ix+1 < len(bytes) && bytes[ix+1] == '*':
-			ix = endOfBlockComment(bytes, ix)
-		case bytes[ix] == '$':
-			if end, ok := endOfDollarQuoted(bytes, ix); ok {
-				ix = end
-			} else {
-				ix++
-			}
-		case bytes[ix] == ';':
-			push(&statements, text, Range{Start: start, End: ix})
-			ix++
-			start = ix
-		default:
-			ix++
+// The statement an `EXPLAIN ANALYZE` runs, or `body` itself when it is not
+// one.
+//
+// **`EXPLAIN ANALYZE` executes the statement it explains**, so
+// `EXPLAIN ANALYZE CREATE TABLE t AS …` makes a table exactly as the bare
+// statement does, and the readers that ask "does this change the shape"
+// have to read past the prefix. A plain `EXPLAIN` executes nothing and is
+// not skipped. `body` is past its leading comments already.
+func pastExplainAnalyze(body string) string {
+	// Most statements are not an `EXPLAIN`, and this runs per statement
+	// per frame, so they are turned away before anything is scanned.
+	if len(body) < len("explain") || !eqIgnoreASCIICase(body[:len("explain")], "explain") {
+		return body
+	}
+	at, tok, ok := codeToken(body, 0)
+	if !ok || tok.kind != tokWord || !eqIgnoreASCIICase(body[at:tok.end], "explain") {
+		return body
+	}
+	at, tok, ok = codeToken(body, tok.end)
+	if !ok {
+		return body
+	}
+	switch {
+	// The old spelling: `EXPLAIN ANALYZE [VERBOSE] statement`.
+	case tok.kind == tokWord && isAnalyze(body[at:tok.end]):
+		after := tok.end
+		if at, tok, ok := codeToken(body, after); ok && tok.kind == tokWord &&
+			eqIgnoreASCIICase(body[at:tok.end], "verbose") {
+			after = tok.end
+		}
+		return skipLeadingComments(body[after:])
+	// The option list: `EXPLAIN (ANALYZE, BUFFERS) statement`.
+	case tok.kind == tokOther && body[at] == '(':
+		if end, analyze := explainOptions(body, tok.end); analyze {
+			return skipLeadingComments(body[end:])
 		}
 	}
-	push(&statements, text, Range{Start: start, End: len(bytes)})
+	return body
+}
+
+// Where an `EXPLAIN` option list that opened before `ix` closes, and
+// whether one of its options is an `ANALYZE` that is not switched off —
+// `ANALYZE false` explains without running, as a plain `EXPLAIN` does.
+func explainOptions(body string, ix int) (int, bool) {
+	analyze := false
+	option, words := "", 0
+	for {
+		at, tok, ok := codeToken(body, ix)
+		if !ok {
+			// An unclosed list is not a statement anything runs.
+			return len(body), false
+		}
+		ix = tok.end
+		piece := body[at:tok.end]
+		if tok.kind == tokOther && (piece == "," || piece == ")") {
+			if words == 1 && isAnalyze(option) {
+				analyze = true
+			}
+			if piece == ")" {
+				return ix, analyze
+			}
+			option, words = "", 0
+			continue
+		}
+		words++
+		if words == 1 {
+			option = piece
+		}
+		if words == 2 && isAnalyze(option) && !isOff(piece) {
+			analyze = true
+		}
+	}
+}
+
+// Both spellings Postgres accepts.
+func isAnalyze(word string) bool {
+	return eqIgnoreASCIICase(word, "analyze") || eqIgnoreASCIICase(word, "analyse")
+}
+
+// The values that switch a boolean option off, quoted or not.
+func isOff(value string) bool {
+	value = strings.Trim(value, "'")
+	return eqIgnoreASCIICase(value, "false") || eqIgnoreASCIICase(value, "off") || value == "0"
+}
+
+// Whether a `SELECT`, `WITH`, `TABLE` or `VALUES` statement has an `INTO`
+// outside every bracket, string and comment — the shape of
+// `SELECT … INTO new_table`, which creates a table without opening with a
+// verb that says so.
+//
+// It is the veto's reader, so it errs toward `true`: a top-level `INTO`
+// that makes no table costs a mark that is not painted, nothing more. The
+// `INTO` of an `INSERT INTO` or a `MERGE INTO` at the end of a `WITH` is
+// the one shape left out, because it is the ordinary way to write a
+// data-modifying CTE and a veto on every one of them would silence the
+// check for nothing.
+func selectsInto(body string) bool {
+	depth, prev := 0, ""
+	for ix := 0; ; {
+		at, tok, ok := codeToken(body, ix)
+		if !ok {
+			return false
+		}
+		ix = tok.end
+		piece := body[at:tok.end]
+		switch tok.kind {
+		case tokWord:
+			if depth == 0 && eqIgnoreASCIICase(piece, "into") &&
+				!eqIgnoreASCIICase(prev, "insert") && !eqIgnoreASCIICase(prev, "merge") {
+				return true
+			}
+			prev = piece
+			continue
+		case tokOther:
+			switch piece {
+			case "(":
+				depth++
+			case ")":
+				if depth > 0 {
+					depth--
+				}
+			}
+		}
+		prev = ""
+	}
+}
+
+// Byte ranges of the statements in `text`, whitespace trimmed and the
+// separating semicolons left out.
+//
+// The walk is psql's own (`src/fe_utils/psqlscan.l`), as far as finding
+// the semicolons needs: the server is what the statements go to, and a
+// split that disagreed with the client every Postgres user already knows
+// would send half a statement.
+func ranges(text string) []Range {
+	var statements []Range
+	start := 0
+	var state splitState
+
+	for ix := 0; ix < len(text); {
+		tok := nextToken(text, ix)
+		switch tok.kind {
+		case tokSpace, tokComment:
+		case tokWord:
+			state.content = true
+			state.word(text[ix:tok.end])
+		case tokQuoted:
+			state.content = true
+		case tokOther:
+			switch text[ix] {
+			case ';':
+				if state.parens == 0 && state.begins == 0 {
+					push(&statements, text, Range{Start: start, End: ix}, state.content)
+					start = tok.end
+					state = splitState{}
+					ix = tok.end
+					continue
+				}
+			case '(':
+				state.parens++
+			case ')':
+				if state.parens > 0 {
+					state.parens--
+				}
+			}
+			state.content = true
+		}
+		ix = tok.end
+	}
+	push(&statements, text, Range{Start: start, End: len(text)}, state.content)
 	return statements
 }
 
-func push(statements *[]Range, text string, rng Range) {
+// splitState is what the walk knows about the statement it is inside —
+// psql's `paren_depth`, `begin_depth` and `identifiers`, reset at every
+// statement's start.
+type splitState struct {
+	// A semicolon inside brackets is not the end of the statement:
+	// `CREATE RULE … DO ALSO (INSERT …; INSERT …)` is one.
+	parens int
+	// A semicolon inside a SQL-standard function body is not either:
+	// `CREATE FUNCTION … BEGIN ATOMIC SELECT 1; SELECT 2; END` is one.
+	begins int
+	// How many bare words the statement has read, and the first letter of
+	// each of its first four when it is one of [routineWords].
+	words int
+	lead  [4]byte
+	// Whether anything but space and comments has been read. A stretch of
+	// nothing but comments is not a statement: sent on its own, the
+	// server answers an empty query, which no line of the buffer asked for.
+	content bool
+}
+
+// The words psql watches for at a statement's front:
+// `CREATE [OR REPLACE] FUNCTION|PROCEDURE`.
+var routineWords = [...]string{"create", "function", "procedure", "or", "replace"}
+
+// word is psql's heuristic for a SQL-standard body, ported as it is.
+// Short of a parser, `BEGIN` and `END` are counted only in a statement
+// that creates a routine, a `CASE` counts only inside such a `BEGIN`
+// (because it too ends with `END`), and none of them count inside
+// brackets.
+func (s *splitState) word(w string) {
+	if s.words < len(s.lead) {
+		for _, known := range routineWords {
+			if eqIgnoreASCIICase(w, known) {
+				s.lead[s.words] = known[0]
+				break
+			}
+		}
+	}
+	s.words++
+	if s.parens > 0 || !s.createsRoutine() {
+		return
+	}
+	switch {
+	case eqIgnoreASCIICase(w, "begin"):
+		s.begins++
+	case eqIgnoreASCIICase(w, "case"):
+		if s.begins > 0 {
+			s.begins++
+		}
+	case eqIgnoreASCIICase(w, "end"):
+		if s.begins > 0 {
+			s.begins--
+		}
+	}
+}
+
+func (s *splitState) createsRoutine() bool {
+	l := s.lead
+	return l[0] == 'c' && (l[1] == 'f' || l[1] == 'p' ||
+		(l[1] == 'o' && l[2] == 'r' && (l[3] == 'f' || l[3] == 'p')))
+}
+
+func push(statements *[]Range, text string, rng Range, content bool) {
+	if !content {
+		return
+	}
 	trimmed := trim(text, rng)
 	if !trimmed.IsEmpty() {
 		*statements = append(*statements, trimmed)
@@ -767,27 +981,147 @@ func push(statements *[]Range, text string, rng Range) {
 
 func trim(text string, rng Range) Range {
 	slice := text[rng.Start:rng.End]
-	start := rng.Start + (len(slice) - len(strings.TrimLeftFunc(slice, unicode.IsSpace)))
-	end := rng.End - (len(slice) - len(strings.TrimRightFunc(slice, unicode.IsSpace)))
+	start := rng.Start + (len(slice) - len(strings.TrimLeftFunc(slice, isSpaceOrBOM)))
+	end := rng.End - (len(slice) - len(strings.TrimRightFunc(slice, isSpaceOrBOM)))
 	return Range{Start: start, End: max(end, start)}
 }
 
-func memchr(bytes []byte, needle byte, from int) (int, bool) {
-	for ix := from; ix < len(bytes); ix++ {
-		if bytes[ix] == needle {
-			return ix, true
+// isSpaceOrBOM is space as the trimming reads it. A byte order mark is
+// what a file pasted from an editor that writes one starts with, and it
+// is no more part of the statement than the line break after it.
+func isSpaceOrBOM(r rune) bool {
+	return unicode.IsSpace(r) || r == '\uFEFF'
+}
+
+// The byte order mark as UTF-8.
+const bom = "\uFEFF"
+
+// tokKind is what one token is, as far as splitting a buffer and reading a
+// verb need to know.
+type tokKind int
+
+const (
+	// tokSpace is whitespace, or a byte order mark.
+	tokSpace tokKind = iota
+	tokComment
+	// tokQuoted is a string, a quoted name or a dollar-quoted body.
+	tokQuoted
+	// tokWord is a bare name or keyword.
+	tokWord
+	// tokOther is a number, a parameter, or one character of punctuation.
+	tokOther
+)
+
+type token struct {
+	kind tokKind
+	end  int
+}
+
+// nextToken is the token that starts at `ix`, which is inside `text`.
+//
+// **A bare word is read whole**, which is what keeps a `$` inside a name
+// from opening a quote: psql's identifiers may hold `$` after their first
+// byte, so `price$usd$` is a name and not the start of a body that runs to
+// the end of the buffer. The same rule tells an escape string from a name
+// that ends in `e`: `E'…'` is a word of its own followed by a quote, and
+// `xE'…'` is the name `xE` followed by a plain string.
+func nextToken(text string, ix int) token {
+	b := text[ix]
+	switch {
+	case isSQLSpace(b):
+		return token{tokSpace, ix + 1}
+	// Above ASCII, so it would otherwise begin a name.
+	case strings.HasPrefix(text[ix:], bom):
+		return token{tokSpace, ix + len(bom)}
+	case b == '-' && ix+1 < len(text) && text[ix+1] == '-':
+		if found := strings.IndexByte(text[ix:], '\n'); found >= 0 {
+			return token{tokComment, ix + found + 1}
 		}
+		return token{tokComment, len(text)}
+	case b == '/' && ix+1 < len(text) && text[ix+1] == '*':
+		return token{tokComment, endOfBlockComment(text, ix)}
+	case b == '\'' || b == '"':
+		return token{tokQuoted, endOfQuoted(text, ix, b)}
+	case b == '$':
+		if end, ok := endOfDollarQuoted(text, ix); ok {
+			return token{tokQuoted, end}
+		}
+		// `$1` is a parameter; a `$` with no digits is an operator's.
+		end := ix + 1
+		for end < len(text) && isDigit(text[end]) {
+			end++
+		}
+		return token{tokOther, end}
+	case isIdentStart(b):
+		end := identEnd(text, ix)
+		if end == ix+1 && (b == 'e' || b == 'E') && end < len(text) && text[end] == '\'' {
+			return token{tokQuoted, endOfEscapeString(text, end)}
+		}
+		return token{tokWord, end}
+	case isDigit(b) || (b == '.' && ix+1 < len(text) && isDigit(text[ix+1])):
+		end := ix
+		for end < len(text) && (isDigit(text[end]) || text[end] == '.' || text[end] == '_') {
+			end++
+		}
+		// `1e10`, `0x1F`, and psql's "trailing junk": letters straight
+		// after a number belong to it, so they never start a name.
+		if end < len(text) && isIdentStart(text[end]) {
+			end = identEnd(text, end)
+		}
+		return token{tokOther, end}
+	default:
+		return token{tokOther, ix + 1}
 	}
-	return 0, false
+}
+
+// codeToken is the first token at or after `ix` that is neither space nor
+// a comment, and where it starts; false at the end of the text.
+func codeToken(text string, ix int) (int, token, bool) {
+	for ix < len(text) {
+		tok := nextToken(text, ix)
+		if tok.kind != tokSpace && tok.kind != tokComment {
+			return ix, tok, true
+		}
+		ix = tok.end
+	}
+	return ix, token{}, false
+}
+
+// isSQLSpace is psql's `space`: the ASCII whitespace and the vertical tab.
+func isSQLSpace(b byte) bool {
+	return isASCIIWhitespace(b) || b == '\v'
+}
+
+// isIdentStart is psql's `ident_start`: a letter, `_`, or any byte above
+// ASCII, because a name may be any letter there is.
+func isIdentStart(b byte) bool {
+	return isASCIIAlpha(b) || b == '_' || b >= 0x80
+}
+
+// Where a bare word starting at `start` ends: psql's `ident_cont`, which
+// is `ident_start`, the digits and `$`.
+func identEnd(text string, start int) int {
+	ix := start + 1
+	for ix < len(text) && (isIdentStart(text[ix]) || isDigit(text[ix]) || text[ix] == '$') {
+		ix++
+	}
+	return ix
+}
+
+func isDigit(b byte) bool {
+	return '0' <= b && b <= '9'
 }
 
 // Index just past the closing quote, treating a doubled quote as an
 // escape. An unterminated quote runs to the end of the buffer.
-func endOfQuoted(bytes []byte, start int, quote byte) int {
+//
+// A plain string reads a backslash as itself — `standard_conforming_strings`
+// has been on by default since PostgreSQL 9.1 — so `'a\'` is closed.
+func endOfQuoted(text string, start int, quote byte) int {
 	ix := start + 1
-	for ix < len(bytes) {
-		if bytes[ix] == quote {
-			if ix+1 < len(bytes) && bytes[ix+1] == quote {
+	for ix < len(text) {
+		if text[ix] == quote {
+			if ix+1 < len(text) && text[ix+1] == quote {
 				ix += 2
 				continue
 			}
@@ -795,18 +1129,40 @@ func endOfQuoted(bytes []byte, start int, quote byte) int {
 		}
 		ix++
 	}
-	return len(bytes)
+	return len(text)
 }
 
-func endOfBlockComment(bytes []byte, start int) int {
+// Index just past an escape string whose opening quote is at `quote`. A
+// backslash there escapes the byte after it, so `E'it\'s; here'` is one
+// string, and a doubled quote is an escape too.
+func endOfEscapeString(text string, quote int) int {
+	ix := quote + 1
+	for ix < len(text) {
+		switch text[ix] {
+		case '\\':
+			ix += 2
+		case '\'':
+			if ix+1 < len(text) && text[ix+1] == '\'' {
+				ix += 2
+				continue
+			}
+			return ix + 1
+		default:
+			ix++
+		}
+	}
+	return len(text)
+}
+
+func endOfBlockComment(text string, start int) int {
 	ix := start + 2
 	// Postgres nests block comments, unlike C.
 	depth := 1
-	for ix+1 < len(bytes) {
-		if bytes[ix] == '/' && bytes[ix+1] == '*' {
+	for ix+1 < len(text) {
+		if text[ix] == '/' && text[ix+1] == '*' {
 			depth++
 			ix += 2
-		} else if bytes[ix] == '*' && bytes[ix+1] == '/' {
+		} else if text[ix] == '*' && text[ix+1] == '/' {
 			depth--
 			ix += 2
 			if depth == 0 {
@@ -816,28 +1172,32 @@ func endOfBlockComment(bytes []byte, start int) int {
 			ix++
 		}
 	}
-	return len(bytes)
+	return len(text)
 }
 
 // Index just past a `$tag$ ... $tag$` body, or false when the `$` does
 // not open one.
-func endOfDollarQuoted(bytes []byte, start int) (int, bool) {
+//
+// The tag is psql's `dolq_start` and `dolq_cont`: a letter, `_` or a byte
+// above ASCII, then those or digits. So `$é$` opens a body, and `$1$` does
+// not — `$1` is a parameter. An unterminated body runs to the end of the
+// buffer, as an unterminated string does.
+func endOfDollarQuoted(text string, start int) (int, bool) {
 	ix := start + 1
-	for ix < len(bytes) && (isASCIIAlphanumeric(bytes[ix]) || bytes[ix] == '_') {
-		ix++
+	if ix < len(text) && isIdentStart(text[ix]) {
+		for ix < len(text) && (isIdentStart(text[ix]) || isDigit(text[ix])) {
+			ix++
+		}
 	}
-	if ix >= len(bytes) || bytes[ix] != '$' {
+	if ix >= len(text) || text[ix] != '$' {
 		return 0, false
 	}
-	tag := bytes[start : ix+1]
-	ix = ix + 1
-	for ix+len(tag) <= len(bytes) {
-		if string(bytes[ix:ix+len(tag)]) == string(tag) {
-			return ix + len(tag), true
-		}
-		ix++
+	tag := text[start : ix+1]
+	body := ix + 1
+	if found := strings.Index(text[body:], tag); found >= 0 {
+		return body + found + len(tag), true
 	}
-	return len(bytes), true
+	return len(text), true
 }
 
 // The Rust standard library's ASCII helpers and `str` methods, spelled out
@@ -892,8 +1252,25 @@ func asciiLower(s string) string {
 }
 
 // eqIgnoreASCIICase is `str::eq_ignore_ascii_case`.
+// It allocates nothing, because the splitter asks it of every bare word in
+// the buffer on every frame.
 func eqIgnoreASCIICase(a, b string) bool {
-	return len(a) == len(b) && asciiLower(a) == asciiLower(b)
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if lowerASCII(a[i]) != lowerASCII(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerASCII(c byte) byte {
+	if 'A' <= c && c <= 'Z' {
+		return c + ('a' - 'A')
+	}
+	return c
 }
 
 // isASCIIAlpha is `u8::is_ascii_alphabetic`.

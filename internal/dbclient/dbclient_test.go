@@ -2,6 +2,7 @@ package dbclient
 
 import (
 	"bytes"
+	"math"
 	"strings"
 	"testing"
 )
@@ -156,5 +157,22 @@ func TestBytesAreCutWithoutAMarker(t *testing.T) {
 	// `display` is what marks it, as it does for any long byte string.
 	if !strings.HasSuffix(result.Rows[0][0].Display(), "…") {
 		t.Fatalf("display = %q", result.Rows[0][0].Display())
+	}
+}
+
+func TestBytesCopyWholeAndShowShort(t *testing.T) {
+	long := make(ValueBytes, 20)
+	long[19] = 0xab
+	if got := long.Display(); got != `\x`+strings.Repeat("00", 16)+"…" {
+		t.Fatalf("display = %q", got)
+	}
+	if got := FullText(long); got != `\x`+strings.Repeat("00", 19)+"ab" {
+		t.Fatalf("full = %q", got)
+	}
+	if got := FullText(ValueText("a")); got != "a" {
+		t.Fatalf("full = %q", got)
+	}
+	if got := ValueFloat(math.Inf(-1)).Display(); got != "-Infinity" {
+		t.Fatalf("float = %q", got)
 	}
 }

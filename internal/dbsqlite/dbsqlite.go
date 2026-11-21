@@ -8,14 +8,17 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/nick318/meerkat/internal/dbclient"
 	"github.com/nick318/meerkat/internal/introspect"
@@ -181,6 +184,22 @@ func (s *sqliteSession) IsClosed() bool {
 	return s.conn == nil
 }
 
+// Introspect reads the catalog down this tab's own connection, which is
+// the only one that sees the databases this tab attached and the temp
+// tables it made.
+func (s *sqliteSession) Introspect(ctx context.Context) (*introspect.Catalog, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn == nil {
+		return nil, errors.New("this tab's session is closed")
+	}
+	catalog, err := readCatalog(ctx, s.conn)
+	if err != nil {
+		return nil, err
+	}
+	return &catalog, nil
+}
+
 func (s *sqliteSession) Close(ctx context.Context) {
 	s.mu.Lock()
 	conn := s.conn
@@ -240,12 +259,225 @@ func watchSession(session *sqliteSession, conn *sql.Conn) {
 	runtime.AddCleanup(session, detach, conn)
 }
 
-// --- the per-table reads `introspect` makes beside `pragma_table_info` ---
+// --- the catalog reads ---
 
-// indexes is a table's indexes, the implicit ones a `UNIQUE` or a
+// querier is what a catalog read runs on: the pool, or one pinned
+// connection. `ATTACH` and a temp table belong to the connection that
+// made them, so a read that is to see them has to stay on one connection
+// from the database list to the last pragma — see `readCatalog`.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// quoteIdent quotes a name for SQLite the way the standard says, doubling
+// any `"` inside it. It is only for a schema name in front of
+// `sqlite_master`, the one place a name cannot be bound: every other
+// name goes to the pragma functions as a parameter.
+func quoteIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// readCatalog reads one schema per database the connection has open:
+// `main` first, then each `ATTACH`ed one in the order it was attached,
+// and `temp` last, and only when it holds a relation — SQLite may list it
+// on any connection, and an empty schema of that name would be noise in
+// the sidebar.
+//
+// SQLite has no sequences, stored routines or user types, so a schema
+// holds relations and nothing else.
+func readCatalog(ctx context.Context, q querier) (introspect.Catalog, error) {
+	var names []string
+	if err := queryAll(ctx, q,
+		"SELECT name FROM pragma_database_list ORDER BY seq",
+		nil,
+		func(rows *sql.Rows) error {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return err
+			}
+			names = append(names, name)
+			return nil
+		},
+	); err != nil {
+		return introspect.Catalog{}, err
+	}
+	hasTemp := slices.Contains(names, "temp")
+	names = slices.DeleteFunc(names, func(name string) bool { return name == "temp" })
+	if hasTemp {
+		names = append(names, "temp")
+	}
+
+	schemas := make([]introspect.Schema, 0, len(names))
+	for _, name := range names {
+		tables, err := readTables(ctx, q, name)
+		if err != nil {
+			return introspect.Catalog{}, err
+		}
+		if name == "temp" && len(tables) == 0 {
+			continue
+		}
+		schemas = append(schemas, introspect.Schema{
+			Name:      name,
+			Tables:    tables,
+			Sequences: []introspect.Sequence{},
+			Routines:  []introspect.Routine{},
+			Types:     []introspect.UserType{},
+		})
+	}
+	return introspect.Catalog{Schemas: schemas}, nil
+}
+
+// readTables reads the relations of one schema, each with its columns,
+// keys, indexes and triggers.
+//
+// `sqlite_` is SQLite's own prefix, matched with its `_` escaped: a bare
+// `_` in `LIKE` is any character, and would hide a user's `sqlitex`.
+func readTables(ctx context.Context, q querier, schema string) ([]introspect.Table, error) {
+	type named struct{ name, kind string }
+	var names []named
+	if err := queryAll(ctx, q,
+		"SELECT name, type FROM "+quoteIdent(schema)+".sqlite_master "+
+			`WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite\_%' ESCAPE '\' `+
+			"ORDER BY name",
+		nil,
+		func(rows *sql.Rows) error {
+			var n named
+			if err := rows.Scan(&n.name, &n.kind); err != nil {
+				return err
+			}
+			names = append(names, n)
+			return nil
+		},
+	); err != nil {
+		return nil, err
+	}
+
+	tables := make([]introspect.Table, 0, len(names))
+	for _, n := range names {
+		columns, primaryKey, err := readColumns(ctx, q, schema, n.name)
+		if err != nil {
+			return nil, err
+		}
+		kind := introspect.TableKindTable
+		if n.kind == "view" {
+			kind = introspect.TableKindView
+		}
+		indexes, err := readIndexes(ctx, q, schema, n.name)
+		if err != nil {
+			return nil, err
+		}
+		foreignKeys, err := readForeignKeys(ctx, q, schema, n.name)
+		if err != nil {
+			return nil, err
+		}
+		triggers, err := readTriggers(ctx, q, schema, n.name)
+		if err != nil {
+			return nil, err
+		}
+		tables = append(tables, introspect.Table{
+			Name:       n.name,
+			Kind:       kind,
+			Columns:    columns,
+			PrimaryKey: primaryKey,
+			// SQLite keeps no row estimate; a per-table COUNT(*) would
+			// scan every table on connect, so report nothing.
+			ApproxRows:  nil,
+			Indexes:     indexes,
+			ForeignKeys: foreignKeys,
+			// SQLite keeps a check only in the `CREATE TABLE` text, and
+			// reading it back out would mean parsing SQL. A unique
+			// constraint is an index here, and is listed there.
+			Constraints: []introspect.Constraint{},
+			Triggers:    triggers,
+		})
+	}
+	return tables, nil
+}
+
+// Values of `pragma_table_xinfo`'s `hidden`. `pragma_table_info` is the
+// same read with every hidden column left out, generated ones among them,
+// so a table with a generated column used to show one column short.
+const (
+	columnVirtualHidden = 1 // a virtual table's own column: FTS5's `rank`
+	columnVirtual       = 2 // GENERATED ALWAYS AS (…) VIRTUAL
+	columnStored        = 3 // GENERATED ALWAYS AS (…) STORED
+)
+
+// readColumns reads a relation's columns, and its primary key in key
+// order. A virtual table's hidden columns are left out: they are how the
+// module takes arguments, not something a row holds, and `SELECT *` does
+// not return them either.
+//
+// A generated column says so with an empty expression. SQLite keeps the
+// expression only in the `CREATE TABLE` text, and the driver does not
+// parse SQL to get it.
+func readColumns(ctx context.Context, q querier, schema, table string) ([]introspect.Column, []string, error) {
+	type ordered struct {
+		ord int64
+		col string
+	}
+	var pk []ordered
+	columns := []introspect.Column{}
+	if err := queryAll(ctx, q,
+		`SELECT name, type, "notnull", dflt_value, pk, hidden FROM pragma_table_xinfo(?1, ?2)`,
+		[]any{table, schema},
+		func(rows *sql.Rows) error {
+			var (
+				col, dataType        string
+				notNull, ord, hidden int64
+				def                  sql.NullString
+			)
+			if err := rows.Scan(&col, &dataType, &notNull, &def, &ord, &hidden); err != nil {
+				return err
+			}
+			if hidden == columnVirtualHidden {
+				return nil
+			}
+			if ord > 0 {
+				pk = append(pk, ordered{ord, col})
+			}
+			var defPtr *string
+			if def.Valid {
+				d := def.String
+				defPtr = &d
+			}
+			var generated *string
+			if hidden == columnVirtual || hidden == columnStored {
+				expression := ""
+				generated = &expression
+			}
+			columns = append(columns, introspect.Column{
+				Name:      col,
+				DataType:  dataType,
+				Nullable:  notNull == 0,
+				Default:   defPtr,
+				Generated: generated,
+			})
+			return nil
+		},
+	); err != nil {
+		return nil, nil, err
+	}
+	slices.SortStableFunc(pk, func(a, b ordered) int {
+		switch {
+		case a.ord < b.ord:
+			return -1
+		case a.ord > b.ord:
+			return 1
+		}
+		return 0
+	})
+	primaryKey := make([]string, 0, len(pk))
+	for _, p := range pk {
+		primaryKey = append(primaryKey, p.col)
+	}
+	return columns, primaryKey, nil
+}
+
+// readIndexes is a table's indexes, the implicit ones a `UNIQUE` or a
 // `PRIMARY KEY` makes among them. `origin` says which: `pk`, `u`, or `c`
 // for one made with `CREATE INDEX`.
-func (c *SqliteConnection) indexes(ctx context.Context, table string) ([]introspect.Index, error) {
+func readIndexes(ctx context.Context, q querier, schema, table string) ([]introspect.Index, error) {
 	type entry struct {
 		name    string
 		unique  int64
@@ -253,9 +485,9 @@ func (c *SqliteConnection) indexes(ctx context.Context, table string) ([]introsp
 		partial int64
 	}
 	var list []entry
-	if err := queryAll(ctx, c.pool,
-		`SELECT name, "unique", origin, partial FROM pragma_index_list(?1) ORDER BY name`,
-		[]any{table},
+	if err := queryAll(ctx, q,
+		`SELECT name, "unique", origin, partial FROM pragma_index_list(?1, ?2) ORDER BY name`,
+		[]any{table, schema},
 		func(rows *sql.Rows) error {
 			var e entry
 			if err := rows.Scan(&e.name, &e.unique, &e.origin, &e.partial); err != nil {
@@ -271,9 +503,9 @@ func (c *SqliteConnection) indexes(ctx context.Context, table string) ([]introsp
 	for _, e := range list {
 		// A key over an expression names no column, and reads `NULL`.
 		var key []string
-		if err := queryAll(ctx, c.pool,
-			"SELECT name FROM pragma_index_info(?1) ORDER BY seqno",
-			[]any{e.name},
+		if err := queryAll(ctx, q,
+			"SELECT name FROM pragma_index_info(?1, ?2) ORDER BY seqno",
+			[]any{e.name, schema},
 			func(rows *sql.Rows) error {
 				var column sql.NullString
 				if err := rows.Scan(&column); err != nil {
@@ -303,20 +535,24 @@ func (c *SqliteConnection) indexes(ctx context.Context, table string) ([]introsp
 	return indexes, nil
 }
 
-// foreignKeys is a table's foreign keys. SQLite names none of them, so
-// each is named the way Postgres would have named it:
+// readForeignKeys is a table's foreign keys. SQLite names none of them,
+// so each is named the way Postgres would have named it:
 // `orders_user_id_fkey`, and `orders_user_id_fkey1` for a second key over
 // the same columns, which Postgres would have named that way too.
-func (c *SqliteConnection) foreignKeys(ctx context.Context, table string) ([]introspect.ForeignKey, error) {
+//
+// A key's target is always in the table's own schema: SQLite resolves
+// `REFERENCES` in the database the table lives in, and has no syntax to
+// name another.
+func readForeignKeys(ctx context.Context, q querier, schema, table string) ([]introspect.ForeignKey, error) {
 	type numbered struct {
 		id  int64
 		key introspect.ForeignKey
 	}
 	var keys []numbered
-	if err := queryAll(ctx, c.pool,
-		`SELECT id, "table", "from", "to" FROM pragma_foreign_key_list(?1) `+
+	if err := queryAll(ctx, q,
+		`SELECT id, "table", "from", "to" FROM pragma_foreign_key_list(?1, ?2) `+
 			`ORDER BY id, seq`,
-		[]any{table},
+		[]any{table, schema},
 		func(rows *sql.Rows) error {
 			var (
 				id           int64
@@ -332,7 +568,7 @@ func (c *SqliteConnection) foreignKeys(ctx context.Context, table string) ([]int
 					key: introspect.ForeignKey{
 						Name:          "",
 						Columns:       []string{},
-						TargetSchema:  "main",
+						TargetSchema:  schema,
 						TargetTable:   target,
 						TargetColumns: []string{},
 					},
@@ -355,9 +591,9 @@ func (c *SqliteConnection) foreignKeys(ctx context.Context, table string) ([]int
 		// is where the columns have to be read from.
 		if len(key.TargetColumns) != len(key.Columns) {
 			primary := []string{}
-			if err := queryAll(ctx, c.pool,
-				"SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk",
-				[]any{key.TargetTable},
+			if err := queryAll(ctx, q,
+				"SELECT name FROM pragma_table_info(?1, ?2) WHERE pk > 0 ORDER BY pk",
+				[]any{key.TargetTable, schema},
 				func(rows *sql.Rows) error {
 					var name string
 					if err := rows.Scan(&name); err != nil {
@@ -384,10 +620,13 @@ func (c *SqliteConnection) foreignKeys(ctx context.Context, table string) ([]int
 	return named, nil
 }
 
-func (c *SqliteConnection) triggers(ctx context.Context, table string) ([]introspect.Trigger, error) {
+// readTriggers is a table's triggers, read from the schema the table is
+// in. A `TEMP` trigger on a table of `main` lives in `temp`'s list and is
+// not shown: its `tbl_name` does not say which schema's table it means.
+func readTriggers(ctx context.Context, q querier, schema, table string) ([]introspect.Trigger, error) {
 	triggers := []introspect.Trigger{}
-	err := queryAll(ctx, c.pool,
-		"SELECT name, sql FROM sqlite_master "+
+	err := queryAll(ctx, q,
+		"SELECT name, sql FROM "+quoteIdent(schema)+".sqlite_master "+
 			"WHERE type = 'trigger' AND tbl_name = ?1 ORDER BY name",
 		[]any{table},
 		func(rows *sql.Rows) error {
@@ -486,124 +725,17 @@ func (c *SqliteConnection) OpenSession(ctx context.Context) (dbclient.Session, e
 	return session, nil
 }
 
+// Introspect reads the catalog on one pooled connection, held from the
+// database list to the last pragma, so every read agrees on which
+// databases are attached. An `ATTACH` is per connection: one a tab ran on
+// its session is seen by that session's `Introspect`, not here.
 func (c *SqliteConnection) Introspect(ctx context.Context) (introspect.Catalog, error) {
-	type named struct{ name, kind string }
-	var names []named
-	if err := queryAll(ctx, c.pool,
-		"SELECT name, type FROM sqlite_master "+
-			"WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' "+
-			"ORDER BY name",
-		nil,
-		func(rows *sql.Rows) error {
-			var n named
-			if err := rows.Scan(&n.name, &n.kind); err != nil {
-				return err
-			}
-			names = append(names, n)
-			return nil
-		},
-	); err != nil {
+	conn, err := c.pool.Conn(ctx)
+	if err != nil {
 		return introspect.Catalog{}, err
 	}
-
-	tables := make([]introspect.Table, 0, len(names))
-	for _, n := range names {
-		type ordered struct {
-			ord int64
-			col string
-		}
-		var pk []ordered
-		columns := []introspect.Column{}
-		if err := queryAll(ctx, c.pool,
-			`SELECT name, type, "notnull", dflt_value, pk FROM pragma_table_info(?1)`,
-			[]any{n.name},
-			func(rows *sql.Rows) error {
-				var (
-					col, dataType string
-					notNull, ord  int64
-					def           sql.NullString
-				)
-				if err := rows.Scan(&col, &dataType, &notNull, &def, &ord); err != nil {
-					return err
-				}
-				if ord > 0 {
-					pk = append(pk, ordered{ord, col})
-				}
-				var defPtr *string
-				if def.Valid {
-					d := def.String
-					defPtr = &d
-				}
-				columns = append(columns, introspect.Column{
-					Name:     col,
-					DataType: dataType,
-					Nullable: notNull == 0,
-					Default:  defPtr,
-				})
-				return nil
-			},
-		); err != nil {
-			return introspect.Catalog{}, err
-		}
-		slices.SortStableFunc(pk, func(a, b ordered) int {
-			switch {
-			case a.ord < b.ord:
-				return -1
-			case a.ord > b.ord:
-				return 1
-			}
-			return 0
-		})
-		primaryKey := make([]string, 0, len(pk))
-		for _, p := range pk {
-			primaryKey = append(primaryKey, p.col)
-		}
-
-		kind := introspect.TableKindTable
-		if n.kind == "view" {
-			kind = introspect.TableKindView
-		}
-		indexes, err := c.indexes(ctx, n.name)
-		if err != nil {
-			return introspect.Catalog{}, err
-		}
-		foreignKeys, err := c.foreignKeys(ctx, n.name)
-		if err != nil {
-			return introspect.Catalog{}, err
-		}
-		triggers, err := c.triggers(ctx, n.name)
-		if err != nil {
-			return introspect.Catalog{}, err
-		}
-		tables = append(tables, introspect.Table{
-			Name:       n.name,
-			Kind:       kind,
-			Columns:    columns,
-			PrimaryKey: primaryKey,
-			// SQLite keeps no row estimate; a per-table COUNT(*) would
-			// scan every table on connect, so report nothing.
-			ApproxRows:  nil,
-			Indexes:     indexes,
-			ForeignKeys: foreignKeys,
-			// SQLite keeps a check only in the `CREATE TABLE` text, and
-			// reading it back out would mean parsing SQL. A unique
-			// constraint is an index here, and is listed there.
-			Constraints: []introspect.Constraint{},
-			Triggers:    triggers,
-		})
-	}
-
-	// SQLite has no sequences, stored routines or user types, so the
-	// one schema holds relations and nothing else.
-	return introspect.Catalog{
-		Schemas: []introspect.Schema{{
-			Name:      "main",
-			Tables:    tables,
-			Sequences: []introspect.Sequence{},
-			Routines:  []introspect.Routine{},
-			Types:     []introspect.UserType{},
-		}},
-	}, nil
+	defer conn.Close()
+	return readCatalog(ctx, conn)
 }
 
 func (c *SqliteConnection) ServerVersion(ctx context.Context) (string, error) {
@@ -653,41 +785,9 @@ func collect(ctx context.Context, conn *sql.Conn, sqlText string, limits dbclien
 		return dbclient.QueryResult{}, err
 	}
 	sink := dbclient.NewRowSink(limits)
-	rows, err := conn.QueryContext(ctx, sqlText)
-	if err != nil {
-		return dbclient.QueryResult{}, err
-	}
-	columns, err := rows.Columns()
-	if err != nil {
-		rows.Close()
-		return dbclient.QueryResult{}, err
-	}
-	raw := make([]any, len(columns))
-	dest := make([]any, len(columns))
-	for i := range raw {
-		dest[i] = &raw[i]
-	}
-	for rows.Next() {
-		if !sink.HasColumns() {
-			sink.Columns(slices.Clone(columns))
-		}
-		if err := rows.Scan(dest...); err != nil {
-			rows.Close()
-			return dbclient.QueryResult{}, err
-		}
-		values := make([]dbclient.Value, 0, len(columns))
-		for i := range raw {
-			values = append(values, decode(raw[i]))
-		}
-		if !sink.Push(values) {
-			break
-		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return dbclient.QueryResult{}, err
-	}
-	if err := rows.Close(); err != nil {
+	if err := conn.Raw(func(driverConn any) error {
+		return stream(ctx, driverConn, sqlText, sink)
+	}); err != nil {
 		return dbclient.QueryResult{}, err
 	}
 	after, err := totalChanges(ctx, conn)
@@ -701,6 +801,90 @@ func collect(ctx context.Context, conn *sql.Conn, sqlText string, limits dbclien
 	return sink.Finish(affected), nil
 }
 
+// stream runs sqlText on the driver's own connection and pushes its rows
+// into sink. It goes under database/sql rather than through it because
+// the driver's rows have to be reached before the first row is read: see
+// `undeclareTimes`.
+//
+// database/sql would also stop a run whose context ended, between two
+// rows; the loop checks the context there for the same reason.
+func stream(ctx context.Context, driverConn any, sqlText string, sink *dbclient.RowSink) error {
+	queryer, ok := driverConn.(driver.QueryerContext)
+	if !ok {
+		return fmt.Errorf("the SQLite driver cannot run a query on %T", driverConn)
+	}
+	rows, err := queryer.QueryContext(ctx, sqlText, nil)
+	if err != nil {
+		return err
+	}
+	undeclareTimes(rows)
+	columns := rows.Columns()
+	dest := make([]driver.Value, len(columns))
+	for {
+		if err := ctx.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		err := rows.Next(dest)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		if !sink.HasColumns() {
+			sink.Columns(slices.Clone(columns))
+		}
+		values := make([]dbclient.Value, 0, len(columns))
+		for i := range dest {
+			values = append(values, decode(dest[i]))
+		}
+		if !sink.Push(values) {
+			break
+		}
+	}
+	return rows.Close()
+}
+
+// undeclareTimes makes modernc read a column declared `DATE`, `DATETIME`
+// or `TIMESTAMP` as the column it is: SQLite stores no date type, and
+// what such a column holds is the text, number or blob that was written
+// to it.
+//
+// modernc parses the text of such a column into a `time.Time` and does
+// not keep the text, so `'2024-01-01'` came back as `2024-01-01
+// 00:00:00+00:00` and a `'2024-01-01T10:00:00.500Z'` lost its zeros and
+// its `Z` — a viewer showing something other than what is stored. No DSN
+// option turns it off: `_texttotime` is the same parse for columns with
+// no declared type, and `_inttotime` is the integer one, which is off by
+// default. Which columns it parses is decided in `rows.Next` from
+// `rows.decltypes`, the declared types read once when the statement is
+// prepared, so blanking those three names there is a column with no
+// declared type to `Next`, and its text comes back as the string it is.
+//
+// The field is modernc's own and unexported; `TestADateColumnShowsWhatIsStored`
+// fails the day a bump of the pinned module renames it. Until then a
+// missing field leaves the parse on — dates reformatted, never a failed
+// run — and `decode` writes the time in modernc's own layout.
+func undeclareTimes(rows driver.Rows) {
+	value := reflect.ValueOf(rows)
+	if value.Kind() != reflect.Pointer || value.IsNil() || value.Elem().Kind() != reflect.Struct {
+		return
+	}
+	declared := value.Elem().FieldByName("decltypes")
+	if !declared.IsValid() || declared.Kind() != reflect.Slice || declared.Type().Elem().Kind() != reflect.String {
+		return
+	}
+	for i := range declared.Len() {
+		slot := declared.Index(i)
+		switch slot.String() {
+		case "DATE", "DATETIME", "TIMESTAMP":
+			reflect.NewAt(slot.Type(), unsafe.Pointer(slot.UnsafeAddr())).Elem().SetString("")
+		}
+	}
+}
+
 func totalChanges(ctx context.Context, conn *sql.Conn) (int64, error) {
 	var n int64
 	err := conn.QueryRowContext(ctx, "SELECT total_changes()").Scan(&n)
@@ -710,7 +894,11 @@ func totalChanges(ctx context.Context, conn *sql.Conn) (int64, error) {
 // decode turns what the driver read into a value. The Rust build matched
 // on the value's own storage class (sqlx names it `INTEGER`, `REAL`,
 // `BLOB` or `TEXT`), which is exactly what modernc hands back as a Go type.
-func decode(raw any) dbclient.Value {
+//
+// modernc reads no `BOOLEAN` column as a `bool` — a `2` stored there is
+// the integer 2 — so a `bool` only arrives from a driver that changed
+// its mind, and is shown as it says.
+func decode(raw driver.Value) dbclient.Value {
 	switch v := raw.(type) {
 	case nil:
 		return dbclient.ValueNull{}
@@ -721,24 +909,29 @@ func decode(raw any) dbclient.Value {
 	case float64:
 		return dbclient.ValueFloat(v)
 	case []byte:
+		// modernc reads an empty blob as a nil slice. It is still a blob,
+		// not SQL's NULL and not an empty string, so it stays `ValueBytes`
+		// and is given a slice of its own.
+		if v == nil {
+			v = []byte{}
+		}
 		return dbclient.ValueBytes(v)
 	case string:
 		return dbclient.ValueText(v)
 	case time.Time:
-		// modernc parses the text of a column declared DATE, DATETIME
-		// or TIMESTAMP into a time, which sqlx never did, and does not
-		// keep the text it parsed. This is its own first layout, the one
-		// it writes a time in.
+		// Only when `undeclareTimes` could not reach modernc's rows: the
+		// stored text is gone by now, and this is modernc's own first
+		// layout, the one it writes a time in.
 		return dbclient.ValueText(v.Format("2006-01-02 15:04:05.999999999-07:00"))
 	default:
 		return dbclient.ValueText(fmt.Sprint(v))
 	}
 }
 
-// queryAll runs a catalog read on the pool and hands each row to each.
+// queryAll runs a catalog read and hands each row to each.
 // sqlx's `fetch_all`: every row is read before the next query goes out.
-func queryAll(ctx context.Context, pool *sql.DB, query string, args []any, each func(*sql.Rows) error) error {
-	rows, err := pool.QueryContext(ctx, query, args...)
+func queryAll(ctx context.Context, q querier, query string, args []any, each func(*sql.Rows) error) error {
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}

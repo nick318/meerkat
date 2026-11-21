@@ -613,7 +613,10 @@ since pasting the word `NULL` would make it data, and a value holding a
 comma, a quote or a line break is quoted with its own quotes doubled — or
 one cell would read as two fields, and one with a newline in it would
 shear every row below it out of line. Nothing marked copies nothing
-rather than the whole result.
+rather than the whole result. A `bytea` copies whole, as `\x` and its hex
+(`dbclient::full_text`): a cell paints only the first sixteen bytes, and a
+copy that stopped there would hand over a different value. The value card
+and the ⌘F search read it whole too.
 
 A selection is a set of indices into the rows on screen, so **anything
 that replaces the rows clears it**: a page turn, a refresh, a run.
@@ -1054,6 +1057,20 @@ release listeners are the window's, hung by the element while the drag
 is on, for the reason the grid's are. The caret is painted with a
 selection as well as without one, and the caret's line wears
 `active_line`.
+
+**A completion writes a name the way a statement must spell it.**
+`query::QuoteIdentIfNeeded` quotes a name Postgres would fold or read as a
+reserved word — `Users`, `order`, `my table` — and a quote the user
+already opened before the word is taken in rather than doubled. A bare
+`Users` would fail, or worse, read `users`.
+
+**The buffer is split the way `psql` splits it.** `query::statement_ranges`
+is a port of `psqlscan.l`'s rules: a `;` ends a statement only outside
+strings (an `E'…'` string honours backslash escapes), quoted names,
+comments, dollar-quoted bodies, **brackets** (`CREATE RULE … DO (a; b)`),
+and a `BEGIN ATOMIC … END` body of a `CREATE FUNCTION` or `PROCEDURE`. A
+`$` inside a name never opens a dollar quote, and a statement of nothing
+but comments is not a statement.
 
 ### Async bridge
 
@@ -2068,7 +2085,18 @@ marks warn in the same tones. A session that never connected goes grey
 `db_postgres` reads `pg_catalog` (not `information_schema`) for tables and
 columns, because it also carries the `reltuples` estimate and `format_type`
 renders type names the way `psql` does. Primary keys come from
-`information_schema`, which reports key column order.
+`pg_constraint` too, in `conkey` order — **never `information_schema`**:
+`table_constraints` lists only tables the role owns or holds a privilege
+other than `SELECT` on, so a read-only role saw no key anywhere.
+
+**A partition is listed under its parent.** A partition (`relispartition`)
+is left out of the schema's tables and read into `Table::partitions` with
+its bound, which the sidebar paints as a `PARTITIONS` folder and the
+schema report diffs as an object; a table of a thousand partitions is
+otherwise a sidebar of a thousand names. A generated column's expression
+sits in `pg_attrdef` beside the defaults, so `attgenerated` moves it to
+`Column::generated`, and `attidentity` fills `Column::identity`: neither
+is a default the user can override.
 
 **The rest of the catalog is its own reads, not one join.** Indexes,
 constraints, triggers, sequences, routines and types each come from their
@@ -2099,7 +2127,15 @@ PostgreSQL 10 — `pg_sequence`, `prokind`, `conparentid` — is gated on
 on a session: a refused read inside the user's transaction would abort
 it.
 
-SQLite has no sequences, routines or types. Its indexes and foreign keys
+SQLite has no sequences, routines or types. Each attached database
+(`pragma_database_list`) is a schema of its own, `main` first. Columns
+come from `pragma_table_xinfo`, because `table_info` leaves generated
+columns out. modernc parses the text of a `DATE`, `DATETIME` or
+`TIMESTAMP` column into a time and does not keep the text, so the driver
+blanks those declared types on the driver's rows before the first row
+(`undeclareTimes`, by reflection on modernc's `decltypes`): a viewer shows
+what is stored. That reads an unexported field of the pinned modernc, so
+run `TestADateColumnShowsWhatIsStored` after a bump. Its indexes and foreign keys
 come from the `pragma_index_list` and `pragma_foreign_key_list` table
 functions, and it names no foreign key, so each is named the way Postgres
 would have, with a number after a name already taken. A key that names
@@ -2110,22 +2146,43 @@ Every field the model gained after its first cut is `#[serde(default)]`,
 because the cached catalog is JSON an older build may have written, and a
 row that no longer parsed would cost the first paint.
 
-Decode result columns by matching on `type_info().name()` — `try_get::<String>`
-fails on non-text Postgres types. An unknown type must never error: a viewer
-must not fall over on exotic columns.
+**Postgres renders every value itself, except the few the grid keeps as
+more than text.** A run picks the wire format per column when it
+executes (`resultFormats` in `decode.go`): binary for `bool`, the
+integers, `oid`, `xid`, `xid8` and `bytea`, which become `Value::Bool`,
+`Value::Int` and `Value::Bytes`; the server's own **text** for everything
+else. Text is what `psql` prints and is right for every type there will
+ever be — an `interval`, an enum, a composite, a range, an array of any of
+them, a BC date, `infinity`, a `numeric` `NaN`, `24:00:00`. The first
+edition asked for binary across the board, as sqlx did, decoded by hand
+what it could, painted `<INTERVAL>` for the rest, and failed the whole
+result on `infinity` or a `NaN`. Text that is not UTF-8 (an `SQL_ASCII`
+database) is drawn with a replacement character, never an error.
 
-**What sqlx cannot decode is read off the wire.** sqlx knows the built-in
-types by OID, under upper-case names, and calls everything else by the name
-it reads back from the catalog — `xid8`, `tsvector` — with no `Decode` for
-it, so `try_get` fails on every Rust type. `off_the_wire` takes the bytes
-instead. A statement sent **unprepared** answers in text format, which is
-Postgres's own rendering and is right for every type there will ever be. A
-run is **prepared**, so it answers in binary, where each type is its own
-layout and nothing generic can be said: `xid` and `xid8` are big-endian
-unsigned integers, `tsvector` is read by `tsvector` — a lexeme count, then
-each lexeme NUL-terminated with its positions, the weight in the top two
-bits of each — and everything else keeps the `<type_name>` placeholder it
-had. A short or malformed value is an error on that cell, never a panic.
+**The startup packet sends no `TimeZone` and no `DateStyle`.** A startup
+parameter outranks `ALTER ROLE … SET` and `ALTER DATABASE … SET`, so
+forcing them made `now()::date` a UTC date and read `'03/04/2024'` month
+first on a day-first database. Values arrive in the session's own zone
+and style, as `psql` shows them.
+
+**What the server says beside a result is kept.** `OnNotice` and
+`OnNotification` file notices, warnings and `NOTIFY` payloads under the
+connection a run is watching (`messages.go`), and they land in
+`QueryResult::messages`; the query pane lists them in a strip over the
+result. **`COPY … FROM STDIN` is refused before it is sent** — the run has
+no rows to send, and the server would wait for them — and **`COPY … TO
+STDOUT` is read through the copy protocol**, a line a row, under the same
+memory cap.
+
+**A connection string is read the way libpq reads one**
+(`parseConnectURL`): `postgres://` or `postgresql://` URLs with a host
+list (`h1:5432,h2:5433`, tried in order, `reach` knocking each), a socket
+as `%2Ftmp` or `?host=/tmp`, IPv6 in brackets, and libpq's own
+`key=value` form; `connect_timeout` and `target_session_attrs` are
+honoured. **An error never repeats the URL**: `net/url`'s own words quote
+the text around the fault, which is a password cut at its `#`. A saved
+profile keeps the parameters it has no field for in `Profile::params`
+(`sslmode` among them), and its password as the server checks it, decoded.
 
 A transaction id is unsigned 64 bits, so one past `i64::MAX` goes through
 as its digits rather than as a negative `Value::Int`.
@@ -2250,7 +2307,9 @@ two rsyncs over one bundle.
 ### Persistence
 
 Profiles live in a SQLite file under the user data directory. `Store::migrate`
-adds columns one at a time so an older profiles file keeps its rows. Passwords
+adds columns one at a time so an older profiles file keeps its rows.
+`params` is the connection string's parameters the profile has no field
+for, query-encoded. Passwords
 go to the OS keychain keyed by profile id, and never touch that file.
 
 ## Pinned mygo

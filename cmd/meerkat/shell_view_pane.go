@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/egoist/mygo/ui"
@@ -1374,6 +1375,9 @@ func (s *Shell) queryPane(c *ui.Context, tab *QueryTab, colors *theme.ThemeColor
 	// Directly over the result, because it is about what the runs have
 	// done rather than about the statement above them.
 	s.txBar(c, tab, colors)
+	// Over the result it came with: a `DO` block that only raises
+	// notices has nothing else to show.
+	messagesStrip(c, tab, colors)
 	// Result header
 	header := ui.Row(c.Key("result-header")).
 		Height(40).
@@ -1926,6 +1930,51 @@ func capNote(c *ui.Context, tab *QueryTab, colors *theme.ThemeColors) {
 // was sent a statement and refused it. This one is about a statement
 // nobody has sent, so it takes the panel's own ground and says its piece
 // in the error ink rather than lighting a whole strip up like a failure.
+// messagesShown is how many of a run's messages the strip lists before it
+// says how many more there are. A loop that raises a notice a row would
+// otherwise push the result off the pane.
+const messagesShown = 6
+
+// messagesStrip lists what the server said beside the last run: notices,
+// warnings and notifications, one a line, in the mono, in the order they
+// came. Nothing said is no strip.
+func messagesStrip(c *ui.Context, tab *QueryTab, colors *theme.ThemeColors) {
+	if len(tab.messages) == 0 {
+		return
+	}
+	shown, more := messageLines(tab.messages)
+	ui.Column(c.Key("messages-strip")).
+		Shrink(0).
+		Gap(2).
+		Padding(7, 14).
+		BorderWidth(0, 0, 1, 0).
+		BorderColor(colors.Hairline.Color()).
+		Background(colors.Panel.Color()).
+		Font(theme.MonoFontFamily).
+		FontSize(11).
+		TextColor(colors.TextBody.Color()).
+		Children(func() {
+			for _, line := range shown {
+				ui.Box(c).MinWidth(0).Children(func() { ui.Text(c, line).SingleLine() })
+			}
+			if more != "" {
+				ui.Text(c, more).TextColor(colors.TextMuted.Color())
+			}
+		})
+}
+
+// messageLines is what the strip lists — each message on one line, since
+// a notice may carry newlines — and the note on how many it left out.
+func messageLines(messages []string) (shown []string, more string) {
+	for i, message := range messages {
+		if i == messagesShown {
+			return shown, fmt.Sprintf("%d more", len(messages)-messagesShown)
+		}
+		shown = append(shown, strings.Join(strings.Fields(message), " "))
+	}
+	return shown, ""
+}
+
 func syntaxStrip(c *ui.Context, tab *QueryTab, colors *theme.ThemeColors) {
 	found := tab.editor.Diagnostics()
 	ix := spokenFor(found, tab.editor.Cursor())

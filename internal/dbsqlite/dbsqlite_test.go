@@ -2,6 +2,7 @@ package dbsqlite
 
 import (
 	"context"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -287,5 +288,306 @@ func TestASqliteSessionAnswersTheSessionAPI(t *testing.T) {
 	session.Close(ctx)
 	if !session.IsClosed() {
 		t.Fatal("a closed session does not read as closed")
+	}
+}
+
+// --- what is stored is what is shown ---
+
+// rowValues runs a query on run and answers with its rows, failing the
+// test when it does not run.
+func rowValues(t *testing.T, run func(context.Context, string) (dbclient.QueryResult, error), sql string) [][]dbclient.Value {
+	t.Helper()
+	return mustExecute(t, run, sql).Rows
+}
+
+// wantValues checks each row's one value against want, by variant and by
+// value: `ValueText("")` and `ValueBytes{}` must not read as each other.
+func wantValues(t *testing.T, rows [][]dbclient.Value, want []dbclient.Value) {
+	t.Helper()
+	if len(rows) != len(want) {
+		t.Fatalf("rows = %d, want %d", len(rows), len(want))
+	}
+	for i := range want {
+		got := rows[i][0]
+		if reflect.TypeOf(got) != reflect.TypeOf(want[i]) || !got.Equal(want[i]) {
+			t.Errorf("row %d = %#v, want %#v", i, got, want[i])
+		}
+	}
+}
+
+// modernc parses the text of a column declared DATE, DATETIME or
+// TIMESTAMP into a time and drops the text; see `undeclareTimes`. Every
+// value must come back as it was written, whether it parses as a date,
+// does not, or is not text at all — on the pool, on a session, through a
+// view, and with the declared type in lower case.
+func TestADateColumnShowsWhatIsStored(t *testing.T) {
+	ctx := context.Background()
+	conn := openInMemory(t)
+	for _, statement := range []string{
+		"CREATE TABLE stamps (seq INTEGER PRIMARY KEY, d DATE, dt datetime, ts TIMESTAMP)",
+		`INSERT INTO stamps (seq, d, dt, ts) VALUES
+			(1, '2024-01-01', '2024-01-01 10:00', '2024-01-01T10:00:00.500Z'),
+			(2, 'tomorrow', '2024-01-01 10:00:00+02:00', '2024-01-01 10:00:00.000'),
+			(3, 1700000000, 1.5, X'01'),
+			(4, NULL, '', '2024-01-01')`,
+		"CREATE VIEW stamp_view AS SELECT seq, d, dt, ts FROM stamps",
+	} {
+		mustExecute(t, conn.Execute, statement)
+	}
+	want := map[string][]dbclient.Value{
+		"d": {
+			dbclient.ValueText("2024-01-01"),
+			dbclient.ValueText("tomorrow"),
+			dbclient.ValueInt(1700000000),
+			dbclient.ValueNull{},
+		},
+		"dt": {
+			dbclient.ValueText("2024-01-01 10:00"),
+			dbclient.ValueText("2024-01-01 10:00:00+02:00"),
+			dbclient.ValueFloat(1.5),
+			dbclient.ValueText(""),
+		},
+		"ts": {
+			dbclient.ValueText("2024-01-01T10:00:00.500Z"),
+			dbclient.ValueText("2024-01-01 10:00:00.000"),
+			dbclient.ValueBytes{0x01},
+			dbclient.ValueText("2024-01-01"),
+		},
+	}
+	session, err := conn.OpenSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close(ctx)
+	for _, relation := range []string{"stamps", "stamp_view"} {
+		for column, values := range want {
+			query := "SELECT " + column + " FROM " + relation + " ORDER BY seq"
+			wantValues(t, rowValues(t, conn.Execute, query), values)
+			wantValues(t, rowValues(t, session.Execute, query), values)
+		}
+	}
+}
+
+// modernc reads no BOOLEAN column as a bool: what is stored there is an
+// integer or a text, and is shown as one.
+func TestABooleanColumnShowsWhatIsStored(t *testing.T) {
+	conn := openInMemory(t)
+	mustExecute(t, conn.Execute, "CREATE TABLE flags (seq INTEGER PRIMARY KEY, flag BOOLEAN)")
+	mustExecute(t, conn.Execute, "INSERT INTO flags (seq, flag) VALUES (1, 2), (2, 1), (3, 0), (4, 'true')")
+	wantValues(t, rowValues(t, conn.Execute, "SELECT flag FROM flags ORDER BY seq"), []dbclient.Value{
+		dbclient.ValueInt(2),
+		dbclient.ValueInt(1),
+		dbclient.ValueInt(0),
+		dbclient.ValueText("true"),
+	})
+}
+
+// A value past what a float64 holds exactly must come back to the digit,
+// whatever name the column's integer type has.
+func TestALargeIntegerComesBackExact(t *testing.T) {
+	conn := openInMemory(t)
+	const big = 326335020369620480
+	mustExecute(t, conn.Execute, `CREATE TABLE ids (a INTEGER, b BIGINT, c UNSIGNED BIG INT)`)
+	mustExecute(t, conn.Execute, `INSERT INTO ids VALUES (326335020369620480, 326335020369620480, 326335020369620480)`)
+	for _, column := range []string{"a", "b", "c"} {
+		wantValues(t, rowValues(t, conn.Execute, "SELECT "+column+" FROM ids"), []dbclient.Value{dbclient.ValueInt(big)})
+	}
+	wantValues(t, rowValues(t, conn.Execute, "SELECT 326335020369620480"), []dbclient.Value{dbclient.ValueInt(big)})
+}
+
+// An empty blob, an empty string and NULL are three different values, in
+// a column of no declared type and in a typed one.
+func TestAnEmptyBlobAnEmptyStringAndNullStayApart(t *testing.T) {
+	conn := openInMemory(t)
+	mustExecute(t, conn.Execute, "CREATE TABLE empties (seq INTEGER PRIMARY KEY, bare, typed BLOB)")
+	mustExecute(t, conn.Execute, "INSERT INTO empties VALUES (1, X'', X''), (2, '', ''), (3, NULL, NULL)")
+	want := []dbclient.Value{
+		dbclient.ValueBytes{},
+		dbclient.ValueText(""),
+		dbclient.ValueNull{},
+	}
+	for _, column := range []string{"bare", "typed"} {
+		wantValues(t, rowValues(t, conn.Execute, "SELECT "+column+" FROM empties ORDER BY seq"), want)
+	}
+}
+
+// --- the catalog ---
+
+// `pragma_table_info` leaves a generated column out; the catalog must
+// list it, marked generated. A virtual table's hidden columns are how
+// the module takes arguments, and are left out.
+func TestIntrospectListsGeneratedColumns(t *testing.T) {
+	ctx := context.Background()
+	conn := openInMemory(t)
+	mustExecute(t, conn.Execute, `CREATE TABLE shapes (
+		side INTEGER NOT NULL DEFAULT 1,
+		area INTEGER GENERATED ALWAYS AS (side * side),
+		perimeter INTEGER AS (side * 4) STORED)`)
+	mustExecute(t, conn.Execute, "CREATE VIRTUAL TABLE notes USING fts5(title, body)")
+
+	catalog, err := conn.Introspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables := catalog.Schemas[0].Tables
+	columnsOf := func(name string) []introspect.Column {
+		for i := range tables {
+			if tables[i].Name == name {
+				return tables[i].Columns
+			}
+		}
+		t.Fatalf("no table %q", name)
+		return nil
+	}
+
+	type column struct {
+		name      string
+		generated bool
+		def       string
+	}
+	var got []column
+	for _, c := range columnsOf("shapes") {
+		entry := column{name: c.Name, generated: c.Generated != nil}
+		if c.Generated != nil && *c.Generated != "" {
+			t.Errorf("%s: generated = %q, want the empty expression", c.Name, *c.Generated)
+		}
+		if c.Default != nil {
+			entry.def = *c.Default
+		}
+		got = append(got, entry)
+	}
+	want := []column{{"side", false, "1"}, {"area", true, ""}, {"perimeter", true, ""}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("columns = %+v, want %+v", got, want)
+	}
+
+	var names []string
+	for _, c := range columnsOf("notes") {
+		names = append(names, c.Name)
+	}
+	if !reflect.DeepEqual(names, []string{"title", "body"}) {
+		t.Fatalf("virtual table columns = %q", names)
+	}
+}
+
+// Every attached database is a schema of its own, after `main` and in
+// the order it was attached; `temp` comes last and only once it holds a
+// relation. Names that need quoting — a schema with a `"` in it, tables
+// with a `.`, a `'` or a `"` — are read whole, with their keys, indexes
+// and triggers.
+func TestIntrospectReadsEveryAttachedDatabase(t *testing.T) {
+	ctx := context.Background()
+	conn := openInMemory(t)
+	mustExecute(t, conn.Execute, "CREATE TABLE users (id INTEGER PRIMARY KEY)")
+	session, err := conn.OpenSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close(ctx)
+
+	dir := t.TempDir()
+	quoteLiteral := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+	for _, statement := range []string{
+		"ATTACH DATABASE " + quoteLiteral(filepath.Join(dir, "aux.db")) + " AS aux",
+		"ATTACH DATABASE " + quoteLiteral(filepath.Join(dir, "odd.db")) + ` AS "we""ird.db"`,
+		`CREATE TABLE aux."o'neil" (id INTEGER PRIMARY KEY, label TEXT)`,
+		`CREATE TABLE aux."foo.bar" (
+			id INTEGER PRIMARY KEY,
+			owner INTEGER REFERENCES "o'neil",
+			doubled INTEGER AS (id * 2))`,
+		`CREATE INDEX aux."foo.bar_owner" ON "foo.bar" (owner)`,
+		`CREATE TRIGGER aux."foo.bar_stamp" AFTER INSERT ON "foo.bar" BEGIN SELECT 1; END`,
+		`CREATE TABLE "we""ird.db"."say ""hi""" (x TEXT)`,
+	} {
+		mustExecute(t, session.Execute, statement)
+	}
+
+	schemaNames := func(catalog *introspect.Catalog) []string {
+		var names []string
+		for _, schema := range catalog.Schemas {
+			names = append(names, schema.Name)
+		}
+		return names
+	}
+	catalog, err := session.Introspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if catalog == nil {
+		t.Fatal("a SQLite session cannot read its catalog")
+	}
+	if got, want := schemaNames(catalog), []string{"main", "aux", `we"ird.db`}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("schemas = %q, want %q", got, want)
+	}
+
+	aux := catalog.Schemas[1]
+	var tableNames []string
+	for _, table := range aux.Tables {
+		tableNames = append(tableNames, table.Name)
+	}
+	if !reflect.DeepEqual(tableNames, []string{"foo.bar", "o'neil"}) {
+		t.Fatalf("aux tables = %q", tableNames)
+	}
+	fooBar, oNeil := aux.Tables[0], aux.Tables[1]
+	if len(fooBar.Columns) != 3 || fooBar.Columns[2].Generated == nil {
+		t.Fatalf("foo.bar columns = %+v", fooBar.Columns)
+	}
+	if !reflect.DeepEqual(oNeil.PrimaryKey, []string{"id"}) || len(oNeil.Columns) != 2 {
+		t.Fatalf("o'neil = %+v", oNeil)
+	}
+	if len(fooBar.Indexes) != 1 || fooBar.Indexes[0].Name != "foo.bar_owner" || fooBar.Indexes[0].Definition != "(owner)" {
+		t.Fatalf("foo.bar indexes = %+v", fooBar.Indexes)
+	}
+	if len(fooBar.ForeignKeys) != 1 {
+		t.Fatalf("foo.bar keys = %+v", fooBar.ForeignKeys)
+	}
+	if got := fooBar.ForeignKeys[0].Detail(); got != "(owner) → aux.o'neil(id)" {
+		t.Fatalf("key detail = %q", got)
+	}
+	if len(fooBar.Triggers) != 1 || fooBar.Triggers[0].Timing != "after insert" {
+		t.Fatalf("foo.bar triggers = %+v", fooBar.Triggers)
+	}
+	weird := catalog.Schemas[2]
+	if len(weird.Tables) != 1 || weird.Tables[0].Name != `say "hi"` || weird.Tables[0].Columns[0].Name != "x" {
+		t.Fatalf("we\"ird.db = %+v", weird.Tables)
+	}
+
+	// A temp relation puts `temp` on the list, last.
+	mustExecute(t, session.Execute, "CREATE TEMP TABLE scratch (n INTEGER)")
+	catalog, err = session.Introspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := schemaNames(catalog), []string{"main", "aux", `we"ird.db`, "temp"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("schemas = %q, want %q", got, want)
+	}
+
+	// The pool's connections attached nothing.
+	pooled, err := conn.Introspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := schemaNames(&pooled); !reflect.DeepEqual(got, []string{"main"}) {
+		t.Fatalf("pooled schemas = %q", got)
+	}
+}
+
+// A table whose name looks like SQLite's own prefix to `LIKE` is still
+// the user's: only `sqlite_` itself is SQLite's.
+func TestIntrospectKeepsATableNamedLikeSqlitesOwn(t *testing.T) {
+	ctx := context.Background()
+	conn := openInMemory(t)
+	mustExecute(t, conn.Execute, "CREATE TABLE sqlitex (id INTEGER)")
+	mustExecute(t, conn.Execute, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)")
+	catalog, err := conn.Introspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, table := range catalog.Schemas[0].Tables {
+		names = append(names, table.Name)
+	}
+	if !reflect.DeepEqual(names, []string{"sqlitex", "t"}) {
+		t.Fatalf("tables = %q", names)
 	}
 }

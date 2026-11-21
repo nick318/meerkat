@@ -511,9 +511,9 @@ func relationParts(table *introspect.Table) *Parts {
 		if table.IsKey(column.Name) {
 			mark = MarkKey
 		}
-		columns = append(columns, newLeaf(column.Name, column.DataType, mark))
+		columns = append(columns, newLeaf(column.Name, columnDetail(&column), mark))
 	}
-	var indexes, keys, constraints, triggers []Leaf
+	var indexes, keys, constraints, triggers, partitions []Leaf
 	for i := range table.Indexes {
 		ix := &table.Indexes[i]
 		indexes = append(indexes, newLeaf(ix.Name, ix.Detail(), MarkIndex))
@@ -530,8 +530,12 @@ func relationParts(table *introspect.Table) *Parts {
 		t := &table.Triggers[i]
 		triggers = append(triggers, newLeaf(t.Name, t.Detail(), MarkTrigger))
 	}
+	for _, p := range table.Partitions {
+		partitions = append(partitions, newLeaf(p.Name, p.Bound, MarkPartition))
+	}
 	var folders []Folder
 	for _, folder := range []Folder{
+		{"Partitions", partitions},
 		{"Indexes", indexes},
 		{"Foreign keys", keys},
 		{"Constraints", constraints},
@@ -1087,12 +1091,35 @@ func columnCount(n int) string {
 	return fmt.Sprintf("%d columns", n)
 }
 
+// columnDetail is the faint line after a column's name in the sidebar: its
+// type, and whether its values come from the column itself — a generated
+// expression or an identity — since neither is a default the user can
+// override by writing the column.
+func columnDetail(column *introspect.Column) string {
+	switch {
+	case column.Generated != nil:
+		return column.DataType + " · generated"
+	case column.Identity != nil:
+		return column.DataType + " · identity"
+	}
+	return column.DataType
+}
+
 // columnNote is the words after a column's type: what the catalog says
 // about it that the type does not.
 func columnNote(column *introspect.Column) string {
 	nullable := "not null"
 	if column.Nullable {
 		nullable = "nullable"
+	}
+	if column.Generated != nil {
+		if *column.Generated == "" {
+			return fmt.Sprintf("%s · generated", nullable)
+		}
+		return fmt.Sprintf("%s · generated as %s", nullable, *column.Generated)
+	}
+	if column.Identity != nil {
+		return fmt.Sprintf("%s · identity %s", nullable, *column.Identity)
 	}
 	if column.Default != nil {
 		return fmt.Sprintf("%s · default %s", nullable, *column.Default)

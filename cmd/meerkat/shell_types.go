@@ -1223,6 +1223,10 @@ type QueryTab struct {
 	// rows. The result line says so, because a grid that stops at an
 	// arbitrary row must not read as the whole answer.
 	truncated bool
+	// What the server said beside the last run's results — notices,
+	// warnings, notifications — in the order it said them. Nil on a tab
+	// whose last run failed or said nothing.
+	messages []string
 	// How many statements the last run sent, so the result strip can say
 	// which set is on screen.
 	statementsRun int
@@ -1732,6 +1736,8 @@ type Ran struct {
 	ran int
 	// See [Tally]'s field of the same name.
 	boundaryTag string
+	// What the server said beside every statement of the run, in order.
+	messages []string
 }
 
 // RunOutcome is what a run hands back: the tab's session, and how the
@@ -1847,6 +1853,8 @@ type Tally struct {
 	// `COMMIT` of a failed transaction with the tag `ROLLBACK` and no
 	// error, and this is the only place that is said.
 	boundaryTag string
+	// What the server said beside the statements so far.
+	messages []string
 }
 
 // CatalogRow is one row of the sidebar's tree, flattened so the list can
@@ -1922,6 +1930,8 @@ const (
 	MarkSequence
 	MarkRoutine
 	MarkType
+	// MarkPartition is a partition of a partitioned table.
+	MarkPartition
 )
 
 // How far one level of the tree steps in: a chevron and the gap after it,

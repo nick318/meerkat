@@ -153,6 +153,10 @@ const (
 	ObjectKindSequence
 	ObjectKindRoutine
 	ObjectKindType
+	// ObjectKindPartition is a partition of a partitioned table: a table
+	// of its own, but listed under its parent, so a partition that came
+	// or went is news about the parent.
+	ObjectKindPartition
 )
 
 func (k ObjectKind) Noun() string {
@@ -171,6 +175,8 @@ func (k ObjectKind) Noun() string {
 		return "routine"
 	case ObjectKindType:
 		return "type"
+	case ObjectKindPartition:
+		return "partition"
 	}
 	panic(fmt.Sprintf("introspect: unknown ObjectKind %d", int(k)))
 }
@@ -191,6 +197,8 @@ func (k ObjectKind) Plural() string {
 		return "routines"
 	case ObjectKindType:
 		return "types"
+	case ObjectKindPartition:
+		return "partitions"
 	}
 	panic(fmt.Sprintf("introspect: unknown ObjectKind %d", int(k)))
 }
@@ -399,6 +407,9 @@ func tableObjects(table *Table) []object {
 	for i := range table.Triggers {
 		objects = append(objects, object{ObjectKindTrigger, table.Triggers[i].Name, table.Triggers[i].Detail()})
 	}
+	for _, p := range table.Partitions {
+		objects = append(objects, object{ObjectKindPartition, p.Name, p.Bound})
+	}
 	return objects
 }
 
@@ -520,5 +531,6 @@ func diffColumns(before, after *Table) []ColumnDelta {
 // sameShape says whether two readings of one column describe the same
 // column. The name is what matched them; this is everything else.
 func sameShape(a, b *Column) bool {
-	return a.DataType == b.DataType && a.Nullable == b.Nullable && eqString(a.Default, b.Default)
+	return a.DataType == b.DataType && a.Nullable == b.Nullable && eqString(a.Default, b.Default) &&
+		eqString(a.Generated, b.Generated) && eqString(a.Identity, b.Identity)
 }

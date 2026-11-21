@@ -339,6 +339,9 @@ func (s *Store) migrate() error {
 			{"server", "TEXT"},
 			{"env", "TEXT"},
 			{"read_only", "INTEGER"},
+			// The connection string's parameters a profile has no
+			// field for, query-encoded: `sslmode`, `connect_timeout`…
+			{"params", "TEXT"},
 		},
 	); err != nil {
 		return err
@@ -412,8 +415,8 @@ func (s *Store) SaveProfile(p *dbclient.Profile) error {
 	}
 	_, err := s.conn.Exec(
 		`INSERT INTO profiles
-                (id, name, engine, host, port, database, user, read_only)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                (id, name, engine, host, port, database, user, read_only, params)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 engine = excluded.engine,
@@ -421,7 +424,8 @@ func (s *Store) SaveProfile(p *dbclient.Profile) error {
                 port = excluded.port,
                 database = excluded.database,
                 user = excluded.user,
-                read_only = excluded.read_only`,
+                read_only = excluded.read_only,
+                params = excluded.params`,
 		p.Id,
 		p.Name,
 		engineStr(p.Engine),
@@ -430,6 +434,7 @@ func (s *Store) SaveProfile(p *dbclient.Profile) error {
 		p.Database,
 		optString(p.User),
 		p.ReadOnly,
+		p.Params,
 	)
 	return err
 }
@@ -453,7 +458,7 @@ func (s *Store) ListProfiles() ([]dbclient.Profile, error) {
 func (s *Store) ListConnections() ([]SavedConnection, error) {
 	rows, err := s.conn.Query(
 		`SELECT id, name, engine, host, port, database, user,
-                    last_opened, server, env, read_only
+                    last_opened, server, env, read_only, params
              FROM profiles
              ORDER BY last_opened IS NULL, last_opened DESC, name`,
 	)
@@ -466,10 +471,11 @@ func (s *Store) ListConnections() ([]SavedConnection, error) {
 		var (
 			id, name, engine, database string
 			host, user, server, env    sql.NullString
+			params                     sql.NullString
 			port, lastOpened, readOnly sql.NullInt64
 		)
 		if err := rows.Scan(&id, &name, &engine, &host, &port, &database, &user,
-			&lastOpened, &server, &env, &readOnly); err != nil {
+			&lastOpened, &server, &env, &readOnly, &params); err != nil {
 			return nil, err
 		}
 		portValue, err := optU16(port)
@@ -488,6 +494,7 @@ func (s *Store) ListConnections() ([]SavedConnection, error) {
 				// A row an older build wrote has no answer here, and
 				// the careful reading of no answer is "do not write".
 				ReadOnly: !readOnly.Valid || readOnly.Int64 != 0,
+				Params:   params.String,
 			},
 			LastOpened: fromNullInt64(lastOpened),
 			Server:     fromNullString(server),

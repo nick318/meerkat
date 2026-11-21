@@ -440,3 +440,24 @@ func TestConnectionsRowsSelectOnAClickAndOpenOnADoubleClick(t *testing.T) {
 		t.Error("cancel left the form open")
 	}
 }
+
+func TestARowUrlCarriesASocketAnIpv6HostAndTheParameters(t *testing.T) {
+	profile := dbclient.Profile{
+		Engine:   dbclient.EnginePostgres,
+		Host:     connectionsSome("/var/run/postgresql"),
+		Port:     connectionsSome(uint16(5432)),
+		Database: "meerkat",
+		Params:   "sslmode=require",
+	}
+	if got := profileUrl(&profile); got != "postgres://%2Fvar%2Frun%2Fpostgresql:5432/meerkat?sslmode=require" {
+		t.Errorf("profileUrl = %q", got)
+	}
+	profile.Host, profile.Params = connectionsSome("::1"), ""
+	if got := profileUrl(&profile); got != "postgres://[::1]:5432/meerkat" {
+		t.Errorf("profileUrl = %q", got)
+	}
+	profile.Host, profile.Port = connectionsSome("h1:5433,h2:5434"), nil
+	if got := profileUrl(&profile); got != "postgres://h1:5433,h2:5434/meerkat" {
+		t.Errorf("profileUrl = %q", got)
+	}
+}

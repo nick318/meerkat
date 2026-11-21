@@ -316,6 +316,8 @@ func leafMark(c *ui.Context, mark Mark, colors *theme.ThemeColors) ui.Element {
 				glyph("ƒ")
 			case MarkType:
 				glyph("τ")
+			case MarkPartition:
+				glyph("⊟")
 			}
 		})
 }

@@ -480,7 +480,7 @@ func field(value dbclient.Value) string {
 	if _, null := value.(dbclient.ValueNull); null {
 		return ""
 	}
-	text := value.Display()
+	text := dbclient.FullText(value)
 	if strings.ContainsAny(text, ",\n\r\"") {
 		return "\"" + strings.ReplaceAll(text, "\"", "\"\"") + "\""
 	}

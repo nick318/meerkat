@@ -1732,8 +1732,12 @@ func (e *SqlEditor) applyCompletion(ix int) {
 	if ix < 0 || ix >= len(e.completions) {
 		return
 	}
-	label := e.completions[ix].Label
 	r := e.completionRange
+	label := completionText(e.completions[ix], e.content, r)
+	// A name the user opened a quote for takes that quote in.
+	if r.Start > 0 && e.content[r.Start-1] == '"' && e.completions[ix].Kind != KindKeyword {
+		r.Start--
+	}
 
 	// Accepting is one undo step, never joined to the typing before it.
 	e.lastEdit = editNone

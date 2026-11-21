@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -268,6 +267,13 @@ func must[T any](value T, err error) T {
 
 func connectTest(t *testing.T, url string, readOnly bool) *PostgresConnection {
 	t.Helper()
+	// Values are the server's own text, in the session's zone, so the
+	// tests pin the zone rather than inherit the test server's.
+	separator := "?"
+	if strings.Contains(url, "?") {
+		separator = "&"
+	}
+	url += separator + "options[TimeZone]=UTC"
 	conn := must(ConnectURL(context.Background(), url, readOnly))
 	t.Cleanup(func() { conn.Close(context.Background()) })
 	return conn
@@ -374,11 +380,11 @@ func TestIntrospectAndQuery(t *testing.T) {
 	}
 	wantValue(t, result.Rows[0][0], dbclient.ValueInt(1))
 	wantValue(t, result.Rows[0][1], text("ada@example.com"))
-	// Trailing zeroes drop: see the NUMERIC arm of `decode`.
-	wantValue(t, result.Rows[0][3], text("1280"))
-	wantValue(t, result.Rows[0][7], text("2026-08-15 09:12:00 +00:00"))
+	// The server's own rendering keeps the declared scale.
+	wantValue(t, result.Rows[0][3], text("1280.00"))
+	wantValue(t, result.Rows[0][7], text("2026-08-15 09:12:00+00"))
 	wantValue(t, result.Rows[0][4], dbclient.ValueBool(true))
-	wantValue(t, result.Rows[0][5], text("{\"a\":1}"))
+	wantValue(t, result.Rows[0][5], text("{\"a\": 1}"))
 	wantValue(t, result.Rows[0][6], text("00000000-0000-0000-0000-000000000001"))
 	wantValue(t, result.Rows[0][8], text("2026-08-15"))
 	wantValue(t, result.Rows[1][2], dbclient.ValueNull{})
@@ -565,20 +571,69 @@ func TestATriggerSaysWhenItFires(t *testing.T) {
 	}
 }
 
-func TestUnknownTypesDoNotFailTheResult(t *testing.T) {
+func TestEveryTypeReadsAsPostgresPrintsIt(t *testing.T) {
 	url := testURL(t)
-	conn := connectTest(t, url, true)
+	ctx := context.Background()
+	conn := connectTest(t, url, false)
+	session := must(conn.OpenSession(ctx))
+	for _, statement := range []string{
+		"CREATE TYPE pg_temp.mood AS ENUM ('ok', 'not ok')",
+		"CREATE TYPE pg_temp.pair AS (a int, b text)",
+	} {
+		execOK(t, session.Execute, statement)
+	}
 
-	// `point` has no mapping in the driver; it must render as a
-	// placeholder instead of failing the query.
-	result := execOK(t, conn.Execute, "SELECT point(1, 2) AS p, 1 AS n")
-	wantValue(t, result.Rows[0][0], text("<POINT>"))
-	wantValue(t, result.Rows[0][1], dbclient.ValueInt(1))
+	// Each of these either painted `<TYPE>` or failed the whole result
+	// when the run asked for every column in binary.
+	cases := []struct {
+		sql  string
+		want dbclient.Value
+	}{
+		{"point(1, 2)", text("(1,2)")},
+		{"interval '1 day 02:03:04'", text("1 day 02:03:04")},
+		{"'192.168.0.1/24'::inet", text("192.168.0.1/24")},
+		{"'::1'::cidr", text("::1/128")},
+		{"'08:00:2b:01:02:03'::macaddr", text("08:00:2b:01:02:03")},
+		{"B'1010'", text("1010")},
+		{"'12:00:00+02'::timetz", text("12:00:00+02")},
+		{"int4range(1, 10)", text("[1,10)")},
+		{"'{[1,3),[5,7)}'::int4multirange", text("{[1,3),[5,7)}")},
+		{"row(1, 'a')", text("(1,a)")},
+		{"row(1, 'x')::pg_temp.pair", text("(1,x)")},
+		{"'ok'::pg_temp.mood", text("ok")},
+		{"'pg_class'::regclass", text("pg_class")},
+		{"'a'::\"char\"", text("a")},
+		{"'<a>x</a>'::xml", text("<a>x</a>")},
+		{"'infinity'::timestamp", text("infinity")},
+		{"'-infinity'::timestamptz", text("-infinity")},
+		{"'infinity'::date", text("infinity")},
+		{"'0001-01-01 BC'::date", text("0001-01-01 BC")},
+		{"'24:00:00'::time", text("24:00:00")},
+		{"'NaN'::numeric", text("NaN")},
+		{"'Infinity'::numeric", text("Infinity")},
+		{"'-Infinity'::numeric", text("-Infinity")},
+		{"0.000001::numeric", text("0.000001")},
+		{"'Infinity'::float8", text("Infinity")},
+		{"0.1::float4", text("0.1")},
+		{"'{\"n\": 10.00}'::jsonb", text(`{"n": 10.00}`)},
+		{"12345::oid", dbclient.ValueInt(12345)},
+		{"4294967295::oid", dbclient.ValueInt(4294967295)},
+		{"5::int2", dbclient.ValueInt(5)},
+		{"'\\x00ff'::bytea", dbclient.ValueBytes{0x00, 0xff}},
+		{"true", dbclient.ValueBool(true)},
+	}
+	for _, c := range cases {
+		result, err := session.Execute(ctx, "SELECT "+c.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", c.sql, err)
+		}
+		if !result.Rows[0][0].Equal(c.want) {
+			t.Errorf("%s = %#v, want %#v", c.sql, result.Rows[0][0], c.want)
+		}
+	}
 }
 
-// The wire readers, against the server that writes those bytes: the
-// layouts are documented rather than versioned, so a test over a
-// fixture alone would go on passing if the reading were wrong.
+// A transaction id is read in binary and stays a number.
 func TestTransactionIdsAndTsvectorsReadAsValues(t *testing.T) {
 	url := testURL(t)
 	conn := connectTest(t, url, true)
@@ -598,11 +653,8 @@ func TestTransactionIdsAndTsvectorsReadAsValues(t *testing.T) {
 	wantValue(t, result.Rows[0][4], text("'a''b'"))
 }
 
-// An array comes back in binary on a prepared run, and sqlx has no
-// reading of it that fits every array, so it used to paint
-// `<TEXT[]>`. Each cell here must read the way `psql` prints it —
-// braces, quotes and all — except that a date or a time inside one
-// reads the way the same value reads in a cell of its own.
+// An array is the server's own text, so each cell here must read the
+// way `psql` prints it — braces, quotes and all.
 func TestArraysReadAsPostgresPrintsThem(t *testing.T) {
 	url := testURL(t)
 	conn := connectTest(t, url, true)
@@ -638,14 +690,14 @@ func TestArraysReadAsPostgresPrintsThem(t *testing.T) {
 		"{1.50,-0.001,12345678.9,0}",
 		"{NaN,Infinity}",
 		"{2024-02-29,infinity}",
-		`{"1999-12-31 23:59:59.500000"}`,
-		`{"2024-01-01 00:00:00 +00:00"}`,
+		`{"1999-12-31 23:59:59.5"}`,
+		`{"2024-01-01 00:00:00+00"}`,
 		"{24:00:00,08:30:00}",
 		"{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}",
 		`{"{\"k\": 1}"}`,
 		`{"\\x0102"}`,
 		"{abc}",
-		"{<POINT>}",
+		`{"(1,2)"}`,
 		`{10000-01-01,"0001-01-01 BC"}`,
 		`{"0001-01-01 00:00:00 BC"}`,
 		"{0.1,1.234567e+06}",
@@ -1686,304 +1738,6 @@ func TestAUrlWithoutADatabaseIsRejected(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
-
-// tsvectorBytes is the bytes `tsvectorsend` writes, so the reader can be
-// argued with without a server: a lexeme count, then each lexeme
-// NUL-terminated with its positions.
-type lexeme struct {
-	text      string
-	positions [][2]uint16
-}
-
-func tsvectorBytes(lexemes []lexeme) []byte {
-	bytes := binary.BigEndian.AppendUint32(nil, uint32(len(lexemes)))
-	for _, l := range lexemes {
-		bytes = append(bytes, l.text...)
-		bytes = append(bytes, 0)
-		bytes = binary.BigEndian.AppendUint16(bytes, uint16(len(l.positions)))
-		for _, p := range l.positions {
-			position, weight := p[0], p[1]
-			bytes = binary.BigEndian.AppendUint16(bytes, position|(weight<<14))
-		}
-	}
-	return bytes
-}
-
-func TestATsvectorReadsAsPostgresPrintsIt(t *testing.T) {
-	want := func(bytes []byte, expected string) {
-		t.Helper()
-		got, err := tsvector(bytes)
-		if err != nil || got != expected {
-			t.Fatalf("got (%q, %v), want %q", got, err, expected)
-		}
-	}
-	want(tsvectorBytes([]lexeme{{"fox", [][2]uint16{{3, 0}}}, {"quick", [][2]uint16{{2, 3}, {7, 0}}}}), "'fox':3 'quick':2A,7")
-
-	// No positions at all — `to_tsvector` always gives them, but
-	// `'a'::tsvector` does not.
-	want(tsvectorBytes([]lexeme{{"a", nil}}), "'a'")
-	want(tsvectorBytes(nil), "")
-
-	// Every weight has its letter, and D — weight 0 — has none.
-	want(tsvectorBytes([]lexeme{{"w", [][2]uint16{{1, 3}, {2, 2}, {3, 1}, {4, 0}}}}), "'w':1A,2B,3C,4")
-
-	// A quote and a backslash are doubled, or the rendering could not
-	// be read back as a tsvector.
-	want(tsvectorBytes([]lexeme{{"it's", nil}, {"a\\b", nil}}), "'it''s' 'a\\\\b'")
-}
-
-func TestAShortTsvectorIsAnErrorNotAPanic(t *testing.T) {
-	// A count that promises more than the bytes hold must not index
-	// past the end: a viewer reports the cell, it does not abort.
-	for _, bytes := range [][]byte{
-		{0, 0, 0, 1},
-		{0, 0},
-		// A lexeme with no terminator.
-		{0, 0, 0, 1, 'a'},
-		// A position count with no positions behind it.
-		{0, 0, 0, 1, 'a', 0, 0, 1},
-	} {
-		if _, err := tsvector(bytes); err == nil {
-			t.Fatalf("%v read without an error", bytes)
-		}
-	}
-}
-
-// int4ArrayBytes is the bytes `array_send` writes for a one-dimensional
-// `int4[]`, so the reader can be argued with without a server.
-func int4ArrayBytes(lower int32, items []*int32) []byte {
-	var bytes []byte
-	bytes = binary.BigEndian.AppendUint32(bytes, 1)
-	bytes = binary.BigEndian.AppendUint32(bytes, 0)
-	bytes = binary.BigEndian.AppendUint32(bytes, 23)
-	bytes = binary.BigEndian.AppendUint32(bytes, uint32(int32(len(items))))
-	bytes = binary.BigEndian.AppendUint32(bytes, uint32(lower))
-	for _, item := range items {
-		if item != nil {
-			bytes = binary.BigEndian.AppendUint32(bytes, 4)
-			bytes = binary.BigEndian.AppendUint32(bytes, uint32(*item))
-		} else {
-			bytes = binary.BigEndian.AppendUint32(bytes, uint32(0xFFFFFFFF))
-		}
-	}
-	return bytes
-}
-
-func some(n int32) *int32 { return &n }
-
-func int4Array(bytes []byte) (string, error) {
-	int4 := builtins[23]
-	items, err := arrayWireOf(bytes)
-	if err != nil {
-		return "", err
-	}
-	return array(&items, int4), nil
-}
-
-func TestAnArrayReadsAsPostgresPrintsIt(t *testing.T) {
-	want := func(bytes []byte, expected string) {
-		t.Helper()
-		got, err := int4Array(bytes)
-		if err != nil || got != expected {
-			t.Fatalf("got (%q, %v), want %q", got, err, expected)
-		}
-	}
-	want(int4ArrayBytes(1, []*int32{some(1), nil, some(-3)}), "{1,NULL,-3}")
-	// A dimension that does not start at 1 says where it starts.
-	want(int4ArrayBytes(-1, []*int32{some(5)}), "[-1:-1]={5}")
-	// No dimensions at all is the empty array.
-	empty := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23}
-	want(empty, "{}")
-}
-
-func TestAMalformedArrayIsAnErrorNotAPanic(t *testing.T) {
-	bytes := int4ArrayBytes(1, []*int32{some(1), some(2)})
-	// Cut short anywhere, in the header or in an element.
-	for end := range len(bytes) {
-		if _, err := int4Array(bytes[:end]); err == nil {
-			t.Fatalf("cut at %d", end)
-		}
-	}
-	// Bytes past the last element.
-	long := append(append([]byte{}, bytes...), 0)
-	if _, err := int4Array(long); err == nil {
-		t.Fatal("bytes past the end read")
-	}
-	// More dimensions than Postgres allows, and a negative length.
-	deep := append([]byte{}, bytes...)
-	binary.BigEndian.PutUint32(deep[:4], 7)
-	if _, err := int4Array(deep); err == nil {
-		t.Fatal("seven dimensions read")
-	}
-	negative := append([]byte{}, bytes...)
-	binary.BigEndian.PutUint32(negative[12:16], uint32(0xFFFFFFFE))
-	if _, err := int4Array(negative); err == nil {
-		t.Fatal("a negative length read")
-	}
-}
-
-// A header is a promise about the bytes behind it, and one that
-// promises billions of elements must be refused before anything is
-// built for them.
-func TestAnArrayHeaderCannotPromiseMoreThanItsBytes(t *testing.T) {
-	header := func(lengths []int32) []byte {
-		var bytes []byte
-		bytes = binary.BigEndian.AppendUint32(bytes, uint32(int32(len(lengths))))
-		bytes = binary.BigEndian.AppendUint32(bytes, 0)
-		bytes = binary.BigEndian.AppendUint32(bytes, 23)
-		for _, length := range lengths {
-			bytes = binary.BigEndian.AppendUint32(bytes, uint32(length))
-			bytes = binary.BigEndian.AppendUint32(bytes, 1)
-		}
-		return bytes
-	}
-	// A zero length inside a dimension would be braces around nothing,
-	// two billion times over; the server sends no dimensions instead.
-	if _, err := int4Array(header([]int32{math.MaxInt32, 0})); err == nil {
-		t.Fatal("a zero-length dimension read")
-	}
-	six := []int32{math.MaxInt32, math.MaxInt32, math.MaxInt32, math.MaxInt32, math.MaxInt32, math.MaxInt32}
-	if _, err := int4Array(header(six)); err == nil {
-		t.Fatal("six huge dimensions read")
-	}
-	short := header([]int32{3})
-	short = binary.BigEndian.AppendUint32(short, 4)
-	short = binary.BigEndian.AppendUint32(short, 1)
-	if _, err := int4Array(short); err == nil {
-		t.Fatal("a short array read")
-	}
-}
-
-func TestACatalogVectorReadsSpaceSeparated(t *testing.T) {
-	int2 := builtins[21]
-	var bytes []byte
-	for _, word := range []int32{1, 0, 21, 2, 0} {
-		bytes = binary.BigEndian.AppendUint32(bytes, uint32(word))
-	}
-	for _, n := range []int16{1, 3} {
-		bytes = binary.BigEndian.AppendUint32(bytes, 2)
-		bytes = binary.BigEndian.AppendUint16(bytes, uint16(n))
-	}
-	items, err := arrayWireOf(bytes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := vector(&items, int2); got != "1 3" {
-		t.Fatalf("got %q", got)
-	}
-	if !isVector("int2vector") {
-		t.Fatal("int2vector")
-	}
-	if !isVector("oidvector") {
-		t.Fatal("oidvector")
-	}
-	if isVector("INT2[]") {
-		t.Fatal("INT2[]")
-	}
-}
-
-func TestADateReadsAcrossTheWholePostgresRange(t *testing.T) {
-	want := func(days int64, date, era string) {
-		t.Helper()
-		gotDate, gotEra := calendarDate(days)
-		if gotDate != date || gotEra != era {
-			t.Fatalf("calendarDate(%d) = (%q, %q), want (%q, %q)", days, gotDate, gotEra, date, era)
-		}
-	}
-	want(0, "2000-01-01", "")
-	want(-1, "1999-12-31", "")
-	want(59, "2000-02-29", "")
-	// Past the year 9999, where `time` stops.
-	want(2_914_635, "9980-01-01", "")
-	want(2_921_940, "10000-01-01", "")
-	// There is no year zero: the day before 0001-01-01 is 1 BC.
-	want(-730_119, "0001-01-01", "")
-	want(-730_120, "0001-12-31", " BC")
-}
-
-func TestAFloatReadsAsPostgresPrintsIt(t *testing.T) {
-	float8 := func(value float64) string {
-		return float(value, rustLowerExp(value, 64), rustDisplay(value, 64), 15)
-	}
-	float4 := func(value float32) string {
-		return float(float64(value), rustLowerExp(float64(value), 32), rustDisplay(float64(value), 32), 6)
-	}
-	for _, c := range []struct{ got, want string }{
-		{float4(0.1), "0.1"},
-		{float4(123456.0), "123456"},
-		{float4(1234567.0), "1.234567e+06"},
-		{float8(1e14), "100000000000000"},
-		{float8(1e15), "1e+15"},
-		{float8(-2.5e300), "-2.5e+300"},
-		{float8(0.0001), "0.0001"},
-		{float8(0.00001), "1e-05"},
-		{float8(math.Copysign(0, -1)), "-0"},
-		{float8(math.Inf(-1)), "-Infinity"},
-	} {
-		if c.got != c.want {
-			t.Fatalf("got %q, want %q", c.got, c.want)
-		}
-	}
-}
-
-func TestAnArrayElementIsQuotedWhenItWouldMisread(t *testing.T) {
-	quoted := func(item string) string {
-		var out strings.Builder
-		arrayItemTo(&out, item)
-		return out.String()
-	}
-	for _, c := range []struct{ item, want string }{
-		{"plain", "plain"},
-		{"", `""`},
-		{"null", `"null"`},
-		{"a b", `"a b"`},
-		{"{x}", `"{x}"`},
-		{`say "hi"`, `"say \"hi\""`},
-		{`a\b`, `"a\\b"`},
-	} {
-		if got := quoted(c.item); got != c.want {
-			t.Fatalf("quoted(%q) = %q, want %q", c.item, got, c.want)
-		}
-	}
-}
-
-// numericBytes is the bytes `numeric_send` writes: a digit count, a
-// weight, a sign, a display scale, then the base-10000 digits.
-func numericBytes(weight int16, sign uint16, scale uint16, digits []uint16) []byte {
-	var bytes []byte
-	bytes = binary.BigEndian.AppendUint16(bytes, uint16(len(digits)))
-	bytes = binary.BigEndian.AppendUint16(bytes, uint16(weight))
-	bytes = binary.BigEndian.AppendUint16(bytes, sign)
-	bytes = binary.BigEndian.AppendUint16(bytes, scale)
-	for _, digit := range digits {
-		bytes = binary.BigEndian.AppendUint16(bytes, digit)
-	}
-	return bytes
-}
-
-func TestANumericKeepsItsScale(t *testing.T) {
-	want := func(bytes []byte, expected string) {
-		t.Helper()
-		got, err := numeric(bytes)
-		if err != nil || got != expected {
-			t.Fatalf("got (%q, %v), want %q", got, err, expected)
-		}
-	}
-	want(numericBytes(0, 0, 2, []uint16{1280}), "1280.00")
-	want(numericBytes(1, 0, 1, []uint16{1234, 5678, 9000}), "12345678.9")
-	want(numericBytes(-1, 0x4000, 3, []uint16{10}), "-0.001")
-	// Digits past the ones sent are zero, on either side of the point.
-	want(numericBytes(2, 0, 0, []uint16{7}), "700000000")
-	want(numericBytes(0, 0, 0, nil), "0")
-	want(numericBytes(0, 0xC000, 0, nil), "NaN")
-	if _, err := numeric(numericBytes(0, 0x1234, 0, nil)); err == nil {
-		t.Fatal("an unknown sign read")
-	}
-	if _, err := numeric([]byte{0, 1, 0, 0, 0, 0, 0, 0}); err == nil {
-		t.Fatal("a missing digit read")
-	}
-}
-
 func TestATransactionIdStaysUnsigned(t *testing.T) {
 	wantValue(t, transactionID(7), dbclient.ValueInt(7))
 	wantValue(t, transactionID(uint64(math.MaxUint32)), dbclient.ValueInt(4294967295))
@@ -2268,4 +2022,266 @@ func TestAnEmptyResultKeepsTheSessionsColumns(t *testing.T) {
 	if len(updated.Columns) != 0 {
 		t.Fatalf("update columns = %v", updated.Columns)
 	}
+}
+
+// A role that may only read sees the primary keys, a partitioned table
+// lists its partitions under itself, and a generated or identity column
+// says so rather than passing its expression off as a default.
+func TestIntrospectReadsKeysPartitionsAndGeneratedColumns(t *testing.T) {
+	url := testURL(t)
+	ctx := context.Background()
+	conn := connectTest(t, url, false)
+	for _, statement := range []string{
+		"DROP SCHEMA IF EXISTS meerkat_parts CASCADE",
+		"CREATE SCHEMA meerkat_parts",
+		`CREATE TABLE meerkat_parts.events (
+                 id bigint GENERATED ALWAYS AS IDENTITY,
+                 at date NOT NULL,
+                 n int,
+                 twice int GENERATED ALWAYS AS (n * 2) STORED,
+                 PRIMARY KEY (id, at)
+             ) PARTITION BY RANGE (at)`,
+		"CREATE TABLE meerkat_parts.events_2024 PARTITION OF meerkat_parts.events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')",
+		"CREATE TABLE meerkat_parts.events_rest PARTITION OF meerkat_parts.events DEFAULT",
+	} {
+		execOK(t, conn.Execute, statement)
+	}
+	t.Cleanup(func() { _, _ = conn.Execute(context.Background(), "DROP SCHEMA IF EXISTS meerkat_parts CASCADE") })
+
+	session := must(conn.OpenSession(ctx))
+	t.Cleanup(func() { session.Close(context.Background()) })
+	// A role of its own, made and dropped inside one transaction, so a
+	// failed run leaves nothing behind. Making a role needs the right to;
+	// a server that refuses skips that half.
+	asReader := true
+	for _, statement := range []string{
+		"BEGIN",
+		"CREATE ROLE meerkat_parts_reader",
+		"GRANT USAGE ON SCHEMA meerkat_parts TO meerkat_parts_reader",
+		"GRANT SELECT ON ALL TABLES IN SCHEMA meerkat_parts TO meerkat_parts_reader",
+		"SET ROLE meerkat_parts_reader",
+	} {
+		if _, err := session.Execute(ctx, statement); err != nil {
+			t.Logf("reading as the owner: %v", err)
+			_, _ = session.Execute(ctx, "ROLLBACK")
+			asReader = false
+			break
+		}
+	}
+	catalog := must(session.Introspect(ctx))
+	if asReader {
+		execOK(t, session.Execute, "ROLLBACK")
+	}
+
+	var schema *introspect.Schema
+	for i := range catalog.Schemas {
+		if catalog.Schemas[i].Name == "meerkat_parts" {
+			schema = &catalog.Schemas[i]
+		}
+	}
+	if schema == nil {
+		t.Fatal("no meerkat_parts schema")
+	}
+	if len(schema.Tables) != 1 || schema.Tables[0].Name != "events" {
+		t.Fatalf("tables = %+v, want the parent alone", schema.Tables)
+	}
+	events := schema.Tables[0]
+	if got := strings.Join(events.PrimaryKey, ","); got != "id,at" {
+		t.Fatalf("primary key = %q", got)
+	}
+	if len(events.Partitions) != 2 {
+		t.Fatalf("partitions = %+v", events.Partitions)
+	}
+	if p := events.Partitions[0]; p.Name != "events_2024" || p.Bound != "FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')" {
+		t.Fatalf("partition = %+v", p)
+	}
+	if p := events.Partitions[1]; p.Name != "events_rest" || p.Bound != "DEFAULT" {
+		t.Fatalf("partition = %+v", p)
+	}
+	columns := map[string]introspect.Column{}
+	for _, column := range events.Columns {
+		columns[column.Name] = column
+	}
+	if c := columns["id"]; c.Identity == nil || *c.Identity != "always" || c.Default != nil {
+		t.Fatalf("id = %+v", c)
+	}
+	if c := columns["twice"]; c.Generated == nil || *c.Generated != "(n * 2)" || c.Default != nil {
+		t.Fatalf("twice = %+v", c)
+	}
+	if c := columns["n"]; c.Generated != nil || c.Identity != nil {
+		t.Fatalf("n = %+v", c)
+	}
+}
+
+// A notice, a warning and a notification come back beside the result
+// they arrived with, and a `COPY` with the client at one end neither
+// hangs nor loses its rows.
+func TestARunCarriesWhatTheServerSaidAndCopyIsReadNotWaitedOn(t *testing.T) {
+	url := testURL(t)
+	ctx := context.Background()
+	conn := connectTest(t, url, false)
+	session := must(conn.OpenSession(ctx))
+	t.Cleanup(func() { session.Close(context.Background()) })
+
+	result := execOK(t, session.Execute,
+		"DO $$ BEGIN RAISE NOTICE 'hello %', 1; RAISE WARNING 'careful'; END $$")
+	if got := strings.Join(result.Messages, "\n"); got != "NOTICE: hello 1\nWARNING: careful" {
+		t.Fatalf("messages = %q", got)
+	}
+	execOK(t, session.Execute, "LISTEN meerkat_channel")
+	result = execOK(t, session.Execute, "NOTIFY meerkat_channel, 'ping'")
+	if len(result.Messages) != 1 || !strings.HasPrefix(result.Messages[0], "NOTIFY meerkat_channel from backend ") ||
+		!strings.HasSuffix(result.Messages[0], ": ping") {
+		t.Fatalf("messages = %q", result.Messages)
+	}
+	// A statement that says nothing carries nothing.
+	if result := execOK(t, session.Execute, "SELECT 1"); len(result.Messages) != 0 {
+		t.Fatalf("messages = %q", result.Messages)
+	}
+
+	execOK(t, session.Execute, "CREATE TEMP TABLE copied (a int, b text)")
+	execOK(t, session.Execute, "INSERT INTO copied VALUES (1, 'x'), (2, NULL)")
+	result = execOK(t, session.Execute, "COPY copied TO STDOUT")
+	if len(result.Columns) != 1 || len(result.Rows) != 2 {
+		t.Fatalf("copy out = %+v", result)
+	}
+	wantValue(t, result.Rows[0][0], text("1\tx"))
+	wantValue(t, result.Rows[1][0], text("2\t\\N"))
+	if result.Tag != "COPY 2" {
+		t.Fatalf("tag = %q", result.Tag)
+	}
+	result = execOK(t, session.Execute, "COPY (SELECT 'a;b' AS v) TO STDOUT WITH (FORMAT csv, HEADER)")
+	if len(result.Rows) != 2 {
+		t.Fatalf("copy out = %+v", result.Rows)
+	}
+
+	timed, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if _, err := session.Execute(timed, "copy copied from stdin"); err == nil || !strings.Contains(err.Error(), "FROM STDIN") {
+		t.Fatalf("copy in = %v", err)
+	}
+	// The session is still good for the next statement.
+	execOK(t, session.Execute, "SELECT count(*) FROM copied")
+}
+
+func TestCopyStdioReadsWhichEndTheClientIsAt(t *testing.T) {
+	cases := map[string]copyEnd{
+		"COPY t FROM STDIN":                          copyIn,
+		"copy t (a, b) from stdin with (format csv)": copyIn,
+		"COPY (SELECT 1) TO STDOUT":                  copyOut,
+		"/* c */ COPY t TO stdout":                   copyOut,
+		"COPY stdin FROM '/tmp/x'":                   copyNone,
+		"COPY t TO '/tmp/stdout'":                    copyNone,
+		"COPY (SELECT 'from stdin') TO '/tmp/x'":     copyNone,
+		"SELECT 'copy t from stdin'":                 copyNone,
+	}
+	for sql, want := range cases {
+		if got := copyStdio(sql); got != want {
+			t.Errorf("%s = %v, want %v", sql, got, want)
+		}
+	}
+}
+
+// Every form of connection string a libpq client accepts, and an error
+// that never repeats the URL it could not read.
+func TestConnectionStringsReadAsLibpqReadsThem(t *testing.T) {
+	t.Setenv("PGHOST", "")
+	os.Unsetenv("PGHOST")
+	t.Setenv("PGPORT", "5432")
+	parse := func(text string) connectOptions {
+		t.Helper()
+		options, err := parseConnectURL(text)
+		if err != nil {
+			t.Fatalf("%s: %v", text, err)
+		}
+		return options
+	}
+	hosts := func(o connectOptions) string {
+		var out []string
+		for _, h := range o.hosts() {
+			out = append(out, fmt.Sprintf("%s:%d", h.host, h.port))
+		}
+		return strings.Join(out, ",")
+	}
+
+	o := parse("postgres://bar%5E:%5Dfoo@db/testdb%5B")
+	if o.username != "bar^" || deref(o.password) != "]foo" || deref(o.database) != "testdb[" {
+		t.Fatalf("decoded = %q %q %q", o.username, deref(o.password), deref(o.database))
+	}
+	if got := hosts(parse("postgresql://h1:5433,h2,[::1]:5434/db")); got != "h1:5433,h2:5432,::1:5434" {
+		t.Fatalf("hosts = %q", got)
+	}
+	if o := parse("postgres://%2Ftmp:5433/db"); o.socket == nil || *o.socket != "/tmp" || o.port != 5433 {
+		t.Fatalf("socket = %v port = %d", o.socket, o.port)
+	}
+	o = parse(`host=db.internal port=6432 dbname='my db' user=ada password='it\'s' connect_timeout=3 target_session_attrs=read-write sslmode=require`)
+	if hosts(o) != "db.internal:6432" || deref(o.database) != "my db" || o.username != "ada" || deref(o.password) != "it's" ||
+		o.connectTimeout != 3*time.Second || deref(o.targetSessionAttrs) != "read-write" || deref(o.sslMode) != "require" {
+		t.Fatalf("key/value = %+v", o)
+	}
+	if got := hosts(parse("host=h1,h2 port=5433,5434 dbname=x")); got != "h1:5433,h2:5434" {
+		t.Fatalf("hosts = %q", got)
+	}
+	if o := parse(`password='a\'b c'`); deref(o.password) != "a'b c" {
+		t.Fatalf("password = %q", deref(o.password))
+	}
+
+	for _, bad := range []string{
+		"postgres://u:hunter#2@db/x",
+		"postgres://u:pa%zzword@db/x",
+	} {
+		_, err := parseConnectURL(bad)
+		if err == nil {
+			t.Fatalf("%s parsed", bad)
+		}
+		if strings.Contains(err.Error(), "hunter") || strings.Contains(err.Error(), "pa%zz") {
+			t.Fatalf("the error repeats the password: %v", err)
+		}
+	}
+	if _, err := parseConnectURL("mysql://db/x"); err == nil || !strings.Contains(err.Error(), "PostgreSQL") {
+		t.Fatalf("mysql = %v", err)
+	}
+}
+
+// A saved connection keeps what its URL said beyond the fields it has: a
+// host list, a socket, `sslmode`, and the password as the server checks
+// it, not as the URL spelled it.
+func TestAProfileKeepsWhatItsUrlSaid(t *testing.T) {
+	profile, password, err := ProfileFromURL("p", "", "postgres://ada:p%40ss@h1:5433,h2:5434/db?sslmode=verify-full&application_name=me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if password == nil || *password != "p@ss" {
+		t.Fatalf("password = %v", password)
+	}
+	if profile.Host == nil || *profile.Host != "h1:5433,h2:5434" || profile.Port != nil {
+		t.Fatalf("host = %v port = %v", profile.Host, profile.Port)
+	}
+	if profile.Params != "application_name=me&sslmode=verify-full" {
+		t.Fatalf("params = %q", profile.Params)
+	}
+	profile, _, err = ProfileFromURL("p", "", "postgres:///db?host=/var/run/postgresql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.Host == nil || *profile.Host != "/var/run/postgresql" {
+		t.Fatalf("socket = %v", profile.Host)
+	}
+}
+
+// A timestamp reads in the session's own zone: the app sends no zone of
+// its own, so a role's or a database's setting — or a `SET` — is what the
+// grid shows, as `psql` shows it.
+func TestATimestampReadsInTheSessionsZone(t *testing.T) {
+	url := testURL(t)
+	ctx := context.Background()
+	conn := connectTest(t, url, true)
+	session := must(conn.OpenSession(ctx))
+	t.Cleanup(func() { session.Close(context.Background()) })
+	execOK(t, session.Execute, "SET TIME ZONE 'Asia/Kolkata'")
+	execOK(t, session.Execute, "SET DateStyle = 'ISO, DMY'")
+	result := execOK(t, session.Execute,
+		"SELECT '2024-01-01 12:00:00+00'::timestamptz, '03/04/2024'::date")
+	wantValue(t, result.Rows[0][0], text("2024-01-01 17:30:00+05:30"))
+	wantValue(t, result.Rows[0][1], text("2024-04-03"))
 }

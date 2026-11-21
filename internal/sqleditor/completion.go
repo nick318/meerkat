@@ -302,3 +302,23 @@ func qualifierRange(text string, prefixStart int) (Range, bool) {
 	}
 	return r, true
 }
+
+// completionText is what accepting a completion writes over `r`: a
+// keyword as it is, and a name as a statement has to spell it — in
+// double quotes when Postgres would fold it or read it as a key word, and
+// always when the user has already opened a quote before it. A closing
+// quote already after the word is not written twice.
+func completionText(c Completion, content string, r Range) string {
+	if c.Kind == KindKeyword {
+		return c.Label
+	}
+	opened := r.Start > 0 && content[r.Start-1] == '"'
+	if !opened && !query.NeedsQuotes(c.Label) {
+		return c.Label
+	}
+	text := query.QuoteIdent(c.Label)
+	if r.End < len(content) && content[r.End] == '"' {
+		text = text[:len(text)-1]
+	}
+	return text
+}

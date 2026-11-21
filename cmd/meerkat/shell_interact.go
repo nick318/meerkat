@@ -1141,7 +1141,7 @@ func (s *Shell) peekValue() (name string, row int, value string, ok bool) {
 	if peek.cell.Column >= len(data.Columns) {
 		return "", 0, "", false
 	}
-	return data.Columns[peek.cell.Column], firstRow + peek.cell.Row, cells[peek.cell.Column].Display(), true
+	return data.Columns[peek.cell.Column], firstRow + peek.cell.Row, dbclient.FullText(cells[peek.cell.Column]), true
 }
 
 // peekShown is the text the card paints: the value, cut to `PEEK_CHARS`.

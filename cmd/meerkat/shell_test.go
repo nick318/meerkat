@@ -1625,3 +1625,18 @@ func TestTheReportHeaderNamesOneObjectAndRevealsItsRelation(t *testing.T) {
 		t.Errorf("subject = %v", subject)
 	}
 }
+
+func TestTheMessagesStripListsSixAndCountsTheRest(t *testing.T) {
+	shown, more := messageLines([]string{"NOTICE: a\nb", "NOTICE: c"})
+	if len(shown) != 2 || shown[0] != "NOTICE: a b" || more != "" {
+		t.Fatalf("shown = %q, more = %q", shown, more)
+	}
+	var many []string
+	for i := 0; i < 9; i++ {
+		many = append(many, "NOTICE: "+strconv.Itoa(i))
+	}
+	shown, more = messageLines(many)
+	if len(shown) != messagesShown || more != "3 more" {
+		t.Fatalf("shown = %q, more = %q", shown, more)
+	}
+}

@@ -14,6 +14,7 @@ package dbclient
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -37,6 +38,11 @@ type Profile struct {
 	Port     *uint16 `json:"port"`
 	Database string  `json:"database"`
 	User     *string `json:"user"`
+	// The connection string's parameters the profile has no field for —
+	// `sslmode`, `sslrootcert`, `application_name`, `connect_timeout`,
+	// `target_session_attrs`, `options` — query-encoded. A host may be a
+	// list, `h1:5433,h2`, with `Port` nil.
+	Params string `json:"params,omitempty"`
 	// Whether the session this profile opens refuses to write. It is a
 	// connection parameter, not a label: the driver asks the server for a
 	// read-only session, so the server is what enforces it. A profile
@@ -310,20 +316,35 @@ func display(v Value) string {
 	case ValueText:
 		return string(v)
 	case ValueBytes:
-		return fmt.Sprintf("0x%s", hexPrefix(v, 16))
+		return `\x` + hexPrefix(v, 16)
 	}
 	panic(fmt.Sprintf("dbclient: unknown Value %T", v))
 }
 
-// formatFloat is Rust's `f64::to_string`: the shortest digits that read
-// back as the same number, never in exponent form, and `inf`, `-inf` and
-// `NaN` for the three that are not numbers.
+// FullText is a value written out whole, for what is read or copied
+// rather than painted in a lane: ⌘C, the value card, the ⌘F search.
+//
+// It differs from [Value.Display] only for bytes. A cell shows the first
+// sixteen of them, because a lane holds no more and hex-encoding a
+// megabyte for every frame would freeze the window; a copy that stopped
+// at sixteen bytes would silently hand over a different value. Bytes are
+// written the way Postgres writes `bytea`, `\x` and the hex.
+func FullText(v Value) string {
+	if bytes, ok := v.(ValueBytes); ok {
+		return `\x` + hex.EncodeToString(bytes)
+	}
+	return v.Display()
+}
+
+// formatFloat is the shortest digits that read back as the same number,
+// never in exponent form, and `Infinity`, `-Infinity` and `NaN` — the
+// spellings SQL itself reads back — for the three that are not numbers.
 func formatFloat(f float64) string {
 	switch {
 	case math.IsInf(f, 1):
-		return "inf"
+		return "Infinity"
 	case math.IsInf(f, -1):
-		return "-inf"
+		return "-Infinity"
 	case math.IsNaN(f):
 		return "NaN"
 	}
@@ -405,6 +426,12 @@ type QueryResult struct {
 	Truncated bool
 	// Where the run's time went, as far as the client could see it.
 	Wire Wire
+	// What the server said beside the result, in the order it said it:
+	// a `RAISE NOTICE`, a warning, a notice that `DROP … IF EXISTS` found
+	// nothing, a notification on a channel the session listens on. A
+	// `DO` block that only raises notices has nothing else to say, so
+	// dropping these would leave its run with no answer at all.
+	Messages []string
 }
 
 // Refusal is why the server refused a statement it was asked to prepare.

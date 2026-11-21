@@ -22,11 +22,20 @@ type tableRow struct {
 }
 
 // columnRow is one row of the column listing: schema, table, column, type,
-// nullable, default.
+// nullable, default, and `attgenerated` and `attidentity` (empty for an
+// ordinary column, and on a server too old to have them).
 type columnRow struct {
 	schema, table, name, dataType string
 	nullable                      bool
 	defaultValue                  *string
+	generated, identity           string
+}
+
+// partitionRow is one partition: the parent's schema and name, the
+// partition's schema and name, and its bound.
+type partitionRow struct {
+	schema, table, partitionSchema, partition string
+	bound                                     *string
 }
 
 // keyRow is one row of the primary-key listing: schema, table, column.
@@ -130,6 +139,11 @@ func orDefault[R any](rows []R, err error) []R {
 // PostgreSQL 10 is not sent to an older server at all, so it cannot
 // abort a transaction the session read is running inside.
 func readCatalog(ctx context.Context, conn *pgx.Conn) (introspect.Catalog, error) {
+	var version int32
+	if err := conn.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&version); err != nil {
+		return introspect.Catalog{}, fmt.Errorf("failed to read the server version: %w", err)
+	}
+
 	tables, err := fetchAll(ctx, conn,
 		"SELECT n.nspname, c.relname, c.relkind::text, c.reltuples::bigint "+
 			"FROM pg_class c "+
@@ -148,11 +162,22 @@ func readCatalog(ctx context.Context, conn *pgx.Conn) (introspect.Catalog, error
 		return introspect.Catalog{}, fmt.Errorf("failed to list tables: %w", err)
 	}
 
+	// `attidentity` is PostgreSQL 10 and `attgenerated` 12. A generated
+	// column's expression sits in `pg_attrdef` like a default, so it is
+	// told apart here rather than painted as one.
+	identity, generated := "''::text", "''::text"
+	if version >= 100000 {
+		identity = "a.attidentity::text"
+	}
+	if version >= 120000 {
+		generated = "a.attgenerated::text"
+	}
 	columns, err := fetchAll(ctx, conn,
 		"SELECT n.nspname, c.relname, a.attname, "+
 			"format_type(a.atttypid, a.atttypmod), "+
 			"NOT a.attnotnull, "+
-			"pg_get_expr(d.adbin, d.adrelid) "+
+			"pg_get_expr(d.adbin, d.adrelid), "+
+			generated+", "+identity+" "+
 			"FROM pg_attribute a "+
 			"JOIN pg_class c ON c.oid = a.attrelid "+
 			"JOIN pg_namespace n ON n.oid = c.relnamespace "+
@@ -165,23 +190,30 @@ func readCatalog(ctx context.Context, conn *pgx.Conn) (introspect.Catalog, error
 			"ORDER BY n.nspname, c.relname, a.attnum",
 		func(rows pgx.Rows) (columnRow, error) {
 			var r columnRow
-			err := rows.Scan(&r.schema, &r.table, &r.name, &r.dataType, &r.nullable, &r.defaultValue)
+			err := rows.Scan(&r.schema, &r.table, &r.name, &r.dataType, &r.nullable, &r.defaultValue, &r.generated, &r.identity)
 			return r, err
 		})
 	if err != nil {
 		return introspect.Catalog{}, fmt.Errorf("failed to list columns: %w", err)
 	}
 
-	// `key_column_usage.ordinal_position` already gives key order.
+	// The keys come from `pg_constraint`, never `information_schema`:
+	// `table_constraints` lists only the tables the role owns or holds a
+	// privilege on other than `SELECT`, so a read-only role — the usual
+	// one for a viewer — saw no primary key anywhere. `conkey` is in key
+	// order, which the ordinality keeps.
 	keys, err := fetchAll(ctx, conn,
-		"SELECT tc.table_schema, tc.table_name, kcu.column_name "+
-			"FROM information_schema.table_constraints tc "+
-			"JOIN information_schema.key_column_usage kcu "+
-			"ON kcu.constraint_name = tc.constraint_name "+
-			"AND kcu.constraint_schema = tc.constraint_schema "+
-			"WHERE tc.constraint_type = 'PRIMARY KEY' "+
-			"AND tc.table_schema NOT IN ('pg_catalog', 'information_schema') "+
-			"ORDER BY tc.table_schema, tc.table_name, kcu.ordinal_position",
+		"SELECT n.nspname, c.relname, a.attname "+
+			"FROM pg_constraint k "+
+			"JOIN pg_class c ON c.oid = k.conrelid "+
+			"JOIN pg_namespace n ON n.oid = c.relnamespace "+
+			"CROSS JOIN LATERAL unnest(k.conkey) WITH ORDINALITY AS key(attnum, ord) "+
+			"JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = key.attnum "+
+			"WHERE k.contype = 'p' "+
+			"AND n.nspname NOT IN ('pg_catalog', 'information_schema') "+
+			"AND n.nspname NOT LIKE 'pg_toast%' "+
+			"AND n.nspname NOT LIKE 'pg_temp%' "+
+			"ORDER BY n.nspname, c.relname, key.ord",
 		func(rows pgx.Rows) (keyRow, error) {
 			var r keyRow
 			err := rows.Scan(&r.schema, &r.table, &r.column)
@@ -191,9 +223,28 @@ func readCatalog(ctx context.Context, conn *pgx.Conn) (introspect.Catalog, error
 		return introspect.Catalog{}, fmt.Errorf("failed to list primary keys: %w", err)
 	}
 
-	var version int32
-	if err := conn.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&version); err != nil {
-		return introspect.Catalog{}, fmt.Errorf("failed to read the server version: %w", err)
+	// A partition is listed under its parent, not beside it. Declarative
+	// partitioning is PostgreSQL 10.
+	var partitions []partitionRow
+	if version >= 100000 {
+		partitions = orDefault(fetchAll(ctx, conn,
+			"SELECT pn.nspname, p.relname, cn.nspname, c.relname, "+
+				"pg_get_expr(c.relpartbound, c.oid) "+
+				"FROM pg_inherits i "+
+				"JOIN pg_class c ON c.oid = i.inhrelid "+
+				"JOIN pg_namespace cn ON cn.oid = c.relnamespace "+
+				"JOIN pg_class p ON p.oid = i.inhparent "+
+				"JOIN pg_namespace pn ON pn.oid = p.relnamespace "+
+				"WHERE c.relispartition "+
+				"AND pn.nspname NOT IN ('pg_catalog', 'information_schema') "+
+				"AND pn.nspname NOT LIKE 'pg_toast%' "+
+				"AND pn.nspname NOT LIKE 'pg_temp%' "+
+				"ORDER BY pn.nspname, p.relname, c.relname",
+			func(rows pgx.Rows) (partitionRow, error) {
+				var r partitionRow
+				err := rows.Scan(&r.schema, &r.table, &r.partitionSchema, &r.partition, &r.bound)
+				return r, err
+			}))
 	}
 
 	// `pg_get_indexdef` writes the whole `CREATE INDEX`; the part after
@@ -371,6 +422,7 @@ func readCatalog(ctx context.Context, conn *pgx.Conn) (introspect.Catalog, error
 
 	return buildCatalog(catalogRows{
 		tables:      tables,
+		partitions:  partitions,
 		columns:     columns,
 		keys:        keys,
 		indexes:     indexes,
@@ -386,6 +438,7 @@ func readCatalog(ctx context.Context, conn *pgx.Conn) (introspect.Catalog, error
 // tree.
 type catalogRows struct {
 	tables      []tableRow
+	partitions  []partitionRow
 	columns     []columnRow
 	keys        []keyRow
 	indexes     []indexRow
@@ -423,12 +476,36 @@ func buildCatalog(rows catalogRows) introspect.Catalog {
 	}
 
 	columns := byTable(rows.columns, func(r columnRow) (tableKey, introspect.Column) {
-		return tableKey{r.schema, r.table}, introspect.Column{
+		column := introspect.Column{
 			Name:     r.name,
 			DataType: r.dataType,
 			Nullable: r.nullable,
 			Default:  r.defaultValue,
 		}
+		switch r.generated {
+		case "s", "v":
+			column.Generated, column.Default = r.defaultValue, nil
+		}
+		switch r.identity {
+		case "a":
+			always := "always"
+			column.Identity = &always
+		case "d":
+			byDefault := "by default"
+			column.Identity = &byDefault
+		}
+		return tableKey{r.schema, r.table}, column
+	})
+	// A partition is a table of its own, so it is keyed apart from its
+	// parent and left out of the schema's list of tables.
+	partitionOf := make(map[tableKey]bool, len(rows.partitions))
+	partitions := byTable(rows.partitions, func(r partitionRow) (tableKey, introspect.Partition) {
+		partitionOf[tableKey{r.partitionSchema, r.partition}] = true
+		name := r.partition
+		if r.partitionSchema != r.schema {
+			name = r.partitionSchema + "." + r.partition
+		}
+		return tableKey{r.schema, r.table}, introspect.Partition{Name: name, Bound: deref(r.bound)}
 	})
 	keys := byTable(rows.keys, func(r keyRow) (tableKey, string) {
 		return tableKey{r.schema, r.table}, r.column
@@ -481,6 +558,9 @@ func buildCatalog(rows catalogRows) introspect.Catalog {
 
 	for _, r := range rows.tables {
 		key := tableKey{r.schema, r.table}
+		if partitionOf[key] {
+			continue
+		}
 		kind := introspect.TableKindTable
 		switch r.relkind {
 		// Views and materialized views read the same to a viewer.
@@ -504,6 +584,7 @@ func buildCatalog(rows catalogRows) introspect.Catalog {
 			ForeignKeys: foreignKeys[key],
 			Constraints: constraints[key],
 			Triggers:    triggers[key],
+			Partitions:  partitions[key],
 		}
 		delete(columns, key)
 		delete(keys, key)

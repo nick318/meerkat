@@ -654,6 +654,7 @@ func (s *Shell) runActiveQuery() {
 					tab.changed = nil
 				}
 				tab.truncated = result.Truncated
+				tab.messages = ran.messages
 				tab.statementsRun = ran.ran
 				tab.data = resultsgrid.NewGridData(result.Columns, result.Rows)
 				// A run answers with a different set of rows, and a
@@ -737,6 +738,7 @@ func (s *Shell) runActiveQuery() {
 				// did, and this one says nothing about rows at all.
 				tab.changed = nil
 				tab.truncated = false
+				tab.messages = nil
 				tab.data = emptyGrid()
 				tab.selection.Clear()
 				run = Outcome{
@@ -1563,6 +1565,7 @@ func (t *Tally) add(
 	ms uint64,
 ) {
 	t.ran++
+	t.messages = append(t.messages, result.Messages...)
 	if _, ok := query.TransactionVerb(statement); ok {
 		t.boundaryTag = result.Tag
 	}
@@ -1614,5 +1617,6 @@ func (t *Tally) finish(started time.Time) Ran {
 		elapsedMs:   uint64(time.Since(started).Milliseconds()),
 		ran:         t.ran,
 		boundaryTag: t.boundaryTag,
+		messages:    t.messages,
 	}
 }

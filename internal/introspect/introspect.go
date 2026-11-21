@@ -76,6 +76,20 @@ type Table struct {
 	Constraints []Constraint `json:"constraints"`
 	// serde(default)
 	Triggers []Trigger `json:"triggers"`
+	// The partitions of a partitioned table, each with its bound. A
+	// partition is a table of its own, but listing every one of them
+	// beside its parent turns a table of a thousand partitions into a
+	// sidebar of a thousand names, so the driver lists them here instead.
+	// serde(default)
+	Partitions []Partition `json:"partitions,omitempty"`
+}
+
+// Partition is one partition of a partitioned table.
+type Partition struct {
+	Name string `json:"name"`
+	// The bound as the server prints it: `FOR VALUES FROM (1) TO (10)`,
+	// `DEFAULT`.
+	Bound string `json:"bound"`
 }
 
 type TableKind int
@@ -108,6 +122,17 @@ type Column struct {
 	DataType string  `json:"data_type"`
 	Nullable bool    `json:"nullable"`
 	Default  *string `json:"default"`
+	// The expression of a generated column, which is not a default:
+	// nothing the user writes reaches the column. An empty string says
+	// the engine reports the column as generated but not how — SQLite's
+	// pragma names no expression. Nil for an ordinary column.
+	// serde(default)
+	Generated *string `json:"generated,omitempty"`
+	// `always` or `by default` for an identity column, whose values come
+	// from a sequence the column owns and so carry no default of their
+	// own. Nil for an ordinary column.
+	// serde(default)
+	Identity *string `json:"identity,omitempty"`
 }
 
 func (t *Table) HasPrimaryKey() bool {
@@ -406,6 +431,7 @@ func (t *Table) Clone() Table {
 		Indexes:     cloneSlice(t.Indexes),
 		Constraints: cloneSlice(t.Constraints),
 		Triggers:    cloneSlice(t.Triggers),
+		Partitions:  cloneSlice(t.Partitions),
 	}
 	if t.ApproxRows != nil {
 		rows := *t.ApproxRows
@@ -430,6 +456,8 @@ func (t *Table) Clone() Table {
 func (c *Column) Clone() Column {
 	out := *c
 	out.Default = cloneString(c.Default)
+	out.Generated = cloneString(c.Generated)
+	out.Identity = cloneString(c.Identity)
 	return out
 }
 
@@ -453,7 +481,9 @@ func (c *Column) Equal(other *Column) bool {
 	return c.Name == other.Name &&
 		c.DataType == other.DataType &&
 		c.Nullable == other.Nullable &&
-		eqString(c.Default, other.Default)
+		eqString(c.Default, other.Default) &&
+		eqString(c.Generated, other.Generated) &&
+		eqString(c.Identity, other.Identity)
 }
 
 func cloneSlice[T any](s []T) []T {

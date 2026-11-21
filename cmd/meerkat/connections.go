@@ -61,6 +61,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -2059,10 +2060,25 @@ func profileUrl(profile *dbclient.Profile) string {
 	if profile.Host != nil {
 		host = *profile.Host
 	}
-	if profile.Port != nil {
-		return fmt.Sprintf("%s://%s:%d/%s", scheme, host, *profile.Port, profile.Database)
+	switch {
+	// A socket directory is a path, which a URL's host part can only
+	// carry escaped.
+	case strings.HasPrefix(host, "/"):
+		host = url.PathEscape(host)
+	// An IPv6 address is bracketed, or its colons read as a port. A
+	// list (`h1:5433,h2`) is written as it was saved.
+	case strings.Count(host, ":") > 1 && !strings.Contains(host, ","):
+		host = "[" + host + "]"
 	}
-	return fmt.Sprintf("%s://%s/%s", scheme, host, profile.Database)
+	address := host
+	if profile.Port != nil {
+		address = fmt.Sprintf("%s:%d", host, *profile.Port)
+	}
+	text := fmt.Sprintf("%s://%s/%s", scheme, address, profile.Database)
+	if profile.Params != "" {
+		text += "?" + profile.Params
+	}
+	return text
 }
 
 // Put the form's user and password over whatever the URL carried, and

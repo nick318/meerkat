@@ -7,8 +7,8 @@
 // `pg_catalog` rather than
 // `information_schema` for tables and columns, because `pg_catalog` also
 // carries the `reltuples` row estimate and `format_type` renders the type
-// names the way `psql` shows them. Primary keys come from
-// `information_schema`, which already reports the key column order.
+// names the way `psql` shows them. Primary keys come from `pg_constraint`
+// as well: `information_schema` hides them from a role that may only read.
 // Indexes, constraints, triggers, sequences, routines and types come
 // from `pg_catalog` too, each rendered by the server's own `pg_get_*`
 // function so a definition reads the way `\d` prints it.
@@ -16,7 +16,7 @@
 // Go port of `crates/db_postgres`, which was backed by sqlx. The source is
 // split by topic: this file is the connection and the session,
 // `catalog.go` the introspection, `decode.go` the value decoding, and
-// `sqlxcompat.go` what sqlx did for the Rust build that pgx does not.
+// `messages.go` the notices, notifications and `COPY` a run can meet.
 package dbpostgres
 
 import (
@@ -37,6 +37,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
@@ -95,13 +96,30 @@ const stopTimeout = 5 * time.Second
 // Go port: pgx's pool does not retry a refused connect, but the knock is
 // kept — it is the same one round trip, and it is what words the failure
 // as `host:port · …` before any pool is built.
+//
+// A connection string that lists several hosts is reachable when any one
+// of them answers; otherwise the first host's failure is the one
+// reported, because it is the one the user wrote first.
 func reach(ctx context.Context, options *connectOptions) error {
-	host := options.host
-	if options.socket != nil || strings.HasPrefix(host, "/") {
+	var first error
+	for _, h := range options.hosts() {
+		err := knock(ctx, h.host, h.port, options.timeout())
+		if err == nil {
+			return nil
+		}
+		if first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// knock is one bare TCP connect to one host. A socket path needs none.
+func knock(ctx context.Context, host string, port uint16, timeout time.Duration) error {
+	if strings.HasPrefix(host, "/") {
 		return nil
 	}
-	port := options.port
-	knockCtx, cancel := context.WithTimeout(ctx, connectTimeout)
+	knockCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(knockCtx, "tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
@@ -110,7 +128,7 @@ func reach(ctx context.Context, options *connectOptions) error {
 		return nil
 	}
 	if knockCtx.Err() != nil {
-		return dbclient.NewConnectError(dbclient.ConnectFailureTimeout, noAnswer(host, port))
+		return dbclient.NewConnectError(dbclient.ConnectFailureTimeout, noAnswerWithin(host, port, timeout))
 	}
 	message := fmt.Sprintf("%s:%d · %s", host, port, err)
 	// Go port: Go's resolver words a failed lookup as "no such host",
@@ -131,7 +149,12 @@ func reach(ctx context.Context, options *connectOptions) error {
 // sentence names a pool, which is nothing the person looking at it asked
 // about.
 func noAnswer(host string, port uint16) string {
-	return fmt.Sprintf("%s:%d did not answer within %d s", host, port, int(connectTimeout.Seconds()))
+	return noAnswerWithin(host, port, connectTimeout)
+}
+
+// noAnswerWithin is [noAnswer] for a connect given its own deadline.
+func noAnswerWithin(host string, port uint16, timeout time.Duration) string {
+	return fmt.Sprintf("%s:%d did not answer within %d s", host, port, int(timeout.Seconds()))
 }
 
 // errPoolTimedOut is sqlx's `Error::PoolTimedOut`: the pool's acquire
@@ -220,7 +243,7 @@ func isTLSError(err error) bool {
 }
 
 func namesTLS(message string) bool {
-	lowered := asciiLowercase(message)
+	lowered := strings.ToLower(message)
 	for _, word := range []string{"certificate", "handshake", "tls"} {
 		if strings.Contains(lowered, word) {
 			return true
@@ -375,8 +398,6 @@ type PostgresConnection struct {
 	// connection. The next run puts it back, because every run asks — a
 	// timeout is a guard, not a promise.
 	statementTimeout string
-	// Go port: sqlx's per-connection `cache_type_info`. See `typeCache`.
-	types *typeCache
 }
 
 var _ dbclient.Connection = (*PostgresConnection)(nil)
@@ -426,14 +447,34 @@ func ConnectProbe(ctx context.Context, profile *dbclient.Profile, password Passw
 	options := newConnectOptions()
 	database := profile.Database
 	options.database = &database
-	if profile.Host != nil {
-		options.host = *profile.Host
-	}
 	if profile.Port != nil {
 		options.port = *profile.Port
 	}
+	if profile.Host != nil {
+		// A host may be a list, `h1:5433,h2`, as a URL writes one.
+		hosts, ports, err := splitHostList(*profile.Host)
+		if err != nil {
+			return nil, err
+		}
+		if err := options.setHosts(hosts, ports); err != nil {
+			return nil, err
+		}
+	}
 	if profile.User != nil {
 		options.username = *profile.User
+	}
+	if profile.Params != "" {
+		params, err := url.ParseQuery(profile.Params)
+		if err != nil {
+			return nil, errors.New("the connection's saved parameters could not be read")
+		}
+		for key, values := range params {
+			for _, value := range values {
+				if err := options.apply(key, value); err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
 	switch password := password.(type) {
 	case PasswordKeychain:
@@ -531,7 +572,6 @@ func connectWith(ctx context.Context, options connectOptions, readOnly bool) (*P
 		label:            label,
 		limits:           dbclient.DefaultLimits(),
 		statementTimeout: statementTimeout,
-		types:            newTypeCache(),
 	}, nil
 }
 
@@ -619,7 +659,19 @@ func ProfileFromURL(id, name, url string) (dbclient.Profile, *string, error) {
 		profileName = database
 	}
 	host := options.host
+	if options.socket != nil {
+		host = *options.socket
+	}
 	port := options.port
+	portPtr := &port
+	if len(options.more) > 0 {
+		// A list keeps each host's port beside it, as the URL did.
+		var entries []string
+		for _, h := range options.hosts() {
+			entries = append(entries, hostEntry(h.host)+":"+strconv.Itoa(int(h.port)))
+		}
+		host, portPtr = strings.Join(entries, ","), nil
+	}
 	var userPtr *string
 	if username != "" {
 		userPtr = &username
@@ -629,33 +681,81 @@ func ProfileFromURL(id, name, url string) (dbclient.Profile, *string, error) {
 		Name:     profileName,
 		Engine:   dbclient.EnginePostgres,
 		Host:     &host,
-		Port:     &port,
+		Port:     portPtr,
 		Database: database,
 		User:     userPtr,
+		Params:   profileParams(url),
 		// A URL says nothing about how careful to be, so the caller sets
 		// the flag from the form. Read-only is the value a new connection
 		// starts on.
 		ReadOnly: true,
 	}
-	return profile, passwordIn(url), nil
+	// The parsed password, not the URL's text of it: `p%40ss` is the
+	// password `p@ss`, and the keychain must hold what the server checks.
+	var password *string
+	if options.passwordGiven && options.password != nil && *options.password != "" {
+		given := *options.password
+		password = &given
+	}
+	return profile, password, nil
 }
 
-// passwordIn is the password inside a URL's credentials, if it carries
-// one.
-func passwordIn(url string) *string {
-	_, rest, ok := strings.Cut(url, "://")
-	if !ok {
-		return nil
+// hostEntry is a host as a URL writes it: an IPv6 address in brackets.
+func hostEntry(host string) string {
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
 	}
-	credentials, _, ok := strings.Cut(rest, "@")
-	if !ok {
-		return nil
+	return host
+}
+
+// profileKeys are the parameters a profile keeps in fields of its own, or
+// never keeps at all — the password goes to the keychain.
+var profileKeys = map[string]bool{
+	"host": true, "hostaddr": true, "port": true, "dbname": true,
+	"user": true, "password": true,
+}
+
+// profileParams is every parameter of a connection string a profile has
+// no field for — `sslmode`, `sslrootcert`, `application_name`,
+// `connect_timeout`, `target_session_attrs`, `options` — query-encoded,
+// so a saved connection connects the way its URL said to. Without them a
+// connection saved with `?sslmode=verify-full` reconnected on `prefer`.
+func profileParams(text string) string {
+	params := url.Values{}
+	keep := func(key, value string) {
+		if !profileKeys[key] {
+			params.Add(key, value)
+		}
 	}
-	_, password, ok := strings.Cut(credentials, ":")
-	if !ok || password == "" {
-		return nil
+	text = strings.TrimSpace(text)
+	if _, rest, ok := strings.Cut(text, "://"); ok {
+		query := rest
+		if q := strings.IndexByte(rest, '?'); q >= 0 {
+			query = rest[q+1:]
+		} else {
+			query = ""
+		}
+		query, _, _ = strings.Cut(query, "#")
+		for _, pair := range strings.Split(query, "&") {
+			if pair == "" {
+				continue
+			}
+			rawKey, rawValue, _ := strings.Cut(pair, "=")
+			key, err1 := url.QueryUnescape(rawKey)
+			value, err2 := url.QueryUnescape(rawValue)
+			if err1 == nil && err2 == nil {
+				keep(key, value)
+			}
+		}
+	} else {
+		// A key/value string: the parse has already accepted it, so
+		// only the pairs are read back out.
+		pairs, _ := splitKeywordValue(text)
+		for _, pair := range pairs {
+			keep(pair[0], pair[1])
+		}
 	}
-	return &password
+	return params.Encode()
 }
 
 // shortVersion: `16.2 (Debian 16.2-1.pgdg120+2)` is more than a connection
@@ -730,7 +830,7 @@ func (c *PostgresConnection) Execute(ctx context.Context, sql string) (dbclient.
 		conn.Release()
 		return dbclient.QueryResult{}, err
 	}
-	result, err := collectCapped(ctx, conn.Conn(), c.pool, backend, sql, c.limits, c.types)
+	result, err := collectCapped(ctx, conn.Conn(), c.pool, backend, sql, c.limits)
 	// The connection goes back to the pool here.
 	conn.Release()
 	if err == nil {
@@ -762,7 +862,6 @@ func (c *PostgresConnection) OpenSession(ctx context.Context) (dbclient.Session,
 		linkMs:  link,
 		counted: make(map[int64]counted),
 		limits:  c.limits,
-		types:   c.types,
 	}
 	// The Rust `impl Drop`, as near as Go has one: see `PostgresSession`.
 	runtime.AddCleanup(session, func(held *heldConn) { held.detach() }, held)
@@ -857,7 +956,6 @@ type PostgresSession struct {
 	// wasted round trip per run, for ever, on every such server.
 	noStatementStats atomic.Bool
 	limits           dbclient.Limits
-	types            *typeCache
 }
 
 var _ dbclient.Session = (*PostgresSession)(nil)
@@ -958,7 +1056,7 @@ func (s *PostgresSession) Execute(ctx context.Context, sql string) (dbclient.Que
 		return dbclient.QueryResult{}, err
 	}
 	defer s.held.release()
-	result, err := collectCapped(ctx, conn, s.app, s.backend, sql, s.limits, s.types)
+	result, err := collectCapped(ctx, conn, s.app, s.backend, sql, s.limits)
 	if err == nil {
 		link := s.linkMs
 		result.Wire.LinkMs = &link
@@ -1320,7 +1418,42 @@ func between(before *counted, now counted) *dbclient.ServerTiming {
 	}
 }
 
-// collectCapped runs one statement and collects it, up to `limits`.
+// collectCapped runs one statement and collects it, up to `limits`, with
+// what the server said beside it. A `COPY` with the client at one end is
+// not sent as a query: see messages.go.
+func collectCapped(
+	ctx context.Context,
+	conn *pgx.Conn,
+	app *pgxpool.Pool,
+	backend dbclient.RunId,
+	sql string,
+	limits dbclient.Limits,
+) (dbclient.QueryResult, error) {
+	pg := conn.PgConn()
+	take := watch(pg)
+	var (
+		result dbclient.QueryResult
+		err    error
+	)
+	switch copyStdio(sql) {
+	case copyIn:
+		err = errCopyFromStdin
+	case copyOut:
+		sent := time.Now()
+		result, err = copyOutResult(ctx, pg, sql, limits)
+		result.Wire = wireOf(sent, nil)
+	default:
+		result, err = collectStatement(ctx, conn, app, backend, sql, limits)
+	}
+	messages := take()
+	if err != nil {
+		return dbclient.QueryResult{}, err
+	}
+	result.Messages = messages
+	return result, nil
+}
+
+// collectStatement runs one statement and collects it, up to `limits`.
 //
 // The rows are **streamed** and decoded one at a time, so the process
 // holds one row plus whatever the sink has kept — never the whole result.
@@ -1340,19 +1473,17 @@ func between(before *counted, now counted) *dbclient.ServerTiming {
 // an empty result is named by the connection that ran it — the one that
 // can see the session's temp tables and its `search_path`.
 //
-// Go port: sqlx prepared the statement, resolved its column types on the
-// same connection, and executed it asking for every column in binary.
-// This does the same through pgconn — the unnamed statement, `typeCache`
-// for the types, and one binary format code for every result column — so
-// `decode` reads the bytes sqlx's reader read.
-func collectCapped(
+// The statement is prepared unnamed, and executed asking for each column
+// in the format [resultFormats] picks for its type: the server's own text
+// for nearly everything, binary for the few values the grid keeps as more
+// than text. See decode.go.
+func collectStatement(
 	ctx context.Context,
 	conn *pgx.Conn,
 	app *pgxpool.Pool,
 	backend dbclient.RunId,
 	sql string,
 	limits dbclient.Limits,
-	types *typeCache,
 ) (dbclient.QueryResult, error) {
 	sink := dbclient.NewRowSink(limits)
 	// Stamped before the statement goes out and again on the first row off
@@ -1371,22 +1502,15 @@ func collectCapped(
 	if err != nil {
 		return dbclient.QueryResult{}, wrapDB(err)
 	}
-	columnTypes, fetched, err := types.fieldTypes(ctx, conn, described.Fields)
-	if err != nil {
-		return dbclient.QueryResult{}, wrapDB(err)
-	}
-	if fetched {
-		// The type lookups went down this connection and replaced the
-		// unnamed statement, so it is prepared again.
-		if _, err := pg.Prepare(ctx, "", sql, nil); err != nil {
-			return dbclient.QueryResult{}, wrapDB(err)
-		}
+	oids := make([]uint32, len(described.Fields))
+	for i, field := range described.Fields {
+		oids[i] = field.DataTypeOID
 	}
 	// Whether the statement runs inside the user's transaction block. The
 	// status is the one the prepare's `ReadyForQuery` reported, and nothing
 	// changes it before this statement ends.
 	inTransaction := pg.TxStatus() == txOpen
-	reader := pg.ExecPrepared(ctx, "", nil, nil, []int16{formatBinary})
+	reader := pg.ExecPrepared(ctx, "", nil, nil, resultFormats(oids))
 	capped := false
 	for reader.NextRow() {
 		// Taken before the row is decoded, or this process's own
@@ -1406,8 +1530,7 @@ func collectCapped(
 		raw := reader.Values()
 		values := make([]dbclient.Value, 0, len(raw))
 		for i := range raw {
-			info := columnTypes[i]
-			value, err := decode(raw[i], fields[i].Format, info, i)
+			value, err := decode(raw[i], fields[i].Format, fields[i].DataTypeOID, i)
 			if err != nil {
 				_, _ = reader.Close()
 				return dbclient.QueryResult{}, err
@@ -1614,6 +1737,23 @@ type connectOptions struct {
 	sslKey          *string
 	applicationName *string
 	options         *string
+	// The hosts after the first, for a connection string that lists
+	// several; libpq tries them in order.
+	more []hostPort
+	// The ports a `port=` parameter listed, kept so a `host=` list that
+	// comes after it can pair them up.
+	portsGiven         []uint16
+	connectTimeout     time.Duration
+	targetSessionAttrs *string
+	// Whether the password came from the connection string itself rather
+	// than from `PGPASSWORD`: only the first is the user's to save.
+	passwordGiven bool
+}
+
+// hostPort is one host of a list, and its port.
+type hostPort struct {
+	host string
+	port uint16
 }
 
 // newConnectOptions is `PgConnectOptions::new()`: the libpq environment
@@ -1680,38 +1820,64 @@ func defaultHost(port uint16) string {
 	return "localhost"
 }
 
-// parseConnectURL is `PgConnectOptions::from_str`: the URL over the
-// defaults, every parameter sqlx read, and the rest ignored as sqlx
-// ignored them.
+// errUnreadableURL is what a URL the parser cannot read is reported as.
+// The parser's own words quote the text around the fault — `invalid port
+// ":hunter" after host` is a password cut at its `#` — and the message is
+// painted on screen, so none of the URL goes into it.
+var errUnreadableURL = errors.New(
+	"the URL could not be read · in the user name and the password, write @ : / ? # % as %40 %3A %2F %3F %23 %25")
+
+// parseConnectURL reads a connection string over the libpq defaults: a
+// `postgres://` or `postgresql://` URL, or libpq's own `key=value` form.
+//
+// The URL's host part is read here rather than by `net/url`, because a
+// PostgreSQL URL may name several hosts — `h1:5432,h2:5433` — and a Unix
+// socket as `%2Ftmp`, and `net/url` refuses both.
 func parseConnectURL(text string) (connectOptions, error) {
-	parsed, err := url.Parse(text)
-	if err != nil {
-		return connectOptions{}, err
-	}
-	if parsed.Scheme == "" {
+	text = strings.TrimSpace(text)
+	scheme, rest, isURL := strings.Cut(text, "://")
+	if !isURL {
+		if strings.Contains(text, "=") {
+			return parseKeywordValue(text)
+		}
 		return connectOptions{}, errors.New("relative URL without a base")
 	}
-	options := newConnectOptions()
-
-	if host := parsed.Hostname(); host != "" {
-		if strings.HasPrefix(host, "/") {
-			options.socket = &host
-		} else {
-			options.host = host
-		}
+	switch strings.ToLower(scheme) {
+	case "postgres", "postgresql":
+	default:
+		return connectOptions{}, fmt.Errorf("meerkat connects to PostgreSQL, and the URL names %q", scheme)
 	}
-	if portText := parsed.Port(); portText != "" {
-		port, err := strconv.ParseUint(portText, 10, 16)
+	authorityEnd := strings.IndexAny(rest, "/?#")
+	if authorityEnd < 0 {
+		authorityEnd = len(rest)
+	}
+	authority, tail := rest[:authorityEnd], rest[authorityEnd:]
+	userinfo, hostList := "", authority
+	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+		userinfo, hostList = authority[:at+1], authority[at+1:]
+	}
+	// The rest of the URL goes to `net/url` with one plain host in place
+	// of the list, which is read below.
+	parsed, err := url.Parse("postgres://" + userinfo + "localhost" + tail)
+	if err != nil {
+		return connectOptions{}, errUnreadableURL
+	}
+	options := newConnectOptions()
+	if hostList != "" {
+		hosts, ports, err := splitHostList(hostList)
 		if err != nil {
-			return connectOptions{}, errors.New("invalid port number")
+			return connectOptions{}, err
 		}
-		options.port = uint16(port)
+		if err := options.setHosts(hosts, ports); err != nil {
+			return connectOptions{}, err
+		}
 	}
 	if username := parsed.User.Username(); username != "" {
 		options.username = username
 	}
 	if password, ok := parsed.User.Password(); ok {
 		options.password = &password
+		options.passwordGiven = true
 	}
 	if path := strings.TrimLeft(parsed.Path, "/"); path != "" {
 		options.database = &path
@@ -1723,69 +1889,264 @@ func parseConnectURL(text string) (connectOptions, error) {
 		rawKey, rawValue, _ := strings.Cut(pair, "=")
 		key, err := url.QueryUnescape(rawKey)
 		if err != nil {
-			return connectOptions{}, err
+			return connectOptions{}, errUnreadableURL
 		}
 		value, err := url.QueryUnescape(rawValue)
 		if err != nil {
-			return connectOptions{}, err
+			return connectOptions{}, errUnreadableURL
 		}
-		switch {
-		case key == "sslmode" || key == "ssl-mode":
-			switch value {
-			case "disable", "allow", "prefer", "require", "verify-ca", "verify-full":
-				options.sslMode = &value
-			default:
-				return connectOptions{}, fmt.Errorf("unknown value %q for `ssl_mode`", value)
-			}
-		case key == "sslrootcert" || key == "ssl-root-cert" || key == "ssl-ca":
-			options.sslRootCert = &value
-		case key == "sslcert" || key == "ssl-cert":
-			options.sslCert = &value
-		case key == "sslkey" || key == "ssl-key":
-			options.sslKey = &value
-		case key == "statement-cache-capacity":
-			if _, err := strconv.ParseUint(value, 10, 64); err != nil {
-				return connectOptions{}, err
-			}
-		case key == "host":
-			if strings.HasPrefix(value, "/") {
-				options.socket = &value
-			} else {
-				options.host = value
-			}
-		case key == "hostaddr":
-			if net.ParseIP(value) == nil {
-				return connectOptions{}, errors.New("invalid IP address syntax")
-			}
-			options.host = value
-		case key == "port":
-			port, err := strconv.ParseUint(value, 10, 16)
-			if err != nil {
-				return connectOptions{}, err
-			}
-			options.port = uint16(port)
-		case key == "dbname":
-			options.database = &value
-		case key == "user":
-			options.username = value
-		case key == "password":
-			options.password = &value
-		case key == "application_name":
-			options.applicationName = &value
-		case key == "options":
-			if options.options != nil {
-				joined := *options.options + " " + value
-				options.options = &joined
-			} else {
-				options.options = &value
-			}
-		case strings.HasPrefix(key, "options["):
-			if inner, ok := strings.CutSuffix(strings.TrimPrefix(key, "options["), "]"); ok {
-				options.addOption(inner, value)
-			}
+		if err := options.apply(key, value); err != nil {
+			return connectOptions{}, err
 		}
 	}
 	return options, nil
+}
+
+// parseKeywordValue reads libpq's `host=db port=5432 dbname='my db'` form.
+func parseKeywordValue(text string) (connectOptions, error) {
+	pairs, err := splitKeywordValue(text)
+	if err != nil {
+		return connectOptions{}, err
+	}
+	options := newConnectOptions()
+	for _, pair := range pairs {
+		if err := options.apply(pair[0], pair[1]); err != nil {
+			return connectOptions{}, err
+		}
+	}
+	return options, nil
+}
+
+// splitKeywordValue is the pairs of a libpq key/value string: pairs apart
+// by white space, a value in single quotes where it holds white space, and
+// a backslash escaping the character after it.
+func splitKeywordValue(text string) ([][2]string, error) {
+	var pairs [][2]string
+	rest := text
+	for {
+		rest = strings.TrimLeftFunc(rest, unicode.IsSpace)
+		if rest == "" {
+			return pairs, nil
+		}
+		eq := strings.IndexByte(rest, '=')
+		if eq < 0 {
+			return nil, errors.New("a connection string pair has no `=`")
+		}
+		key := strings.TrimSpace(rest[:eq])
+		rest = strings.TrimLeftFunc(rest[eq+1:], unicode.IsSpace)
+		var value strings.Builder
+		quoted := strings.HasPrefix(rest, "'")
+		i, closed := 0, !quoted
+		if quoted {
+			i = 1
+		}
+		for i < len(rest) {
+			c := rest[i]
+			if c == '\\' && i+1 < len(rest) {
+				value.WriteByte(rest[i+1])
+				i += 2
+				continue
+			}
+			if quoted && c == '\'' {
+				closed = true
+				i++
+				break
+			}
+			if !quoted && unicode.IsSpace(rune(c)) {
+				break
+			}
+			value.WriteByte(c)
+			i++
+		}
+		if !closed {
+			return nil, errors.New("a quoted value in the connection string is not closed")
+		}
+		pairs = append(pairs, [2]string{key, value.String()})
+		rest = rest[i:]
+	}
+}
+
+// splitHostList reads a URL's host part — `h1`, `h1:5433,[::1]:5434`,
+// `%2Ftmp` — into hosts and their ports. A port of 0 is one the entry
+// did not name.
+func splitHostList(list string) ([]string, []uint16, error) {
+	var hosts []string
+	var ports []uint16
+	for _, entry := range strings.Split(list, ",") {
+		host, portText := entry, ""
+		if strings.HasPrefix(entry, "[") {
+			end := strings.IndexByte(entry, ']')
+			if end < 0 {
+				return nil, nil, errors.New("an IPv6 host in the URL is missing its `]`")
+			}
+			host, portText = entry[1:end], strings.TrimPrefix(entry[end+1:], ":")
+		} else if colon := strings.LastIndexByte(entry, ':'); colon >= 0 {
+			host, portText = entry[:colon], entry[colon+1:]
+		}
+		decoded, err := url.PathUnescape(host)
+		if err != nil {
+			return nil, nil, errUnreadableURL
+		}
+		var port uint16
+		if portText != "" {
+			parsed, err := strconv.ParseUint(portText, 10, 16)
+			if err != nil {
+				return nil, nil, errors.New("invalid port number")
+			}
+			port = uint16(parsed)
+		}
+		hosts = append(hosts, decoded)
+		ports = append(ports, port)
+	}
+	return hosts, ports, nil
+}
+
+// setHosts makes `hosts` the hosts to try, in order, each on its port —
+// a port of 0 takes the default. An empty host is the default host. The
+// first one is `host` (or `socket`, for a path); the rest are tried after
+// it, the way libpq tries a list.
+func (o *connectOptions) setHosts(hosts []string, ports []uint16) error {
+	if len(ports) > 1 && len(ports) != len(hosts) {
+		return errors.New("the connection string names a different number of hosts and ports")
+	}
+	var list []hostPort
+	for i, host := range hosts {
+		port := o.port
+		switch {
+		case len(ports) == 1 && ports[0] != 0:
+			port = ports[0]
+		case len(ports) > 1 && ports[i] != 0:
+			port = ports[i]
+		}
+		if host == "" {
+			host = o.host
+		}
+		list = append(list, hostPort{host, port})
+	}
+	if len(list) == 0 {
+		return nil
+	}
+	o.socket = nil
+	o.host, o.port = list[0].host, list[0].port
+	if strings.HasPrefix(o.host, "/") {
+		socket := o.host
+		o.socket = &socket
+		o.host = "localhost"
+	}
+	o.more = list[1:]
+	return nil
+}
+
+// apply sets one connection parameter, by libpq's name for it — or by
+// the spellings sqlx accepted, which saved URLs may still carry.
+// Parameters this driver has no use for are ignored, as libpq ignores
+// none and sqlx ignored them all.
+func (o *connectOptions) apply(key, value string) error {
+	switch {
+	case key == "sslmode" || key == "ssl-mode":
+		switch value {
+		case "disable", "allow", "prefer", "require", "verify-ca", "verify-full":
+			o.sslMode = &value
+		default:
+			return fmt.Errorf("unknown value %q for `sslmode`", value)
+		}
+	case key == "sslrootcert" || key == "ssl-root-cert" || key == "ssl-ca":
+		o.sslRootCert = &value
+	case key == "sslcert" || key == "ssl-cert":
+		o.sslCert = &value
+	case key == "sslkey" || key == "ssl-key":
+		o.sslKey = &value
+	case key == "statement-cache-capacity":
+		if _, err := strconv.ParseUint(value, 10, 64); err != nil {
+			return err
+		}
+	case key == "host":
+		hosts := strings.Split(value, ",")
+		ports := []uint16{0}
+		if len(o.more) > 0 || o.portsGiven != nil {
+			ports = o.portsGiven
+		}
+		return o.setHosts(hosts, ports)
+	case key == "hostaddr":
+		if net.ParseIP(value) == nil {
+			return errors.New("invalid IP address syntax")
+		}
+		o.host = value
+		o.socket = nil
+	case key == "port":
+		var ports []uint16
+		for _, text := range strings.Split(value, ",") {
+			port, err := strconv.ParseUint(strings.TrimSpace(text), 10, 16)
+			if err != nil {
+				return errors.New("invalid port number")
+			}
+			ports = append(ports, uint16(port))
+		}
+		o.portsGiven = ports
+		o.port = ports[0]
+		hosts := []string{o.host}
+		if o.socket != nil {
+			hosts[0] = *o.socket
+		}
+		for _, more := range o.more {
+			hosts = append(hosts, more.host)
+		}
+		if len(ports) > 1 || len(o.more) > 0 {
+			return o.setHosts(hosts, ports)
+		}
+	case key == "dbname":
+		o.database = &value
+	case key == "user":
+		o.username = value
+	case key == "password":
+		o.password = &value
+		o.passwordGiven = true
+	case key == "application_name":
+		o.applicationName = &value
+	case key == "connect_timeout":
+		seconds, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || seconds < 0 {
+			return errors.New("connect_timeout is not a number of seconds")
+		}
+		// libpq reads 0 as "wait for ever". A viewer that hangs on a
+		// connect it cannot cancel is worse than one that gives up, so
+		// 0 keeps the app's own limit.
+		if seconds > 0 {
+			o.connectTimeout = time.Duration(seconds) * time.Second
+		}
+	case key == "target_session_attrs":
+		o.targetSessionAttrs = &value
+	case key == "options":
+		if o.options != nil {
+			joined := *o.options + " " + value
+			o.options = &joined
+		} else {
+			o.options = &value
+		}
+	case strings.HasPrefix(key, "options["):
+		if inner, ok := strings.CutSuffix(strings.TrimPrefix(key, "options["), "]"); ok {
+			o.addOption(inner, value)
+		}
+	}
+	return nil
+}
+
+// hosts is every host to try, in order, with its port: the first one,
+// then the rest of a list.
+func (o *connectOptions) hosts() []hostPort {
+	first := hostPort{o.host, o.port}
+	if o.socket != nil {
+		first.host = *o.socket
+	}
+	return append([]hostPort{first}, o.more...)
+}
+
+// timeout is how long one connect may take.
+func (o *connectOptions) timeout() time.Duration {
+	if o.connectTimeout > 0 {
+		return o.connectTimeout
+	}
+	return connectTimeout
 }
 
 // addOption is `PgConnectOptions::options`: one `-c key=value` more in the
@@ -1807,16 +2168,16 @@ func (o *connectOptions) addOption(key, value string) {
 // `extra_float_digits`, then `application_name` and `options`), its pool
 // timings, and no connection opened up front.
 func (o *connectOptions) poolConfig(maxConns int32) (*pgxpool.Config, error) {
-	settings := [][2]string{}
-	if o.socket != nil {
-		settings = append(settings, [2]string{"host", *o.socket})
-	} else {
-		settings = append(settings, [2]string{"host", o.host})
+	var hosts, ports []string
+	for _, h := range o.hosts() {
+		hosts = append(hosts, h.host)
+		ports = append(ports, strconv.Itoa(int(h.port)))
 	}
-	settings = append(settings,
-		[2]string{"port", strconv.Itoa(int(o.port))},
-		[2]string{"user", o.username},
-	)
+	settings := [][2]string{
+		{"host", strings.Join(hosts, ",")},
+		{"port", strings.Join(ports, ",")},
+		{"user", o.username},
+	}
 	if o.password != nil {
 		settings = append(settings, [2]string{"password", *o.password})
 	}
@@ -1837,16 +2198,22 @@ func (o *connectOptions) poolConfig(maxConns int32) (*pgxpool.Config, error) {
 	if o.sslKey != nil {
 		settings = append(settings, [2]string{"sslkey", *o.sslKey})
 	}
+	// `client_encoding` is the one setting the app needs for itself: it
+	// reads text as UTF-8. `DateStyle` and `TimeZone` are deliberately
+	// not sent. A startup parameter outranks `ALTER ROLE … SET` and
+	// `ALTER DATABASE … SET`, so forcing them — as the first edition did,
+	// after sqlx — made `now()::date` a UTC date and read `'03/04/2024'`
+	// month first on a database its owner had set day first: the same
+	// statement answered differently here and in `psql`. Values are the
+	// server's own text now (see decode.go), so they come back in the
+	// session's own zone and style without the app reading either.
 	settings = append(settings,
-		// Sets the display format for date and time values,
-		// as well as the rules for interpreting ambiguous date input values.
-		[2]string{"DateStyle", "ISO, MDY"},
-		// Sets the client-side encoding (character set).
 		[2]string{"client_encoding", "UTF8"},
-		// Sets the time zone for displaying and interpreting time stamps.
-		[2]string{"TimeZone", "UTC"},
 		[2]string{"extra_float_digits", "2"},
 	)
+	if o.targetSessionAttrs != nil {
+		settings = append(settings, [2]string{"target_session_attrs", *o.targetSessionAttrs})
+	}
 	if o.applicationName != nil {
 		settings = append(settings, [2]string{"application_name", *o.applicationName})
 	}
@@ -1872,7 +2239,11 @@ func (o *connectOptions) poolConfig(maxConns int32) (*pgxpool.Config, error) {
 	// and none lives past thirty.
 	config.MaxConnIdleTime = 10 * time.Minute
 	config.MaxConnLifetime = 30 * time.Minute
-	config.ConnConfig.ConnectTimeout = connectTimeout
+	config.ConnConfig.ConnectTimeout = o.timeout()
+	// What the server says beside a result goes to the run reading on
+	// that connection; see messages.go.
+	config.ConnConfig.OnNotice = onNotice
+	config.ConnConfig.OnNotification = onNotification
 	// The app's own statements run unnamed, so nothing it asks leaves a
 	// prepared statement on a session's connection for a `DISCARD ALL` the
 	// user types to pull out from under it.
