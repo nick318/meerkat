@@ -776,7 +776,7 @@ func lineAt(text string, offset int) query.Range {
 }
 
 // confirmCopy is what the close confirmation says; see ConfirmCopy.
-func confirmCopy(what Close, running []string, open []string) ConfirmCopy {
+func confirmCopy(what Close, running []string, open []string, staged ...StagedTab) ConfirmCopy {
 	var title, verb, keep, act string
 	switch what.Kind {
 	case CloseKindTab:
@@ -785,6 +785,8 @@ func confirmCopy(what Close, running []string, open []string) ConfirmCopy {
 			first = running[0]
 		} else if len(open) != 0 {
 			first = open[0]
+		} else if len(staged) != 0 {
+			first = staged[0].name
 		}
 		title, verb, keep, act = fmt.Sprintf("Close “%s”?", first), "Closing the tab", "Keep tab", "Close it"
 	case CloseKindShell:
@@ -820,6 +822,14 @@ func confirmCopy(what Close, running []string, open []string) ConfirmCopy {
 		} else {
 			body = append(body, fmt.Sprintf("%d tabs have transactions open. %s rolls them back.", len(open), verb))
 		}
+	}
+	// Staged changes are lost in a third way: nothing was sent, so the
+	// server loses nothing, and the user loses what they typed.
+	if len(staged) == 1 {
+		body = append(body, fmt.Sprintf("“%s” has %d %s not applied. They live only in this tab; %s throws them away.",
+			staged[0].name, staged[0].changes, plural(staged[0].changes, "change", "changes"), strings.ToLower(verb[:1])+verb[1:]))
+	} else if len(staged) > 1 {
+		body = append(body, fmt.Sprintf("%d tabs have changes not applied. %s throws them away.", len(staged), verb))
 	}
 	return ConfirmCopy{Title: title, Body: body, Keep: keep, Act: act}
 }

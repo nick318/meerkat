@@ -8,8 +8,8 @@ Meerkat is a native cross-platform database viewer written in Go on
 [mygo](https://github.com/egoist/mygo), whose native UI is immediate mode and
 drawn on the GPU. One Go binary, no webview, no server. The repo is one Go
 module: a package per former Rust crate under `internal/`, and the binary in
-`cmd/meerkat`. Current milestone: read-only PostgreSQL. In-place editing and
-MySQL are Phase 2.
+`cmd/meerkat`. Current milestone: PostgreSQL, with in-place editing of a
+query result (see "Editing a result in place"). MySQL is Phase 2.
 
 **The Go code is a mechanical port of the first edition, Rust on
 [GPUI](https://www.gpui.rs)**. Its source was removed from the tree after
@@ -2342,6 +2342,71 @@ chrome, and the footer row is what the *list* answers to. The toast
 opens in the same corner, above it. One
 updater for the whole app, a global entity: two windows must not race
 two rsyncs over one bundle.
+
+### Editing a result in place
+
+**The server says where every column came from, and that is the whole of
+the rule.** A `RowDescription` carries each column's table OID and
+attribute number (`QueryResult.Origins`, filled in `collectStatement` from
+the prepare it already does). `dbclient.Editable` is the rule, a plain
+function: every column with a source comes from one table, the table is a
+plain or partitioned table, and its whole primary key is in the result.
+Nothing parses the SQL. A renamed column is still its column, so it
+edits; a column selected twice, a generated column and an identity
+`ALWAYS` column are locked; an expression is locked. A join is never
+editable, and that is a decision, not a gap. The table is read by
+`Connection.EditTarget` on the app pool after the grid is on screen, and
+nothing edits until it answers.
+
+**A row is named by its primary key and nothing else**, as pgAdmin
+names it: one `UPDATE` per row, every edited cell in its `SET`, and the
+key as the `WHERE`. A row somebody changed since it was read is
+overwritten; a row that is gone, or whose key changed, matches nothing
+and the apply rolls back as a conflict, with "reload row". An earlier
+cut checked every visible column's old value and was dropped: a trigger
+touching an `updated_at` made every edit a conflict. **The cost is the
+self-join**: the origins name a table, never a copy of it, so an edit to
+`m.name` in `SELECT e.id, m.name FROM staff e JOIN staff m …` lands on
+row `e.id`. pgAdmin has the same hole.
+
+**Every value goes out as text with type OID 0**, so the server types it
+from the column: every type works with no type table here. Every
+`UPDATE` and `INSERT` ends in `RETURNING` the result's table columns, and
+`resultsgrid.Merge` puts what came back in place — triggers, defaults
+and serial ids land on screen without a re-run.
+
+**The apply goes down the tab's own session** (`Session.Apply`): outside
+a transaction it is `BEGIN … COMMIT`, all or nothing; inside one it is
+fenced by a savepoint of its own, so a refusal leaves the user's
+transaction as it was and a success commits nothing. A failed
+transaction refuses it before anything is sent. A run in flight holds
+the session, so an apply is refused then, as a commit is.
+
+**Staged edits are a model with no window in it**: `resultsgrid.Edits`
+holds changed cells, added rows (pinned under the header, newest first),
+deleted rows and an undo stack, and `Display` is what the grid paints.
+The tab keeps the result as the server sent it in `ResultEdit.base`, so
+a discard or ⌘Z only ever forgets. `Edits.Build` turns them into
+changes; the shell paints them through `resultsgrid.EditView`, which
+hands the grid marks and decides nothing.
+
+The keys: ⏎, a double click or a typed character edits; **⇧⏎ is the
+value card** on an editable result (⏎ still is on any other); ⌥⌘N stages
+NULL, and an emptied field is the empty string; ⌘I adds a row, ⌘⌫ marks
+rows for deletion, ⌘Z and ⇧⌘Z walk the staged changes, ⌘V pastes CSV.
+**While a cell editor is open the grid's own key table steps aside** —
+the field sits inside the grid, whose bare space and arrows would take
+its keys — and `CellEditorKeyBindings` is dispatched in its place.
+
+**⌘S and ⇧⌘R answer the bar that is up.** The change bar takes the
+transaction bar's place while anything is staged: ⌘S applies, ⇧⌘R
+discards. With nothing staged the transaction bar is back and the keys
+commit and roll back as before. Staged edits are a third thing at stake
+beside runs and transactions: `guard_close` counts them, and ⌘⏎ over
+them asks first (apply, then run · discard and run · stay).
+
+The design reference is the "Meerkat inline editing" canvas; the plan
+and what was left out are in `docs/tasks/inline-edit.md`.
 
 ### Persistence
 

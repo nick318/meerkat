@@ -147,6 +147,22 @@ const (
 	ShellSelectAllPeek
 	ShellCommitTransaction
 	ShellRollbackTransaction
+	// Editing a result in place.
+	ShellEditCell
+	ShellAddRow
+	ShellDeleteRows
+	ShellUndoEdit
+	ShellRedoEdit
+	ShellSetNull
+	ShellPasteCells
+	ShellEditorPrev
+	ShellPickPrev
+	ShellPickNext
+	ShellPreviewApply
+	ShellPreviewClose
+	ShellGuardStay
+	ShellGuardApply
+	ShellGuardDiscard
 	// ShellGoToTab1 … ShellGoToTab8 are ⌘1 … ⌘8, and ShellGoToLastTab is
 	// ⌘9: a browser's keys for a tab by its place in the strip. The eight
 	// are consecutive, so the place is the action less ShellGoToTab1.
@@ -321,7 +337,62 @@ const PeekKeyContext = "ValuePeek"
 // its GridKeyContext half.
 func PeekGridKeyBindings() []uikit.KeyBinding[ShellAction] {
 	return []uikit.KeyBinding[ShellAction]{
-		uikit.Bind("enter", ShellPeekValue),
+		// ⏎ edits the cursor's cell when the result takes an edit, and
+		// opens the card on any other — so on a read-only result it is
+		// still the card, as it always was. ⇧⏎ is the card everywhere.
+		uikit.Bind("enter", ShellEditCell),
+		uikit.Bind("shift-enter", ShellPeekValue),
+	}
+}
+
+// EditGridKeyBindings are the grid's keys for editing a result. They live
+// in GridKeyContext, so they only answer while the grid holds the focus,
+// and they do nothing on a result that takes no edit.
+//
+// ⌘N is the window's, so a new row is ⌘I. ⌘Z and ⇧⌘Z walk the staged
+// changes, which the grid had no other use for.
+func EditGridKeyBindings() []uikit.KeyBinding[ShellAction] {
+	return []uikit.KeyBinding[ShellAction]{
+		uikit.Bind("cmd-i", ShellAddRow),
+		uikit.Bind("cmd-backspace", ShellDeleteRows),
+		uikit.Bind("cmd-z", ShellUndoEdit),
+		uikit.Bind("cmd-shift-z", ShellRedoEdit),
+		uikit.Bind("cmd-alt-n", ShellSetNull),
+		uikit.Bind("cmd-v", ShellPasteCells),
+	}
+}
+
+// CellEditorKeyBindings are dispatched on the grid's element **in place
+// of** the grid's own while a cell editor is open. The field sits inside
+// the grid, and the grid binds a bare space and the arrows: an ancestor
+// binding takes the key before the field can type it, so the grid steps
+// aside. ⏎, ⇥ and ⎋ are the field's own.
+func CellEditorKeyBindings() []uikit.KeyBinding[ShellAction] {
+	return []uikit.KeyBinding[ShellAction]{
+		uikit.Bind("shift-tab", ShellEditorPrev),
+		uikit.Bind("cmd-alt-n", ShellSetNull),
+		uikit.Bind("up", ShellPickPrev),
+		uikit.Bind("down", ShellPickNext),
+	}
+}
+
+// PreviewKeyBindings are the SQL preview's keys. ⌘⏎ applies, the chord
+// that means "do it" everywhere else.
+func PreviewKeyBindings() []uikit.KeyBinding[ShellAction] {
+	return []uikit.KeyBinding[ShellAction]{
+		uikit.Bind("cmd-enter", ShellPreviewApply),
+		uikit.Bind("escape", ShellPreviewClose),
+	}
+}
+
+// EditGuardKeyBindings are the re-run question's keys: ⏎ and ⎋ stay, as
+// the close confirmation's do; ⌘S applies first, ⌘⏎ discards and runs.
+func EditGuardKeyBindings() []uikit.KeyBinding[ShellAction] {
+	return []uikit.KeyBinding[ShellAction]{
+		uikit.Bind("enter", ShellGuardStay),
+		uikit.Bind("escape", ShellGuardStay),
+		uikit.Bind("cmd-s", ShellGuardApply),
+		uikit.Bind("cmd-enter", ShellGuardDiscard),
 	}
 }
 
@@ -836,6 +907,13 @@ type Shell struct {
 	peek *Peek
 	// The close the user is being asked about, while the dialog is up.
 	confirm *Confirm
+	// The question a run asks over staged changes, while it is up.
+	editGuard *EditGuard
+	// The statements an apply would send, while the preview is up.
+	preview *ApplyPreview
+	// The grid's text-input client: a character typed on an editable
+	// cell opens the editor with it.
+	starter *editStarter
 	// True while a repaint loop is running for the query timers. Runs come
 	// and go in several tabs at once; the loop belongs to the window.
 	timing bool
@@ -1039,11 +1117,20 @@ type Confirm struct {
 	// The tabs whose runs this close would stop, by name.
 	running []string
 	// The tabs whose open transactions this close would roll back. One of
-	// the two lists is always filled: with nothing to lose, no question.
+	// the three lists is always filled: with nothing to lose, no question.
 	open []string
+	// The tabs whose staged changes this close would throw away.
+	staged []StagedTab
 	// The dialog holds the focus while it is up, so its key context is
 	// the deepest one and answers the keystroke.
 	focus ui.Handle
+}
+
+// StagedTab is a tab holding changes not yet applied, for the close
+// dialog.
+type StagedTab struct {
+	name    string
+	changes int
 }
 
 // CloseKind is which way out a Close is.
@@ -1308,6 +1395,10 @@ type QueryTab struct {
 	// `CREATE`, `ALTER`, `DROP` or `TRUNCATE`. `None` is the ordinary
 	// case and paints nothing. See [`SchemaReport`].
 	schemaReport *SchemaReport
+	// The result as something to edit: what the server said about its
+	// columns, the table they name, and what is staged. Nil when the last
+	// run answered with no table column at all. A run replaces it.
+	edit *ResultEdit
 	// What the user has marked in the result. A run replaces the rows, so
 	// it clears with them.
 	selection  resultsgrid.Selection

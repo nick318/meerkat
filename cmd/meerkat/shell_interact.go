@@ -1366,6 +1366,11 @@ func (s *Shell) activate(ix int) {
 	// activated, so they go rather than being carried to a result they
 	// were never opened on.
 	s.columnFind = nil
+	// A cell editor is a control on one result too. What it holds is
+	// kept, as a click elsewhere keeps it: leaving a tab is not ⎋.
+	if current, ok := s.activeTab().(*QueryTab); ok && current.edit != nil && current.edit.cell != nil {
+		s.keepCellEditor(current.id, 0)
+	}
 	// Its needle outlives it, so ⌘G on the next tab steps over what was
 	// typed here, as it would after ⎋.
 	if find := s.resultFind; find != nil {
@@ -1563,10 +1568,52 @@ func (s *Shell) handleAction(action ShellAction) {
 		s.copyPeek()
 	case ShellSelectAllPeek:
 		s.selectAllPeek()
+	// ⌘S and ⇧⌘R answer the bar that is up: the change bar while
+	// something is staged, the transaction bar otherwise.
 	case ShellCommitTransaction:
+		if tab, ok := s.activeTab().(*QueryTab); ok && tab.changeBarUp() {
+			s.applyEdits(nil)
+			return
+		}
 		s.endTransaction(dbclient.TxEndCommit)
 	case ShellRollbackTransaction:
+		if tab, ok := s.activeTab().(*QueryTab); ok && tab.changeBarUp() {
+			s.discardEdits()
+			return
+		}
 		s.endTransaction(dbclient.TxEndRollback)
+	case ShellEditCell:
+		s.editCell()
+	case ShellAddRow:
+		s.addRow()
+	case ShellDeleteRows:
+		s.deleteRows()
+	case ShellUndoEdit:
+		s.undoEdit(false)
+	case ShellRedoEdit:
+		s.undoEdit(true)
+	case ShellSetNull:
+		s.setNull()
+	case ShellPasteCells:
+		s.pasteCells()
+	case ShellEditorPrev:
+		if tab, ok := s.activeTab().(*QueryTab); ok {
+			s.keepCellEditor(tab.id, -1)
+		}
+	case ShellPickPrev:
+		s.stepPick(false)
+	case ShellPickNext:
+		s.stepPick(true)
+	case ShellPreviewApply:
+		s.applyEdits(nil)
+	case ShellPreviewClose:
+		s.closePreview()
+	case ShellGuardStay:
+		s.answerEditGuard(false, false)
+	case ShellGuardApply:
+		s.answerEditGuard(true, false)
+	case ShellGuardDiscard:
+		s.answerEditGuard(false, true)
 	}
 }
 

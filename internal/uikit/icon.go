@@ -60,6 +60,10 @@ const (
 	IconDatabase
 	// IconSearch is a search line.
 	IconSearch
+	// IconLock is a column that does not take an edit.
+	IconLock
+	// IconPencil is a result that takes an edit.
+	IconPencil
 )
 
 // DrawIcon is an icon at `size` pixels square, stroked in `color`. (Rust:
@@ -214,6 +218,19 @@ func iconData(kind Icon, scale float32) string {
 		circle(6., 6., 4.)
 		w.moveTo(9., 9.)
 		w.lineTo(12.3, 12.3)
+	case IconLock:
+		rect(2.5, 6.5, 9., 6.)
+		w.moveTo(4.5, 6.5)
+		w.lineTo(4.5, 4.5)
+		w.arcTo(2.5, 2.5, 0, false, true, 9.5, 4.5)
+		w.lineTo(9.5, 6.5)
+	case IconPencil:
+		w.moveTo(9.5, 2.5)
+		w.lineTo(11.5, 4.5)
+		w.lineTo(5., 11.)
+		w.lineTo(3., 11.)
+		w.lineTo(3., 9.)
+		w.close()
 	}
 	return w.b.String()
 }

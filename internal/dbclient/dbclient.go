@@ -432,6 +432,13 @@ type QueryResult struct {
 	// `DO` block that only raises notices has nothing else to say, so
 	// dropping these would leave its run with no answer at all.
 	Messages []string
+	// Origins says, per column, which table column the server says it
+	// came from. Nil for an engine that does not say (SQLite).
+	Origins []ColumnOrigin
+	// Cut is the cells [Limits.MaxCellBytes] shortened. Such a cell is
+	// not the value in the table, so it can be neither edited nor
+	// compared against. Nil when nothing was cut.
+	Cut map[CellAt]bool
 }
 
 // Refusal is why the server refused a statement it was asked to prepare.
@@ -610,6 +617,7 @@ type RowSink struct {
 	rows      [][]Value
 	bytes     int
 	truncated bool
+	cut       map[CellAt]bool
 }
 
 func NewRowSink(limits Limits) *RowSink {
@@ -636,8 +644,12 @@ func (s *RowSink) HasColumns() bool {
 // driver must stop reading — the row was not kept.
 func (s *RowSink) Push(values []Value) bool {
 	capped := make([]Value, len(values))
+	var cut []int
 	for i, value := range values {
 		capped[i] = value.Cap(s.limits.MaxCellBytes)
+		if WasCut(value, s.limits.MaxCellBytes) {
+			cut = append(cut, i)
+		}
 	}
 	values = capped
 	// The row's own `Vec` counts as well. It is 24 bytes against a
@@ -654,9 +666,26 @@ func (s *RowSink) Push(values []Value) bool {
 		return false
 	}
 
+	for _, column := range cut {
+		if s.cut == nil {
+			s.cut = map[CellAt]bool{}
+		}
+		s.cut[CellAt{Row: len(s.rows), Column: column}] = true
+	}
 	s.bytes += size
 	s.rows = append(s.rows, values)
 	return true
+}
+
+// WasCut says whether [Value.Cap] shortens this value.
+func WasCut(v Value, max int) bool {
+	switch v := v.(type) {
+	case ValueText:
+		return len(v) > max
+	case ValueBytes:
+		return len(v) > max
+	}
+	return false
 }
 
 // Bytes is what the result holds so far, by the same reckoning as the cap.
@@ -678,56 +707,13 @@ func (s *RowSink) Finish(rowsAffected uint64) QueryResult {
 		Rows:         s.rows,
 		RowsAffected: rowsAffected,
 		Truncated:    s.truncated,
+		Cut:          s.cut,
 		// The sink counts bytes, not seconds. The driver is what holds
 		// the clock, because only the driver knows when the statement
 		// went out, and it fills this in on the way back.
 		Wire: Wire{},
 	}
 }
-
-// RowChange is one pending edit against a table: one of [RowChangeUpdate],
-// [RowChangeInsert] or [RowChangeDelete]. Commit generates parameterized
-// `UPDATE`/`INSERT`/`DELETE` statements and runs them in one transaction.
-type RowChange interface {
-	isRowChange()
-}
-
-// ColumnValue is the Rust build's `(String, Value)`: a column and a value.
-type ColumnValue struct {
-	Column string
-	Value  Value
-}
-
-// ColumnEdit is the Rust build's `(String, Value, Value)`: a column, its
-// old value and its new one.
-type ColumnEdit struct {
-	Column string
-	Old    Value
-	New    Value
-}
-
-type RowChangeUpdate struct {
-	Table string
-	// Primary-key columns and their CURRENT values, used in `WHERE`.
-	Key []ColumnValue
-	// Edited columns: (column, old value, new value). Old values also
-	// go into `WHERE` for optimistic concurrency.
-	Set []ColumnEdit
-}
-
-type RowChangeInsert struct {
-	Table  string
-	Values []ColumnValue
-}
-
-type RowChangeDelete struct {
-	Table string
-	Key   []ColumnValue
-}
-
-func (RowChangeUpdate) isRowChange() {}
-func (RowChangeInsert) isRowChange() {}
-func (RowChangeDelete) isRowChange() {}
 
 // RunId is a statement the server is running, as the server itself names
 // it. PostgreSQL uses the backend process id; an engine with no way to
@@ -887,6 +873,16 @@ type Session interface {
 	// several must not report it as the run's: only the last one is here.
 	ServerTiming(ctx context.Context) (*ServerTiming, error)
 
+	// Apply writes a changeset to `table` down this session, and answers
+	// with what the server returned for each change. See [Apply] for the
+	// transaction it runs in and what a refusal leaves behind.
+	Apply(ctx context.Context, table *EditTarget, changes []RowChange, returning []int16) (ApplyOutcome, error)
+
+	// Reload reads one row of `table` again, by its key, as the columns
+	// `columns` name: the conflict's "reload row". Nil, nil when the row
+	// is gone.
+	Reload(ctx context.Context, table *EditTarget, key []AttrValue, columns []int16) ([]Value, error)
+
 	// Close rolls back and hands the connection back. `execute` fails
 	// afterwards.
 	//
@@ -920,6 +916,16 @@ func (SessionDefaults) RelationExists(context.Context, string) (bool, bool, erro
 
 func (SessionDefaults) ServerTiming(context.Context) (*ServerTiming, error) {
 	return nil, nil
+}
+
+// Apply is refused: an engine that does not edit says so rather than
+// pretending to have written anything.
+func (SessionDefaults) Apply(context.Context, *EditTarget, []RowChange, []int16) (ApplyOutcome, error) {
+	return ApplyOutcome{}, ErrEditUnsupported
+}
+
+func (SessionDefaults) Reload(context.Context, *EditTarget, []AttrValue, []int16) ([]Value, error) {
+	return nil, ErrEditUnsupported
 }
 
 // IsClosed is `false`: an engine that cannot see its connection die has
@@ -1008,9 +1014,16 @@ type Connection interface {
 	// always answers `Ok(false)`.
 	Stop(ctx context.Context, run RunId, how Stop) (bool, error)
 
-	// Apply applies a changeset in one transaction. Returns rows affected.
-	// Must roll back and report a conflict when an `Update` matches 0 rows.
-	Apply(ctx context.Context, changes []RowChange) (uint64, error)
+	// EditTarget reads what editing a result of the relation `oid`
+	// needs: its qualified name, its kind, its key and its columns by
+	// attribute number. Nil, nil when there is no such relation, or the
+	// engine cannot say. See [EditTarget].
+	EditTarget(ctx context.Context, oid uint32) (*EditTarget, error)
+
+	// PreviewEdit is the statements [Session.Apply] would send, with
+	// every value written as a literal, for the user to read. It sends
+	// nothing, and needs no session: a tab may have none yet.
+	PreviewEdit(table *EditTarget, changes []RowChange, returning []int16) []string
 }
 
 // ConnectionDefaults holds the default bodies of [Connection]'s methods. A
@@ -1027,6 +1040,16 @@ func (ConnectionDefaults) RelationExists(context.Context, string) (bool, bool, e
 
 func (ConnectionDefaults) Stop(context.Context, RunId, Stop) (bool, error) {
 	return false, nil
+}
+
+// EditTarget is nil: an engine that reports no column origins has no
+// result to edit.
+func (ConnectionDefaults) EditTarget(context.Context, uint32) (*EditTarget, error) {
+	return nil, nil
+}
+
+func (ConnectionDefaults) PreviewEdit(*EditTarget, []RowChange, []int16) []string {
+	return nil
 }
 
 // ---------------------------------------------------------------------------

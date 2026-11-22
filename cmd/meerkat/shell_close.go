@@ -38,7 +38,8 @@ func (s *Shell) guardClose(what Close) bool {
 		return false
 	}
 	running, open := s.workEndedBy(what)
-	if len(running) == 0 && len(open) == 0 {
+	staged := s.stagedEndedBy(what)
+	if len(running) == 0 && len(open) == 0 && len(staged) == 0 {
 		return true
 	}
 	// The palette must not be left underneath: two overlays both taking
@@ -53,6 +54,7 @@ func (s *Shell) guardClose(what Close) bool {
 		what:    what,
 		running: running,
 		open:    open,
+		staged:  staged,
 	}
 	// Go port: the dialog's handle lives in the Confirm, so it is focused
 	// once the Confirm is in place (Rust focused it, then stored it).
@@ -84,6 +86,22 @@ func (s *Shell) workEndedBy(what Close) (running []string, open []string) {
 		}
 	}
 	return running, open
+}
+
+// stagedEndedBy is the tabs a close would throw staged changes away in.
+// They are the third thing at stake: nothing was sent, so the server
+// loses nothing, but the user loses what they typed.
+func (s *Shell) stagedEndedBy(what Close) []StagedTab {
+	var staged []StagedTab
+	for _, tab := range s.tabs {
+		if what.Kind == CloseKindTab && tab.ID() != what.Tab {
+			continue
+		}
+		if tab, ok := tab.(*QueryTab); ok && tab.staged() > 0 {
+			staged = append(staged, StagedTab{name: tab.title, changes: tab.staged()})
+		}
+	}
+	return staged
 }
 
 // cancelRuns asks the server to give up every run this close would end,

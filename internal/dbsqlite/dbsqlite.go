@@ -766,10 +766,6 @@ func (c *SqliteConnection) Execute(ctx context.Context, sqlText string) (dbclien
 	return collect(ctx, conn, sqlText, c.limits)
 }
 
-func (c *SqliteConnection) Apply(context.Context, []dbclient.RowChange) (uint64, error) {
-	return 0, errors.New("in-place editing is not implemented yet (Phase 2)")
-}
-
 // collect runs one buffer on conn and streams its rows into a capped sink.
 //
 // sqlx's `fetch_many` handed over each statement's completion and with it

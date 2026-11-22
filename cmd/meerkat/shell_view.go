@@ -40,7 +40,12 @@ var gridViewKeys = concatBindings(
 	GridKeyBindings(),
 	ResultFindGridKeyBindings(),
 	PeekGridKeyBindings(),
+	EditGridKeyBindings(),
 )
+
+// The grid's element while a cell editor is open in it: see
+// CellEditorKeyBindings.
+var cellEditorViewKeys = CellEditorKeyBindings()
 
 // The overlays' and the inner contexts' own tables.
 var (
@@ -48,6 +53,8 @@ var (
 	catalogFilterViewKeys = CatalogFilterKeyBindings()
 	peekViewKeys          = PeekKeyBindings()
 	confirmViewKeys       = ConfirmKeyBindings()
+	previewViewKeys       = PreviewKeyBindings()
+	editGuardViewKeys     = EditGuardKeyBindings()
 	paletteViewKeys       = PaletteKeyBindings()
 )
 
@@ -173,7 +180,11 @@ func (s *Shell) View(c *ui.Context) ui.Element {
 							Children(func() {
 								s.connectStrip(c, colors)
 								s.pane(c, colors)
-								s.statusStrip(c, colors)
+								// While a cell is being edited the strip is
+								// about the edit: what it was and the keys.
+								if !s.editingStatus(c, colors) {
+									s.statusStrip(c, colors)
+								}
 							})
 						s.paneHandle(c, DividerSidebar, colors)
 					})
@@ -195,6 +206,8 @@ func (s *Shell) View(c *ui.Context) ui.Element {
 		// could be painted.
 		s.columnFindOverlay(c, colors)
 		s.peekOverlay(c, colors)
+		s.previewOverlay(c, colors)
+		s.editGuardOverlay(c, colors)
 		s.paletteOverlay(c, colors)
 		// Last, so it paints over the palette on the one frame where
 		// both could be up.
@@ -439,6 +452,15 @@ func (s *Shell) tabItem(c *ui.Context, ix int, tab Tab, colors *theme.ThemeColor
 			FontWeight(weight).
 			TextColor(ink.Color()).
 			Children(func() { ui.Text(c, tab.Title()).SingleLine() })
+		// A tab holding changes not yet applied says so from the strip,
+		// so a tab the user walked away from does not hide them.
+		if query, ok := tab.(*QueryTab); ok && query.staged() > 0 {
+			ui.Box(c.Key(fmt.Sprintf("staged-%d", id))).
+				Shrink(0).
+				Size(7, 7).
+				Radius(3.5).
+				Background(colors.Edit.Color())
+		}
 		closeInk := colors.TextFaint
 		if isActive {
 			closeInk = colors.TextMuted

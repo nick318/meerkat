@@ -901,8 +901,15 @@ func (c *PostgresConnection) Stop(ctx context.Context, run dbclient.RunId, how d
 	return cancel(ctx, c.pool, run, how)
 }
 
-func (c *PostgresConnection) Apply(ctx context.Context, changes []dbclient.RowChange) (uint64, error) {
-	return 0, errors.New("in-place editing is not implemented yet (Phase 2)")
+// EditTarget reads the relation on the app pool. It is asked after the
+// result is on screen, so it must not queue behind the tab's session.
+func (c *PostgresConnection) EditTarget(ctx context.Context, oid uint32) (*dbclient.EditTarget, error) {
+	conn, err := acquire(ctx, c.pool)
+	if err != nil {
+		return nil, fmt.Errorf("no connection to read the table: %w", err)
+	}
+	defer conn.Release()
+	return readEditTarget(ctx, conn.Conn(), oid)
 }
 
 // PostgresSession is one tab's pinned connection.
@@ -1593,6 +1600,7 @@ func collectStatement(
 	}
 	result := sink.Finish(affected)
 	result.Tag = tag
+	result.Origins = origins(described.Fields)
 	result.Wire = wireOf(sent, firstRow)
 	return result, nil
 }

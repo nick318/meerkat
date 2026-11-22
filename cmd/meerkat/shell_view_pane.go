@@ -114,7 +114,26 @@ func (s *Shell) resultBody(c *ui.Context, tabID uint64, colors *theme.ThemeColor
 				MinHeight(0).
 				MinWidth(0).
 				AlignItems(ui.Stretch)
-			if action, ok := uikit.DispatchKeys(grid, gridViewKeys); ok {
+			// While a cell editor is open the grid steps aside: its bare
+			// keys would take the editor's spaces and arrows.
+			var edit *resultsgrid.EditView
+			editing := false
+			if query, ok := tab.(*QueryTab); ok {
+				edit = s.editView(query)
+				editing = query.edit != nil && query.edit.cell != nil
+			}
+			keys := gridViewKeys
+			if editing {
+				keys = cellEditorViewKeys
+			} else if edit != nil {
+				// A character typed on an editable cell opens the editor
+				// with it.
+				if s.starter == nil {
+					s.starter = &editStarter{s: s}
+				}
+				grid.HandleTextInput(s.starter).Cursor(ui.CursorDefault)
+			}
+			if action, ok := uikit.DispatchKeys(grid, keys); ok {
 				s.handleAction(action)
 			}
 			grid.Children(func() {
@@ -122,6 +141,7 @@ func (s *Shell) resultBody(c *ui.Context, tabID uint64, colors *theme.ThemeColor
 					FirstRow(firstRow).
 					OnHit(s.hitHandler(tabID)).
 					Hits(hits).
+					Edit(edit).
 					Render(c)
 			})
 		})
@@ -147,6 +167,11 @@ func (s *Shell) hitHandler(tabID uint64) resultsgrid.OnHit {
 		tab := s.tabMut(tabID)
 		if tab == nil {
 			return
+		}
+		// A press outside the editor keeps what it holds, the way a
+		// spreadsheet does.
+		if query, ok := tab.(*QueryTab); ok && !dragging && query.edit != nil && query.edit.cell != nil {
+			s.keepCellEditor(query.id, 0)
 		}
 		marked := tab.Marked()
 		if marked == nil {
@@ -1349,6 +1374,7 @@ func (s *Shell) queryPane(c *ui.Context, tab *QueryTab, colors *theme.ThemeColor
 		Children(func() {
 			s.runButton(c, tab, colors)
 			s.txSwitch(c, tab, colors)
+			s.editChip(c, tab, colors)
 			s.runTimer(c, tab, colors)
 			// **Everything after the controls gives up room before
 			// any of them does.** `min_w(0)` on each child is what
@@ -1401,8 +1427,12 @@ func (s *Shell) queryPane(c *ui.Context, tab *QueryTab, colors *theme.ThemeColor
 		s.errorStrip(c, tab.id, *tab.error, colors)
 	}
 	// Directly over the result, because it is about what the runs have
-	// done rather than about the statement above them.
-	s.txBar(c, tab, colors)
+	// done rather than about the statement above them. The change bar
+	// takes the same place while something is staged: one bar at a time,
+	// and its keys act on what it says.
+	if !s.changeBar(c, tab, colors) {
+		s.txBar(c, tab, colors)
+	}
 	// Over the result it came with: a `DO` block that only raises
 	// notices has nothing else to show.
 	messagesStrip(c, tab, colors)
@@ -1435,6 +1465,7 @@ func (s *Shell) queryPane(c *ui.Context, tab *QueryTab, colors *theme.ThemeColor
 			Children(func() { ui.Text(c, summary).SingleLine() })
 		capNote(c, tab, colors)
 		ui.Box(c).Grow(1).Basis(0)
+		s.addRowButton(c, tab, colors)
 		// The way to a column of the result, on the line that
 		// describes the result — not on the toolbar above the
 		// editor, which is about the statement.
@@ -1678,13 +1709,27 @@ func (s *Shell) statusStrip(c *ui.Context, colors *theme.ThemeColors) ui.Element
 					AlignItems(ui.Center).
 					Gap(12).
 					Children(func() {
-						for _, hint := range [][2]string{
+						hints := [][2]string{
 							{"↑↓←→", "move"},
 							{"⌘J", "column"},
 							{"⏎", "value"},
 							{"space", "pick"},
 							{"⌘C", "copy"},
-						} {
+						}
+						// On a result that takes an edit, ⏎ edits and the
+						// card moves to ⇧⏎, and the row keys join them.
+						if query, ok := tab.(*QueryTab); ok && query.edit != nil && s.editRule(query).OK() {
+							hints = [][2]string{
+								{"↑↓←→", "move"},
+								{"⏎", "edit"},
+								{"⇧⏎", "value"},
+								{"⌘I", "row"},
+								{"⌘⌫", "delete"},
+								{"⌘Z", "undo"},
+								{"space", "pick"},
+							}
+						}
+						for _, hint := range hints {
 							uikit.KeyHint(c, hint[0], hint[1])
 						}
 					})

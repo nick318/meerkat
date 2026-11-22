@@ -448,6 +448,14 @@ func (s *Shell) runActiveQuery() {
 	if tab.run.inFlight() || tab.txEnding {
 		return
 	}
+	// A run replaces the rows on screen, and staged changes name rows of
+	// this result: the user is asked first.
+	if tab.edit != nil && tab.edit.applying {
+		return
+	}
+	if !s.guardRun(tab) {
+		return
+	}
 	// The tab opens before the connection does, so ⌘⏎ can arrive
 	// first. Say so rather than doing nothing — and say why: "not
 	// connected" under a connect that failed is the one line that
@@ -657,6 +665,7 @@ func (s *Shell) runActiveQuery() {
 				tab.messages = ran.messages
 				tab.statementsRun = ran.ran
 				tab.data = resultsgrid.NewGridData(result.Columns, result.Rows)
+				s.landEditable(tab, result)
 				// A run answers with a different set of rows, and a
 				// selection points at rows by index. Marks from the
 				// last answer can only point at these ones wrongly.
@@ -740,6 +749,7 @@ func (s *Shell) runActiveQuery() {
 				tab.truncated = false
 				tab.messages = nil
 				tab.data = emptyGrid()
+				tab.edit = nil
 				tab.selection.Clear()
 				run = Outcome{
 					elapsed:  nil,

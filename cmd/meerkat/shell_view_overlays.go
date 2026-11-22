@@ -33,11 +33,15 @@ func (s *Shell) confirmOverlay(c *ui.Context, colors *theme.ThemeColors) {
 	if confirm == nil {
 		return
 	}
-	copy := confirmCopy(confirm.what, confirm.running, confirm.open)
+	copy := confirmCopy(confirm.what, confirm.running, confirm.open, confirm.staged...)
 	// Every tab the close would touch, named once even when it is in
 	// both lists.
 	var named []string
-	for _, name := range append(slices.Clone(confirm.running), confirm.open...) {
+	names := append(slices.Clone(confirm.running), confirm.open...)
+	for _, tab := range confirm.staged {
+		names = append(names, tab.name)
+	}
+	for _, name := range names {
 		if !slices.Contains(named, name) {
 			named = append(named, name)
 		}

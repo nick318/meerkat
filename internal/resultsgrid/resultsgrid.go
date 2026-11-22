@@ -246,6 +246,12 @@ func NewGridData(columns []string, rows [][]dbclient.Value) *GridData {
 	}
 }
 
+// WithRows is the same result with other rows in it, keeping this one's
+// lane widths: an edit typed into a lane must not make it jump.
+func (d *GridData) WithRows(rows [][]dbclient.Value) *GridData {
+	return &GridData{Columns: d.Columns, Rows: rows, widths: d.widths}
+}
+
 // EmptyGridData is `GridData::empty`.
 func EmptyGridData() *GridData {
 	return NewGridData(nil, nil)
@@ -393,6 +399,7 @@ type Grid struct {
 	firstRow  int
 	onHit     OnHit
 	hits      []Cell
+	edit      *EditView
 }
 
 // NewGrid is `Grid::new`.
@@ -432,8 +439,8 @@ func (g *Grid) Hits(hits []Cell) *Grid {
 
 // Render builds the grid into the current parent and returns it.
 func (g *Grid) Render(c *ui.Context) ui.Element {
-	id, data, state, selection, firstRow, onHit, hits :=
-		g.id, g.data, g.state, g.selection, g.firstRow, g.onHit, g.hits
+	id, data, state, selection, firstRow, onHit, hits, edit :=
+		g.id, g.data, g.state, g.selection, g.firstRow, g.onHit, g.hits, g.edit
 	colors := &theme.Current().Colors
 	// The content can be wider than the pane; the whole grid scrolls
 	// sideways as one, gutter and header included. The gutter goes with
@@ -471,7 +478,7 @@ func (g *Grid) Render(c *ui.Context) ui.Element {
 			// character, which only a monospace honours.
 			Font(theme.MonoFontFamily).
 			Children(func() {
-				head := headerRow(c, data, &marks, extent, onHit, colors)
+				head := headerRow(c, data, &marks, extent, onHit, edit, colors)
 				// The drag lives on the window, not on a hitbox, so it
 				// goes on working past the edges of the pane. Go port:
 				// it is the list's own pointer capture; see
@@ -481,7 +488,7 @@ func (g *Grid) Render(c *ui.Context) ui.Element {
 					surface = &dragSurface{data: data, state: state, onHit: onHit}
 					surface.frame(c)
 				}
-				rows := rowList(c, id, data, state, &marks, hits, firstRow, onHit, contentWidth)
+				rows := rowList(c, id, data, state, &marks, hits, firstRow, onHit, edit, contentWidth)
 				if surface != nil {
 					surface.listen(rows)
 				}
@@ -781,6 +788,7 @@ func rowList(
 	hits []Cell,
 	firstRow int,
 	onHit OnHit,
+	edit *EditView,
 	contentWidth float32,
 ) ui.Element {
 	colors := &theme.Current().Colors
@@ -797,6 +805,7 @@ func rowList(
 			firstRow,
 			state,
 			onHit,
+			edit,
 			colors,
 		)
 	}).
@@ -816,6 +825,7 @@ func headerRow(
 	marks *Selection,
 	extent Extent,
 	onHit OnHit,
+	edit *EditView,
 	colors *theme.ThemeColors,
 ) ui.Element {
 	row := ui.Row(c).
@@ -896,7 +906,20 @@ func headerRow(
 			if current {
 				cell.TextColor(colors.AccentDeep.Color())
 			}
+			mark := edit.column(ix)
+			if mark.Key || mark.Locked {
+				cell.Gap(6)
+			}
 			cell.Children(func() {
+				// A key column wears the key, and a column that takes no
+				// edit inside a result that does wears a lock: the rest
+				// of the header is the part that edits.
+				if mark.Key {
+					uikit.DrawIcon(c, uikit.IconKey, 11, colors.AccentDeep)
+				}
+				if mark.Locked {
+					uikit.DrawIcon(c, uikit.IconLock, 11, colors.TextMuted)
+				}
 				// The name as the database spells it. The first edition set
 				// headers in capitals, which made `userId` and `userid` — two
 				// different columns to Postgres — read as the same one.
@@ -948,9 +971,12 @@ func dataRow(
 	firstRow int,
 	state *GridState,
 	onHit OnHit,
+	edit *EditView,
 	colors *theme.ThemeColors,
 ) ui.Element {
 	p := &state.pointer
+	rowMark, number := edit.rowMark(ix, firstRow+ix)
+	wash, gutterInk, rowInk, marked := rowColors(rowMark, colors)
 	picked := marks.IsPicked(ix)
 	// The gutter is the one target that speaks for the whole record, so it
 	// is the one target that washes the whole row. A cell washes itself:
@@ -969,8 +995,15 @@ func dataRow(
 		// A ticked row is washed whole: the tick is a statement about the
 		// record, not about a cell in it.
 		row.Background(colors.Selection.Color())
+	} else if marked && wash != (theme.Hsla{}) {
+		// An added, deleted or conflicting row says so whole, under any
+		// mark a cell of it carries.
+		row.Background(wash.Color())
 	} else if rowHovered {
 		row.Background(colors.Panel.Color())
+	}
+	if rowMark == RowDeleted {
+		row.Strikethrough().DecorationColor(rowInk.Color())
 	}
 
 	row.Children(func() {
@@ -985,9 +1018,14 @@ func dataRow(
 		case haveCursor && cursor.Row == ix:
 			gutterColor = colors.TextSecondary
 		}
-		gutterText := strconv.Itoa(firstRow + ix)
+		gutterText := strconv.Itoa(number)
+		if marked {
+			gutterText = gutterGlyph(rowMark)
+			gutterColor = gutterInk
+		}
 		if picked {
 			gutterText = tick
+			gutterColor = colors.AccentDeep
 		}
 		gutter := ui.Row(c.Key("gutter")).
 			Width(gutterWidth).
@@ -999,6 +1037,9 @@ func dataRow(
 			BorderColor(colors.Hairline.Color()).
 			FontSize(theme.SizeMeta).
 			TextColor(gutterColor.Color())
+		if marked {
+			gutter.FontWeight(600)
+		}
 		gutter.Children(func() { ui.Text(c, gutterText) })
 		if onHit != nil {
 			gutterHover := colors.Hairline
@@ -1046,14 +1087,45 @@ func dataRow(
 			width := widths[column]
 			cursor := marks.IsCursor(ix, column)
 			_, hit := slices.BinarySearchFunc(hits, NewCell(ix, column), Cell.Compare)
+			cellMark := edit.cellMark(ix, column)
+			editing := edit.editing(ix, column)
 			cell := lane(ui.Row(c.Key(column)), width, column == last).
 				PaddingX(12).
 				FillHeight().
 				AlignItems(ui.Center).
 				Clip().
 				TextColor(valueColor(value, colors).Color())
+			if rowMark == RowDeleted {
+				cell.TextColor(rowInk.Color())
+			}
+			if editing {
+				// The editor is the cell: white, with the accent's ring
+				// drawn inside it, so the value does not move.
+				cell.Background(colors.Raised.Color()).
+					InsetShadow(0, 0, 0, 2, colors.Accent.Color()).
+					PaddingX(10).
+					Children(func() { edit.Editor(c) })
+				continue
+			}
 			cell.Children(func() {
-				if _, null := value.(dbclient.ValueNull); null {
+				switch cellMark {
+				case CellStaged:
+					cornerFlag(c, colors.Edit)
+				case CellRefused:
+					cornerFlag(c, colors.Error)
+				}
+				_, null := value.(dbclient.ValueNull)
+				switch {
+				case cellMark == CellDefault:
+					chip(c, "DEFAULT", colors.EditDefault, colors.EditAdded)
+				case null && cellMark == CellStaged:
+					chip(c, "NULL", colors.EditBorder, colors.EditText)
+				case cellMark == CellRefused:
+					ui.Text(c, CellText(value, cellChars(width, column == last, windowWidth))).
+						SingleLine().
+						WavyUnderline().
+						DecorationColor(colors.Error.Color())
+				case null:
 					// Absence, set in a well so it cannot be read as the word
 					// somebody stored. Faint grey alone was 2.2:1 — it said
 					// "nothing here" by being nearly invisible.
@@ -1065,10 +1137,20 @@ func dataRow(
 						FontSize(theme.SizeCaption).
 						FixedLineHeight(17).
 						Children(func() { ui.Text(c, "NULL") })
-				} else {
+				default:
 					ui.Text(c, CellText(value, cellChars(width, column == last, windowWidth))).SingleLine()
 				}
 			})
+			switch cellMark {
+			case CellStaged:
+				cell.Background(colors.EditSurface.Color()).TextColor(colors.EditText.Color())
+			case CellRefused:
+				cell.Background(colors.MatchError.Color()).TextColor(colors.Error.Color())
+			case CellLocked:
+				if rowMark != RowAdded && rowMark != RowDeleted && rowMark != RowConflict {
+					cell.Background(colors.EditLocked.Color())
+				}
+			}
 			// The cursor's cell is the strongest mark on screen, the rest of
 			// the range a wash under it. Neither carries a border: a border
 			// would take a pixel out of the cell's content box and shift the
