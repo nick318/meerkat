@@ -33,7 +33,7 @@ var (
 // version is the version of this build, and the one place it is written:
 // `scripts/bundle-mac.sh` reads it from here for the bundle's
 // Info.plist.
-const version = "0.1.12"
+const version = "0.1.13"
 
 // Channel is where a build came from, and so where its updates come from.
 type Channel int
