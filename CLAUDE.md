@@ -1330,6 +1330,13 @@ vertical one, so it travels with its lines. It takes no room until a run
 has been made. The per-statement clock is the statement's own, around its
 tokio task.
 
+**A `TRUNCATE` wears the mark and opens no report.** It is in
+`ddl_verb` because it cannot be undone and the server reports no count
+for it, so the teal is a fair warning; but it empties a table and
+changes no shape, so `Tally::add` leaves it out of the run's `Shape` and
+nothing reads the catalog back for it. Its statistic stays `truncated ·
+2.2 s`.
+
 **What changed is read off the catalog, never guessed from the SQL.**
 Once a shape-changing statement lands, `Shell::report_schema` reads the
 catalog again and `introspect::diff` compares it with the one the shell
@@ -1343,7 +1350,21 @@ objects of a table that came or went are not listed: a `CREATE TABLE`
 with a key makes an index, and saying so beside the table would say one
 event twice. **An object is never data lost**: `drops_anything` and
 `dropped_names` count tables and columns only, so a committed `DROP
-INDEX` is not painted as something that cannot be recovered. `SchemaReport` on the
+INDEX` is not painted as something that cannot be recovered.
+
+**The report keeps only what the run's statements name.** The catalog
+the diff starts from is the one the shell already had — read at the
+connect, or from the cache — and on a shared database the shape moves in
+between: a migration, a colleague, another app. A whole diff laid every
+one of those changes at the statement just run, and said a view somebody
+else dropped "cannot be recovered from here". So `scope_delta` keeps a
+relation the statements name, and an object whose name or relation they
+name; `query::NamesIn` reads the names token by token, folding an
+unquoted one and keeping a quoted one, and a `CREATE`, `ALTER` or `DROP
+SCHEMA` owns everything in its schema. It errs toward keeping: a name in
+a check or a key's target counts. What is left out still reaches the
+sidebar, which is a picture of the database and not of the run.
+`SchemaReport` on the
 tab holds the result, and `Shell::schema_strip` paints it as the comp's
 SCHEMA CHANGED panel, first under the editor: a `+` row on the green wash,
 a `−` row on the clay wash with the name struck through, a `~` row saying

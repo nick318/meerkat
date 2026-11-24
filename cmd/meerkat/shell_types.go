@@ -1764,10 +1764,12 @@ type Changed struct {
 }
 
 // ddlAt is one shape-changing statement of a run: Rust's `(usize,
-// DdlVerb)` — its index in the run, and its verb.
+// DdlVerb)` — its index in the run, and its verb — and its text, which
+// says what the report may lay at its door (see [scopeDelta]).
 type ddlAt struct {
-	ix   int
-	verb query.DdlVerb
+	ix        int
+	verb      query.DdlVerb
+	statement string
 }
 
 // SchemaReport is what a run did to the **shape** of the database, read
@@ -1868,9 +1870,10 @@ type RunOutcome struct {
 	shape Shape
 }
 
-// Shape is the `CREATE`, `ALTER`, `DROP` and `TRUNCATE` statements a run
-// has sent and had answered, with their index in the run and what they
-// cost.
+// Shape is the `CREATE`, `ALTER` and `DROP` statements a run has sent and
+// had answered, with their index in the run and what they cost. A
+// `TRUNCATE` wears the DDL mark in the editor but is not here: it empties
+// a table and changes no shape, so there is nothing to read back.
 type Shape struct {
 	ddl []ddlAt
 	ms  uint64

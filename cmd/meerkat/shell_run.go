@@ -1579,8 +1579,10 @@ func (t *Tally) add(
 	if _, ok := query.TransactionVerb(statement); ok {
 		t.boundaryTag = result.Tag
 	}
-	if ddl != nil {
-		t.shape.ddl = append(t.shape.ddl, ddlAt{ix: ix, verb: *ddl})
+	// A `TRUNCATE` changes rows, not the shape: its statistic says
+	// `truncated`, and the catalog is not read back for it.
+	if ddl != nil && *ddl != query.DdlVerbTruncate {
+		t.shape.ddl = append(t.shape.ddl, ddlAt{ix: ix, verb: *ddl, statement: statement})
 		t.shape.ms += ms
 	}
 	if len(result.Columns) == 0 {

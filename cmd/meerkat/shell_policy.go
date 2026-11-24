@@ -184,6 +184,41 @@ func statementMeta(verb *query.DdlVerb, statement string, result *dbclient.Query
 	}
 }
 
+// scopeDelta keeps what the run's shape-changing statements could have
+// done: a relation they name, and an object whose name or relation they
+// name.
+//
+// **The catalog the diff starts from is the one the shell already had**,
+// read at the connect or an earlier run, and on a shared database the
+// shape moves in between — a migration, a colleague, another app. Left
+// whole, the diff lays every one of those changes at the door of the
+// statement the user just ran, and says a view somebody else dropped
+// "cannot be recovered from here". What is left out still reaches the
+// sidebar, which is a picture of the database and not of the run.
+func scopeDelta(delta introspect.Delta, statements []ddlAt) introspect.Delta {
+	texts := make([]string, len(statements))
+	for i, statement := range statements {
+		texts[i] = statement.statement
+	}
+	names := query.NamesIn(texts)
+	var scoped introspect.Delta
+	for _, relation := range delta.Relations {
+		if names.Mentions(relation.Schema, relation.Name) {
+			scoped.Relations = append(scoped.Relations, relation)
+		}
+	}
+	for _, object := range delta.Objects {
+		// A routine is named by its signature, and a statement by the
+		// name alone.
+		name, _, _ := strings.Cut(object.Name, "(")
+		if names.Mentions(object.Schema, name) ||
+			(object.Relation != nil && names.Mentions(object.Schema, *object.Relation)) {
+			scoped.Objects = append(scoped.Objects, object)
+		}
+	}
+	return scoped
+}
+
 // ddlMeta is the statistic beside a shape-changing statement once the
 // catalog has been read back, when the run held exactly one and the
 // report can be laid at its door: `altered · +2 −1 columns · 12 ms`.

@@ -19,9 +19,10 @@ import (
 // the change is visible to while a transaction holds it; the pool
 // answers only for a tab with no session, which cannot have run a
 // statement, so in practice never. The catalog the shell had is what
-// the new one is compared with, and it is taken for the sidebar only
-// when nothing is uncommitted — a table one tab has not committed
-// must not appear in the tree every other tab reads.
+// the new one is compared with — kept to what the run's statements
+// name, because that catalog may be hours old — and it is taken for
+// the sidebar only when nothing is uncommitted — a table one tab has
+// not committed must not appear in the tree every other tab reads.
 //
 // Rust: `fn report_schema(&mut self, tab_id, generation, cx)`.
 func (s *Shell) reportSchema(tabID, generation uint64) {
@@ -68,7 +69,7 @@ func (s *Shell) reportSchema(tabID, generation uint64) {
 				return
 			}
 			if before != nil {
-				report.delta = introspect.Diff(before, &after)
+				report.delta = scopeDelta(introspect.Diff(before, &after), report.statements)
 			} else {
 				report.delta = introspect.Delta{}
 			}

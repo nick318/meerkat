@@ -241,7 +241,8 @@ func (v DdlVerb) Past() string {
 // word past the comments and does not parse SQL. `TRUNCATE` is here
 // although it changes rows and no shape, because it is the one row-change
 // the server reports no count for, and it is irreversible in the same way
-// a `DROP` is.
+// a `DROP` is. It wears the mark only: the shell reads no catalog back for
+// it, because there is no shape to read.
 //
 // Being wrong is cheap. A missed verb costs a statement painted plain and
 // a sidebar refreshed one run late; a false one costs a teal mark and one

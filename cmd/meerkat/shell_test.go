@@ -1387,10 +1387,10 @@ func TestTheSchemaNoteSaysWhetherTheChangeCanBeTakenBack(t *testing.T) {
 }
 
 func TestTheReportHeaderNamesOneRelationOrCountsThem(t *testing.T) {
-	if got := reportVerbs([]ddlAt{{0, query.DdlVerbAlter}, {2, query.DdlVerbAlter}}); got != "altered" {
+	if got := reportVerbs([]ddlAt{{ix: 0, verb: query.DdlVerbAlter}, {ix: 2, verb: query.DdlVerbAlter}}); got != "altered" {
 		t.Errorf("report_verbs = %q", got)
 	}
-	if got := reportVerbs([]ddlAt{{0, query.DdlVerbCreate}, {1, query.DdlVerbDrop}}); got != "created, dropped" {
+	if got := reportVerbs([]ddlAt{{ix: 0, verb: query.DdlVerbCreate}, {ix: 1, verb: query.DdlVerbDrop}}); got != "created, dropped" {
 		t.Errorf("report_verbs = %q", got)
 	}
 	subject, reveal := reportSubject(shellAltered(nil))
@@ -1638,5 +1638,47 @@ func TestTheMessagesStripListsSixAndCountsTheRest(t *testing.T) {
 	shown, more = messageLines(many)
 	if len(shown) != messagesShown || more != "3 more" {
 		t.Fatalf("shown = %q, more = %q", shown, more)
+	}
+}
+
+// A diff against a catalog read hours ago carries what everybody else did
+// since; the report keeps what the run's own statements name.
+func TestTheSchemaReportKeepsWhatTheRunNamed(t *testing.T) {
+	orders := "orders"
+	delta := introspect.Delta{
+		Relations: []introspect.RelationDelta{
+			{Schema: "public", Name: "orders", Change: introspect.RelationAltered{}},
+			{Schema: "dbo", Name: "sa_card_rate", Change: introspect.RelationDropped{}},
+		},
+		Objects: []introspect.ObjectDelta{
+			{Schema: "public", Relation: &orders, Kind: introspect.ObjectKindIndex, Name: "orders_note_ix", Change: introspect.ObjectAdded{}},
+			{Schema: "public", Kind: introspect.ObjectKindRoutine, Name: "touch(integer)", Change: introspect.ObjectAdded{}},
+			{Schema: "public", Kind: introspect.ObjectKindRoutine, Name: "other(integer)", Change: introspect.ObjectAdded{}},
+		},
+	}
+	got := scopeDelta(delta, []ddlAt{
+		{ix: 0, verb: query.DdlVerbCreate, statement: "CREATE INDEX ON orders (note)"},
+		{ix: 1, verb: query.DdlVerbCreate, statement: "CREATE FUNCTION touch(int) RETURNS int AS $$ select 1 $$ LANGUAGE sql"},
+	})
+	if len(got.Relations) != 1 || got.Relations[0].Name != "orders" {
+		t.Errorf("relations = %+v, want orders alone", got.Relations)
+	}
+	if len(got.Objects) != 2 || got.Objects[0].Name != "orders_note_ix" || got.Objects[1].Name != "touch(integer)" {
+		t.Errorf("objects = %+v, want the index and touch", got.Objects)
+	}
+}
+
+// A TRUNCATE empties a table and changes no shape, so it opens no report.
+func TestATruncateIsNotAShapeChange(t *testing.T) {
+	var tally Tally
+	truncate := query.DdlVerbTruncate
+	tally.add(0, "TRUNCATE TABLE audit_log", &truncate, dbclient.QueryResult{}, 5)
+	if len(tally.shape.ddl) != 0 {
+		t.Errorf("shape = %+v, want nothing for a TRUNCATE", tally.shape.ddl)
+	}
+	alter := query.DdlVerbAlter
+	tally.add(1, "ALTER TABLE t ADD c int", &alter, dbclient.QueryResult{}, 5)
+	if len(tally.shape.ddl) != 1 || tally.shape.ddl[0].statement != "ALTER TABLE t ADD c int" {
+		t.Errorf("shape = %+v, want the ALTER", tally.shape.ddl)
 	}
 }
